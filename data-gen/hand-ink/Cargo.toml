@@ -1,0 +1,18 @@
+[package]
+name = "hand-ink"
+version = "0.1.0"
+edition = "2021"
+description = "Deterministic handwritten-ink variant of clean sheet-music PNGs (seeded smooth displacement + ink jitter + paper grain, topology-preserving); writes paired output + params.json."
+license = "MIT OR Apache-2.0"
+
+[[bin]]
+name = "hand-ink"
+path = "src/main.rs"
+
+[dependencies]
+image = { version = "0.25", features = ["png"] }
+clap = { version = "4", features = ["derive"] }
+serde_json = "1"
+
+[profile.release]
+opt-level = 3

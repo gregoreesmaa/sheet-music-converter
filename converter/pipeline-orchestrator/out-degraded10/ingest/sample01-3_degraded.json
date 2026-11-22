@@ -1,0 +1,8 @@
+{
+  "page": "sample01-3_degraded",
+  "source": "converter/pipeline-orchestrator\\../../data-gen/score-corpus/degraded10\\sample01-3_degraded.jpg",
+  "bytes": 553362,
+  "sha": "fnv1a:9c5e0a3b8b82a148",
+  "format": "jpg",
+  "seed": 20261022
+}

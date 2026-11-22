@@ -1,0 +1,56 @@
+# Example config for pipeline-orchestrator.
+# Copy to config.toml and edit. All paths are resolved relative to
+# the directory containing the config file unless given as absolute.
+#
+# Run:  pipeline-orchestrator --config config.toml
+# Resume after an interruption: add --resume.
+
+[global]
+# Master seed. Every byte the pipeline emits derives deterministically
+# from (seed, stage, unit key), so the same config always yields the
+# same dataset. Override per-run with `--seed <U64>`.
+seed = 20261022
+# Number of base scores rendered. Total artifacts ~= count * variants.
+count = 16
+# Root directory for stage outputs (<out>/render, <out>/vary, ...).
+out_dir = "out"
+# Where completion records live. Defaults to <out_dir>/.pipeline-state.
+# state_file = "out/.pipeline-state"
+
+[render]
+enabled = true
+# Placeholder backend. Swap for "lilypond" / "verovio" wrappers that
+# consume the same seed + index contract (see README.md).
+backend = "placeholder"
+width = 2480
+height = 3508
+
+[vary]
+enabled = true
+# Deterministic engraving variants derived per (sample, variant).
+variants_per_sample = 3
+
+# Optional handwriting-ink stage (external binary, not sequenced here).
+# Run data-gen/hand-ink between render and vary:
+#   hand-ink --input out/render --out-dir out/hand-ink --seed 20261022 --level high
+# then point vary at out/hand-ink. Deterministic port of
+# tmp-train/hw-synth/v3 level v3_high; see ../hand-ink/README.md.
+# [hand-ink]
+# enabled = false
+# level = "high"
+
+[degrade]
+enabled = true
+# Degradation strength in [0.0, 1.0]; controls artifact density.
+level = 0.4
+# Render-once-degrade-many fan-out: degrade variants per vary output (1–64).
+# The N variants share one render/vary parent through independent
+# (seed, stage, key) streams, so render cost per training page drops ~N×.
+# 1 keeps the legacy `r..v..d` keys (bit-identical to older runs); N > 1
+# uses `r..v..d0 .. d{N-1}`.
+degrades_per_variant = 1
+
+[pack]
+enabled = true
+# Manifest format written alongside the packed file list.
+format = "manifest"

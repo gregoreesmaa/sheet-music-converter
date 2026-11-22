@@ -1,0 +1,10 @@
+[package]
+name = "degrade-gpu"
+version = "0.1.0"
+edition = "2021"
+description = "WGPU GPU backend for photo-degrade dense stages (resident single-submit chain + fused rotate/downscale affine)."
+
+[dependencies]
+wgpu = "30"
+pollster = "0.3"
+bytemuck = { version = "1", features = ["derive"] }

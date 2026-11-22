@@ -1,0 +1,20 @@
+[package]
+name = "symbox-extract"
+version = "0.1.0"
+edition = "2021"
+description = "MuseScore SVG page -> glyph/staff boxes JSON aligned to the sister PNG (pilot label source)."
+license = "MIT OR Apache-2.0"
+
+[lib]
+name = "symbox_extract"
+path = "src/lib.rs"
+
+[[bin]]
+name = "symbox-extract"
+path = "src/main.rs"
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+image = { version = "0.25", features = ["png", "jpeg"] }

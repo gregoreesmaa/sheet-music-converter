@@ -1,0 +1,223 @@
+{
+  "input": "grid.png",
+  "output": "grid_p15.png",
+  "file_seed": 15,
+  "strength": 0.6,
+  "backend": "cpu",
+  "width": 1131,
+  "height": 1506,
+  "paper_grain_sigma": 2.113755,
+  "paper_speckle_prob": 0.0010142609,
+  "curl_side": "top",
+  "curl_px": 30.554928,
+  "curl_shade": 0.10856824,
+  "bend_spine_cx": 750.66504,
+  "bend_spine_w": 58.46365,
+  "bend_ripple_fx": 1.2698832,
+  "bend_ripple_fy": 1.4616663,
+  "bend_ripple_ph": 2.7820833,
+  "perspective_max_frac": 0.042000003,
+  "corner_offsets": [
+    [
+      42.63263,
+      -4.8
+    ],
+    [
+      -0.48439756,
+      7.956486
+    ],
+    [
+      4.8,
+      4.8
+    ],
+    [
+      15.073954,
+      4.8
+    ]
+  ],
+  "warp_fit_scale": 0.07312106,
+  "warp_out_px": 4.8,
+  "rotation_deg": 1.2812394,
+  "frame_mode": "tight",
+  "frame_pad_px": [
+    0,
+    0,
+    0,
+    0
+  ],
+  "frame_cut_px": [
+    30,
+    24,
+    28,
+    9
+  ],
+  "frame_notation_bbox": [
+    124,
+    118,
+    1100,
+    1455
+  ],
+  "frame_quiet_px": [
+    124,
+    118,
+    99,
+    144
+  ],
+  "frame_safe_px": 3,
+  "dist_k1": -0.000657237,
+  "dist_k2": -0.0002450833,
+  "dist_fit_scale": 0.014069718,
+  "focus_mode": "uniform",
+  "focus_y": 0.5065926,
+  "focus_h": 0.27381274,
+  "tilt_sigma": 1.305277,
+  "blur_sigma": 1.1532527,
+  "glare_center": [
+    14.325162,
+    1470.202
+  ],
+  "glare_radius": 509.67026,
+  "glare_alpha": 0.23370676,
+  "shadow_angle_deg": 85.36201,
+  "shadow_strength": 0.10193279,
+  "vignette_strength": 0.12674525,
+  "ca_px": 0.038295187,
+  "ink": {
+    "enabled": true,
+    "fade_amount": 0.34293962,
+    "blotches": [
+      [
+        0.17392743,
+        0.6930456,
+        0.31570494,
+        0.68671525
+      ],
+      [
+        0.24414885,
+        0.10206753,
+        0.15927793,
+        0.6217532
+      ],
+      [
+        0.8067163,
+        0.23484176,
+        0.24076948,
+        0.78100765
+      ]
+    ],
+    "dropout_clusters": 365,
+    "dropout_radius": 1.8048472,
+    "gap_attempts": 68,
+    "gap_max_len": 13,
+    "ghost_alpha": 0.061914623,
+    "ghost_radius": 1,
+    "toner_amp": 0.1299042,
+    "toner_fx": 2.4785748,
+    "toner_fy": 2.6407604,
+    "toner_phase": 1.4763023,
+    "brown_amount": 0.3349946
+  },
+  "paper": {
+    "enabled": true,
+    "yellowing": 0.5633351,
+    "mottle": 0.90317947,
+    "edge": 0.81365883,
+    "foxing_spots": 21,
+    "foxing_amount": 0.36311752,
+    "fiber_strokes": 91,
+    "fiber_amount": 0.05255258,
+    "cockle": 0.92652035,
+    "water_present": false,
+    "water_x": 0.30851084,
+    "water_y": 0.97895736,
+    "water_radius": 0.25651643,
+    "water_amount": 0.754226
+  },
+  "wear": {
+    "enabled": true,
+    "heavy_zones": [
+      [
+        0.011913061,
+        0.99905336,
+        0.16002214,
+        0.9284219
+      ],
+      [
+        0.7025556,
+        0.8234911,
+        0.14827195,
+        0.6085623
+      ],
+      [
+        0.47888678,
+        0.16741043,
+        0.1908106,
+        0.87680936
+      ]
+    ],
+    "heavy_lift": 0.4557471,
+    "flake_clusters": 75,
+    "band_period": 15.61827,
+    "band_amp": 0.024718486,
+    "streaks": 0,
+    "toner_bands": 0,
+    "misreg": [
+      0,
+      0
+    ],
+    "eraser_count": 0,
+    "stain_water": false,
+    "stain_oil": false
+  },
+  "capture": {
+    "enabled": true,
+    "motion_angle_deg": 140.4187,
+    "motion_radius": 1,
+    "fingerprint_edge": 2,
+    "fingerprint_x": 509,
+    "fingerprint_y": 24,
+    "fingerprint_rx": 45,
+    "fingerprint_ry": 56,
+    "fingerprint_oil": 6.8713536,
+    "tape_height": 53,
+    "tape_opacity": 0.22166058,
+    "tape_edge": 2,
+    "tape_start_frac": 0.22921681,
+    "tape_len_frac": 0.47354832,
+    "residue_count": 2,
+    "residue_rects": [
+      [
+        820,
+        488,
+        178,
+        93
+      ],
+      [
+        810,
+        122,
+        250,
+        75
+      ]
+    ],
+    "hole_x": 1141,
+    "hole_y": 155,
+    "hole_radius": 18,
+    "sticky_corner": 2,
+    "sticky_size": 152,
+    "sticky_tone": 2,
+    "exposure_lift": 2.1247344,
+    "exposure_compress": 0.98501813,
+    "banding_amplitude": 1.9653333,
+    "banding_period": 3
+  },
+  "scale_x": 0.96166486,
+  "scale_y": 0.94560343,
+  "tear_count": 0,
+  "stain_count": 0,
+  "pencil_count": 0,
+  "fold_corner": "none",
+  "fold_creases": [],
+  "highlight": "none",
+  "noise_sigma": 7.8080883,
+  "jpeg_quality": 69
+}

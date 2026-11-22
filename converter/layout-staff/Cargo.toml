@@ -1,0 +1,20 @@
+[package]
+name = "layout-staff"
+version = "0.1.0"
+edition = "2021"
+description = "Detect staff systems/staves in cleaned sheet-music images (classical projection fallback with a neural-model hook trait); writes systems/staves JSON + staff-probability map PNG."
+
+[[bin]]
+name = "layout-staff"
+path = "src/main.rs"
+
+[dependencies]
+image = { version = "0.25", features = ["png", "jpeg"] }
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+ndarray = { version = "0.17", optional = true }
+ort = { version = "2.0.0-rc.15", optional = true }
+
+[features]
+onnx = ["dep:ort", "dep:ndarray"]

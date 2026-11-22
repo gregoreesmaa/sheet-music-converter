@@ -1,0 +1,45 @@
+# Example config for the converter pipeline-orchestrator.
+# Copy to config.toml and edit. All relative paths resolve against
+# the directory containing the config file.
+#
+# Run:  pipeline-orchestrator --config config.toml
+# Resume after an interruption: add --resume.
+
+[global]
+# Master seed. Every layout box and symbol derives deterministically
+# from (seed, stage, page), so the same config + inputs always yield
+# the same outputs. Override per-run with `--seed <U64>`.
+seed = 20261022
+# Root directory for stage outputs (<out>/ingest, <out>/layout, ...).
+out_dir = "out"
+# Where completion records live. Defaults to <out_dir>/.pipeline-state.
+# state_file = "out/.pipeline-state"
+
+[ingest]
+enabled = true
+# Directory of page images (scanned in sorted order). Each matching
+# file becomes one pipeline unit ("page").
+input_dir = "samples"
+# Comma-separated file extensions (lowercase, without dots).
+extensions = "png,jpg,jpeg,tif,tiff,bmp"
+
+[layout]
+enabled = true
+# Staff systems detected per page (deterministic placeholder boxes;
+# swap for a real detector consuming the same seed + page contract).
+systems_per_page = 4
+# Reference page size the boxes are computed against.
+page_width = 2480
+page_height = 3508
+
+[symbols]
+enabled = true
+# Symbols emitted per staff system (deterministic placeholders).
+symbols_per_system = 24
+# Placeholder confidences below this are dropped from the output.
+min_confidence = 0.5
+
+[serialize]
+enabled = true
+# Final score format: "json" or "musicxml".
+format = "musicxml"

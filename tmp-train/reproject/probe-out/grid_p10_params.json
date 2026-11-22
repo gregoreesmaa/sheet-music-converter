@@ -1,0 +1,210 @@
+{
+  "input": "grid.png",
+  "output": "grid_p10.png",
+  "file_seed": 10,
+  "strength": 0.6,
+  "backend": "cpu",
+  "width": 855,
+  "height": 1079,
+  "paper_grain_sigma": 1.8090941,
+  "paper_speckle_prob": 0.0008038835,
+  "curl_side": "left",
+  "curl_px": 18.587578,
+  "curl_shade": 0.13906972,
+  "bend_spine_cx": 498.778,
+  "bend_spine_w": 77.49525,
+  "bend_ripple_fx": 1.7492552,
+  "bend_ripple_fy": 1.6915317,
+  "bend_ripple_ph": 1.691879,
+  "perspective_max_frac": 0.042000003,
+  "corner_offsets": [
+    [
+      43.105377,
+      65.213036
+    ],
+    [
+      4.8,
+      52.464806
+    ],
+    [
+      -25.26724,
+      4.8
+    ],
+    [
+      -4.8,
+      4.8
+    ]
+  ],
+  "warp_fit_scale": 0.13073915,
+  "warp_out_px": 4.8,
+  "rotation_deg": 4.777753,
+  "frame_mode": "inset",
+  "frame_pad_px": [
+    10,
+    39,
+    16,
+    13
+  ],
+  "frame_cut_px": [
+    0,
+    0,
+    0,
+    0
+  ],
+  "frame_notation_bbox": [
+    92,
+    193,
+    1098,
+    1462
+  ],
+  "frame_quiet_px": [
+    92,
+    193,
+    101,
+    137
+  ],
+  "frame_safe_px": 3,
+  "dist_k1": -0.00092506484,
+  "dist_k2": -0.00027985,
+  "dist_fit_scale": 0.026335584,
+  "focus_mode": "uniform",
+  "focus_y": 0.3467275,
+  "focus_h": 0.22945833,
+  "tilt_sigma": 0.77010214,
+  "blur_sigma": 1.4371953,
+  "glare_center": [
+    5.3065014,
+    1604.4283
+  ],
+  "glare_radius": 622.39844,
+  "glare_alpha": 0.15712486,
+  "shadow_angle_deg": 80.96628,
+  "shadow_strength": 0.15252729,
+  "vignette_strength": 0.04388739,
+  "ca_px": 0.047533896,
+  "ink": {
+    "enabled": true,
+    "fade_amount": 0.18945357,
+    "blotches": [
+      [
+        0.9740655,
+        0.4368953,
+        0.24599212,
+        0.88270944
+      ],
+      [
+        0.34244174,
+        0.3763833,
+        0.34519434,
+        0.49294233
+      ],
+      [
+        0.11985123,
+        0.8628653,
+        0.12048642,
+        0.48962128
+      ]
+    ],
+    "dropout_clusters": 358,
+    "dropout_radius": 1.1867192,
+    "gap_attempts": 61,
+    "gap_max_len": 12,
+    "ghost_alpha": 0.059403967,
+    "ghost_radius": 2,
+    "toner_amp": 0.14722626,
+    "toner_fx": 1.3250103,
+    "toner_fy": 2.8757083,
+    "toner_phase": 1.3471153,
+    "brown_amount": 0.19023432
+  },
+  "paper": {
+    "enabled": true,
+    "yellowing": 0.1631431,
+    "mottle": 0.5377229,
+    "edge": 0.9545903,
+    "foxing_spots": 172,
+    "foxing_amount": 0.4597975,
+    "fiber_strokes": 45,
+    "fiber_amount": 0.0706107,
+    "cockle": 0.311184,
+    "water_present": false,
+    "water_x": 0.96182305,
+    "water_y": 0.11203802,
+    "water_radius": 0.17546618,
+    "water_amount": 0.834928
+  },
+  "wear": {
+    "enabled": true,
+    "heavy_zones": [
+      [
+        0.8197805,
+        0.70132995,
+        0.2056101,
+        0.5516574
+      ],
+      [
+        0.15579504,
+        0.6067935,
+        0.20536536,
+        0.8695077
+      ],
+      [
+        0.49793667,
+        0.26730704,
+        0.080164455,
+        0.7232119
+      ]
+    ],
+    "heavy_lift": 0.4961466,
+    "flake_clusters": 96,
+    "band_period": 17.350079,
+    "band_amp": 0.03503554,
+    "streaks": 2,
+    "toner_bands": 0,
+    "misreg": [
+      0,
+      0
+    ],
+    "eraser_count": 0,
+    "stain_water": true,
+    "stain_oil": false
+  },
+  "capture": {
+    "enabled": true,
+    "motion_angle_deg": 68.3656,
+    "motion_radius": 2,
+    "fingerprint_edge": 3,
+    "fingerprint_x": 378,
+    "fingerprint_y": 1746,
+    "fingerprint_rx": 44,
+    "fingerprint_ry": 55,
+    "fingerprint_oil": 10.22064,
+    "tape_height": 30,
+    "tape_opacity": 0.20324968,
+    "tape_edge": 3,
+    "tape_start_frac": 0.30895048,
+    "tape_len_frac": 0.4266296,
+    "residue_count": 0,
+    "residue_rects": [],
+    "hole_x": 48,
+    "hole_y": 1706,
+    "hole_radius": 11,
+    "sticky_corner": 1,
+    "sticky_size": 233,
+    "sticky_tone": 0,
+    "exposure_lift": -0.88669544,
+    "exposure_compress": 0.99449164,
+    "banding_amplitude": 0.98470956,
+    "banding_period": 6
+  },
+  "scale_x": 0.6293435,
+  "scale_y": 0.6174495,
+  "tear_count": 0,
+  "stain_count": 0,
+  "pencil_count": 3,
+  "fold_corner": "none",
+  "fold_creases": [],
+  "highlight": "none",
+  "noise_sigma": 2.0227804,
+  "jpeg_quality": 61
+}

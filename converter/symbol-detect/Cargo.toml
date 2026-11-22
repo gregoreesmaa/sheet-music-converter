@@ -1,0 +1,24 @@
+[package]
+name = "symbol-detect"
+version = "0.1.0"
+edition = "2021"
+description = "Detect music-symbol glyph boxes/labels from staff crops plus a staff map (classical stub; ONNX hook trait included)."
+license = "MIT OR Apache-2.0"
+
+[[bin]]
+name = "symbol-detect"
+path = "src/main.rs"
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+image = "0.25"
+ndarray = { version = "0.17", optional = true }
+ort = { version = "2.0.0-rc.15", optional = true }
+
+# Optional ONNX runtime. The default build stays lightweight and
+# offline-friendly; `--features onnx` wires the patch-classifier backend
+# behind `--backend onnx` (same `ort` pin as `layout-staff`).
+[features]
+onnx = ["dep:ort", "dep:ndarray"]

@@ -1,0 +1,16 @@
+{
+  "seed": 20261022,
+  "stages": ["ingest", "layout", "symbols", "serialize"],
+  "pages": [
+    {"page": "sample01-1_degraded"},
+    {"page": "sample01-2_degraded"},
+    {"page": "sample01-3_degraded"},
+    {"page": "sample02-1_degraded"},
+    {"page": "sample02-2_degraded"},
+    {"page": "sample03-1_degraded"},
+    {"page": "sample03-2_degraded"},
+    {"page": "sample03-3_degraded"},
+    {"page": "sample04-1_degraded"},
+    {"page": "sample04-2_degraded"}
+  ]
+}

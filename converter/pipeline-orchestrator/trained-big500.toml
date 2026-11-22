@@ -1,0 +1,47 @@
+# Tuned converter config from the big500 training corpus (25,490 degraded pages).
+# Copy to config.toml and run: pipeline-orchestrator --config config.toml
+# All relative paths resolve against the directory containing the config file.
+#
+# Derived in converter/TRAINING_BIG500.md from big500-renders (clean PNG +
+# MusicXML ground truth) x big500-degraded10 (10 phone-photo variants/page).
+# Placeholder stage volumes below are training means, not defaults (round 2):
+#   systems_per_page = 7  (min-fill 0.10: 6.7-7.3 systems/page over 48 pages)
+#   symbols_per_system = 84 (min-area 16: ~589 glyphs/page / ~7 systems)
+
+[global]
+# Same seed lineage as config.example.toml; reruns stay bit-identical.
+seed = 20261022
+# Root directory for stage outputs (<out>/ingest, <out>/layout, ...).
+out_dir = "out-big500-tuned"
+# Where completion records live. Defaults to <out_dir>/.pipeline-state.
+# state_file = "out/.pipeline-state"
+
+[ingest]
+enabled = true
+# 25,490 training photos: <score>-<page>_d<variant>.jpg, ground truth in
+# ../../data-gen/score-corpus/big500-renders (<score>.musicxml + <score>.json).
+# Swap to ../../data-gen/score-corpus/degraded10 for the 10-photo held-out set.
+input_dir = "../../data-gen/score-corpus/big500-degraded10"
+# Comma-separated file extensions (lowercase, without dots).
+extensions = "png,jpg,jpeg,tif,tiff,bmp"
+
+[layout]
+enabled = true
+# Training mean with --min-fill 0.10 (zero empty pages over 48; see
+# TRAINING_BIG500.md sec. 7).
+systems_per_page = 7
+# Reference page size the boxes are computed against.
+page_width = 2480
+page_height = 3508
+
+[symbols]
+enabled = true
+# Training mean with --min-area 16 (~589 glyphs/page / ~7 systems/page ~= 84).
+symbols_per_system = 84
+# Placeholder confidences below this are dropped from the output.
+min_confidence = 0.5
+
+[serialize]
+enabled = true
+# Final score format: "json" or "musicxml".
+format = "musicxml"

@@ -1,0 +1,20 @@
+[package]
+name = "pipeline-orchestrator"
+version = "0.1.0"
+edition = "2021"
+description = "Deterministic, seeded, resumable render -> vary -> degrade -> pack data-generation driver"
+license = "MIT OR Apache-2.0"
+
+[[bin]]
+name = "pipeline-orchestrator"
+path = "src/main.rs"
+
+# No third-party dependencies on purpose: the binary must build
+# offline (e.g. on render-farm workers without crates.io access).
+# Config parsing, RNG, hashing and the CLI are implemented on std only.
+
+[dependencies]
+image = { version = "0.25", features = ["jpeg"] }
+
+[profile.release]
+opt-level = 3

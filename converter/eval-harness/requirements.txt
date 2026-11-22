@@ -1,0 +1,5 @@
+# Evaluation-only Python dependencies (reference scorers).
+# Install into the project venv: uv pip install -r requirements.txt
+# (or: .venv\Scripts\python -m pip install -r requirements.txt)
+# Pinned to the versions the published benchmark figures were produced with.
+musicdiff==6.0

@@ -1,0 +1,97 @@
+{
+  "do_not_train": [
+    "ds0072-3",
+    "ds0091-3",
+    "ds0091-5",
+    "ds0198-2",
+    "ds0324-7",
+    "ds0342-3",
+    "ds0351-6",
+    "ds0362-4",
+    "ds0364-3",
+    "ds0366-3",
+    "ds0367-2",
+    "ds0368-2",
+    "ds0369-3",
+    "ds0372-2",
+    "ds0382-2",
+    "sq7070319-1",
+    "sq7070319-3",
+    "sq7070781-2",
+    "sq7070781-3",
+    "sq8438915-5"
+  ],
+  "train_pool": {
+    "path": "tmp-train/mvd-data",
+    "page_stems": 2523,
+    "sorted_stem_list_sha256": "08da680ca92715d2e6a053f42fea45334a1dafb8fe62ef2421b796cf7b58327f"
+  },
+  "held_out_4page_gate": [
+    "ds0005-1",
+    "ds0005-2",
+    "ds0005-3",
+    "ds0005-4"
+  ],
+  "train_set_probe_pages": [
+    "ds0014-4",
+    "ds0114-4",
+    "ds0131-7",
+    "ds0137-3",
+    "ds0142-2",
+    "ds0241-12",
+    "ds0293-2",
+    "ds0297-9",
+    "ds0345-10",
+    "ds0459-8",
+    "ds0460-5"
+  ],
+  "quarantine_txt": {
+    "present": true,
+    "path": "tmp-train/mvd-data/quarantine.txt",
+    "stem_count": 26,
+    "gate20_ids_contained": [
+      "ds0072-3",
+      "ds0091-3",
+      "ds0091-5",
+      "ds0198-2",
+      "ds0324-7",
+      "ds0342-3",
+      "ds0351-6",
+      "ds0362-4",
+      "ds0364-3",
+      "ds0366-3",
+      "ds0367-2",
+      "ds0368-2",
+      "ds0369-3",
+      "ds0372-2",
+      "ds0382-2"
+    ],
+    "gate20_ids_absent": [
+      "sq7070319-1",
+      "sq7070319-3",
+      "sq7070781-2",
+      "sq7070781-3",
+      "sq8438915-5"
+    ],
+    "gate20_absent_reason": "sq* quartet pages are new CC0 renders never in the mvd-data train pool; covered by do_not_train regardless, so no leak",
+    "searched": [
+      "tmp-train/mvd-data/quarantine.txt",
+      "tmp-train/quarantine.txt",
+      "data-gen/score-corpus/quarantine.txt",
+      "quarantine.txt"
+    ],
+    "reconciliation": "quarantine lists mvd-data page stems (pagination-mismatched/untypeable pages), orthogonal to license_declined_not_in_path (external corpora/tools declined on license terms: no overlap by construction); corrects the probe-report findings claim of 14 gate20 IDs (recount: 15)",
+    "note": "honored by tmp-train/mvd/train.py list_pairs: any stem listed here never loads (verified 2026-11-07)"
+  },
+  "license_declined_not_in_path": [
+    "torchvision-distributed weights (ToS)",
+    "ConvNeXt-V2 timm (CC-BY-NC)",
+    "Nougat/Donut-v2/DiT (NC-family)",
+    "GrandStaff + SMT weights (unverified)",
+    "Legato abc2xml.py (LGPL)",
+    "DCML corpora (CC BY-NC-SA)",
+    "musescore.com scraping (ToS/mixed copyright)"
+  ],
+  "gate20_provenance": "CC0: big500 Lieder (OpenScore Lieder mirror) + OpenScore-StringQuartets (commit 2614b0b); no NC/ND material",
+  "overlap_statement": "gate20 page IDs are disjoint from mvd-data stems, the 4-page gate, and the 11 train-set probe pages (asserted in the freeze script)"
+}

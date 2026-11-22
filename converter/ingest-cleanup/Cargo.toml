@@ -1,0 +1,15 @@
+[package]
+name = "ingest-cleanup"
+version = "0.1.0"
+edition = "2021"
+description = "Sheet-music photo ingest: EXIF-normalize, blur/glare quality gates, deskew, and binarize to a clean black-on-white image."
+license = "MIT OR Apache-2.0"
+
+[[bin]]
+name = "ingest-cleanup"
+path = "src/main.rs"
+
+[dependencies]
+image = { version = "0.25", features = ["png", "jpeg"] }
+clap = { version = "4", features = ["derive"] }
+kamadak-exif = "0.6"

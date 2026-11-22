@@ -1,0 +1,14 @@
+{
+  "dark_count_ratio": 0.9992,
+  "field_sigma_px": 10.0,
+  "file_seed": 1234,
+  "grain_sigma": 2.2,
+  "ink_amplitude": 0.14,
+  "ink_gain_lo": 0.93,
+  "input": "ds0002-1.png",
+  "label_note": "topology-preserving: dark-count ratio 0.9992 (nothing deleted); wobble <= 5.0px",
+  "level": "v3_high",
+  "max_abs_displacement_px": 5.0,
+  "route": "deterministic hand-ink wobble (no generative model); Rust port of tmp-train/hw-synth/v3 level v3_high",
+  "seed": 1234
+}

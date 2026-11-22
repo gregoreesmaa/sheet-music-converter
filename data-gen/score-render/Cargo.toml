@@ -1,0 +1,10 @@
+[package]
+name = "score-render"
+version = "0.1.0"
+edition = "2021"
+description = "Render MusicXML/MEI/ABC scores in input/scores to clean PNGs + ground-truth JSON via a renderer trait (Verovio/LilyPond hook, stub fallback)."
+license = "MIT"
+
+[[bin]]
+name = "score-render"
+path = "src/main.rs"

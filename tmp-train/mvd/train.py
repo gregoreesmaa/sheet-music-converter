@@ -1,0 +1,1959 @@
+"""MVD v1 trainer: page PNGs -> bekern ids (teacher-forced NLL).
+
+Real experiment harness (lives in tmp-train, not shipped). Usage:
+
+    .venv/Scripts/python.exe tmp-train/mvd/train.py \
+        --renders data-gen/score-corpus/big500-renders \
+        --targets tmp-train/mvd-data \
+        --pages ds0001-1 --steps 500 --eval-every 100 --out tmp-train/mvd-runs/overfit1
+
+Pairing: each ``<stem>-bekern.txt`` in targets pairs with
+``<stem>.png`` (clean) PLUS every ``<stem>_d*.jpg`` (degraded variants)
+in renders (page stems like ``ds0001-1`` and system stems like
+``ds0001-1-s0`` alike); stems in ``quarantine.txt``
+(pagination-mismatched renders, untypeable pages) are never loaded.
+Images are resized to ``--height`` (aspect kept, LANCZOS); batch widths
+are padded to the batch max with the standardized white-paper value and
+targets with ``data.PAD_ID``. Reports teacher-forced NLL plus, on eval
+steps, greedy token error rate (Levenshtein / reference length) on the
+first eval page. Checkpoints: ``ckpt-<step>.pt`` + ``meta.json``
+(vocab size pinned).
+"""
+
+from __future__ import annotations
+
+import argparse
+import bisect
+import json
+import math
+import os
+import random
+import sys
+from pathlib import Path
+
+import torch
+from PIL import Image
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import data  # noqa: E402
+import model  # noqa: E402
+import heat_features  # noqa: E402
+import compact_sidecar  # noqa: E402
+
+
+def list_pairs(renders, targets, exclude=(), include_degraded=True,
+               include_handink=False, include_simshots=False):
+    """Pair every ``<stem>-bekern.txt`` with its images.
+
+    Each bekern stem pairs with ``<stem>.png`` (clean) plus all
+    ``<stem>_d*.jpg`` (degraded variants) found in renders — so one
+    system ``<stem>-bekern.txt`` yields 1 clean + N degraded pairs
+    (``include_degraded=False`` restores clean-only pairing). Stems in
+    ``quarantine.txt`` or matching ``exclude`` are skipped before
+    pairing. Sorted by bekern stem, clean first then degraded.
+    Spike S10: ``include_handink=True`` additionally pairs
+    ``<stem>_h*.png/.jpg`` (hand-ink variants, same targets),
+    appended after the degraded pairs of their stem.
+    S16b: ``include_simshots=True`` additionally pairs
+    ``<stem>_s*.png/.jpg`` (simulated screen captures, same targets),
+    appended after any hand-ink pairs of their stem.
+    """
+    renders = Path(renders)
+    targets = Path(targets)
+    quar = set()
+    qf = targets / 'quarantine.txt'
+    if qf.exists():
+        quar = {ln.strip() for ln in qf.read_text(encoding='utf-8').split()
+                if ln.strip()}
+    # One sorted listing up front: the old per-stem
+    # renders.glob(stem + '_d*.jpg') re-scanned the whole directory per
+    # bekern stem (O(stems x files); ~3e9 comparisons on the full
+    # corpus, hanging startup for tens of minutes). Prefix-range search
+    # over the single listing has identical results (fnmatch '*' here
+    # can only match within a filename, i.e. startswith + endswith).
+    names = sorted(os.listdir(renders))
+    pairs = []
+    for bek in sorted(targets.glob('*-bekern.txt')):
+        stem = bek.name[:-len('-bekern.txt')]
+        if any(s in stem for s in exclude):
+            continue
+        if stem in quar:
+            continue
+        clean = renders / (stem + '.png')
+        if clean.exists():
+            pairs.append((str(clean), str(bek), stem))
+        if include_degraded:
+            pre = stem + '_d'
+            i = bisect.bisect_left(names, pre)
+            while i < len(names) and names[i].startswith(pre):
+                if names[i].endswith('.jpg'):
+                    pairs.append((str(renders / names[i]), str(bek), stem))
+                i += 1
+        if include_handink:
+            pre = stem + '_h'
+            i = bisect.bisect_left(names, pre)
+            while i < len(names) and names[i].startswith(pre):
+                if names[i].endswith(('.png', '.jpg')):
+                    pairs.append((str(renders / names[i]), str(bek), stem))
+                i += 1
+        if include_simshots:
+            pre = stem + '_s'
+            i = bisect.bisect_left(names, pre)
+            while i < len(names) and names[i].startswith(pre):
+                if names[i].endswith(('.png', '.jpg')):
+                    pairs.append((str(renders / names[i]), str(bek), stem))
+                i += 1
+    return pairs
+
+
+def filter_pages(pairs, substrings=None, exact_file=None):
+    """Select training pairs by page stem.
+
+    ``substrings``: keep pairs whose stem contains any of them (legacy,
+    can over-match: 'ds0318-1' also hits 'ds0318-10'). ``exact_file``:
+    path to a stem-per-line list, exact match only (curriculum bands).
+    When both are given the result is the union (order: substrings
+    first, then exact-only additions). Neither given returns pairs.
+    """
+    if not substrings and not exact_file:
+        return pairs
+    sel = []
+    if substrings:
+        sel += [p for p in pairs
+                if any(s in p[2] for s in substrings)]
+    if exact_file:
+        want = {ln.strip() for ln in Path(exact_file).read_text(
+            encoding='utf-8').split() if ln.strip()}
+        seen = {p[2] for p in sel}
+        sel += [p for p in pairs if p[2] in want and p[2] not in seen]
+    return sel
+
+
+META_KEYS = ('vocab', 'pages', 'height', 'lr', 'seed', 'exclude',
+             'shuffle', 'no_amp', 'accum', 'init_from', 'trunk_lr_mult',
+             'warmup', 'cosine', 'sample_p', 'pages_file', 'batch_size',
+             'pretrained', 'no_degraded', 'tok_weight', 'tok_dropout',
+             'extra_chans', 'hybrid_cache', 'heat_pt', 'stride',
+             'aux_weight', 'aux_every', 'heat_dropout',
+             'coord_weight', 'coord_every', 'simshots')
+
+# Values new flags had implicitly before they existed. An old
+# meta.json missing one of these keys resumes iff the current run uses
+# the legacy value; any non-default use is a genuine mismatch and is
+# refused. Re-apply contract for parked work: landing a new flag MUST
+# append it to BOTH RESUME_KEYS and LEGACY_DEFAULTS (with its legacy
+# value), or old out dirs brick on --resume.
+LEGACY_DEFAULTS = {
+    'heat_cache': False,
+    'compile': False,
+    'grad_checkpoint': False,
+}
+
+# Exact fingerprint enforced on --resume (T0.2): every key here must
+# match meta.json, else the run is refused with a pointer to
+# --init-from in a fresh --out dir.
+RESUME_KEYS = ('vocab', 'pages', 'height', 'lr', 'seed', 'exclude',
+               'shuffle', 'no_amp', 'accum', 'trunk_lr_mult', 'warmup',
+               'cosine', 'sample_p', 'batch_size', 'pretrained',
+               'no_degraded', 'tok_weight', 'tok_dropout', 'extra_chans',
+               'hybrid_cache', 'heat_pt', 'stride', 'aux_weight',
+               'aux_every', 'heat_dropout', 'coord_weight', 'coord_every',
+               'margin_weight',
+               'margin_siblings', 'margin', 'margin_every',
+               'mwer_weight', 'mwer_beams', 'mwer_every',
+               'mwer_maxlen', 'action_weight', 'action_every',
+               'specaug_p', 'specaug_slope', 'handink', 'simshots')
+
+_LOCK_HELD = []
+
+
+def acquire_lock(out):
+    """Claim ``<out>/.lock`` as this run's single-writer token.
+
+    Refuses with exit 1 when the file already exists. The lock holds
+    our pid and is removed at clean exit; a killed run leaves it
+    behind, so the refusal names the exact file to delete ONLY after
+    confirming no training process is using this ``--out`` dir.
+    """
+    import atexit
+    out = Path(out)
+    lock = out / '.lock'
+    try:
+        fd = os.open(str(lock), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+    except FileExistsError:
+        sys.exit('refusing: %s is locked by another run '
+                 '(delete %s only if no training process is using it)'
+                 % (out, lock))
+    with os.fdopen(fd, 'w') as f:
+        f.write('%d\n' % os.getpid())
+    _LOCK_HELD.append(str(lock))
+
+    def _release(path=str(lock)):
+        try:
+            Path(path).unlink()
+        except FileNotFoundError:
+            pass
+    atexit.register(_release)
+
+
+def _pid_alive(pid):
+    """True when ``pid`` names a live process (or liveness unreadable).
+
+    Windows-safe: uses ``OpenProcess`` on ``os.name == 'nt'`` (asking
+    the OS instead of signalling), ``os.kill(pid, 0)`` on POSIX. A
+    dead PID means the lock is stale (killed run) and may be removed;
+    an unreadable PID conservatively counts as alive (refuse).
+    """
+    try:
+        pid = int(pid)
+    except (TypeError, ValueError):
+        return True
+    if os.name == 'nt':
+        try:
+            import ctypes
+            _kern = ctypes.windll.kernel32
+            handle = _kern.OpenProcess(0x1000, False, pid)
+            if handle:
+                _kern.CloseHandle(handle)
+                return True
+            return False
+        except Exception:
+            return True
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return True
+    else:
+        return True
+
+
+def acquire_out_lock(out_dir):
+    """Claim ``<out_dir>/.train.lock`` as this run's single-writer token.
+
+    Creates the lock atomically (``O_CREAT | O_EXCL``) holding
+    ``{"pid": <pid>}``. A second writer while the lock is live is
+    refused via ``sys.exit``; a stale lock (dead PID, e.g. a killed
+    run) is removed and recreated. Registers an ``atexit`` handler to
+    unlink the lock on normal exit (including ``sys.exit`` refusals).
+    """
+    import atexit
+    out_dir = Path(out_dir)
+    lock_path = out_dir / '.train.lock'
+    for _ in range(2):
+        try:
+            fd = os.open(str(lock_path),
+                         os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        except FileExistsError:
+            try:
+                raw = lock_path.read_text(encoding='utf-8')
+            except OSError:
+                sys.exit(f"refusing: active writer lock {lock_path} "
+                         f"locked by another run (unreadable lock file)")
+            try:
+                pid = (json.loads(raw).get('pid') if raw.strip()
+                       .startswith('{') else int(raw.strip()))
+            except (ValueError, AttributeError, TypeError):
+                sys.exit(f"refusing: active writer lock {lock_path} "
+                         f"locked by another run (unreadable lock file)")
+            if _pid_alive(pid):
+                sys.exit(f"refusing: active writer lock {lock_path} "
+                         f"locked by another run (pid {pid} still alive)")
+            try:
+                lock_path.unlink()
+            except FileNotFoundError:
+                pass
+            continue
+        with os.fdopen(fd, 'w') as f:
+            f.write(json.dumps({"pid": os.getpid()}))
+        _LOCK_HELD.append(str(lock_path))
+
+        def _release(path=str(lock_path)):
+            try:
+                Path(path).unlink()
+            except FileNotFoundError:
+                pass
+        atexit.register(_release)
+        return lock_path
+    sys.exit(f"refusing: active writer lock {lock_path} "
+             f"locked by another run")
+
+
+def release_out_lock(out_dir):
+    """Remove ``<out_dir>/.train.lock`` held by this process (tests)."""
+    try:
+        (Path(out_dir) / '.train.lock').unlink()
+    except FileNotFoundError:
+        pass
+
+
+MAINTENANCE_EVERY = 500
+
+
+# S13 4x8 VRAM wall: rectification can stretch an ordinary strip to
+# ~5760 px (observed pole, train step 3860 — 5 kills). Typical
+# rectified strips are ~1200-2300 px; beyond this cap the aux+coord
+# triple forward cannot fit 16 GB. Skips are deterministic (same
+# pairs -> same skips), so the fixed step->batch map stays
+# resume-exact (same precedent as the old 8000 sidecar-cap guard).
+BATCH_WIDTH_CAP = 4096
+
+
+def batch_too_wide(width):
+    """True when a rectified batch width must be skipped, not trained."""
+    return width > BATCH_WIDTH_CAP
+
+
+def cuda_mem_stats(device):
+    """(reserved_MB, allocated_MB) on CUDA, else (None, None).
+
+    Observability for the S13 4x8 VRAM wall: allocator growth vs a
+    genuine leak reads directly off the reserved/allocated gap.
+    """
+    if device != 'cuda' or not torch.cuda.is_available():
+        return None, None
+    free = torch.cuda.memory_reserved(device)
+    used = torch.cuda.memory_allocated(device)
+    return free / 1048576.0, used / 1048576.0
+
+
+def maintenance_due(step):
+    """True on the defrag+checkpoint cadence (every 500 steps)."""
+    return step % MAINTENANCE_EVERY == 0
+
+
+def save_checkpoint(out, step, net, opt, sched, updates, args):
+    """Write ``ckpt-<step>.pt`` + ``opt-<step>.pt`` sidecar (atomic).
+
+    Same payload as the eval-block save; factored so the maintenance
+    cadence and the eval cadence share one schema.
+    """
+    atomic_torch_save(net.state_dict(), out / ('ckpt-%d.pt' % step))
+    # Optimizer/scheduler sidecar: makes --resume continue the
+    # schedule instead of restarting it. ckpt-*.pt stays
+    # weights-only for inference loading.
+    atomic_torch_save({'step': step, 'updates': updates[0],
+                       'opt': opt.state_dict(),
+                       'sched': (sched.state_dict()
+                                 if sched is not None else None),
+                       'hp': {'lr': args.lr,
+                              'trunk_mult': args.trunk_lr_mult,
+                              'warmup': args.warmup,
+                              'accum': args.accum,
+                              'cosine': args.cosine}},
+                      out / ('opt-%d.pt' % step))
+
+
+def build_meta(args, pairs):
+    """Full config fingerprint recorded in ``<out>/meta.json``."""
+    return {
+        'vocab': len(data.VOCAB), 'pages': [p[2] for p in pairs],
+        'height': args.height, 'lr': args.lr, 'seed': args.seed,
+        'exclude': args.exclude, 'shuffle': args.shuffle,
+        'no_amp': args.no_amp, 'accum': args.accum,
+        'init_from': args.init_from, 'trunk_lr_mult': args.trunk_lr_mult,
+        'warmup': args.warmup, 'cosine': args.cosine,
+        'sample_p': args.sample_p, 'pages_file': args.pages_file,
+        'batch_size': getattr(args, 'batch_size', 8),
+        'pretrained': getattr(args, 'pretrained', False),
+        'no_degraded': getattr(args, 'no_degraded', False),
+        'tok_weight': getattr(args, 'tok_weight', 1.0),
+        'tok_dropout': getattr(args, 'tok_dropout', 0.0),
+        'margin_weight': getattr(args, 'margin_weight', 0.0),
+        'margin_siblings': getattr(args, 'margin_siblings', 8),
+        'margin': getattr(args, 'margin', 1.0),
+        'margin_every': getattr(args, 'margin_every', 1),
+        'mwer_weight': getattr(args, 'mwer_weight', 0.0),
+        'mwer_beams': getattr(args, 'mwer_beams', 4),
+        'mwer_every': getattr(args, 'mwer_every', 1),
+        'mwer_maxlen': getattr(args, 'mwer_maxlen', 576),
+        'action_weight': getattr(args, 'action_weight', 0.0),
+        'action_every': getattr(args, 'action_every', 1),
+        'specaug_p': getattr(args, 'specaug_p', 0.0),
+        'specaug_slope': getattr(args, 'specaug_slope', 0.02),
+        'extra_chans': getattr(args, 'extra_chans', 0),
+        'stride': getattr(args, 'stride', '8x16'),
+        'aux_weight': getattr(args, 'aux_weight', 0.0),
+        'aux_every': getattr(args, 'aux_every', 1),
+        'heat_dropout': getattr(args, 'heat_dropout', 0.0),
+        'coord_weight': getattr(args, 'coord_weight', 0.0),
+        'coord_every': getattr(args, 'coord_every', 1),
+        'hybrid_cache': getattr(args, 'hybrid_cache', None),
+        'heat_pt': getattr(args, 'heat_pt', None),
+        'handink': getattr(args, 'handink', False),
+        'simshots': getattr(args, 'simshots', False),
+    }
+
+
+STRUCT_WEIGHT_IDS = frozenset((data.TOKEN_TO_ID['bar'],))
+CONTENT_IDS = tuple(sorted(
+    data.TOKEN_TO_ID[tok] for tok in
+    # data.py canonical content sets (private _STEPS etc.; no public
+    # STEPS/OCTAVES/... aliases exist, so they are referenced here):
+    set(data._STEPS) | set(data._OCTAVES) | set(data._ALTERS)
+    | set(data._DURATIONS) | set(data._MARKS) | {'rest'}))
+
+
+def tok_class(tok):
+    """Token class for per-class TF accuracy: header / bar / body / syntax.
+
+    Headers (clef/key/time) are prior-saturated and tracked separately
+    from the gate; barlines are the structural target; syntax (voices,
+    chords, octave digits) is excluded from the grounding gate; body is
+    everything else (durations, steps, accidentals, dots, rests, ties,
+    tuplets, bar-rest, breve).
+    """
+    if tok == 'bar':
+        return 'bar'
+    if tok.startswith(('clef-', 'key', 'time-')):
+        return 'header'
+    if tok.startswith('voice-') or tok == 'chord' \
+            or (len(tok) == 1 and tok.isdigit()):
+        return 'syntax'
+    return 'body'
+
+
+def mutate_modifier_siblings(ref_ids, n=8, rng=None, mod_ids=(),
+                               vocab_size=0):
+    """8 modifier-edited sibling sequences for spike-S3 margin loss.
+
+    Splits ``ref_ids`` on barlines and edits 1-3 modifier tokens inside
+    ONE randomly chosen inter-bar span (drop / insert / swap within
+    ``mod_ids``); spans without modifiers only take inserts, and the
+    pre-first-bar header run (clef/key/time prefix) is never selected.
+    Barlines, pitches, durations and headers survive in every sibling.
+    Deterministic in ``rng``; every sibling differs from ``ref_ids``.
+    ``ref_ids`` must be unpadded (callers strip PAD first). Pure
+    function (no torch needed by callers beyond id lists).
+    """
+    ref = list(ref_ids)
+    rng = rng if rng is not None else random.Random()
+    mods = sorted(m for m in mod_ids if 0 <= m < vocab_size)
+    bar = data.TOKEN_TO_ID.get('bar')
+    nv = len(data.VOCAB)
+    toks = [data.VOCAB[i] if 0 <= i < nv else '' for i in ref]
+    hi = 0
+    while hi < len(toks) and (
+            toks[hi].startswith(('clef-', 'key', 'time-'))):
+        hi += 1
+    bounds, start = [], hi
+    for i, t in enumerate(ref):
+        if i < hi:
+            continue
+        if t == bar:
+            if i > start:
+                bounds.append((start, i))
+            start = i + 1
+    if start < len(ref):
+        bounds.append((start, len(ref)))
+    if not bounds:
+        bounds.append((hi, len(ref)))
+    out = []
+    for _ in range(max(0, n)):
+        lo, end = bounds[rng.randrange(len(bounds))]
+        cur = list(ref)
+        n_edits = rng.randint(1, 3)
+        for _e in range(n_edits):
+            kind = rng.choice(('drop', 'insert', 'swap'))
+            live = [i for i in range(lo, end) if cur[i] in mod_ids]
+            if kind == 'drop' and live:
+                del cur[rng.choice(live)]
+                end -= 1
+            elif kind == 'swap' and live:
+                i = rng.choice(live)
+                old = cur[i]
+                alt = rng.choice(mods)
+                if alt == old and len(mods) > 1:
+                    alt = rng.choice([m for m in mods if m != old])
+                cur[i] = alt
+            else:
+                at = rng.randint(lo, end)
+                cur.insert(at, rng.choice(mods))
+                end += 1
+        if cur == ref:
+            at = rng.randint(lo, end)
+            cur.insert(at, rng.choice(mods))
+        out.append(cur)
+    return out
+
+
+def sibling_margin_loss(ref_lp, sib_lps, margin=1.0):
+    """Mean ``relu(margin + sib - ref)`` over sibling log-probs.
+
+    Zero when the reference beats every sibling by ``margin``;
+    positive otherwise. Empty sibling sets score 0. Pure function.
+    """
+    if sib_lps.numel() == 0:
+        return ref_lp.new_zeros(())
+    return torch.relu(margin + sib_lps - ref_lp).mean()
+
+
+def sequence_logprob(net, mem, ids, mem_mask=None, pad_id=None):
+    """Teacher-forced total log-prob of one id sequence (spike S3).
+
+    Scores ``ids`` (unpadded) against precomputed ``mem`` via
+    :meth:`model.MvdNet.decode_logits` (no re-encode). PAD positions
+    never occur in ``ids`` by contract; ``pad_id`` is accepted for
+    call-site symmetry and ignored.
+    """
+    dev = mem.device
+    t = torch.tensor(list(ids), dtype=torch.long, device=dev)
+    bos = torch.full((1, 1), net.bos_id, dtype=torch.long, device=dev)
+    logits = net.decode_logits(
+        mem, torch.cat([bos, t.unsqueeze(0)[:, :-1]], dim=1), mem_mask)
+    lp = torch.log_softmax(logits[0], dim=-1)
+    return lp[torch.arange(t.numel(), device=dev), t].sum()
+
+
+def weighted_risk(ref_ids, hyp_ids, bar_id, eos_id, micro_ids):
+    """Cost-weighted edit risk of hyp vs ref (spike S4).
+
+    difflib alignment, costs on the ref side: dropped barlines 3,
+    dropped micro-glyphs (modifier ids) 2, anything else 1;
+    substitutions cost ref-side class cost + 1 per hyp token;
+    insertions cost 2 (micro) / 1 (else). A hyp EOS landing before
+    the ref's last content token adds a premature-EOS 3 (the S1
+    hip-short failure). Identical streams score 0. Pure function.
+    """
+    import difflib as _dl
+    ref, hyp = list(ref_ids), list(hyp_ids)
+
+    def _del_cost(t):
+        if t == bar_id:
+            return 3.0
+        if t in micro_ids:
+            return 2.0
+        return 1.0
+
+    def _ins_cost(t):
+        return 2.0 if t in micro_ids else 1.0
+
+    total = 0.0
+    sm = _dl.SequenceMatcher(a=ref, b=hyp, autojunk=False)
+    for tag, i1, i2, j1, j2 in sm.get_opcodes():
+        if tag == 'equal':
+            continue
+        if tag == 'delete':
+            total += sum(_del_cost(t) for t in ref[i1:i2])
+        elif tag == 'insert':
+            total += sum(_ins_cost(t) for t in hyp[j1:j2])
+        else:  # replace
+            total += sum(_del_cost(t) for t in ref[i1:i2])
+            total += float(j2 - j1)
+    if eos_id in hyp:
+        first_eos = hyp.index(eos_id)
+        if first_eos < len(ref) - 1:
+            total += 3.0
+    return total
+
+
+def beam_hyp(row, eos_id, nvocab):
+    """One beam row -> hypothesis ids for MWER risk (spike S4).
+
+    Mirrors ``measure_decode._ids_to_tokens`` (cut at specials) but
+    RETAINS a cutting EOS: premature-EOS detection needs it, while
+    trailing PAD/fill carries no risk signal. No-EOS beams keep
+    content until the first special.
+    """
+    seq = []
+    for t in row:
+        t = int(t)
+        if t == eos_id:
+            seq.append(t)
+            break
+        if t < 0 or t >= nvocab:
+            break
+        seq.append(t)
+    return seq
+
+
+def mwer_loss(beam_lps, risks):
+    """Minimum-word-error-rate loss with mean-risk baseline (spike S4).
+
+    ``beam_lps`` are total log-probs (one per beam, requires grad);
+    ``risks`` are non-differentiable costs. Renormalizes the beam
+    posterior via softmax and charges ``sum p_i (r_i - mean(r))``:
+    zero when all beams tie, negative pressure on above-average-risk
+    beams. Single beams and empty inputs score 0. Pure function.
+    """
+    if beam_lps.numel() == 0:
+        return beam_lps.new_zeros(())
+    if beam_lps.numel() == 1:
+        return beam_lps.new_zeros(())
+    logp = torch.log_softmax(beam_lps, dim=0)
+    probs = torch.exp(logp)
+    base = risks.mean()
+    return (probs * (risks - base)).sum()
+
+
+def keystroke_cost_matrix(vocab_size, mod_ids):
+    """Token substitution cost matrix (spike S7).
+
+    ``C[pred, ref]``: 0 on the diagonal; 3 when a barline is missed
+    or hallucinated (bar conservation — a wrong bar count breaks
+    every downstream measure); 2 for modifier-involved mismatches
+    (dots, ties, articulations); 2 for EOS-involved mistiming;
+    1 otherwise. PAD rows/cols are 0 (positions masked by callers,
+    never scored). Pure function of ids, built once per run.
+    """
+    nv = len(data.VOCAB)
+    bar = data.VOCAB.index('bar')
+    mods = [m for m in mod_ids if 0 <= m < nv]
+    c = torch.ones(vocab_size, vocab_size)
+    c.fill_diagonal_(0.0)
+    c[:, bar] = 3.0
+    c[bar, :] = 3.0
+    c[bar, bar] = 0.0
+    for m in mods:
+        c[:, m] = 2.0
+        c[m, :] = 2.0
+        c[m, m] = 0.0
+    eos = data.EOS_ID
+    c[:, eos] = 2.0
+    c[eos, :] = 2.0
+    c[eos, eos] = 0.0
+    c[:, data.PAD_ID] = 0.0
+    c[data.PAD_ID, :] = 0.0
+    return c
+
+
+def expected_keystroke_risk(logits, tgt, cost):
+    """Mean token-level expected substitution cost (spike S7).
+
+    ``risk = mean over non-PAD positions of sum_v p(v) * C[v, ref]``:
+    the minimum-Bayes-risk token objective. One forward's logits
+    suffice (no beams, unlike S4 MWER); the bar-conservation
+    pressure lives in the cost matrix. PAD positions score 0.
+    ``tgt`` is ``[B, T]`` ids. Pure function (differentiable in
+    ``logits``).
+    """
+    logp = torch.log_softmax(logits.float(), dim=-1)
+    probs = torch.exp(logp).to(logits.dtype)
+    per_pos = (probs * cost.t()[tgt.clamp_min(0)]).sum(-1)
+    mask = (tgt != data.PAD_ID).to(per_pos.dtype)
+    return (per_pos * mask).sum() / mask.sum().clamp_min(1.0)
+
+
+def sample_specaug_params(rng, slope_max=0.02):
+    """Sample one latent SpecAugment spec (spike S8).
+
+    ``rng`` is a ``random.Random`` on the ``'seed:step:specaug'``
+    stream (deterministic across runs, no run-history input).
+    Returns ``{'slope', 'bands', 'slices'}`` for
+    :func:`model.specaugment_latent`: uniform slope in
+    ``[-slope_max, slope_max]`` px/column, 0-1 staff-band row ranges
+    (each 1-9% of height), 0-2 micro-time column ranges (each 1-5%
+    of width). Pure function of the rng state.
+    """
+    slope = rng.uniform(-slope_max, slope_max)
+    bands = []
+    for _ in range(rng.randrange(2)):
+        f0 = rng.random() * 0.9
+        bands.append((f0, min(1.0, f0 + 0.01 + rng.random() * 0.08)))
+    slices = []
+    for _ in range(rng.randrange(3)):
+        f0 = rng.random() * 0.9
+        slices.append((f0, min(1.0, f0 + 0.01 + rng.random() * 0.04)))
+    return {'slope': slope, 'bands': tuple(bands),
+            'slices': tuple(slices)}
+
+
+def maybe_specaug(rng, p, slope_max=0.02):
+    """None with probability ``1 - p``, else a sampled spec dict.
+
+    The apply/skip draw comes first on the same rng stream, so the
+    per-step outcome is still a pure function of ``(seed, step)``.
+    ``p <= 0`` never augments (legacy); ``p >= 1`` always does.
+    """
+    if rng.random() >= p:
+        return None
+    return sample_specaug_params(rng, slope_max)
+
+
+def tf_top1_by_class(logits, tgt):
+    """Top-1 accuracy counts per token class for one strip.
+
+    ``logits`` is a [T, V] tensor, ``tgt`` an iterable of ids aligned to
+    its rows. PAD and EOS positions are skipped. Returns
+    ``{cls: [ok, n]}`` with classes header/bar/body/syntax.
+    """
+    pred = logits.argmax(-1).tolist()
+    ids = tgt if isinstance(tgt, list) else list(tgt)
+    out = {'header': [0, 0], 'bar': [0, 0],
+           'body': [0, 0], 'syntax': [0, 0]}
+    for i, t in enumerate(ids):
+        if t in (data.PAD_ID, data.EOS_ID):
+            continue
+        c = tok_class(data.decode([t])[0])
+        out[c][1] += 1
+        out[c][0] += (int(pred[i]) == t)
+    return out
+
+
+def check_resume(out, meta):
+    """None when ``--resume`` may proceed, else a refusal message.
+
+    Compares the FULL config fingerprint (every key in RESUME_KEYS),
+    not just the pair list: any changed field means the checkpoints on
+    disk belong to a different run, so resuming would silently corrupt
+    the schedule and sidecars.
+    """
+    mf = Path(out) / 'meta.json'
+    if not mf.exists():
+        return None
+    old = json.loads(mf.read_text(encoding='utf-8'))
+    for k in RESUME_KEYS:
+        if k not in old:
+            if k in LEGACY_DEFAULTS and meta.get(k) == LEGACY_DEFAULTS[k]:
+                continue
+            return (f"refusing --resume: config key {k!r} missing in "
+                    f"{mf} (old run predates it) and new value "
+                    f"{meta.get(k)!r} is not the legacy default; "
+                    f"use --init-from in a fresh --out dir")
+        if old[k] != meta.get(k):
+            return (f"refusing --resume: config mismatch on key {k!r}: "
+                    f"old={old[k]} vs new={meta.get(k)}; "
+                    f"use --init-from in a fresh --out dir")
+    return None
+
+
+def atomic_write_text(path, text):
+    """Write text via tmp+rename+fsync so a kill leaves no half-file."""
+    path = Path(path)
+    tmp = path.with_suffix(path.suffix + '.tmp')
+    with open(tmp, 'w', encoding='utf-8') as f:
+        f.write(text)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, path)
+
+
+def atomic_torch_save(obj, path):
+    """torch.save via tmp+rename+fsync so a kill leaves no half-file."""
+    path = Path(path)
+    tmp = path.with_suffix(path.suffix + '.tmp')
+    with open(tmp, 'wb') as f:
+        torch.save(obj, f)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, path)
+
+
+def load_image(path, height):
+    img = Image.open(path).convert('RGB')
+    w, h = img.size
+    nw = max(1, round(w * height / h))
+    img = img.resize((nw, height), Image.LANCZOS)
+    px = torch.from_numpy(
+        __import__('numpy').asarray(img).copy()).float().div_(255.0)
+    # ImageNet standardization (statistics only, no pretrained weights:
+    # torchvision weights carry ImageNet dataset terms, so the trunk
+    # trains from scratch). The 93%-white pages sit at +1.9 sigma
+    # background with negative strokes — the trunk's native diet —
+    # instead of a [0,1] wash that starves early trunk gradients while
+    # the decoder LM learns unconditioned priors (epoch-2 collapse:
+    # identical mem for all pages, identical greedy hyps).
+    return standardize_rgb(px.permute(2, 0, 1))
+
+
+def standardize_rgb(chw):
+    """``[3, H, W]`` float ``/ 255`` tensor -> ImageNet-standardized.
+
+    Factored from :func:`load_image` so the hybrid collate standardizes
+    sidecar RGB identically (same constants, same in-place ops).
+    """
+    mean = torch.tensor([0.485, 0.456, 0.406]).view(3, 1, 1)
+    std = torch.tensor([0.229, 0.224, 0.225]).view(3, 1, 1)
+    return chw.sub_(mean).div_(std)
+
+
+# Standardized ImageNet value of pure-white paper, the fill for width
+# padding in collate(): (1 - mean) / std per channel, i.e. the +2.2 to
+# +2.6 sigma background the trunk reads as blank paper (real page paper
+# sits nearby at ~+1.9 sigma).
+WHITE = torch.tensor([(1 - 0.485) / 0.229, (1 - 0.456) / 0.224,
+                      (1 - 0.406) / 0.225]).view(3, 1, 1)
+
+
+def sidecar_path_for(img_path):
+    """``<stem>.hybrid.pt`` alongside the image (mirrors the cache builder)."""
+    p = Path(img_path)
+    return p.parent / (p.stem + '.hybrid.pt')
+
+
+def load_hybrid_index(jsonl_path):
+    """``hybrid_staff.jsonl`` -> ``{img basename: row}`` for table rows.
+
+    Provenance log for ``--hybrid-cache`` runs: the training filter
+    itself keys on sidecar existence (below), while the index records
+    which strips the cache builder validated (S, sp, kind, source).
+    """
+    index = {}
+    with open(jsonl_path, encoding='utf-8') as f:
+        for ln in f:
+            if not ln.strip():
+                continue
+            r = json.loads(ln)
+            if not r.get('skip') and isinstance(r.get('table'), dict):
+                index[r['img']] = r
+    return index
+
+
+def filter_hybrid_pairs(pairs, hybrid_index=None, allow_on_the_fly=False):
+    """Keep pairs whose image has a sidecar (``.hybrid.npz`` or ``.hybrid.pt``).
+
+    Strips without validated staff tables (marker-transfer skips, ~43%
+    of degraded; clean misses are ~0) are dropped from training —
+    never zero-filled: the model must learn extras as truth, not as
+    sometimes-blank noise. When ``allow_on_the_fly=True`` and
+    ``hybrid_index`` is supplied, pairs present in ``hybrid_index`` are
+    also kept and rectified in memory when no sidecar file exists on
+    disk. Returns ``(kept, n_drop_clean, n_drop_degraded)``; ``kept``
+    preserves input order (deterministic).
+    """
+    kept = []
+    dc = dd = 0
+    for p in pairs:
+        has_file = compact_sidecar.resolve_sidecar_path(p[0]) is not None
+        has_otf = (allow_on_the_fly and hybrid_index is not None
+                   and Path(p[0]).name in hybrid_index)
+        if has_file or has_otf:
+            kept.append(p)
+        elif '_d' in Path(p[0]).stem.rsplit('-', 1)[-1]:
+            dd += 1
+        else:
+            dc += 1
+    return kept, dc, dd
+
+
+def load_sidecar(img_path, height, hybrid_index=None):
+    """``(rgb, gray, staff, S)`` from compact ``.hybrid.npz``, legacy
+    ``.hybrid.pt``, or on-the-fly rectification via ``hybrid_index``.
+
+    ``rgb`` is ImageNet-standardized ``[3, H, W]`` (identical to
+    :func:`load_image` output); ``gray`` is ``[1, H, W]`` ``/ 255``
+    (HeatNet input convention); ``staff`` is ``[1, H, W]`` ``{0, 1}``
+    (rectified staff-grid channel); ``S`` is the strip's staff count
+    (``1..4``) for inactive-slot masking in :func:`collate_hybrid`.
+    A missing or out-of-range ``S`` falls back to ``4`` (mask nothing),
+    preserving legacy behavior. Raises when the sidecar height
+    disagrees with the training ``--height``.
+    """
+    cpath = compact_sidecar.compact_sidecar_path_for(img_path)
+    if cpath.exists():
+        return compact_sidecar.load_compact_sidecar(
+            cpath, height, standardize_fn=standardize_rgb)
+    lpath = sidecar_path_for(img_path)
+    if lpath.exists():
+        blob = torch.load(str(lpath), map_location='cpu', weights_only=True)
+        if int(blob['height']) != int(height):
+            raise ValueError('sidecar %s height %s != train height %s'
+                             % (lpath, blob['height'], height))
+        rgb = standardize_rgb(blob['rgb'].float().div_(255.0))
+        gray = blob['gray'].float().div_(255.0).unsqueeze(0)
+        staff = blob['staff'].float()
+        if staff.dim() == 2:
+            staff = staff.unsqueeze(0)
+        try:
+            nslot = int(blob.get('S', 4))
+        except (TypeError, ValueError):
+            nslot = 4
+        if not 1 <= nslot <= 4:
+            nslot = 4
+        return rgb, gray, staff, nslot
+    if hybrid_index is not None and Path(img_path).name in hybrid_index:
+        return compact_sidecar.rectify_on_the_fly(
+            img_path, hybrid_index[Path(img_path).name], height=height,
+            standardize_fn=standardize_rgb)
+    raise FileNotFoundError(str(lpath))
+
+
+def encode_targets(batch):
+    """Batch bekern targets with EOS + PAD (shared by both collates)."""
+    ids = [data.encode(data.load_bekern(b)) + [data.EOS_ID]
+           for _, b, _ in batch]
+    n = max(len(x) for x in ids)
+    tgt = torch.full((len(ids), n), data.PAD_ID, dtype=torch.long)
+    for i, x in enumerate(ids):
+        tgt[i, :len(x)] = torch.tensor(x, dtype=torch.long)
+    return tgt
+
+
+def collate_hybrid(batch, height, stride='8x16', hybrid_index=None):
+    """Batch rectified sidecar strips: pad widths, pad targets, mask memory.
+
+    Mirrors :func:`collate` exactly (same ``W_max``-to-16 padding, same
+    memory key mask, same targets) but loads RGB/gray/staff from the
+    ``.hybrid.npz`` / ``.hybrid.pt`` sidecars (or on-the-fly when
+    ``hybrid_index`` is supplied) instead of ``load_image``. Gray pads with
+    white (1.0, the HeatNet paper value); staff pads with 0. Heat is
+    NOT computed here (single CUDA forward per step in the loop via
+    :func:`assemble_hybrid_batch`). Inactive staff slots (memory rows
+    ``y_mem >= 8 * S`` for an ``S``-staff strip at height 256 — one
+    64-px slot is 8 memory rows) are masked alongside width padding:
+    they hold canonical white paper, not signal, and unmasked they let
+    slot-count leak in as a strip-ID fingerprint (v2.2 collapse).
+    Returns ``(rgb, tgt, key_mask, gray, staff)`` (CPU tensors);
+    ``key_mask`` is None when nothing is masked (all ``S == 4`` and no
+    width padding), exactly like the legacy path. ``stride='4x8'``
+    (S13) sizes the memory grid for the 4x8 trunk (``H // 4`` rows,
+    ``(w // 4) // 2`` cols; 16 slot rows at height 256). Default keeps
+    the exact legacy grid.
+    """
+    if stride not in ('8x16', '4x8'):
+        raise ValueError('stride must be 8x16 or 4x8, got %r' % stride)
+    loaded = [load_sidecar(p, height, hybrid_index=hybrid_index)
+              for p, _, _ in batch]
+    widths = [rgb.shape[2] for rgb, _, _, _ in loaded]
+    nslots = [s for _, _, _, s in loaded]
+    w_max = max(widths)
+    w_pad = (w_max + 15) // 16 * 16
+    h_mem = height // (4 if stride == '4x8' else 8)
+    w_mem = _mem_width_aniso(w_pad, stride)
+    slot_rows = (64 * h_mem) // height  # 8 at height 256 (16 at 4x8)
+    if w_pad == min(widths) and all(s == 4 for s in nslots):
+        rgb = torch.stack([r for r, _, _, _ in loaded])
+        gray = torch.stack([g for _, g, _, _ in loaded])
+        staff = torch.stack([st for _, _, st, _ in loaded])
+        key_mask = None
+    else:
+        white = WHITE.expand(3, height, w_pad).clone()
+        paper = torch.ones(1, height, w_pad)
+        zero = torch.zeros(1, height, w_pad)
+        rgb, gray, staff = [], [], []
+        for (r, g, st, _), w in zip(loaded, widths):
+            d = w_pad - w
+            rgb.append(torch.cat([r, white[:, :, :d]], dim=2)
+                       if d else r)
+            gray.append(torch.cat([g, paper[:, :, :d]], dim=2)
+                        if d else g)
+            staff.append(torch.cat([st, zero[:, :, :d]], dim=2)
+                         if d else st)
+        rgb, gray, staff = (torch.stack(rgb), torch.stack(gray),
+                            torch.stack(staff))
+        key_mask = torch.ones(len(loaded), h_mem * w_mem, dtype=torch.bool)
+        for i, (w, s) in enumerate(zip(widths, nslots)):
+            valid = _mem_width_aniso(w, stride)
+            pad_cols = torch.arange(w_mem) >= valid
+            pad_rows = torch.arange(h_mem) >= slot_rows * s
+            key_mask[i] = (pad_rows.unsqueeze(1)
+                           | pad_cols.unsqueeze(0)).reshape(-1)
+        if not key_mask.any():
+            key_mask = None
+    return rgb, encode_targets(batch), key_mask, gray, staff
+
+
+def hybrid_model_input(heat_net, pair, height, device, stride='8x16'):
+    """Single-pair ``[1, 11, H, W]`` model input for eval/probes (T2.4)."""
+    rgb, _, _, gray, staff = collate_hybrid([pair], height, stride)
+    return assemble_hybrid_batch(heat_net, rgb.to(device),
+                                 gray.to(device), staff.to(device))
+
+
+def assemble_hybrid_batch(heat_net, rgb, gray, staff):
+    """``(B,3,H,W)`` + gray + staff -> ``(B,11,H,W)`` model input.
+
+    One batched HeatNet forward (fp32, no_grad inside
+    :meth:`heat_features.HeatNet.probs`; call OUTSIDE the AMP
+    autocast block) + staff-grid concat. Shapes must already match
+    (padded by :func:`collate_hybrid`).
+    """
+    heat7 = heat_net.probs(gray)
+    return torch.cat([rgb, heat7.to(rgb.device).float(),
+                      staff.to(rgb.device).float()], dim=1)
+
+
+def heat_channel_dropout(imgs, p):
+    """S13b: per-channel inverted dropout on the 8 hybrid-extra maps.
+
+    Drops whole channels ``[:, 3:, :, :]`` (frozen HeatNet 7-ch +
+    staff grid) with probability ``p`` each, rescaling kept channels
+    by ``1 / (1 - p)``; RGB ``[:, :3]`` is untouched. Forces the trunk
+    to read through missing keypoint channels (decoupling from
+    RowNet/HeatNet failures). ``p == 0`` returns ``imgs`` unchanged
+    (no RNG consumed, legacy path bitwise identical); ``p >= 1`` is
+    refused. Uses the global torch RNG (seeded once in ``main``), so
+    the step->batch map stays the only run-order input.
+    """
+    if p == 0.0:
+        return imgs
+    if not 0.0 < p < 1.0:
+        raise ValueError('heat dropout p must be in [0, 1), got %r' % p)
+    keep = (torch.rand(imgs.shape[0], imgs.shape[1] - 3, 1, 1,
+                       device=imgs.device, dtype=imgs.dtype) >= p)
+    out = imgs.clone()
+    out[:, 3:] = out[:, 3:] * keep.to(imgs.dtype) / (1.0 - p)
+    return out
+
+
+def _mem_width_aniso(w, stride='8x16'):
+    """Encoder output width for input width ``w`` (v2 anisotropic trunk).
+
+    Width path: stem k4/s4 (no pad) -> /2 -> /2 -> s1 (right pad keeps):
+    ``((w // 4) // 2) // 2`` (exact conv arithmetic; ``w // 16`` when
+    ``w`` is a multiple of 16). Height is exact at ``H // 8``.
+    ``stride='4x8'`` (S13) halves the horizontal stride once instead
+    of twice: ``(w // 4) // 2``. Default keeps legacy values.
+    """
+    if stride == '4x8':
+        return (w // 4) // 2
+    if stride != '8x16':
+        raise ValueError('stride must be 8x16 or 4x8, got %r' % stride)
+    return ((w // 4) // 2) // 2
+
+
+def collate(batch, height, stride='8x16'):
+    """Batch variable-width strips: pad widths, pad targets, mask memory.
+
+    Images are padded on the right to the batch ``W_max`` (rounded up to
+    a multiple of 16 so the /16 encoder stays exact) with the
+    standardized white-paper value; targets are padded with
+    ``data.PAD_ID`` (every target still ends with EOS first, so the
+    model observes a stop signal). Returns ``(imgs, tgt, key_mask)``
+    where ``key_mask`` is None when all widths match, else a bool
+    ``[B, H_mem * W_mem]`` memory_key_padding_mask (True = ignore) for
+    the decoder's cross-attention over padded memory columns.
+    ``stride='4x8'`` (S13) sizes the grid for the 4x8 trunk; default
+    keeps the exact legacy grid.
+    """
+    if stride not in ('8x16', '4x8'):
+        raise ValueError('stride must be 8x16 or 4x8, got %r' % stride)
+    pages = [load_image(p, height) for p, _, _ in batch]
+    widths = [pg.shape[2] for pg in pages]
+    w_max = max(widths)
+    # Round up to a multiple of 16: keeps every item's feature width
+    # exact under the /16 horizontal stride (see _mem_width_aniso).
+    w_pad = (w_max + 15) // 16 * 16
+    if w_pad == min(widths):
+        imgs = torch.stack(pages)
+        key_mask = None
+    else:
+        white = WHITE.expand(3, height, w_pad).clone()
+        imgs = torch.stack([
+            torch.cat([pg, white[:, :, :w_pad - w]], dim=2)
+            if w < w_pad else pg for pg, w in zip(pages, widths)])
+        h_mem = height // (4 if stride == '4x8' else 8)
+        w_mem = _mem_width_aniso(w_pad, stride)
+        key_mask = torch.ones(len(pages), h_mem * w_mem, dtype=torch.bool)
+        for i, w in enumerate(widths):
+            valid = _mem_width_aniso(w, stride)
+            # True = ignore: padded columns beyond the item's own
+            # feature width; every row shares the same valid columns.
+            pad_cols = torch.arange(w_mem) >= valid
+            key_mask[i] = (pad_cols.unsqueeze(0).expand(h_mem, w_mem)
+                           .reshape(-1))
+    # Every target ends with EOS: without it the model never observes a
+    # stop signal and greedy decoding always runs to max_len.
+    ids = [data.encode(data.load_bekern(b)) + [data.EOS_ID]
+           for _, b, _ in batch]
+    n = max(len(x) for x in ids)
+    tgt = torch.full((len(ids), n), data.PAD_ID, dtype=torch.long)
+    for i, x in enumerate(ids):
+        tgt[i, :len(x)] = torch.tensor(x, dtype=torch.long)
+    return imgs, tgt, key_mask
+
+
+def build_optimizer(net, lr, trunk_mult=1.0, warmup=0, cosine=False,
+                    total_updates=1):
+    """Four-group AdamW (trunk/dec x decay/plain) + warmup/cosine.
+
+    Trunk groups (``encoder.*``, ``proj.*``) run at ``lr * trunk_mult``;
+    decoder groups at ``lr``. ``plain`` groups hold 1D params, biases,
+    ``layer_scale`` and ``norm.weight`` at ``weight_decay=0.0`` (T1.6a);
+    ``decay`` groups keep the legacy 0.01. The LambdaLR schedule counts
+    OPTIMIZER
+    updates (post-accum flushes): linear warmup over ``warmup`` updates,
+    then optional cosine decay to ~0 over ``total_updates``. Defaults
+    (mult 1.0, no warmup, no cosine) reproduce the legacy single-LR run.
+
+    Scheduler state IS checkpointed (``opt-<step>.pt`` sidecar next to
+    each ``ckpt-<step>.pt``): --resume restores optimizer momentum and
+    the LambdaLR position when the sidecar exists and the optimizer
+    hyperparameters match; otherwise it starts fresh (legacy
+    weights-only behavior, with a note). ``ckpt-*.pt`` stays
+    weights-only so inference loading never changes.
+    """
+    def _no_decay(name, p):
+        """1D tensors, biases, LayerScale and norm weights skip decay."""
+        return (p.ndim <= 1 or name.endswith('layer_scale')
+                or name.endswith('bias') or name.endswith('norm.weight'))
+
+    splits = {'trunk_decay': [], 'trunk_plain': [],
+              'dec_decay': [], 'dec_plain': []}
+    for _n, _p in net.named_parameters():
+        if not _p.requires_grad:
+            continue
+        _trunk = _n.startswith(('encoder.', 'proj.'))
+        _key = 'trunk_' if _trunk else 'dec_'
+        _key += 'plain' if _no_decay(_n, _p) else 'decay'
+        splits[_key].append(_p)
+    grouped = [(splits['trunk_decay'], trunk_mult, 0.01),
+               (splits['dec_decay'], 1.0, 0.01),
+               (splits['trunk_plain'], trunk_mult, 0.0),
+               (splits['dec_plain'], 1.0, 0.0)]
+    grouped = [(ps, m, w) for ps, m, w in grouped if ps]
+    assert splits['trunk_decay'] and splits['dec_decay'], \
+        'param-group split is empty'
+    assert (sum(len(v) for v in splits.values())
+            == sum(1 for _ in net.parameters())), 'param overlap/leak'
+    opt = torch.optim.AdamW([{'params': ps, 'lr': lr, 'weight_decay': w}
+                             for ps, _, w in grouped])
+    if warmup <= 0 and not cosine:
+        return opt, None
+
+    def make_mult(mult):
+        def mult_fn(u):
+            u = float(u)
+            if warmup > 0 and u < warmup:
+                return mult * (u + 1.0) / warmup
+            if cosine:
+                span = max(1, total_updates - warmup)
+                t = min(1.0, max(0.0, (u - warmup) / span))
+                return mult * (0.5 + 0.5 * math.cos(math.pi * t))
+            return mult
+        return mult_fn
+
+    sched = torch.optim.lr_scheduler.LambdaLR(
+        opt, [make_mult(m) for _, m, _ in grouped])
+    return opt, sched
+
+
+def edit_distance(a, b):
+    prev = list(range(len(b) + 1))
+    for i, ca in enumerate(a, 1):
+        cur = [i] + [0] * len(b)
+        for j, cb in enumerate(b, 1):
+            cur[j] = min(prev[j] + 1, cur[j - 1] + 1,
+                         prev[j - 1] + (ca != cb))
+        prev = cur
+    return prev[len(b)]
+
+
+def grounding_probe(net, eimgs, ref_ids):
+    """Standing blank-image grounding probe (T0.3).
+
+    Runs ``net.greedy_kv`` on the real eval image and on a blank
+    all-zeros tensor, strips ``EOS_ID``/``PAD_ID`` from both hyps, and
+    returns ``(hyp_real, ter_real, ter_blank, blank_diff)``. A model
+    that ignores pixels hallucinates the same prior for both inputs
+    (``blank_diff`` ~ 0); one that grounds in the image diverges.
+    """
+    hyp_real = net.greedy_kv(eimgs, max_len=len(ref_ids) + 16,
+                             constrain=True)[0].tolist()
+    blank = torch.zeros_like(eimgs)
+    hyp_blank = net.greedy_kv(blank, max_len=len(ref_ids) + 16,
+                              constrain=True)[0].tolist()
+
+    def _strip(hyp):
+        hyp = [x for x in hyp if x != data.PAD_ID]
+        if data.EOS_ID in hyp:
+            hyp = hyp[:hyp.index(data.EOS_ID)]
+        return hyp
+
+    hyp_real = _strip(hyp_real)
+    hyp_blank = _strip(hyp_blank)
+    ter_real = edit_distance(hyp_real, ref_ids) / max(1, len(ref_ids))
+    ter_blank = edit_distance(hyp_blank, ref_ids) / max(1, len(ref_ids))
+    blank_diff = (edit_distance(hyp_real, hyp_blank)
+                  / max(1, max(len(hyp_real), 1)))
+    return (hyp_real, ter_real, ter_blank, blank_diff)
+
+
+def load_weights_compat(net, state):
+    """Load a checkpoint into ``net``, transplanting the stem / expanding
+    the vocabulary when needed.
+
+    Strict load first (identical shapes, e.g. same ``extra_chans`` and
+    same vocab). When that fails, each mismatch class below is handled
+    independently (both may apply at once); any other shape mismatch
+    re-raises the original error:
+
+    * widened T2.2 stem (``encoder.0.0.weight`` [96, 3, 4, 4]
+      checkpoint vs [96, 3 + extra, 4, 4] net): every other tensor
+      loads strictly and the checkpoint's RGB ``[:, :3]`` weights +
+      bias land in the widened stem (extras keep zero init);
+    * T3.2 vocab expansion (``tok_emb.weight`` / ``out.weight`` /
+      ``out.bias`` with FEWER ckpt rows than the net at the same width,
+      e.g. a 133+3=136-row v2.4 ckpt under the 175+3=178-row T3.2
+      vocab): the overlapping prefix rows copy verbatim (existing ids
+      never shift — the first 136 rows stay byte-identical, including
+      the old PAD/BOS/EOS rows now sitting on ``grace``/``slur-start``/
+      ``slur-stop`` ids, while the new PAD/BOS/EOS rows are fresh) and
+      the extra rows are fresh-init with the model default init
+      (``tok_emb``: normal_(0, 1) like ``nn.Embedding``;
+      ``out.weight``: kaiming-uniform a=sqrt(5) and ``out.bias``:
+      uniform +/-1/sqrt(fan_in) like ``nn.Linear``).
+    * S13 stride transfer (``_PadConv``-wrapped downsample blocks):
+      an 8x16 checkpoint's ``encoder.{i}.1.{weight,bias}`` keys map
+      onto the 4x8 net's ``encoder.{i}.1.conv.{weight,bias}`` names
+      when shapes match exactly (same tensors, renamed by the
+      wrapper). Composes with the aux-fresh rule above; the
+      ``how`` string gains a ``+padconv`` suffix.
+    """
+    try:
+        net.load_state_dict(state)
+        return 'strict'
+    except RuntimeError:
+        pass
+    # S13 stride transfer: ``_apply_stride_4x8`` wraps downsample
+    # blocks in ``_PadConv``, renaming e.g. ``encoder.2.1.weight``
+    # to ``encoder.2.1.conv.weight`` with IDENTICAL tensors. Map an
+    # 8x16 checkpoint's unwrapped keys onto the net's wrapped names
+    # first (moved, not copied — a leftover unwrapped key would
+    # trip the no-unexpected-keys asserts below); the paths below
+    # then see a shape-identical load and the ``how`` string records
+    # the rename. Partial matches fall through to the loud re-raise.
+    own = net.state_dict()
+    renamed = {}
+    for k in own:
+        if '.1.conv.' not in k or not (
+                k.endswith('.weight') or k.endswith('.bias')):
+            continue
+        ck = k.replace('.1.conv.', '.1.', 1)
+        if (ck in state and ck not in own
+                and tuple(state[ck].shape) == tuple(own[k].shape)):
+            renamed[k] = ck
+    padconv = bool(renamed)
+    if padconv:
+        state = dict(state)
+        for k, ck in renamed.items():
+            state[k] = state.pop(ck)
+    # S13b: pre-aux checkpoints carry every trunk/decoder tensor but no
+    # ``aux_head.*`` keys (the head is always fresh-init then). Any
+    # other diff falls through to the stem/vocab paths below, which
+    # re-raise the original error when nothing matches.
+    own = net.state_dict()
+    aux_keys = {k for k in own if k.startswith('aux_head.')}
+    if (aux_keys and not (aux_keys & set(state))
+            and all(k in state and tuple(state[k].shape) == tuple(own[k].shape)
+                    for k in own if k not in aux_keys)
+            and not (set(state) - set(own))):
+        topped = dict(state)
+        topped.update({k: own[k] for k in aux_keys})
+        net.load_state_dict(topped)
+        return ('strict+aux-fresh+padconv' if padconv
+                else 'strict+aux-fresh')
+    stem_w, stem_b = 'encoder.0.0.weight', 'encoder.0.0.bias'
+    emb_w, out_w, out_b = 'tok_emb.weight', 'out.weight', 'out.bias'
+    own = net.state_dict()
+    stem_mismatch = (
+        stem_w in state and stem_w in own
+        and len(state[stem_w].shape) == 4
+        and len(own[stem_w].shape) == 4
+        and state[stem_w].shape[0] == own[stem_w].shape[0]
+        and state[stem_w].shape[1] == 3
+        and own[stem_w].shape[1] > 3
+        and state[stem_w].shape[2:] == own[stem_w].shape[2:])
+    if stem_mismatch and stem_b in state and stem_b in own:
+        if tuple(state[stem_b].shape) != tuple(own[stem_b].shape):
+            stem_mismatch = False
+    n_old = None
+    if all(k in state and k in own for k in (emb_w, out_w, out_b)):
+        ce, ne = state[emb_w].shape, own[emb_w].shape
+        co, no = state[out_w].shape, own[out_w].shape
+        cb, nb = state[out_b].shape, own[out_b].shape
+        if (len(ce) == 2 and len(ne) == 2 and len(co) == 2
+                and len(no) == 2 and len(cb) == 1 and len(nb) == 1
+                and ce[1] == ne[1] == co[1] == no[1]
+                and ce[0] == co[0] == cb[0]
+                and ne[0] == no[0] == nb[0]
+                and ce[0] < ne[0]):
+            n_old = ce[0]
+    vocab_mismatch = n_old is not None
+    if not stem_mismatch and not vocab_mismatch:
+        net.load_state_dict(state)  # re-raise the original error
+    skip = set()
+    if stem_mismatch:
+        skip |= {stem_w, stem_b}
+    if vocab_mismatch:
+        skip |= {emb_w, out_w, out_b}
+    # S13b: pre-aux checkpoints in a stem/vocab transplant keep the
+    # fresh-init aux head (same rule as the strict+aux-fresh path).
+    skip |= ({k for k in own if k.startswith('aux_head.')} - set(state))
+    with torch.no_grad():
+        if stem_mismatch:
+            stem = net.encoder[0][0]
+            stem.weight[:, :3].copy_(state[stem_w])
+            if stem.bias is not None and stem_b in state:
+                stem.bias.copy_(state[stem_b])
+        if vocab_mismatch:
+            net.tok_emb.weight[:n_old].copy_(state[emb_w])
+            net.out.weight[:n_old].copy_(state[out_w])
+            net.out.bias[:n_old].copy_(state[out_b])
+            torch.nn.init.normal_(net.tok_emb.weight[n_old:])
+            torch.nn.init.kaiming_uniform_(net.out.weight[n_old:],
+                                           a=math.sqrt(5))
+            fan_in = net.out.weight.shape[1]
+            bound = 1 / math.sqrt(fan_in) if fan_in > 0 else 0
+            torch.nn.init.uniform_(net.out.bias[n_old:], -bound, bound)
+            dev = net.tok_emb.weight.device
+            assert torch.equal(net.tok_emb.weight[:n_old],
+                               state[emb_w].to(dev)), 'emb prefix shifted'
+            assert torch.equal(net.out.weight[:n_old],
+                               state[out_w].to(dev)), 'head prefix shifted'
+            assert torch.equal(net.out.bias[:n_old],
+                               state[out_b].to(dev)), 'bias prefix shifted'
+    rest = {k: v for k, v in state.items() if k not in skip}
+    missing, unexpected = net.load_state_dict(rest, strict=False)
+    assert not unexpected, unexpected
+    assert set(missing) == (skip & set(own)), missing
+    if stem_mismatch and vocab_mismatch:
+        return ('stem-transplant+vocab-expand+padconv' if padconv
+                else 'stem-transplant+vocab-expand')
+    if vocab_mismatch:
+        return 'vocab-expand+padconv' if padconv else 'vocab-expand'
+    return 'stem-transplant+padconv' if padconv else 'stem-transplant'
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument('--renders', required=True)
+    ap.add_argument('--targets', required=True)
+    ap.add_argument('--pages', nargs='*', default=None,
+                    help='only pages containing one of these substrings')
+    ap.add_argument('--pages-file', default=None,
+                    help='stem-per-line list for EXACT page selection '
+                         '(curriculum bands; avoids --pages substring '
+                         'collisions). Unions with --pages when both given.')
+    ap.add_argument('--exclude', nargs='*', default=[],
+                    help='drop pages containing any of these substrings '
+                         '(held-out gate sets, e.g. ds0005)')
+    ap.add_argument('--shuffle', action='store_true',
+                    help='shuffle pair order once with Random(seed) before '
+                         'training; recorded in meta.json and enforced '
+                         'on --resume')
+    ap.add_argument('--steps', type=int, default=500)
+    ap.add_argument('--eval-every', type=int, default=100)
+    ap.add_argument('--height', type=int, default=256)
+    ap.add_argument('--batch-size', type=int, default=8,
+                    help='true mini-batch over pair order (1 = legacy '
+                         'one-pair-per-step; system strips default 8)')
+    ap.add_argument('--pretrained', action='store_true',
+                    help='init the trunk from timm ConvNeXt-Tiny weights '
+                         'with the anisotropic 8x16 encoder (MvdNet v2)')
+    ap.add_argument('--lr', type=float, default=3e-4)
+    ap.add_argument('--no-amp', action='store_true',
+                    help='disable fp16 autocast (full fp32). Use after an '
+                         'AMP overflow: finite weights but NaN loss/memd '
+                         '(epoch-3 extension diverged at step ~5920 with '
+                         'all-finite ckpt-6000).')
+    ap.add_argument('--accum', type=int, default=1,
+                    help='gradient accumulation: optimizer steps every K '
+                         'pages (effective batch K at batch-1 memory). '
+                         'Pending grads flush at every eval/final step, so '
+                         'checkpoints always sit on update boundaries and '
+                         '--resume regroups identically.')
+    ap.add_argument('--seed', type=int, default=0)
+    ap.add_argument('--out', required=True)
+    ap.add_argument('--resume', action='store_true',
+                    help='load the latest ckpt-<step>.pt and continue '
+                         'after its step (step->page mapping is '
+                         'deterministic, so this is exact)')
+    ap.add_argument('--init-from', default=None,
+                    help='curriculum handoff: load this ckpt-<step>.pt as '
+                         'starting weights for a FRESH run (different page '
+                         'set allowed; step counter restarts at 1, '
+                         'optimizer restarts). Not combinable with --resume.')
+    ap.add_argument('--trunk-lr-mult', type=float, default=1.0,
+                    help='LR multiplier for the vision trunk '
+                         '(encoder.* + proj.*) vs the decoder. Reviewer '
+                         'rec #1: 10x lets the random trunk outrun the '
+                         'decoder LM prior. 1.0 = legacy single-LR.')
+    ap.add_argument('--warmup', type=int, default=0,
+                    help='linear LR warmup over this many OPTIMIZER updates '
+                         '(0 = off). Counts optimizer steps (post-accum), '
+                         'not pages.')
+    ap.add_argument('--cosine', action='store_true',
+                    help='cosine-decay LRs to ~0 over the run after warmup.')
+    ap.add_argument('--sample-p', type=float, default=0.0,
+                    help='two-pass scheduled-sampling probability per input '
+                         'token (0.0 = pure teacher forcing, legacy). '
+                         'Reviewer rec #2: anneal 0 -> 0.3 across stages '
+                         'manually; this flag is the constant-p mechanism.')
+    ap.add_argument('--no-degraded', action='store_true',
+                    help='pair each bekern stem with its clean PNG only '
+                         '(skip <stem>_d*.jpg). Clean-first curriculum '
+                         'phase; recorded in meta.json and enforced '
+                         'on --resume.')
+    ap.add_argument('--handink', action='store_true',
+                    help='spike-S10: also pair <stem>_h*.png/.jpg '
+                         'hand-ink variants with the same bekern targets '
+                         '(appended after degraded pairs per stem). '
+                         'Variants need .hybrid.pt sidecars or the '
+                         'hybrid filter drops them. Recorded in meta.json '
+                         'and enforced on --resume.')
+    ap.add_argument('--simshots', action='store_true',
+                    help='S16b: also pair <stem>_s*.png/.jpg simulated '
+                         'screen captures with the same bekern targets '
+                         '(appended after hand-ink pairs per stem). '
+                         'Variants need .hybrid.pt sidecars or the '
+                         'hybrid filter drops them. Recorded in meta.json '
+                         'and enforced on --resume.')
+    ap.add_argument('--tok-weight', type=float, default=1.0,
+                    help='per-token NLL multiplier for the bar token '
+                         '(bar-only since T1.6a). 1.0 = legacy '
+                         'unweighted. Recorded in meta.json and enforced '
+                         'on --resume.')
+    ap.add_argument('--tok-dropout', type=float, default=0.0,
+                    help='content-token input dropout probability (0.0 = '
+                         'off, legacy). Replaces content-token inputs '
+                         '(steps, octaves, durations, marks, rest) with '
+                         'uniform random real tokens. Recorded in meta.json '
+                         'and enforced on --resume.')
+    ap.add_argument('--margin-weight', type=float, default=0.0,
+                    help='spike-S3 sibling-margin loss weight (0.0 = off, '
+                         'legacy). Adds weight * mean(relu(margin + '
+                         'sib_lp - ref_lp)) over --margin-siblings '
+                         'modifier-edited siblings of one stream-picked '
+                         'sample per margin step. Recorded in meta.json '
+                         'and enforced on --resume.')
+    ap.add_argument('--margin-siblings', type=int, default=8,
+                    help='spike-S3 sibling count per margin step. '
+                         'Recorded in meta.json and enforced on --resume.')
+    ap.add_argument('--margin', type=float, default=1.0,
+                    help='spike-S3 log-prob margin (nats) the reference '
+                         'must beat each sibling by. Recorded in meta.json '
+                         'and enforced on --resume.')
+    ap.add_argument('--margin-every', type=int, default=1,
+                    help='spike-S3 margin cadence in steps (1 = every '
+                         'step). Recorded in meta.json and enforced '
+                         'on --resume.')
+    ap.add_argument('--mwer-weight', type=float, default=0.0,
+                    help='spike-S4 MWER loss weight (0.0 = off, legacy). '
+                         'Adds weight * sum_softmax_p(r - mean(r)) over '
+                         '--mwer-beams on-the-fly grammar beams of one '
+                         'stream-picked sample per MWER step, mixed with '
+                         'CE. Recorded in meta.json and enforced '
+                         'on --resume.')
+    ap.add_argument('--mwer-beams', type=int, default=4,
+                    help='spike-S4 on-the-fly beam count. Recorded in '
+                         'meta.json and enforced on --resume.')
+    ap.add_argument('--mwer-every', type=int, default=1,
+                    help='spike-S4 MWER cadence in steps. Recorded in '
+                         'meta.json and enforced on --resume.')
+    ap.add_argument('--mwer-maxlen', type=int, default=576,
+                    help='spike-S4 beam max_len (must cover the strip '
+                         'reference; truncating below ref length would '
+                         'fake premature-EOS penalties). Recorded in '
+                         'meta.json and enforced on --resume.')
+    ap.add_argument('--action-weight', type=float, default=0.0,
+                    help='spike-S7 token-level expected keystroke-risk '
+                         'weight (0.0 = off, legacy). Adds weight * mean '
+                         'E_{v~p}[C[v, ref]] over the CE forward logits '
+                         '(bar-involved 3x, modifier/EOS 2x, else 1x); no '
+                         'extra decode passes. Recorded in meta.json and '
+                         'enforced on --resume.')
+    ap.add_argument('--action-every', type=int, default=1,
+                    help='spike-S7 action-risk cadence in steps. Recorded '
+                         'in meta.json and enforced on --resume.')
+    ap.add_argument('--specaug-p', type=float, default=0.0,
+                    help='spike-S8 latent SpecAugment probability per step '
+                         '(0.0 = off, legacy). When applied, the batch '
+                         'forward runs through encoder[:4] + pitch-shear '
+                         'SpecAugment + encoder[4:] with a spec sampled '
+                         'from the seed:step:specaug stream. Recorded in '
+                         'meta.json and enforced on --resume.')
+    ap.add_argument('--specaug-slope', type=float, default=0.02,
+                    help='spike-S8 max |pitch-shear slope| in latent px '
+                         'per column. Recorded in meta.json and enforced '
+                         'on --resume.')
+    ap.add_argument('--extra-chans', type=int, default=0,
+                    help='hybrid extra encoder channels (T2.2: 8 = HeatNet '
+                         '7-ch + 1 staff-grid ch, appended after RGB, so '
+                         'in_chans = 3 + extra-chans; stem extras are '
+                         'zero-init). Recorded in meta.json and enforced '
+                         'on --resume.')
+    ap.add_argument('--stride', default='8x16', choices=('8x16', '4x8'),
+                    help='S13: encoder grid stride. 4x8 doubles both axes '
+                         '(H=256 -> 64 rows) for denser visual grounding; '
+                         'only stride/padding hyperparameters move, so '
+                         'timm transfer arity is unchanged. Recorded in '
+                         'meta.json and enforced on --resume.')
+    ap.add_argument('--aux-weight', type=float, default=0.0,
+                    help='S13b: dense ink/keypoint aux loss weight '
+                         '(distills the 8 hybrid-extra channels into a '
+                         '2-layer trunk head, every --aux-every steps). '
+                         'Requires --hybrid-cache. Recorded in meta.json '
+                         'and enforced on --resume.')
+    ap.add_argument('--aux-every', type=int, default=1,
+                    help='S13b: aux term cadence (every Nth step). '
+                         'Recorded in meta.json and enforced on --resume.')
+    ap.add_argument('--heat-dropout', type=float, default=0.0,
+                    help='S13b: per-channel inverted dropout probability '
+                         'on the 8 hybrid-extra input maps (decouples the '
+                         'trunk from HeatNet/RowNet failures). 0.0 keeps '
+                         'the legacy path bitwise identical. Recorded in '
+                         'meta.json and enforced on --resume.')
+    ap.add_argument('--coord-weight', type=float, default=0.0,
+                    help='S13c: cross-attention x-monotonicity weight '
+                         '(penalizes backward reading jumps per voice '
+                         'segment; voice tokens reset). 0.0 keeps the '
+                         'legacy path bitwise identical. Recorded in '
+                         'meta.json and enforced on --resume.')
+    ap.add_argument('--coord-every', type=int, default=1,
+                    help='S13c: coordinate-term cadence (every Nth step). '
+                         'Recorded in meta.json and enforced on --resume.')
+    ap.add_argument('--hybrid-cache', default=None,
+                    help='hybrid rectified-training mode (T2.4): path to '
+                         'hybrid_staff.jsonl. Training pairs are filtered '
+                         'to strips with a <img>.hybrid.pt sidecar '
+                         '(skip-only-degraded policy); RGB comes from the '
+                         'rectified sidecar (not load_image), heat 7-ch '
+                         'from one batched CUDA HeatNet forward per step. '
+                         'Requires --extra-chans 8. Recorded in meta.json '
+                         'and enforced on --resume.')
+    ap.add_argument('--heat-pt', default=heat_features.HEAT_PT_DEFAULT,
+                    help='HeatNet .pt checkpoint for --hybrid-cache '
+                         '(CUDA when available; loaded once, eval mode). '
+                         'Recorded in meta.json and enforced on --resume.')
+    args = ap.parse_args()
+
+    torch.manual_seed(args.seed)
+    random.seed(args.seed)
+    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    print('device:', device, '| torch:', torch.__version__)
+
+    pairs = list_pairs(args.renders, args.targets, exclude=args.exclude,
+                       include_degraded=not args.no_degraded,
+                       include_handink=args.handink,
+                       include_simshots=args.simshots)
+    pairs = filter_pages(pairs, args.pages, args.pages_file)
+    assert pairs, 'no training pairs selected'
+    hybrid_index = None
+    if args.hybrid_cache:
+        if args.extra_chans != heat_features.EXTRA_CHANS:
+            sys.exit('refusing: --hybrid-cache requires --extra-chans %d '
+                     '(got %d)' % (heat_features.EXTRA_CHANS,
+                                   args.extra_chans))
+        hybrid_index = load_hybrid_index(args.hybrid_cache)
+        print('hybrid index: %d validated strips in %s'
+              % (len(hybrid_index), args.hybrid_cache))
+        pairs, drop_clean, drop_deg = filter_hybrid_pairs(pairs)
+        print('hybrid filter: kept %d pairs (dropped clean=%d '
+              'degraded=%d without sidecars)'
+              % (len(pairs), drop_clean, drop_deg))
+        assert pairs, 'no training pairs with sidecars selected'
+    if args.aux_weight > 0 and not args.hybrid_cache:
+        sys.exit('refusing: --aux-weight needs --hybrid-cache (aux '
+                 'targets are the hybrid-extra channels)')
+    if args.shuffle:
+        random.Random(args.seed).shuffle(pairs)
+    print('pairs:', len(pairs))
+
+    if args.pretrained:
+        net = model.MvdNet(vocab=len(data.VOCAB) + 3, anisotropic=True,
+                           pretrained=True, stride=args.stride,
+                           extra_chans=args.extra_chans).to(device)
+        print('MvdNet v2: anisotropic %s encoder + timm pretrained trunk'
+              % args.stride
+              + (' + %d hybrid extra chans' % args.extra_chans
+                 if args.extra_chans else ''))
+    else:
+        net = model.MvdNet(vocab=len(data.VOCAB) + 3,
+                           stride=args.stride,
+                           extra_chans=args.extra_chans).to(device)
+    K0 = max(1, args.accum)
+    total_updates = (args.steps // K0 + 2 * (args.steps //
+                     max(1, args.eval_every) + 1) + 2)
+    opt, sched = build_optimizer(net, args.lr, args.trunk_lr_mult,
+                                 args.warmup, args.cosine, total_updates)
+    if args.trunk_lr_mult != 1.0:
+        print('trunk LR x%.1f (differential groups)' % args.trunk_lr_mult)
+    if args.warmup > 0 or args.cosine:
+        print('schedule: warmup %d updates, cosine=%s (horizon ~%d updates)'
+              % (args.warmup, args.cosine, total_updates))
+    amp = (device == 'cuda') and not args.no_amp
+    if args.no_amp:
+        print('AMP disabled: full fp32')
+    scaler = torch.amp.GradScaler('cuda', enabled=amp)
+    heat_net = None
+    if args.hybrid_cache:
+        heat_net = heat_features.HeatNet(args.heat_pt, device=device)
+        print('HeatNet: %s on %s (%d bytes)'
+              % (args.heat_pt, heat_net.device,
+                 heat_net.param_bytes()), flush=True)
+
+    out = Path(args.out)
+    out.mkdir(parents=True, exist_ok=True)
+    acquire_out_lock(out)
+    meta = build_meta(args, pairs)
+    if args.resume:
+        refusal = check_resume(out, meta)
+        if refusal is not None:
+            sys.exit(refusal)
+    atomic_write_text(out / 'meta.json', json.dumps(meta, indent=1))
+
+    start = 1
+    resumed_ckpt = None
+    if args.resume and args.init_from:
+        sys.exit('refusing: --resume and --init-from are exclusive '
+                 '(resume continues one run; init starts a fresh one)')
+    if args.init_from:
+        state = torch.load(args.init_from, map_location='cpu',
+                           weights_only=True)
+        print('init weights from %s (fresh schedule)' % args.init_from)
+    if args.resume:
+        ckpts = sorted(out.glob('ckpt-*.pt'),
+                       key=lambda p: int(p.stem.split('-')[1]))
+        if ckpts:
+            last = ckpts[-1]
+            state = torch.load(last, map_location='cpu', weights_only=True)
+            start = int(last.stem.split('-')[1]) + 1
+            resumed_ckpt = start - 1
+            print('resuming from %s (step %d)' % (last.name, start - 1))
+        else:
+            state = None
+            print('no checkpoint found, starting fresh')
+    elif args.init_from is None:
+        state = None
+
+    if state is not None:
+        # Weights only here; optimizer/scheduler restore happens below
+        # (after `updates` exists) from the opt-<step>.pt sidecar.
+        # Compat loader: strict when shapes match, else RGB stem
+        # transplant for --extra-chans nets from 3-ch checkpoints.
+        how = load_weights_compat(net, state)
+        if how != 'strict':
+            print('weights: %s' % how)
+    n = len(pairs)
+    K = max(1, args.accum)
+    opt.zero_grad()
+    pending = 0
+    updates = [0]
+    acost = None  # spike-S7 cost matrix, built lazily on device
+    if args.resume and resumed_ckpt is not None:
+        hp_now = {'lr': args.lr, 'trunk_mult': args.trunk_lr_mult,
+                  'warmup': args.warmup, 'accum': args.accum,
+                  'cosine': args.cosine}
+        sidecar = out / ('opt-%d.pt' % resumed_ckpt)
+        if sidecar.exists():
+            blob = torch.load(sidecar, map_location='cpu',
+                              weights_only=True)
+            if blob.get('hp') == hp_now:
+                opt.load_state_dict(blob['opt'])
+                if (sched is not None
+                        and blob.get('sched') is not None):
+                    sched.load_state_dict(blob['sched'])
+                updates[0] = int(blob.get('updates', 0))
+                print('resumed optimizer+scheduler from %s (updates=%d)'
+                      % (sidecar.name, updates[0]))
+            else:
+                print('optimizer hyperparams changed since %s; starting '
+                      'fresh optimizer (weights kept)' % sidecar.name)
+        else:
+            print('no optimizer sidecar for ckpt-%d; starting fresh '
+                  'optimizer (legacy weights-only resume)' % resumed_ckpt)
+
+    def flush():
+        # One guarded optimizer step: unscale, bound, step.
+        # (NaN-cliff note: epoch 3 died at step ~5920 from AMP fp16
+        # overflow off exploding trunk activations; fp32 + this
+        # clipping runs clean. scaler.step still skips inf/NaN grads.)
+        scaler.unscale_(opt)
+        torch.nn.utils.clip_grad_norm_(net.parameters(), 1.0)
+        scaler.step(opt)
+        scaler.update()
+        opt.zero_grad()
+        updates[0] += 1
+        if sched is not None:
+            sched.step()
+
+    B = max(1, args.batch_size)
+    nb = (n + B - 1) // B
+    if B > 1:
+        print('batch-size %d: %d batches/epoch over %d pairs'
+              % (B, nb, n))
+    for step in range(start, args.steps + 1):
+        # Fixed step->batch map (epoch cycles over contiguous slices),
+        # so --resume lands on the identical batch for a given step.
+        b0 = ((step - 1) % nb) * B
+        batch = pairs[b0:b0 + B]
+        if heat_net is None:
+            imgs, tgt, key_mask = collate(batch, args.height,
+                                          args.stride)
+            imgs, tgt = imgs.to(device), tgt.to(device)
+        else:
+            # Hybrid: rectified RGB + staff from sidecars, heat from one
+            # batched fp32 HeatNet forward OUTSIDE autocast (probs() is
+            # no_grad; deterministic given weights).
+            rgb, tgt, key_mask, grayb, staffb = collate_hybrid(
+                batch, args.height, args.stride)
+            # Batch-width guard: a monster strip would OOM inside the
+            # HeatNet forward below (and worse, inside the aux+coord
+            # triple forward on even steps). Skips are deterministic
+            # (same pairs -> same skips), so the fixed step->batch
+            # map stays resume-exact.
+            if batch_too_wide(rgb.shape[-1]):
+                print('skip step %d: batch width %d > cap %d'
+                      % (step, rgb.shape[-1], BATCH_WIDTH_CAP),
+                      flush=True)
+                continue
+            tgt = tgt.to(device)
+            imgs = assemble_hybrid_batch(
+                heat_net, rgb.to(device), grayb.to(device),
+                staffb.to(device))
+            # S13b: aux targets are the UNDROPPED extras (denoising:
+            # predict full keypoint maps from channel-dropped inputs).
+            aux_tgt = imgs[:, 3:].detach() if args.aux_weight > 0 else None
+            if args.heat_dropout > 0:
+                imgs = heat_channel_dropout(imgs, args.heat_dropout)
+        if key_mask is not None:
+            key_mask = key_mask.to(device)
+        aug = None
+        if args.specaug_p > 0:
+            # Spike S8: train-only latent SpecAugment, a pure function
+            # of (seed, step) on its own stream — no run history.
+            # None keeps the legacy forward for that step.
+            aug = maybe_specaug(
+                random.Random('%d:%d:specaug' % (args.seed, step)),
+                args.specaug_p, args.specaug_slope)
+        with torch.amp.autocast('cuda', enabled=amp):
+            loss = net.loss(imgs, tgt, sample_p=args.sample_p,
+                            mem_mask=key_mask, tok_weight=args.tok_weight,
+                            weight_ids=STRUCT_WEIGHT_IDS,
+                            tok_dropout=args.tok_dropout,
+                            content_ids=CONTENT_IDS,
+                            augment=aug) / K
+            mterm = None
+            if args.margin_weight > 0 and step % max(
+                    1, args.margin_every) == 0:
+                # Spike S3: sibling margin on one stream-picked sample
+                # ('seed:step' string seed — deterministic across runs,
+                # no run-history input). One extra encode +
+                # (1 + siblings) decoder passes; the batch CE above is
+                # untouched.
+                mrng = random.Random('%d:%d' % (args.seed, step))
+                mi = mrng.randrange(tgt.shape[0])
+                ref_ids = [t for t in tgt[mi].tolist()
+                           if t != data.PAD_ID]
+                sibs = mutate_modifier_siblings(
+                    ref_ids, args.margin_siblings, mrng,
+                    model.MODIFIER_IDS, len(data.VOCAB))
+                mimg = imgs[mi:mi + 1]
+                mmask = (key_mask[mi:mi + 1]
+                         if key_mask is not None else None)
+                mem1 = net.encode(mimg, mmask)
+                ref_lp = sequence_logprob(net, mem1, ref_ids, mmask)
+                sib_lps = torch.stack(
+                    [sequence_logprob(net, mem1, s, mmask)
+                     for s in sibs])
+                mterm = sibling_margin_loss(ref_lp, sib_lps, args.margin)
+                loss = loss + args.margin_weight * mterm / K
+            wterm = None
+            if args.mwer_weight > 0 and step % max(
+                    1, args.mwer_every) == 0:
+                # Spike S4: MWER on one stream-picked sample
+                # ('seed:step:mwer' string seed — deterministic across
+                # runs, no run-history input). B=4 grammar beams decode
+                # no-grad; their risks vs the reference weight the
+                # grad-carrying teacher-forced beam log-probs.
+                wrng = random.Random('%d:%d:mwer' % (args.seed, step))
+                wi = wrng.randrange(tgt.shape[0])
+                wref = [t for t in tgt[wi].tolist()
+                        if t != data.PAD_ID]
+                wimg = imgs[wi:wi + 1]
+                wmask = (key_mask[wi:wi + 1]
+                         if key_mask is not None else None)
+                with torch.no_grad():
+                    wbeams = net.beam_search(
+                        wimg, beam=args.mwer_beams, strict=True,
+                        max_len=args.mwer_maxlen, mem_mask=wmask,
+                        return_all=True)
+                whyps = [beam_hyp(b, net.eos_id, len(data.VOCAB))
+                         for b in wbeams[0].tolist()]
+                wmem = net.encode(wimg, wmask)
+                wbeam_lps = torch.stack(
+                    [sequence_logprob(net, wmem, h, wmask)
+                     for h in whyps])
+                wrisks = torch.tensor(
+                    [weighted_risk(wref, h, data.TOKEN_TO_ID['bar'],
+                                   net.eos_id, model.MODIFIER_IDS)
+                     for h in whyps],
+                    device=wbeam_lps.device, dtype=torch.float32)
+                wterm = mwer_loss(wbeam_lps, wrisks)
+                loss = loss + args.mwer_weight * wterm / K
+            aterm = None
+            if args.action_weight > 0 and step % max(
+                    1, args.action_every) == 0:
+                # Spike S7: token-level expected keystroke risk on the
+                # batch (one extra forward, no beams). Cost matrix is
+                # a pure function of ids; build once per run.
+                if acost is None:
+                    acost = keystroke_cost_matrix(
+                        net.vocab, model.MODIFIER_IDS).to(imgs.device)
+                abos = torch.full_like(tgt[:, :1], net.bos_id)
+                alogits = net(imgs, torch.cat([abos, tgt[:, :-1]],
+                                              dim=1), key_mask)
+                aterm = expected_keystroke_risk(alogits, tgt, acost)
+                loss = loss + args.action_weight * aterm / K
+            auxterm = None
+            if args.aux_weight > 0 and step % max(
+                    1, args.aux_every) == 0:
+                # S13b: dense ink/keypoint distillation. One extra
+                # trunk encode (grad-carrying, like sample-p's 2x
+                # cost); the batch CE above is untouched. Targets are
+                # the undropped extras resized to the aux grid; padded
+                # columns/slot-masked rows carry no aux loss.
+                apred = net.aux_pred(imgs)
+                agres = torch.nn.functional.interpolate(
+                    aux_tgt, size=apred.shape[-2:], mode='area')
+                abce = torch.nn.functional.binary_cross_entropy_with_logits(
+                    apred, agres, reduction='none').mean(dim=1)
+                if key_mask is not None:
+                    avalid = (~key_mask).to(abce.dtype).reshape(abce.shape)
+                    auxterm = ((abce * avalid).sum()
+                               / avalid.sum().clamp_min(1.0))
+                else:
+                    auxterm = abce.mean()
+                loss = loss + args.aux_weight * auxterm / K
+            cterm = None
+            if args.coord_weight > 0 and step % max(
+                    1, args.coord_every) == 0:
+                # S13c: monotonic-reading supervision. One extra
+                # teacher-forced decoder pass (grad-carrying, like
+                # sample-p's 2x cost); the batch CE above is untouched.
+                # Voice tokens reset segments; PAD never forms pairs.
+                xc = net.x_centroids(imgs, tgt, key_mask)
+                cterm = model.coord_monotonic_penalty(
+                    xc, tgt, model.VOICE_IDS, net.pad_id)
+                loss = loss + args.coord_weight * cterm / K
+        scaler.scale(loss).backward()
+        pending += 1
+        if pending >= K:
+            flush()
+            pending = 0
+        if step == 1 or step % 50 == 0 or step == args.steps:
+            msg = 'step %d/%d loss %.4f' % (step, args.steps,
+                                            loss.item() * K)
+            if mterm is not None:
+                msg += ' marg %.4f' % float(mterm.item())
+            if wterm is not None:
+                msg += ' mwer %.4f' % float(wterm.item())
+            if aterm is not None:
+                msg += ' act %.4f' % float(aterm.item())
+            if auxterm is not None:
+                msg += ' aux %.4f' % float(auxterm.item())
+            if cterm is not None:
+                msg += ' coord %.4f' % float(cterm.item())
+            if aug is not None:
+                msg += ' aug'
+            _res, _alc = cuda_mem_stats(device)
+            if _res is not None:
+                msg += ' mem %.0f/%.0fMB' % (_res, _alc)
+            print(msg, flush=True)
+            if maintenance_due(step) and step != args.steps:
+                # S13 VRAM wall: defrag the expandable-segments pool
+                # and bank a ckpt so a kill loses <= 500 steps.
+                # Numerics-neutral (cache + identical-schema save).
+                torch.cuda.empty_cache()
+                save_checkpoint(out, step, net, opt, sched,
+                                updates, args)
+        if step % args.eval_every == 0 or step == args.steps:
+            if pending:
+                flush()
+                pending = 0
+            # Fixed reference page: rotating with the training batch made
+            # eval TER incomparable across steps.
+            net.eval()
+            with torch.no_grad():
+                if heat_net is None:
+                    eimgs, etgt, _ = collate([pairs[0]], args.height,
+                                             args.stride)
+                    eimgs = eimgs.to(device)
+                # Encoder-collapse guard (epoch 2: mem went constant
+                # across pages while loss kept falling). Two probe
+                # images through encode(): pairwise distance ~0 means
+                # the decoder is learning an unconditioned prior.
+                # Sequential encodes, mean-pooled: page widths vary at
+                # fixed height, so neither stacking nor flattening works
+                # across pages (seq len h*w differs). The mean-pooled
+                # distance still guards the collapse mode (identical mem
+                # for all pages -> ~0). ConvNeXt uses LayerNorm (no batch
+                # interaction), so sequential == batched per page.
+                if heat_net is None:
+                    m0 = net.encode(load_image(
+                        pairs[0][0], args.height).unsqueeze(0).to(device))
+                    m1 = net.encode(load_image(
+                        pairs[1 % len(pairs)][0],
+                        args.height).unsqueeze(0).to(device))
+                else:
+                    ergb, etgt, _, egray, erstaff = collate_hybrid(
+                        [pairs[0]], args.height, args.stride)
+                    eimgs = assemble_hybrid_batch(
+                        heat_net, ergb.to(device), egray.to(device),
+                        erstaff.to(device))
+                    m0 = net.encode(eimgs)
+                    m1 = net.encode(hybrid_model_input(
+                        heat_net, pairs[1 % len(pairs)], args.height,
+                        device, args.stride))
+                memd = (m0.mean(dim=1).reshape(-1)
+                        - m1.mean(dim=1).reshape(-1)).norm().item()
+                hyp = net.greedy(eimgs, max_len=etgt.shape[1] + 16)
+            ref = etgt[0].tolist()
+            ref = [x for x in ref if x != data.PAD_ID]
+            hyp = hyp[0].tolist()
+            eos_hit = data.EOS_ID in hyp
+            if eos_hit:
+                hyp = hyp[:hyp.index(data.EOS_ID)]
+            ter = edit_distance(hyp, ref) / max(1, len(ref))
+            exact = 'EXACT' if hyp == ref else ''
+            # Blank-image grounding probe: a white page through encode()
+            # with the same standardization as load_image. blankd ~0
+            # while memd > 0 means the decoder keys off page identity
+            # but not pixels; blankd ~ memd ~ 0 is full collapse.
+            _mean = torch.tensor([0.485, 0.456, 0.406]).view(3, 1, 1)
+            _std = torch.tensor([0.229, 0.224, 0.225]).view(3, 1, 1)
+            _blank = torch.full((3, args.height, args.height), 1.0)
+            _blank = _blank.sub_(_mean).div_(_std).unsqueeze(0).to(device)
+            if heat_net is not None:
+                # White page carries no staff lines and no keypoints:
+                # the 8 extra channels are exact zeros.
+                _blank = torch.cat(
+                    [_blank, torch.zeros(1, heat_features.EXTRA_CHANS,
+                                         args.height, args.height,
+                                         device=device)], dim=1)
+            _mb = net.encode(_blank)
+            blankd = (m0.mean(dim=1).reshape(-1)
+                      - _mb.mean(dim=1).reshape(-1)).norm().item()
+            hyp_real, ter_real, ter_blank, blank_diff = grounding_probe(
+                net, eimgs, ref)
+            _tfbos = torch.full_like(etgt[:, :1], data.BOS_ID,
+                                           device=device)
+            _tflogits = net(eimgs, torch.cat(
+                [_tfbos, etgt[:, :-1].to(device)], dim=1))[0]
+            _tfcls = tf_top1_by_class(_tflogits, etgt[0].tolist())
+            _tfacc = {k: v[0] / max(1, v[1]) for k, v in _tfcls.items()}
+            print('  eval page=%s len(ref)=%d len(hyp)=%d TER=%.4f '
+                  'memd=%.1f blankd=%.1f ter_blank=%.4f blank_diff=%.4f '
+                  '%s %s tfacc=h%.3f/b%.3f/q%.3f/s%.3f'
+                  % (pairs[0][2], len(ref), len(hyp), ter, memd, blankd,
+                     ter_blank, blank_diff,
+                     'EOS' if eos_hit else 'NOEOS', exact,
+                     _tfacc['header'], _tfacc['bar'], _tfacc['body'],
+                     _tfacc['syntax']),
+                  flush=True)
+            with open(out / 'eval_log.jsonl', 'a',
+                      encoding='utf-8') as _elog:
+                _elog.write(json.dumps(
+                    {'step': step, 'loss': float(loss.item() * K),
+                     'ter': ter_real, 'ter_blank': ter_blank,
+                     'blank_diff': blank_diff, 'memd': memd,
+                     'tf_acc_header': _tfacc['header'],
+                     'tf_acc_bar': _tfacc['bar'],
+                     'tf_acc_body': _tfacc['body'],
+                     'tf_acc_syntax': _tfacc['syntax']}) + '\n')
+            save_checkpoint(out, step, net, opt, sched, updates, args)
+            # Eval temps (~4 GB: full-res encodes + greedy states) stay
+            # referenced as main() locals until the NEXT eval unless
+            # released — a permanent floor between evals on a 16 GB
+            # card. Numerics-neutral (all values already logged/saved).
+            del eimgs, m0, m1, _blank, _mb, _tfbos, _tflogits
+            net.train()
+    print('done:', args.out)
+
+
+if __name__ == '__main__':
+    main()
