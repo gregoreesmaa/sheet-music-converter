@@ -44,15 +44,18 @@ OMR-NED ≤ 0.0185, fixes median 0). Numbers below are measured unless marked.
   assembly ceiling + 1-bit bottleneck + AGPL-3.0 network copyleft. Keep
   strictly as a Docker black-box benchmark (`X1`).
 
-## Execution lock (2026-11-22, user decision)
+## Execution lock (2026-11-23, user decision)
 
 Target: autonomous, permissive-licensed (MIT/BSD/Apache) phone-photo → `.mscz`
 neural Rust pipeline beating Sheetly. Order: **`Route-A` 10k probe (ruthless
-kill gate) → `I1` label-normalization audit → `S18` factored heads**. Beat
+kill gate) → `I1` label-normalization audit → `S18` factored heads →
+multi-engraver Verovio/LilyPond expansion (`multi_engrave.py`)**. Beat
 Audiveris first (Gate B: `> 88.43%` clean / `> 50.43%` photo) before chasing
-10× Sheetly; validate Route-A + S18 on the local RTX 4080 first, then rent
-burst H100s post-gate; treat Gate C (`~0.98–0.99`) as a shippable v1 milestone
-ahead of Gate D (`0.9973`).
+10× Sheetly; validate Route-A + S18 on the local RTX 4080 first (with the
+landed ~2.75× faster shared-pass `B=6` + `bf16` + `channels_last` +
+`width_bucket` + `prefetch` + 16-stage physical/3D-geom `epoch_aug` defaults
+and compact `.hybrid.npz` sidecars), then rent burst H100s post-gate; treat
+Gate C (`~0.98–0.99`) as a shippable v1 milestone ahead of Gate D (`0.9973`).
 
 ## Ranked directions v2
 
