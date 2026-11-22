@@ -39,6 +39,8 @@ import data  # noqa: E402
 import model  # noqa: E402
 import heat_features  # noqa: E402
 import compact_sidecar  # noqa: E402
+import epoch_aug  # noqa: E402
+import fast_loader  # noqa: E402
 
 
 def list_pairs(renders, targets, exclude=(), include_degraded=True,
@@ -135,7 +137,9 @@ META_KEYS = ('vocab', 'pages', 'height', 'lr', 'seed', 'exclude',
              'pretrained', 'no_degraded', 'tok_weight', 'tok_dropout',
              'extra_chans', 'hybrid_cache', 'heat_pt', 'stride',
              'aux_weight', 'aux_every', 'heat_dropout',
-             'coord_weight', 'coord_every', 'simshots')
+             'coord_weight', 'coord_every', 'simshots',
+             'epoch_aug_p', 'epoch_aug_clean_p', 'epoch_redraw_dir',
+             'bf16', 'channels_last', 'width_bucket', 'prefetch')
 
 # Values new flags had implicitly before they existed. An old
 # meta.json missing one of these keys resumes iff the current run uses
@@ -147,6 +151,13 @@ LEGACY_DEFAULTS = {
     'heat_cache': False,
     'compile': False,
     'grad_checkpoint': False,
+    'epoch_aug_p': 0.0,
+    'epoch_aug_clean_p': 0.0,
+    'epoch_redraw_dir': None,
+    'bf16': False,
+    'channels_last': False,
+    'width_bucket': False,
+    'prefetch': 0,
 }
 
 # Exact fingerprint enforced on --resume (T0.2): every key here must
@@ -162,7 +173,9 @@ RESUME_KEYS = ('vocab', 'pages', 'height', 'lr', 'seed', 'exclude',
                'margin_siblings', 'margin', 'margin_every',
                'mwer_weight', 'mwer_beams', 'mwer_every',
                'mwer_maxlen', 'action_weight', 'action_every',
-               'specaug_p', 'specaug_slope', 'handink', 'simshots')
+               'specaug_p', 'specaug_slope', 'handink', 'simshots',
+               'epoch_aug_p', 'epoch_aug_clean_p', 'epoch_redraw_dir',
+               'bf16', 'channels_last', 'width_bucket', 'prefetch')
 
 _LOCK_HELD = []
 
@@ -385,6 +398,13 @@ def build_meta(args, pairs):
         'heat_pt': getattr(args, 'heat_pt', None),
         'handink': getattr(args, 'handink', False),
         'simshots': getattr(args, 'simshots', False),
+        'epoch_aug_p': getattr(args, 'epoch_aug_p', 0.0),
+        'epoch_aug_clean_p': getattr(args, 'epoch_aug_clean_p', 0.0),
+        'epoch_redraw_dir': getattr(args, 'epoch_redraw_dir', None),
+        'bf16': getattr(args, 'bf16', False),
+        'channels_last': getattr(args, 'channels_last', False),
+        'width_bucket': getattr(args, 'width_bucket', False),
+        'prefetch': getattr(args, 'prefetch', 0),
     }
 
 
@@ -1099,8 +1119,14 @@ def build_optimizer(net, lr, trunk_mult=1.0, warmup=0, cosine=False,
         'param-group split is empty'
     assert (sum(len(v) for v in splits.values())
             == sum(1 for _ in net.parameters())), 'param overlap/leak'
-    opt = torch.optim.AdamW([{'params': ps, 'lr': lr, 'weight_decay': w}
-                             for ps, _, w in grouped])
+    all_cuda = all(p.is_cuda for ps, _, _ in grouped for p in ps)
+    opt_kw = {'fused': True} if all_cuda else {}
+    try:
+        opt = torch.optim.AdamW([{'params': ps, 'lr': lr, 'weight_decay': w}
+                                 for ps, _, w in grouped], **opt_kw)
+    except (RuntimeError, TypeError):
+        opt = torch.optim.AdamW([{'params': ps, 'lr': lr, 'weight_decay': w}
+                                 for ps, _, w in grouped])
     if warmup <= 0 and not cosine:
         return opt, None
 
@@ -1328,9 +1354,11 @@ def main():
     ap.add_argument('--steps', type=int, default=500)
     ap.add_argument('--eval-every', type=int, default=100)
     ap.add_argument('--height', type=int, default=256)
-    ap.add_argument('--batch-size', type=int, default=8,
-                    help='true mini-batch over pair order (1 = legacy '
-                         'one-pair-per-step; system strips default 8)')
+    ap.add_argument('--batch-size', type=int, default=6,
+                    help='true mini-batch over pair order (default 6: fastest '
+                         'non-paging batch on 16 GB RTX 4080 SUPER with '
+                         'shared pass; use 4 for extra VRAM headroom on '
+                         'very wide strips)')
     ap.add_argument('--pretrained', action='store_true',
                     help='init the trunk from timm ConvNeXt-Tiny weights '
                          'with the anisotropic 8x16 encoder (MvdNet v2)')
@@ -1509,6 +1537,36 @@ def main():
                     help='HeatNet .pt checkpoint for --hybrid-cache '
                          '(CUDA when available; loaded once, eval mode). '
                          'Recorded in meta.json and enforced on --resume.')
+    ap.add_argument('--epoch-aug-p', type=float, default=0.8,
+                    help='per-epoch deterministic physical+3D-geom aug '
+                         'probability on degraded strips (default 0.8; pass '
+                         '0.0 to disable). Fresh draw each epoch; preserves '
+                         'clean anchors. Recorded in meta.json and enforced '
+                         'on --resume.')
+    ap.add_argument('--epoch-aug-clean-p', type=float, default=0.0,
+                    help='per-epoch photometric/optics aug probability on '
+                         'clean .png strips (default 0.0 preserves the '
+                         '20-30%% clean anchor floor). Recorded in meta.json '
+                         'and enforced on --resume.')
+    ap.add_argument('--epoch-redraw-dir', default=None,
+                    help='optional root holding ep<E>/ fresh photo-degrade '
+                         'redraws; substitutes degraded strips per epoch '
+                         'while keeping clean .png anchors untouched.')
+    ap.add_argument('--bf16', action=argparse.BooleanOptionalAction, default=True,
+                    help='use native bfloat16 AMP + TF32 on CUDA (default on; '
+                         'pass --no-bf16 for fp16+GradScaler).')
+    ap.add_argument('--channels-last', action=argparse.BooleanOptionalAction,
+                    default=True,
+                    help='use NHWC channels_last memory format on ConvNeXt '
+                         'encoder + inputs (default on; --no-channels-last '
+                         'for NCHW).')
+    ap.add_argument('--width-bucket', action=argparse.BooleanOptionalAction,
+                    default=True,
+                    help='group similar-width strips into micro-batches per '
+                         'epoch (default on; --no-width-bucket for flat).')
+    ap.add_argument('--prefetch', type=int, default=4,
+                    help='async background collate prefetch depth (default 4; '
+                         '0 = synchronous legacy collate).')
     args = ap.parse_args()
 
     torch.manual_seed(args.seed)
@@ -1566,9 +1624,18 @@ def main():
         print('schedule: warmup %d updates, cosine=%s (horizon ~%d updates)'
               % (args.warmup, args.cosine, total_updates))
     amp = (device == 'cuda') and not args.no_amp
+    amp_dtype = (torch.bfloat16 if (amp and args.bf16) else torch.float16)
+    if amp and args.bf16:
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+        print('AMP: native bfloat16 + TF32 (GradScaler disabled)')
     if args.no_amp:
         print('AMP disabled: full fp32')
-    scaler = torch.amp.GradScaler('cuda', enabled=amp)
+    if args.channels_last and device == 'cuda':
+        net.encoder = net.encoder.to(memory_format=torch.channels_last)
+        net.proj = net.proj.to(memory_format=torch.channels_last)
+        print('memory format: channels_last (NHWC) on encoder+proj')
+    scaler = torch.amp.GradScaler('cuda', enabled=(amp and amp_dtype == torch.float16))
     heat_net = None
     if args.hybrid_cache:
         heat_net = heat_features.HeatNet(args.heat_pt, device=device)
@@ -1666,21 +1733,68 @@ def main():
     if B > 1:
         print('batch-size %d: %d batches/epoch over %d pairs'
               % (B, nb, n))
-    for step in range(start, args.steps + 1):
-        # Fixed step->batch map (epoch cycles over contiguous slices),
-        # so --resume lands on the identical batch for a given step.
-        b0 = ((step - 1) % nb) * B
-        batch = pairs[b0:b0 + B]
+    pair_widths = None
+    if args.width_bucket and B > 1:
+        pair_widths = fast_loader.measure_pair_widths(
+            pairs, height=args.height, hybrid_index=hybrid_index)
+        print('width-bucket: enabled (min=%d, median=%d, max=%d px)'
+              % (min(pair_widths), sorted(pair_widths)[len(pair_widths) // 2],
+                 max(pair_widths)))
+
+    def _step_batches():
+        cached_ep = -1
+        ep_batches = None
+        for st in range(start, args.steps + 1):
+            ep = (st - 1) // nb
+            bi = (st - 1) % nb
+            if pair_widths is not None:
+                if ep != cached_ep:
+                    ep_batches = fast_loader.epoch_bucketed_batches(
+                        pairs, pair_widths, B, args.seed, ep)
+                    cached_ep = ep
+                raw_b = ep_batches[bi]
+            else:
+                b0 = bi * B
+                raw_b = pairs[b0:b0 + B]
+            yield (st, ep, epoch_aug.resolve_epoch_batch(
+                raw_b, ep, args.epoch_redraw_dir))
+
+    def _collate_step(_st, _ep, batch):
         if heat_net is None:
-            imgs, tgt, key_mask = collate(batch, args.height,
-                                          args.stride)
-            imgs, tgt = imgs.to(device), tgt.to(device)
+            return collate(batch, args.height, args.stride)
+        return collate_hybrid(batch, args.height, args.stride)
+
+    non_block = (device == 'cuda' and args.prefetch > 0)
+    if args.prefetch > 0:
+        stream_ctx = fast_loader.AsyncBatchPrefetcher(
+            _step_batches(), _collate_step,
+            num_workers=min(4, max(2, args.prefetch)),
+            prefetch=args.prefetch,
+            pin_memory=(device == 'cuda'))
+    else:
+        class _SyncStream:
+            def __enter__(self): return self
+            def __exit__(self, *a): return False
+            def __iter__(self):
+                for st, ep, batch in _step_batches():
+                    yield (st, ep, batch, _collate_step(st, ep, batch))
+        stream_ctx = _SyncStream()
+
+    with stream_ctx as batch_stream:
+      for step, epoch, batch, collated in batch_stream:
+        if heat_net is None:
+            imgs, tgt, key_mask = collated
+            imgs = imgs.to(device, non_blocking=non_block)
+            tgt = tgt.to(device, non_blocking=non_block)
+            if args.epoch_aug_p > 0 or args.epoch_aug_clean_p > 0:
+                imgs, _ = epoch_aug.augment_standardized_batch(
+                    imgs, batch, args.seed, epoch,
+                    aug_p=args.epoch_aug_p, clean_p=args.epoch_aug_clean_p)
         else:
             # Hybrid: rectified RGB + staff from sidecars, heat from one
             # batched fp32 HeatNet forward OUTSIDE autocast (probs() is
             # no_grad; deterministic given weights).
-            rgb, tgt, key_mask, grayb, staffb = collate_hybrid(
-                batch, args.height, args.stride)
+            rgb, tgt, key_mask, grayb, staffb = collated
             # Batch-width guard: a monster strip would OOM inside the
             # HeatNet forward below (and worse, inside the aux+coord
             # triple forward on even steps). Skips are deterministic
@@ -1691,17 +1805,26 @@ def main():
                       % (step, rgb.shape[-1], BATCH_WIDTH_CAP),
                       flush=True)
                 continue
-            tgt = tgt.to(device)
+            tgt = tgt.to(device, non_blocking=non_block)
+            rgb_d = rgb.to(device, non_blocking=non_block)
+            gray_d = grayb.to(device, non_blocking=non_block)
+            staff_d = staffb.to(device, non_blocking=non_block)
+            if args.epoch_aug_p > 0 or args.epoch_aug_clean_p > 0:
+                rgb_d, gray_d, staff_d = epoch_aug.augment_standardized_batch(
+                    rgb_d, batch, args.seed, epoch,
+                    aug_p=args.epoch_aug_p, clean_p=args.epoch_aug_clean_p,
+                    grayb=gray_d, staffb=staff_d)
             imgs = assemble_hybrid_batch(
-                heat_net, rgb.to(device), grayb.to(device),
-                staffb.to(device))
+                heat_net, rgb_d, gray_d, staff_d)
             # S13b: aux targets are the UNDROPPED extras (denoising:
             # predict full keypoint maps from channel-dropped inputs).
             aux_tgt = imgs[:, 3:].detach() if args.aux_weight > 0 else None
             if args.heat_dropout > 0:
                 imgs = heat_channel_dropout(imgs, args.heat_dropout)
+        if args.channels_last and device == 'cuda':
+            imgs = imgs.to(memory_format=torch.channels_last)
         if key_mask is not None:
-            key_mask = key_mask.to(device)
+            key_mask = key_mask.to(device, non_blocking=non_block)
         aug = None
         if args.specaug_p > 0:
             # Spike S8: train-only latent SpecAugment, a pure function
@@ -1710,13 +1833,18 @@ def main():
             aug = maybe_specaug(
                 random.Random('%d:%d:specaug' % (args.seed, step)),
                 args.specaug_p, args.specaug_slope)
-        with torch.amp.autocast('cuda', enabled=amp):
-            loss = net.loss(imgs, tgt, sample_p=args.sample_p,
-                            mem_mask=key_mask, tok_weight=args.tok_weight,
-                            weight_ids=STRUCT_WEIGHT_IDS,
-                            tok_dropout=args.tok_dropout,
-                            content_ids=CONTENT_IDS,
-                            augment=aug) / K
+        need_aux = (args.aux_weight > 0 and step % max(1, args.aux_every) == 0)
+        need_coord = (args.coord_weight > 0 and step % max(1, args.coord_every) == 0)
+        with torch.amp.autocast('cuda', enabled=amp, dtype=amp_dtype):
+            ce_loss, apred_shared, xc_shared = net.loss_shared(
+                imgs, tgt, sample_p=args.sample_p,
+                mem_mask=key_mask, tok_weight=args.tok_weight,
+                weight_ids=STRUCT_WEIGHT_IDS,
+                tok_dropout=args.tok_dropout,
+                content_ids=CONTENT_IDS,
+                need_aux=need_aux, need_coord=need_coord,
+                augment=aug)
+            loss = ce_loss / K
             mterm = None
             if args.margin_weight > 0 and step % max(
                     1, args.margin_every) == 0:
@@ -1790,14 +1918,10 @@ def main():
                 aterm = expected_keystroke_risk(alogits, tgt, acost)
                 loss = loss + args.action_weight * aterm / K
             auxterm = None
-            if args.aux_weight > 0 and step % max(
-                    1, args.aux_every) == 0:
-                # S13b: dense ink/keypoint distillation. One extra
-                # trunk encode (grad-carrying, like sample-p's 2x
-                # cost); the batch CE above is untouched. Targets are
-                # the undropped extras resized to the aux grid; padded
-                # columns/slot-masked rows carry no aux loss.
-                apred = net.aux_pred(imgs)
+            if need_aux:
+                # S13b: dense ink/keypoint distillation from the shared trunk
+                # forward (zero redundant ConvNeXt pass).
+                apred = apred_shared
                 agres = torch.nn.functional.interpolate(
                     aux_tgt, size=apred.shape[-2:], mode='area')
                 abce = torch.nn.functional.binary_cross_entropy_with_logits(
@@ -1810,13 +1934,10 @@ def main():
                     auxterm = abce.mean()
                 loss = loss + args.aux_weight * auxterm / K
             cterm = None
-            if args.coord_weight > 0 and step % max(
-                    1, args.coord_every) == 0:
-                # S13c: monotonic-reading supervision. One extra
-                # teacher-forced decoder pass (grad-carrying, like
-                # sample-p's 2x cost); the batch CE above is untouched.
-                # Voice tokens reset segments; PAD never forms pairs.
-                xc = net.x_centroids(imgs, tgt, key_mask)
+            if need_coord:
+                # S13c: monotonic-reading supervision from the shared decoder
+                # pass (zero redundant encoder/decoder pass).
+                xc = xc_shared
                 cterm = model.coord_monotonic_penalty(
                     xc, tgt, model.VOICE_IDS, net.pad_id)
                 loss = loss + args.coord_weight * cterm / K

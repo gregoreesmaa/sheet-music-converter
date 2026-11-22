@@ -532,24 +532,9 @@ class MvdNet(nn.Module):
         feats[6] = nn.Sequential(
             norm4, _PadConv(conv4, (0, 1, 0, 1)))
 
-    def encode(self, images, mem_mask=None):
-        """Encode images to a ``[B, h * w, d]`` memory sequence.
-
-        ``mem_mask`` is an optional bool ``[B, h * w]``
-        memory_key_padding_mask (True = ignore), as built by the
-        train collates. When given, the spatial DC-centering mean is
-        computed over active (non-masked) cells only: width padding
-        and inactive staff-slot paper must not drag the mean or leak
-        padding geometry into the memory. None (default) keeps the
-        exact legacy full-spatial mean.
-
-        When ``self.foveal_tap`` is enabled, Stage-0 (P2, 4x4) features
-        are avg+max pooled to ``(h, w)`` and added as a residual before
-        DC-centering so micro-glyph peaks survive deep downsampling.
-        """
+    def _encode_with_feats(self, images, mem_mask=None):
+        """Encode images once, returning ``(mem_seq, raw_feats, h_mem, w_mem)``."""
         if mem_mask is not None and not mem_mask.any():
-            # No masked cells (e.g. an S=4 eval strip): fall through to
-            # the exact legacy full-spatial mean, bitwise identical.
             mem_mask = None
         if self.foveal_tap:
             p2 = self.encoder[:2](images)     # [B, 96, H/4, W/4]
@@ -576,7 +561,24 @@ class MvdNet(nn.Module):
         y_scale, x_scale = stride_grid_scale(self.stride)
         pos = _sinusoidal_2d(h, w, d, proj.device, y_scale, x_scale)
         seq = self.mem_norm(proj.permute(0, 2, 3, 1).reshape(b, h * w, d)) + pos.reshape(1, h * w, d)
-        return seq
+        return seq, feats, h, w
+
+    def encode(self, images, mem_mask=None):
+        """Encode images to a ``[B, h * w, d]`` memory sequence.
+
+        ``mem_mask`` is an optional bool ``[B, h * w]``
+        memory_key_padding_mask (True = ignore), as built by the
+        train collates. When given, the spatial DC-centering mean is
+        computed over active (non-masked) cells only: width padding
+        and inactive staff-slot paper must not drag the mean or leak
+        padding geometry into the memory. None (default) keeps the
+        exact legacy full-spatial mean.
+
+        When ``self.foveal_tap`` is enabled, Stage-0 (P2, 4x4) features
+        are avg+max pooled to ``(h, w)`` and added as a residual before
+        DC-centering so micro-glyph peaks survive deep downsampling.
+        """
+        return self._encode_with_feats(images, mem_mask)[0]
 
     def aux_pred(self, images):
         """S13b: ``[B, 8, h, w]`` dense keypoint/ink logits.
@@ -731,6 +733,81 @@ class MvdNet(nn.Module):
         return nn.functional.cross_entropy(
             logits.reshape(-1, self.vocab), tgt.reshape(-1),
             ignore_index=self.pad_id, **ce_kw)
+
+    def loss_shared(self, images, tgt, sample_p=0.0, mem_mask=None,
+                    tok_weight=1.0, weight_ids=(), tok_dropout=0.0,
+                    content_ids=(), need_aux=False, need_coord=False,
+                    coord_layer=-1, augment=None):
+        """Single-pass ``(ce_loss, aux_pred, x_centroids)`` sharing 1 encoder + 1 decoder.
+
+        Eliminates the 3x ConvNeXt-Tiny encoder + 2x Transformer decoder
+        redundant autograd graphs when ``aux_weight > 0`` and/or
+        ``coord_weight > 0`` (~2.5x faster, ~2.7x lower peak VRAM, identical
+        forward/gradient math when ``tok_dropout == 0``).
+        """
+        if augment is not None:
+            raise ValueError('spike-S8 latent SpecAugment was removed; '
+                             'pass augment=None')
+        mem, feats, h_mem, w_mem = self._encode_with_feats(images, mem_mask)
+        apred = self.aux_head(feats) if need_aux else None
+
+        bos = torch.full_like(tgt[:, :1], self.bos_id)
+        inp = torch.cat([bos, tgt[:, :-1]], dim=1)
+        if tok_dropout > 0.0 and content_ids:
+            cid = torch.tensor(list(content_ids), device=inp.device)
+            is_content = (inp.unsqueeze(-1) == cid).any(-1)
+            drop = (torch.rand(inp.shape, device=inp.device)
+                    < tok_dropout) & is_content
+            inp = torch.where(
+                drop,
+                torch.randint(0, self.vocab - 3, inp.shape,
+                              device=inp.device),
+                inp)
+        ce_kw = {}
+        if tok_weight != 1.0 and len(weight_ids) > 0:
+            w = torch.ones(self.vocab, device=tgt.device)
+            w[list(weight_ids)] = tok_weight
+            ce_kw['weight'] = w
+
+        dec_in = inp
+        if sample_p > 0.0:
+            with torch.no_grad():
+                probe = self.decode_logits(mem, inp, mem_mask)
+                pred = probe.argmax(-1)
+                keep = (torch.rand_like(inp.float()) >= sample_p)
+                keep[:, 0] = True
+                prev = torch.cat([torch.full_like(tgt[:, :1], -1),
+                                  tgt[:, :-1]], dim=1)
+                keep = keep | (prev == self.pad_id)
+                keep = keep | (pred == self.pad_id) | (pred == self.bos_id)
+                dec_in = torch.where(keep, inp, pred)
+
+        held = {}
+        handle = None
+        top = self.decoder.layers[coord_layer] if need_coord else None
+        if need_coord:
+            def _hook(mod, _inp, out):
+                held['q'] = out.detach().float()
+            handle = top.norm2.register_forward_hook(_hook)
+        try:
+            logits = self.decode_logits(mem, dec_in, mem_mask)
+        finally:
+            if handle is not None:
+                handle.remove()
+
+        ce = nn.functional.cross_entropy(
+            logits.reshape(-1, self.vocab), tgt.reshape(-1),
+            ignore_index=self.pad_id, **ce_kw)
+
+        xc = None
+        if need_coord:
+            w_att = _cross_weights(top.multihead_attn, held['q'], mem.float(),
+                                   key_padding_mask=mem_mask)
+            b, t, _ = w_att.shape
+            xs = (torch.arange(w_mem, device=w_att.device).float() + 0.5) / w_mem
+            xc = (w_att.reshape(b, t, h_mem, w_mem) * xs).sum(dim=(2, 3))
+
+        return ce, apred, xc
 
     @torch.no_grad()
     def greedy(self, images, max_len=2048, constrain=False, mem_mask=None):
