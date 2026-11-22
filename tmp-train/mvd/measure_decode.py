@@ -292,19 +292,11 @@ def decode_system_with_measure_fallback(net, img_tensor, beam=3,
     if adapt_steps:
         bs_kwargs['adapt_steps'] = adapt_steps
         bs_kwargs['adapt_lr'] = adapt_lr
-    # Dropped spikes S1 (ink_eos_veto) and S2 (ilme_lambda) are accepted
-    # as ignored kwargs for eval_sys_gate.py compatibility.
-    _ = (ink_eos_veto, ilme_lambda)
+    # Dropped spikes S1/S2/S6 are accepted as compat kwargs for eval_sys_gate.py.
+    _ = (ink_eos_veto, ilme_lambda, lattice_beams)
     if lattice_repair:
-        # Spike S6: lattice import is lazy (lattice_repair imports
-        # this module at its top; a top-level import here would cycle).
-        import lattice_repair as lrep  # noqa: E402
-        out = net.beam_search(img_tensor, beam=lattice_beams,
-                              strict=True, max_len=564, return_all=True,
-                              **bs_kwargs)
-        return lrep.repair_beams(net, img_tensor,
-                                 bs_kwargs.get('mem_mask'),
-                                 out[0].tolist(), len(data.VOCAB))
+        raise ValueError('dropped spike S6 (lattice_repair) was removed; '
+                         'pass lattice_repair=False')
     out = net.beam_search(img_tensor, beam=beam, strict=True,
                           max_len=564, **bs_kwargs)
     toks = _ids_to_tokens(out)

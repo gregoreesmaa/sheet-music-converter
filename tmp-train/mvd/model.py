@@ -1028,15 +1028,8 @@ class MvdNet(nn.Module):
         self.eval()
         mem = self.encode(images, mem_mask)
         if adapt_steps is not None and adapt_steps > 0:
-            # Spike S9: unsupervised per-strip adapter. Grad work
-            # runs re-enabled inside this no-grad method; the net
-            # stays frozen in eval mode, only A/B fit.
-            import tt_adapter as tta  # noqa: E402 (lazy: eval-only)
-            with torch.enable_grad():
-                mem = tta.adapt_strip(
-                    self, images, mem_mask, steps=adapt_steps,
-                    lr=adapt_lr, rank=adapt_rank,
-                    max_len=min(max_len, 564))['mem']
+            raise ValueError('dropped spike S9 (tt_adapter) was removed; '
+                             'pass adapt_steps=0')
         nb = images.shape[0]
         device = images.device
         K = max(1, beam)
