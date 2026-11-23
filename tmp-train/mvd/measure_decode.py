@@ -36,6 +36,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import data  # noqa: E402
 import grammar  # noqa: E402
 import rectify  # noqa: E402
+import render_diff_verify  # noqa: E402
 
 import numpy as np  # noqa: E402
 import torch  # noqa: E402
@@ -256,6 +257,30 @@ def _ids_to_tokens(out):
     return toks
 
 
+def _obs_gray_for_verify(img_tensor, obs_gray=None):
+    """Extract a 2D uint8 grayscale strip for T4.1 visual reranking."""
+    if obs_gray is not None:
+        if isinstance(obs_gray, Image.Image):
+            return np.asarray(obs_gray.convert('L'), dtype=np.uint8)
+        arr = np.asarray(obs_gray)
+        if arr.ndim == 3:
+            arr = arr[..., :3].mean(axis=2)
+        if arr.dtype != np.uint8:
+            if arr.size > 0 and float(arr.max()) <= 1.0 and float(arr.min()) >= 0.0:
+                arr = arr * 255.0
+            arr = np.clip(np.rint(arr), 0, 255).astype(np.uint8)
+        return arr
+    # Fallback: derive grayscale directly from [1, C, H, W] input tensor RGB channels.
+    rgb = img_tensor[0, :3].detach().cpu().float().numpy()  # [3, H, W]
+    gray = rgb.mean(axis=0)
+    lo, hi = float(gray.min()), float(gray.max())
+    if hi - lo > 1e-6:
+        gray = (gray - lo) / (hi - lo) * 255.0
+    else:
+        gray = np.full_like(gray, 255.0)
+    return np.clip(np.rint(gray), 0, 255).astype(np.uint8)
+
+
 def decode_system_with_measure_fallback(net, img_tensor, beam=3,
                                         mem_mask=None,
                                         ink_eos_veto=False,
@@ -263,7 +288,10 @@ def decode_system_with_measure_fallback(net, img_tensor, beam=3,
                                         lattice_repair=False,
                                         lattice_beams=8,
                                         adapt_steps=0,
-                                        adapt_lr=0.1):
+                                        adapt_lr=0.1,
+                                        verify_beam=False,
+                                        verify_alpha=2.0,
+                                        obs_gray=None):
     """Beam-decode one system strip with per-measure bar-rest fallback.
 
     Runs ``net.beam_search(img_tensor, beam=beam, strict=True,
@@ -285,6 +313,11 @@ def decode_system_with_measure_fallback(net, img_tensor, beam=3,
     ``adapt_steps`` (spike S9): test-time per-strip adapter steps
     (0 = off); passed only when positive so legacy stand-ins keep
     working.
+    ``verify_beam`` (T4.1): when True and ``beam >= 2``, requests all
+    top-K beams + length-normalized logprobs from ``net.beam_search(...,
+    return_beams=True)`` and reranks them via
+    :func:`render_diff_verify.rerank_beams_visual` with weight
+    ``verify_alpha``. Default False preserves legacy behavior bit-for-bit.
     """
     bs_kwargs = {}
     if mem_mask is not None:
@@ -297,6 +330,25 @@ def decode_system_with_measure_fallback(net, img_tensor, beam=3,
     if lattice_repair:
         raise ValueError('dropped spike S6 (lattice_repair) was removed; '
                          'pass lattice_repair=False')
+    if verify_beam and beam >= 2:
+        all_beams, all_scores = net.beam_search(
+            img_tensor, beam=beam, strict=True, max_len=564,
+            return_beams=True, **bs_kwargs)
+        beams_row = all_beams[0]
+        scores_row = all_scores[0]
+        cand_toks = []
+        cand_lps = []
+        for b_ids, lp in zip(beams_row, scores_row):
+            toks = _ids_to_tokens([b_ids])
+            fixed, _, _ = fallback_repair(toks)
+            cand_toks.append(fixed)
+            cand_lps.append(float(lp))
+        if len(cand_toks) >= 2:
+            gray = _obs_gray_for_verify(img_tensor, obs_gray=obs_gray)
+            res = render_diff_verify.rerank_beams_visual(
+                gray, cand_toks, cand_lps, alpha=float(verify_alpha))
+            return list(res['best_toks'])
+        return cand_toks[0] if cand_toks else []
     out = net.beam_search(img_tensor, beam=beam, strict=True,
                           max_len=564, **bs_kwargs)
     toks = _ids_to_tokens(out)
@@ -335,7 +387,7 @@ def _decode_chunk(net, page_img, chunk_staves, beam, extra_fn=None,
                   mem_mask=None, ink_eos_veto=False, ilme_lambda=0.0,
                   lattice_repair=False, adapt_steps=0, adapt_lr=0.1,
                   stride='8x16', target_sp=rectify.REF_TARGET_SP,
-                  height=None):
+                  height=None, verify_beam=False, verify_alpha=2.0):
     """Rectify one <=4-staff chunk and fallback-decode it.
 
     ``extra_fn`` (T2.4 hybrid hook): ``(rect_img, staff_ref) ->
@@ -361,7 +413,9 @@ def _decode_chunk(net, page_img, chunk_staves, beam, extra_fn=None,
         net, tensor, beam=beam, mem_mask=mem_mask,
         ink_eos_veto=ink_eos_veto, ilme_lambda=ilme_lambda,
         lattice_repair=lattice_repair, adapt_steps=adapt_steps,
-        adapt_lr=adapt_lr)
+        adapt_lr=adapt_lr, verify_beam=verify_beam,
+        verify_alpha=verify_alpha,
+        obs_gray=(rect_img if verify_beam else None))
 
 
 def _explicit_voice(measure):
@@ -411,7 +465,8 @@ def decode_multi_staff_system(net, page_img, system_staves_lines,
                               lattice_repair=False, adapt_steps=0,
                               adapt_lr=0.1, stride='8x16',
                               target_sp=rectify.REF_TARGET_SP,
-                              height=None):
+                              height=None, verify_beam=False,
+                              verify_alpha=2.0):
     """Decode a system of any staff count with measure-level merging.
 
     ``<= 4`` staves: rectify once, decode once. ``> 4`` staves: slice
@@ -438,7 +493,9 @@ def decode_multi_staff_system(net, page_img, system_staves_lines,
                              lattice_repair=lattice_repair,
                              adapt_steps=adapt_steps,
                              adapt_lr=adapt_lr, stride=stride,
-                             target_sp=target_sp, height=height)
+                             target_sp=target_sp, height=height,
+                             verify_beam=verify_beam,
+                             verify_alpha=verify_alpha)
     if mem_mask is not None:
         raise ValueError('mem_mask cannot span chunked (> 4 staff) '
                          'decodes; pass None so each chunk builds its '
@@ -453,7 +510,9 @@ def decode_multi_staff_system(net, page_img, system_staves_lines,
                              lattice_repair=lattice_repair,
                              adapt_steps=adapt_steps,
                              adapt_lr=adapt_lr, stride=stride,
-                             target_sp=target_sp, height=height)
+                             target_sp=target_sp, height=height,
+                             verify_beam=verify_beam,
+                             verify_alpha=verify_alpha)
         header, measures, _tb = split_measures(toks)
         merged_header.extend(header)
         while len(merged) < len(measures):

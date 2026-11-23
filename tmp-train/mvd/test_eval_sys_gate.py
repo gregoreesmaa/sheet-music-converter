@@ -1026,5 +1026,172 @@ class TestStaffUNet2DWiring(unittest.TestCase):
             self.assertAlmostEqual(summary['suite31_photo_f1_mean'], 0.45)
 
 
+class TestVerifyBeamVisualRerank(unittest.TestCase):
+    """T4.1: --verify-beam visual reranking in measure_decode and eval_sys_gate."""
+
+    def _beam_ids(self, toks):
+        return [data.TOKEN_TO_ID[t] for t in toks]
+
+    def test_verify_beam_reranks_and_default_false_unchanged(self):
+        corrupted = ['clef-G-2', 'key+0', 'time-4-4', 'whole', 'D', '4', 'bar']
+        clean_true = ['clef-G-2', 'key+0', 'time-4-4', 'whole', 'C', '4', 'bar']
+        ids_bad = self._beam_ids(corrupted)
+        ids_good = self._beam_ids(clean_true)
+
+        class MultiBeamFakeNet:
+            def __init__(self):
+                self.calls = []
+
+            def beam_search(self, images, beam=3, strict=True, max_len=564,
+                            return_beams=False, **kw):
+                self.calls.append({'beam': beam, 'return_beams': return_beams})
+                if return_beams:
+                    return [[ids_bad, ids_good]], [[-0.10, -0.25]]
+                return [ids_bad]
+
+        net = MultiBeamFakeNet()
+        ten = torch.ones(1, 3, 256, 64)
+        obs_strip = Image.new('RGB', (64, 256), (255, 255, 255))
+
+        # Default verify_beam=False: never calls rerank_beams_visual, keeps top beam.
+        with mock.patch.object(
+                esg.mdec.render_diff_verify, 'rerank_beams_visual',
+                side_effect=AssertionError('rerank must not run when verify_beam=False')):
+            got_default = esg.mdec.decode_system_with_measure_fallback(
+                net, ten, beam=2, verify_beam=False)
+        self.assertEqual(got_default, corrupted)
+        self.assertFalse(net.calls[-1]['return_beams'])
+
+        # Opt-in verify_beam=True: calls rerank_beams_visual and picks higher-IoU beam 1.
+        captured = {}
+
+        def fake_rerank(obs_gray, beam_toks_list, beam_logprobs, alpha=2.0):
+            captured['obs_shape'] = obs_gray.shape
+            captured['beam_toks_list'] = list(beam_toks_list)
+            captured['beam_logprobs'] = list(beam_logprobs)
+            captured['alpha'] = alpha
+            # Simulate corrupted top-logprob beam getting low visual IoU (0.15)
+            # and beam 1 getting high visual IoU (0.85).
+            ious = [0.15, 0.85]
+            scores = [lp + alpha * iou for lp, iou in zip(beam_logprobs, ious)]
+            best_idx = 0 if scores[0] >= scores[1] else 1
+            return {
+                'best_idx': best_idx,
+                'best_toks': beam_toks_list[best_idx],
+                'scores': [],
+                'flagged_slices': [],
+                'best_visual_iou': ious[best_idx],
+                'best_combined_score': scores[best_idx],
+            }
+
+        with mock.patch.object(
+                esg.mdec.render_diff_verify, 'rerank_beams_visual',
+                side_effect=fake_rerank):
+            got_verified = esg.mdec.decode_system_with_measure_fallback(
+                net, ten, beam=2, verify_beam=True, verify_alpha=2.0,
+                obs_gray=obs_strip)
+
+        self.assertTrue(net.calls[-1]['return_beams'])
+        self.assertEqual(captured['obs_shape'], (256, 64))
+        self.assertEqual(captured['beam_toks_list'], [corrupted, clean_true])
+        self.assertEqual(captured['beam_logprobs'], [-0.10, -0.25])
+        self.assertAlmostEqual(captured['alpha'], 2.0)
+        self.assertEqual(got_verified, clean_true)
+
+    def test_decode_system_v2_and_curved_forward_verify_beam(self):
+        import numpy as np
+        import staff_unet2d as su
+
+        corrupted = ['clef-G-2', 'key+0', 'time-4-4', 'whole', 'D', '4', 'bar']
+        clean_true = ['clef-G-2', 'key+0', 'time-4-4', 'whole', 'C', '4', 'bar']
+        ids_bad = self._beam_ids(corrupted)
+        ids_good = self._beam_ids(clean_true)
+
+        class MultiBeamFakeNet:
+            def beam_search(self, images, beam=3, strict=True, max_len=564,
+                            return_beams=False, **kw):
+                if return_beams:
+                    return [[ids_bad, ids_good]], [[-0.10, -0.25]]
+                return [ids_bad]
+
+        rerank_calls = []
+
+        def fake_rerank(obs_gray, beam_toks_list, beam_logprobs, alpha=2.0):
+            rerank_calls.append({'shape': obs_gray.shape, 'alpha': alpha})
+            return {
+                'best_idx': 1,
+                'best_toks': beam_toks_list[1],
+                'scores': [],
+                'flagged_slices': [],
+                'best_visual_iou': 0.9,
+                'best_combined_score': float(beam_logprobs[1]) + alpha * 0.9,
+            }
+
+        net = MultiBeamFakeNet()
+        with tempfile.TemporaryDirectory(prefix='t_vbeam_') as tmp:
+            tmpd = Path(tmp)
+            img_path = tmpd / 'strip.png'
+            page_img = Image.new('RGB', (400, 300), (255, 255, 255))
+            page_img.save(img_path)
+            staves = [[50.0, 60.0, 70.0, 80.0, 90.0]]
+
+            # 1) decode_system_v2 with verify_beam=True
+            with mock.patch.object(esg, 'rect_staves_for',
+                                   return_value=(staves, 'test')), \
+                 mock.patch.object(esg.mdec.render_diff_verify,
+                                   'rerank_beams_visual',
+                                   side_effect=fake_rerank):
+                dec_v2 = esg.decode_system_v2(
+                    net, str(img_path), {'img': 'strip.png'}, None,
+                    'cpu', 256, 2, 576, False, tmpd, 'v2-hyp',
+                    verify_beam=True, verify_alpha=2.5)
+            self.assertEqual(dec_v2['tokens'], clean_true)
+            self.assertEqual(len(rerank_calls), 1)
+            self.assertAlmostEqual(rerank_calls[0]['alpha'], 2.5)
+            self.assertEqual(rerank_calls[0]['shape'][0], 256)
+
+            # 2) decode_curved_system with verify_beam=True
+            x_ctrl = np.linspace(20.0, 380.0, 4, dtype=np.float64)
+            y_ctrl = np.full(4, 120.0, dtype=np.float64)
+            csys = su.CurvedSystem(
+                staves=[su.CurvedStaff(
+                    ctrl_pts=np.stack([x_ctrl, y_ctrl], axis=-1),
+                    sp_ctrl=np.full(4, 10.0, dtype=np.float64),
+                    x_start=20.0, x_end=380.0,
+                    sp_median=10.0, confidence=0.95)],
+                x_start=20.0, x_end=380.0,
+                polygon=np.zeros((8, 2), dtype=np.float64), confidence=0.95)
+            with mock.patch.object(esg.mdec.render_diff_verify,
+                                   'rerank_beams_visual',
+                                   side_effect=fake_rerank):
+                dec_curv = esg.decode_curved_system(
+                    net, page_img, csys, heat_net=None, device='cpu',
+                    height=256, beam=2, max_len=576, workdir=tmpd,
+                    stem='curv-hyp', extra_chans=1,
+                    verify_beam=True, verify_alpha=3.0)
+            self.assertEqual(dec_curv['tokens'], clean_true)
+            self.assertEqual(len(rerank_calls), 2)
+            self.assertAlmostEqual(rerank_calls[1]['alpha'], 3.0)
+            self.assertEqual(rerank_calls[1]['shape'][0], 256)
+
+    def test_mvdnet_beam_search_return_beams_cpu(self):
+        import model as mvd_model
+        torch.manual_seed(0)
+        net = mvd_model.MvdNet(vocab=len(data.VOCAB) + 3, d_model=32,
+                               layers=1, heads=4, dim_ff=64,
+                               anisotropic=True, extra_chans=0).eval()
+        imgs = torch.zeros(1, 3, 64, 64)
+        best = net.beam_search(imgs, beam=2, max_len=6, strict=True,
+                               return_beams=False)
+        all_b, scores = net.beam_search(imgs, beam=2, max_len=6, strict=True,
+                                        return_beams=True)
+        self.assertEqual(tuple(all_b.shape[:2]), (1, 2))
+        self.assertEqual(len(scores), 1)
+        self.assertEqual(len(scores[0]), 2)
+        self.assertTrue(all(isinstance(s, float) for s in scores[0]))
+        # Top beam from return_beams=True matches legacy return_beams=False
+        self.assertEqual(all_b[0, 0, :best.shape[1]].tolist(), best[0].tolist())
+
+
 if __name__ == '__main__':
     unittest.main()

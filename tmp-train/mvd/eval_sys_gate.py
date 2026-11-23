@@ -480,6 +480,13 @@ def main():
     ap.add_argument('--adapt-lr', type=float, default=0.1,
                     help='Spike S9: SGD learning rate for the per-strip '
                     'adapter fit')
+    ap.add_argument('--verify-beam', action='store_true',
+                    help='T4.1: render-and-diff visual reranking over top-K '
+                    'beams via render_diff_verify.rerank_beams_visual '
+                    '(CPU-only, requires beam >= 2)')
+    ap.add_argument('--verify-alpha', type=float, default=2.0,
+                    help='T4.1: visual IoU weight for --verify-beam '
+                    '(combined_score = logprob + alpha * visual_iou)')
     ap.add_argument('--suite31-dir', default=str(SUITE31_DEFAULT))
     ap.add_argument('--suite31-manifest', default=None,
                     help='optional path to an alternate Suite31 manifest JSON '
@@ -610,7 +617,9 @@ def main():
                         lattice_repair=args.lattice_repair,
                         adapt_steps=args.adapt_steps,
                         adapt_lr=args.adapt_lr, stride=args.stride,
-                        extra_chans=extra)
+                        extra_chans=extra,
+                        verify_beam=args.verify_beam,
+                        verify_alpha=args.verify_alpha)
                 else:
                     dec = decode_system(net, img, args.height, args.max_len,
                                         args.beam, device, workdir,
@@ -874,6 +883,8 @@ def main():
                      'lattice_repair': args.lattice_repair,
                      'adapt_steps': args.adapt_steps,
                      'adapt_lr': args.adapt_lr,
+                     'verify_beam': bool(args.verify_beam),
+                     'verify_alpha': float(args.verify_alpha),
                      'max_len': args.max_len, 'image_height': args.height,
                      'preprocessing': preproc,
                      'device': device, 'torch': torch.__version__},
@@ -1056,7 +1067,8 @@ def decode_system_v2(net, img_path, row, heat_net, device, height, beam,
                      max_len, hybrid, workdir, stem, ink_eos_veto=False,
                      ilme_lambda=0.0, lattice_repair=False,
                      adapt_steps=0, adapt_lr=0.1, stride='8x16',
-                     extra_chans=None):
+                     extra_chans=None, verify_beam=False,
+                     verify_alpha=2.0):
     """T2.4 decode: rectified (+hybrid/4ch) input, measure-fallback beam search.
 
     Geometry from the cache row (fallback: RowNet detect, then legacy
@@ -1095,18 +1107,28 @@ def decode_system_v2(net, img_path, row, heat_net, device, height, beam,
                 net, img, staves, beam=beam, extra_fn=extra,
                 ink_eos_veto=ink_eos_veto, ilme_lambda=ilme_lambda,
                 lattice_repair=lattice_repair, adapt_steps=adapt_steps,
-                adapt_lr=adapt_lr, stride=stride)
+                adapt_lr=adapt_lr, stride=stride,
+                verify_beam=verify_beam, verify_alpha=verify_alpha)
         else:
-            ten = rectified_input_tensor(img_path, staves, heat_net,
-                                         device, height, hybrid,
-                                         extra_chans=extra_chans)
+            if verify_beam:
+                rect_img, ref = rect_mod.rectify_system_strip(
+                    img, staves, target_sp=10.0, height=height)
+                ten = rectified_input_tensor_from_rect(
+                    rect_img, ref, heat_net, device, extra_chans=extra_chans)
+                obs_gray = rect_img
+            else:
+                ten = rectified_input_tensor(img_path, staves, heat_net,
+                                             device, height, hybrid,
+                                             extra_chans=extra_chans)
+                obs_gray = None
             toks = mdec.decode_system_with_measure_fallback(
                 net, ten, beam=beam,
                 mem_mask=mdec.mask_for_strip(
                     ten, len(staves), stride=stride),
                 ink_eos_veto=ink_eos_veto, ilme_lambda=ilme_lambda,
                 lattice_repair=lattice_repair, adapt_steps=adapt_steps,
-                adapt_lr=adapt_lr)
+                adapt_lr=adapt_lr, verify_beam=verify_beam,
+                verify_alpha=verify_alpha, obs_gray=obs_gray)
     secs = time.time() - t0
     valid = hyp_tokens_valid(toks)
     loop_trimmed = False
@@ -1349,7 +1371,8 @@ def decode_curved_system(net, page_img, curved_sys, heat_net, device, height,
                          beam, max_len, workdir, stem, ink_eos_veto=False,
                          ilme_lambda=0.0, lattice_repair=False,
                          adapt_steps=0, adapt_lr=0.1, stride='8x16',
-                         extra_chans=0):
+                         extra_chans=0, verify_beam=False,
+                         verify_alpha=2.0):
     """Unwarp a ``CurvedSystem`` via ``bezier_ribbon`` and measure-fallback decode.
 
     Directly extracts canonical ``height``-px (default 256 px) strips +
@@ -1380,7 +1403,9 @@ def decode_curved_system(net, page_img, curved_sys, heat_net, device, height,
                 net, ten, beam=beam, mem_mask=mem_mask,
                 ink_eos_veto=ink_eos_veto, ilme_lambda=ilme_lambda,
                 lattice_repair=lattice_repair, adapt_steps=adapt_steps,
-                adapt_lr=adapt_lr)
+                adapt_lr=adapt_lr, verify_beam=verify_beam,
+                verify_alpha=verify_alpha,
+                obs_gray=(rect_img if verify_beam else None))
             chunk_streams.append(ctoks)
     if len(chunk_streams) == 1:
         toks = chunk_streams[0]
@@ -1429,7 +1454,8 @@ def decode_row_system(net, img_file, row, heat_net, device, height, beam,
                       max_len, hybrid, workdir, stem, ink_eos_veto=False,
                       ilme_lambda=0.0, lattice_repair=False,
                       adapt_steps=0, adapt_lr=0.1, stride='8x16',
-                      extra_chans=None):
+                      extra_chans=None, verify_beam=False,
+                      verify_alpha=2.0):
     """Decode one eval strip file with its geometry row (T2.4 shared tail)."""
     return decode_system_v2(net, img_file, row, heat_net, device, height,
                             beam, max_len, hybrid, workdir, stem,
@@ -1438,7 +1464,9 @@ def decode_row_system(net, img_file, row, heat_net, device, height, beam,
                             lattice_repair=lattice_repair,
                             adapt_steps=adapt_steps,
                             adapt_lr=adapt_lr, stride=stride,
-                            extra_chans=extra_chans)
+                            extra_chans=extra_chans,
+                            verify_beam=verify_beam,
+                            verify_alpha=verify_alpha)
 
 
 def run_suite31(args, net, heat_net, workdir, device, extra_chans=None,
@@ -1580,7 +1608,9 @@ def run_suite31(args, net, heat_net, workdir, device, extra_chans=None,
                                 adapt_lr=args.adapt_lr, stride=args.stride,
                                 extra_chans=(extra_chans if extra_chans is not None
                                              else (heat_features.EXTRA_CHANS
-                                                   if args.hybrid else 0)))
+                                                   if args.hybrid else 0)),
+                                verify_beam=bool(getattr(args, 'verify_beam', False)),
+                                verify_alpha=float(getattr(args, 'verify_alpha', 2.0)))
                         except Exception as e:  # noqa: BLE001 - record, continue
                             prow['%s_s%d_error' % (domain, i)] = (
                                 'decode-crash: %s' % e)
@@ -1622,7 +1652,9 @@ def run_suite31(args, net, heat_net, workdir, device, extra_chans=None,
                                 lattice_repair=args.lattice_repair,
                                 adapt_steps=args.adapt_steps,
                                 adapt_lr=args.adapt_lr, stride=args.stride,
-                                extra_chans=extra_chans)
+                                extra_chans=extra_chans,
+                                verify_beam=bool(getattr(args, 'verify_beam', False)),
+                                verify_alpha=float(getattr(args, 'verify_alpha', 2.0)))
                         except Exception as e:  # noqa: BLE001 - record, continue
                             prow['%s_s%d_error' % (domain, i)] = (
                                 'decode-crash: %s' % e)

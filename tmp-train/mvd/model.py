@@ -1232,7 +1232,7 @@ class MvdNet(nn.Module):
                     strict=True, beam=3, len_alpha=0.6, min_len=0,
                     eos_bias=0.0, rep_penalty=1.0, run_cap=2,
                     cycle_repeats=12, no_repeat_ngram=0, fires=None,
-                    mem_mask=None, return_all=False,
+                    mem_mask=None, return_all=False, return_beams=False,
                     adapt_steps=0, adapt_lr=0.1, adapt_rank=8):
         """Grammar-masked beam search with KV-cache + length norm.
 
@@ -1401,21 +1401,25 @@ class MvdNet(nn.Module):
         # Select per page by length-normalized score first; the closed
         # flag only counts for beams ending at a bar boundary (T2.4a).
         # Spike S4: ``return_all`` also returns the non-winning beams
-        # ([nb, K, L] rank-ordered) for on-the-fly MWER; the default
-        # path (best only) is untouched.
+        # ([nb, K, L] rank-ordered) for on-the-fly MWER; ``return_beams``
+        # returns ``(all_beams, norm_logprobs)`` for T4.1 visual reranking.
+        # The default path (best only) is untouched.
         ranked = []
+        ranked_scores = []
         for pg in range(nb):
             cands = []
             for k in range(K):
                 gi = pg * K + k
                 ln = max(1, rows[gi]['gen_len'])
                 norm = ((5.0 + ln) / 6.0) ** len_alpha
-                cands.append((_beam_rank_key(float(cum[gi]) / norm,
+                norm_score = float(cum[gi]) / norm
+                cands.append((_beam_rank_key(norm_score,
                                              rows[gi]['closed'],
                                              rows[gi]['hist'],
-                                             self.eos_id), gi))
+                                             self.eos_id), norm_score, gi))
             cands.sort(key=lambda c: c[0], reverse=True)
-            ranked.append([out[gi, 1:].tolist() for _key, gi in cands])
+            ranked.append([out[gi, 1:].tolist() for _key, _ns, gi in cands])
+            ranked_scores.append([ns for _key, ns, _gi in cands])
         best = [r[0] for r in ranked]
         L = max(len(x) for x in best)
         res = torch.full((nb, L), self.pad_id, dtype=torch.long,
@@ -1424,7 +1428,7 @@ class MvdNet(nn.Module):
             res[i, :len(x)] = torch.tensor(x, dtype=torch.long,
                                            device=device)
         allr = None
-        if return_all:
+        if return_all or return_beams:
             La = max(len(x) for r in ranked for x in r)
             allr = torch.full((nb, K, La), self.pad_id,
                               dtype=torch.long, device=device)
@@ -1447,4 +1451,6 @@ class MvdNet(nn.Module):
                                                  self.eos_id), gi))
                 cands.sort(key=lambda c: c[0], reverse=True)
                 fires.append(int(rows[cands[0][1]].get('fires', 0)))
+        if return_beams:
+            return allr, ranked_scores
         return allr if return_all else res
