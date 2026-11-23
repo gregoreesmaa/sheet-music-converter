@@ -328,6 +328,35 @@ class TestRasterizeAndExtract(unittest.TestCase):
         self.assertEqual(len(systems), 2, "vertical ch2 bleed must not merge two 3-staff systems")
         self.assertEqual([len(s.staves) for s in systems], [3, 3])
 
+    def test_refine_systems_with_page_left_barline_and_duplicate_nms(self):
+        """Left-barline grouping separates 1-staff folk systems, keeps linked multi-staff, and drops <4.5sp dups."""
+        h, w = 800, 600
+        sp = 10.0
+        x0, x1 = 80.0, 520.0
+        # Build a clean synthetic page with:
+        #   - System 0: 2 staves (y=120, y=240) linked by a left barline at x=80
+        #   - System 1: 1 staff (y=420) with NO left barline from y=240
+        #   - System 2: 1 staff (y=580) with NO left barline from y=420
+        page = np.full((h, w), 250, dtype=np.uint8)
+        for yc in (120, 240, 420, 580):
+            for k in range(-2, 3):
+                page[int(yc + k * sp), int(x0):int(x1)] = 20
+        # Draw vertical left system barline connecting staff 0 (top=100) to staff 1 (bot=260).
+        page[100:261, int(x0) - 1:int(x0) + 1] = 15
+
+        def _mk(yc, conf=0.9, xs=x0, xe=x1):
+            cp = np.stack([np.linspace(xs, xe, 4), np.full(4, yc)], axis=-1).astype(np.float64)
+            return su.CurvedStaff(
+                ctrl_pts=cp, sp_ctrl=np.full(4, sp),
+                x_start=xs, x_end=xe, sp_median=sp, confidence=conf,
+            )
+
+        # Feed all 4 real staves + 1 spurious duplicate fragment 2.5*sp below staff 0 as ONE over-merged system.
+        staves = [_mk(120.0, 0.95), _mk(145.0, 0.45, xs=120.0, xe=360.0), _mk(240.0, 0.92), _mk(420.0, 0.90), _mk(580.0, 0.88)]
+        merged = [su.CurvedSystem(staves=staves, x_start=x0, x_end=x1, polygon=np.zeros((4, 2)), confidence=0.8)]
+        refined = su.refine_systems_with_page(Image.fromarray(page, mode="L").convert("RGB"), merged)
+        self.assertEqual([len(s.staves) for s in refined], [2, 1, 1])
+
 
 class TestTrainingSmoke(unittest.TestCase):
     def test_dataset_and_one_epoch_train(self):
