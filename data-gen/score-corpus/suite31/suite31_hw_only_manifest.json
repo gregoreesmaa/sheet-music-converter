@@ -1,8 +1,8 @@
 {
  "suite": "suite31-hw-only",
- "generated_by": "tmp-train/mvd/build_real_hw_suite.py",
- "pieces_expected": 5,
- "license": "Public Domain (IMSLP holographs) + CC0-1.0 (OpenScore StringQuartets); zero NC data",
+ "generated_by": "tmp-train/mvd/build_real_hw_suite.py + tmp-train/mvd/build_debussy_hw.py",
+ "pieces_expected": 9,
+ "license": "Public Domain (IMSLP holographs) + CC0-1.0 (OpenScore StringQuartets) + CC-BY-4.0 (HugoSchtr/debussy-omr, BnF Gallica); zero NC data",
  "pieces": [
   {
    "slug": "hw-beethoven-op135",
@@ -217,6 +217,238 @@
     "file": "hw/gt/gt-p1-hw-schubert-d810.musicxml",
     "sha256": "2364a83941fd53a64df8135ec4ea21c96906f84e130556362fa25cc2951fcb20",
     "bytes": 247419
+   }
+  },
+  {
+   "slug": "hw-debussy-vetement-du-blesse",
+   "handwritten": true,
+   "orientation": "portrait",
+   "document_id": "12148_btv1b100760232",
+   "folio": 2,
+   "work": "Pi\u00e8ce pour l'oeuvre \"V\u00eatement du bless\u00e9\" (p.1)",
+   "composer": "Debussy, Claude",
+   "license": "CC-BY-4.0 (HugoSchtr/debussy-omr, BnF Gallica)",
+   "p1_measures": 38,
+   "system_boxes": [
+    [
+     183,
+     279,
+     3306,
+     1061
+    ],
+    [
+     183,
+     1061,
+     3306,
+     1844
+    ],
+    [
+     183,
+     1844,
+     3306,
+     2626
+    ],
+    [
+     183,
+     2626,
+     3306,
+     3409
+    ],
+    [
+     183,
+     3409,
+     3306,
+     4192
+    ]
+   ],
+   "clean": {
+    "file": "hw/clean/hw-debussy-vetement-du-blesse.png",
+    "sha256": "3c2ded630092adc453fdd104638e50ae452e1c9bbeed16f98288cd4ccbf4d7df",
+    "bytes": 9962258
+   },
+   "photo": {
+    "file": "hw/photo/hw-debussy-vetement-du-blesse.png",
+    "sha256": "4bd4e92bb80a9eaf609a7027a1bcae26f887f83e053bb3976938020d0885ed42",
+    "bytes": 2334454
+   },
+   "gt": {
+    "file": "hw/gt/gt-p1-hw-debussy-vetement-du-blesse.musicxml",
+    "sha256": "f6153f497b383513c49b6c5ba6a36107b33708a009ffd6a29369a77d73690e52",
+    "bytes": 123711
+   }
+  },
+  {
+   "slug": "hw-debussy-berceuse-heroique",
+   "handwritten": true,
+   "orientation": "portrait",
+   "document_id": "12148_btv1b10076394j",
+   "folio": 3,
+   "work": "Berceuse H\u00e9ro\u00efque (p.1)",
+   "composer": "Debussy, Claude",
+   "license": "CC-BY-4.0 (HugoSchtr/debussy-omr, BnF Gallica)",
+   "p1_measures": 32,
+   "system_boxes": [
+    [
+     217,
+     364,
+     3918,
+     1385
+    ],
+    [
+     217,
+     1385,
+     3918,
+     2406
+    ],
+    [
+     217,
+     2406,
+     3918,
+     3428
+    ],
+    [
+     217,
+     3428,
+     3918,
+     4449
+    ],
+    [
+     217,
+     4449,
+     3918,
+     5471
+    ]
+   ],
+   "clean": {
+    "file": "hw/clean/hw-debussy-berceuse-heroique.png",
+    "sha256": "b492cc700577146ca26b9888ce39d9112b26bf150e55fcc44155388104f3d5ce",
+    "bytes": 13436923
+   },
+   "photo": {
+    "file": "hw/photo/hw-debussy-berceuse-heroique.png",
+    "sha256": "8b9cd83c613ef1e5652a85dbfdc917552c7d48d91b77347b2e23963af5724a82",
+    "bytes": 2058520
+   },
+   "gt": {
+    "file": "hw/gt/gt-p1-hw-debussy-berceuse-heroique.musicxml",
+    "sha256": "9c240c25535be15bcc4d9c58d00307956e9c32e120d6610ca4eb2322d29f8eac",
+    "bytes": 182512
+   }
+  },
+  {
+   "slug": "hw-debussy-la-plus-que-lente",
+   "handwritten": true,
+   "orientation": "portrait",
+   "document_id": "12148_btv1b52500675r",
+   "folio": 3,
+   "work": "La plus que lente (p.1)",
+   "composer": "Debussy, Claude",
+   "license": "CC-BY-4.0 (HugoSchtr/debussy-omr, BnF Gallica)",
+   "p1_measures": 49,
+   "system_boxes": [
+    [
+     184,
+     303,
+     3326,
+     1012
+    ],
+    [
+     184,
+     1012,
+     3326,
+     1721
+    ],
+    [
+     184,
+     1721,
+     3326,
+     2430
+    ],
+    [
+     184,
+     2430,
+     3326,
+     3139
+    ],
+    [
+     184,
+     3139,
+     3326,
+     3848
+    ],
+    [
+     184,
+     3848,
+     3326,
+     4557
+    ]
+   ],
+   "clean": {
+    "file": "hw/clean/hw-debussy-la-plus-que-lente.png",
+    "sha256": "b528871fbcf1081f16d1bc73228878f0032bbce9934b1f00e1222b033e69d7b1",
+    "bytes": 14139670
+   },
+   "photo": {
+    "file": "hw/photo/hw-debussy-la-plus-que-lente.png",
+    "sha256": "2baaaefb67d545744495776bd5cfee3213a8fe6e7b0ea05cc605dba8c634086f",
+    "bytes": 2203754
+   },
+   "gt": {
+    "file": "hw/gt/gt-p1-hw-debussy-la-plus-que-lente.musicxml",
+    "sha256": "30efa28d3eb922aa4e132dfa1a0567b860a7401b9e33d76c4c2246c0e64a7eab",
+    "bytes": 242717
+   }
+  },
+  {
+   "slug": "hw-debussy-lindaraja",
+   "handwritten": true,
+   "orientation": "portrait",
+   "document_id": "12148_btv1b55000830z",
+   "folio": 4,
+   "work": "Lindaraja (p.1)",
+   "composer": "Debussy, Claude",
+   "license": "CC-BY-4.0 (HugoSchtr/debussy-omr, BnF Gallica)",
+   "p1_measures": 28,
+   "system_boxes": [
+    [
+     167,
+     258,
+     3022,
+     1162
+    ],
+    [
+     167,
+     1162,
+     3022,
+     2066
+    ],
+    [
+     167,
+     2066,
+     3022,
+     2970
+    ],
+    [
+     167,
+     2970,
+     3022,
+     3874
+    ]
+   ],
+   "clean": {
+    "file": "hw/clean/hw-debussy-lindaraja.png",
+    "sha256": "2760f67fcce17d572caac7a038dcb67b167283bd9b1dfdba46ed0a60ee2b93b5",
+    "bytes": 10874109
+   },
+   "photo": {
+    "file": "hw/photo/hw-debussy-lindaraja.png",
+    "sha256": "99ce5d80410e926e7248c9fb99ef13716c35444485ba4c673a4212a40269b67f",
+    "bytes": 3110800
+   },
+   "gt": {
+    "file": "hw/gt/gt-p1-hw-debussy-lindaraja.musicxml",
+    "sha256": "fcd984cde3253473e739ed772668472017656857f5d1c95eb52fadecbb8586ed",
+    "bytes": 404014
    }
   }
  ]
