@@ -1534,6 +1534,7 @@ def train_staff_unet2d(
     augment: bool = True,
     device: str | None = None,
     seed: int = 42,
+    num_workers: int = 0,
 ) -> Path:
     """Minimal self-contained training loop for ``StaffUNet2D``."""
     torch.manual_seed(seed)
@@ -1550,7 +1551,17 @@ def train_staff_unet2d(
         augment=augment,
         seed=seed,
     )
-    loader = DataLoader(ds, batch_size=batch_size, shuffle=True, num_workers=0, drop_last=False)
+    use_pin = dev.type == "cuda"
+    loader_kw: dict[str, Any] = {
+        "batch_size": batch_size,
+        "shuffle": True,
+        "num_workers": max(0, int(num_workers)),
+        "drop_last": False,
+        "pin_memory": use_pin,
+    }
+    if num_workers > 0:
+        loader_kw["prefetch_factor"] = 2
+    loader = DataLoader(ds, **loader_kw)
 
     model = StaffUNet2D(
         in_channels=in_channels, base_channels=base_channels, out_stride=out_stride
@@ -1562,6 +1573,7 @@ def train_staff_unet2d(
     scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
 
     ckpt_path = out_path / "staff_unet2d.pt"
+    n_batches = len(loader)
     for ep in range(1, epochs + 1):
         ds.set_epoch(ep - 1)
         model.train()
@@ -1569,7 +1581,8 @@ def train_staff_unet2d(
         running = 0.0
         steps = 0
         for x, y in loader:
-            x, y = x.to(dev), y.to(dev)
+            x = x.to(dev, non_blocking=use_pin)
+            y = y.to(dev, non_blocking=use_pin)
             opt.zero_grad(set_to_none=True)
             with torch.amp.autocast(dev.type, enabled=use_amp):
                 preds = model(x)
@@ -1579,22 +1592,33 @@ def train_staff_unet2d(
             scaler.update()
             running += float(loss.detach().item())
             steps += 1
+            if steps % 100 == 0 or steps == 1:
+                print(
+                    f"  [ep {ep:02d}/{epochs:02d} step {steps:04d}/{n_batches:04d}] "
+                    f"loss={running / steps:.4f} ({time.perf_counter() - t0:.1f}s)",
+                    flush=True,
+                )
         sched.step()
         dt = time.perf_counter() - t0
         avg = running / max(1, steps)
-        print(f"[epoch {ep:03d}/{epochs:03d}] loss={avg:.4f} lr={sched.get_last_lr()[0]:.2e} ({dt:.1f}s)")
-
-    torch.save(
-        {
+        print(
+            f"[epoch {ep:03d}/{epochs:03d}] loss={avg:.4f} lr={sched.get_last_lr()[0]:.2e} ({dt:.1f}s)",
+            flush=True,
+        )
+        payload = {
             "state_dict": model.state_dict(),
             "in_channels": in_channels,
             "base_channels": base_channels,
             "out_stride": out_stride,
             "target_h": target_h,
             "target_w": target_w,
-        },
-        ckpt_path,
-    )
+            "epoch": ep,
+            "loss": avg,
+        }
+        tmp_ckpt = out_path / "staff_unet2d.pt.tmp"
+        torch.save(payload, tmp_ckpt)
+        tmp_ckpt.replace(ckpt_path)
+
     return ckpt_path
 
 
@@ -1613,6 +1637,7 @@ def _main() -> None:
     p.add_argument("--no-augment", action="store_true")
     p.add_argument("--device", default=None)
     p.add_argument("--seed", type=int, default=42)
+    p.add_argument("--num-workers", type=int, default=0)
     args = p.parse_args()
     ckpt = train_staff_unet2d(
         manifest=args.manifest,
@@ -1628,8 +1653,9 @@ def _main() -> None:
         augment=not args.no_augment,
         device=args.device,
         seed=args.seed,
+        num_workers=args.num_workers,
     )
-    print(f"Saved checkpoint: {ckpt}")
+    print(f"Saved checkpoint: {ckpt}", flush=True)
 
 
 if __name__ == "__main__":
