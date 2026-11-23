@@ -1,7 +1,7 @@
 {
  "suite": "suite31+hw",
- "generated_by": "tmp-train/mvd/build_real_hw_suite.py + tmp-train/mvd/build_debussy_hw.py",
- "pieces_expected": 40,
+ "generated_by": "tmp-train/mvd/build_real_hw_suite.py + tmp-train/mvd/build_debussy_hw.py + tmp-train/mvd/incorporate_openscore_hw.py",
+ "pieces_expected": 45,
  "sources": {
   "clean_root": "C:\\Users\\grego\\AppData\\Local\\Temp\\ours",
   "photo_root": "C:\\Users\\grego\\AppData\\Local\\Temp\\oursph",
@@ -3029,6 +3029,285 @@
     "file": "hw/gt/gt-p1-hw-debussy-lindaraja.musicxml",
     "sha256": "fcd984cde3253473e739ed772668472017656857f5d1c95eb52fadecbb8586ed",
     "bytes": 404014
+   }
+  },
+  {
+   "slug": "hw-hensel-morgengruss-d-b",
+   "work_id": "hensel-morgengruss-d-b",
+   "handwritten": true,
+   "orientation": "portrait",
+   "source": "openscore-lieder-pdm",
+   "library": "SBB Berlin",
+   "material_type": "Autograph manuscript",
+   "page_index": 1,
+   "rism_url": "https://rism.online/sources/462017400",
+   "iiif_manifest": "https://content.staatsbibliothek-berlin.de/dc/PPN779294270/manifest",
+   "work": "Morgengruss (p.1)",
+   "composer": "Hensel, Fanny",
+   "license": "PDM 1.0 (SBB Berlin) + CC0-1.0 (OpenScore Lieder)",
+   "p1_measures": 10,
+   "system_boxes": [
+    [
+     79,
+     327,
+     1506,
+     1003
+    ],
+    [
+     79,
+     1003,
+     1506,
+     1679
+    ]
+   ],
+   "clean": {
+    "file": "hw/clean/hw-hensel-morgengruss-d-b.png",
+    "sha256": "e2c4c31ab7e3ded129e2879fbf9a8485679884bd9cb67e9a9c0c4e5f15295148",
+    "bytes": 4200400
+   },
+   "photo": {
+    "file": "hw/photo/hw-hensel-morgengruss-d-b.png",
+    "sha256": "e18e1049a2fee31d1b57a1bda1152555bbf6f6942a1e049105ef1ae3188a1d43",
+    "bytes": 2447111
+   },
+   "gt": {
+    "file": "hw/gt/gt-p1-hw-hensel-morgengruss-d-b.musicxml",
+    "sha256": "80b40c8e9f87a6c56c9976174d6d69e8b752e049deb46d8b9c3ba65c3f8cd42e",
+    "bytes": 80864
+   }
+  },
+  {
+   "slug": "hw-mendelssohn-herbstlied-d-b",
+   "work_id": "mendelssohn-herbstlied-d-b",
+   "handwritten": true,
+   "orientation": "portrait",
+   "source": "openscore-lieder-pdm",
+   "library": "SBB Berlin",
+   "material_type": "Autograph manuscript",
+   "page_index": 1,
+   "rism_url": "https://rism.online/sources/464000593",
+   "iiif_manifest": "https://content.staatsbibliothek-berlin.de/dc/PPN728225611/manifest",
+   "work": "Herbstlied (p.1)",
+   "composer": "Mendelssohn, Felix",
+   "license": "PDM 1.0 (SBB Berlin) + CC0-1.0 (OpenScore Lieder)",
+   "p1_measures": 29,
+   "system_boxes": [
+    [
+     80,
+     102,
+     1532,
+     442
+    ],
+    [
+     80,
+     442,
+     1532,
+     782
+    ],
+    [
+     80,
+     782,
+     1532,
+     1122
+    ],
+    [
+     80,
+     1122,
+     1532,
+     1462
+    ],
+    [
+     80,
+     1462,
+     1532,
+     1802
+    ]
+   ],
+   "clean": {
+    "file": "hw/clean/hw-mendelssohn-herbstlied-d-b.png",
+    "sha256": "12701b572c07cc7958b1e90431faab3c3fb75c736ee705d2c57db0755a30bc9b",
+    "bytes": 4489765
+   },
+   "photo": {
+    "file": "hw/photo/hw-mendelssohn-herbstlied-d-b.png",
+    "sha256": "5194eec3ad1b96a2e4e7ac64f1ed825d2ef5088b077c8d075d8eb69821652ef9",
+    "bytes": 1566778
+   },
+   "gt": {
+    "file": "hw/gt/gt-p1-hw-mendelssohn-herbstlied-d-b.musicxml",
+    "sha256": "f17608e3a5d62eb7fa1c1e03daa7184d95f5729ec25298b545f66cdca96d98b7",
+    "bytes": 164469
+   }
+  },
+  {
+   "slug": "hw-beethoven-das-blumchen-wunderhold-d-b",
+   "work_id": "beethoven-das-blumchen-wunderhold-d-b",
+   "handwritten": true,
+   "orientation": "portrait",
+   "source": "openscore-lieder-pdm",
+   "library": "SBB Berlin",
+   "material_type": "Manuscript copy",
+   "page_index": 1,
+   "rism_url": "https://rism.online/sources/452004437",
+   "iiif_manifest": "https://content.staatsbibliothek-berlin.de/dc/PPN1031115978/manifest",
+   "work": "Das Bl\u00fcmchen Wunderhold (p.1)",
+   "composer": "Beethoven, Ludwig van",
+   "license": "PDM 1.0 (SBB Berlin) + CC0-1.0 (OpenScore Lieder)",
+   "p1_measures": 21,
+   "system_boxes": [
+    [
+     69,
+     143,
+     1328,
+     414
+    ],
+    [
+     69,
+     414,
+     1328,
+     685
+    ],
+    [
+     69,
+     685,
+     1328,
+     956
+    ],
+    [
+     69,
+     956,
+     1328,
+     1228
+    ]
+   ],
+   "clean": {
+    "file": "hw/clean/hw-beethoven-das-blumchen-wunderhold-d-b.png",
+    "sha256": "170adac081f3bac7dc9dbb0a092aeff01d114370cbb31e8f907ab9125f7e2b82",
+    "bytes": 4680526
+   },
+   "photo": {
+    "file": "hw/photo/hw-beethoven-das-blumchen-wunderhold-d-b.png",
+    "sha256": "3f537ffc845dcadc49b7a37e9c5821cf74c744138ad5b8c6b35e01328aa9c6ec",
+    "bytes": 1655935
+   },
+   "gt": {
+    "file": "hw/gt/gt-p1-hw-beethoven-das-blumchen-wunderhold-d-b.musicxml",
+    "sha256": "d085fc890ce94fdab81b531ba37bcc3daf90d1e8407463b244930191d2d6cb37",
+    "bytes": 106989
+   }
+  },
+  {
+   "slug": "hw-cornelius-botschaft-d-b",
+   "work_id": "cornelius-botschaft-d-b",
+   "handwritten": true,
+   "orientation": "portrait",
+   "source": "openscore-lieder-pdm",
+   "library": "SBB Berlin",
+   "material_type": "Autograph manuscript",
+   "page_index": 1,
+   "rism_url": "https://rism.online/sources/1001062148",
+   "iiif_manifest": "https://content.staatsbibliothek-berlin.de/dc/PPN167120624X/manifest",
+   "work": "Botschaft (p.1)",
+   "composer": "Cornelius, Peter",
+   "license": "PDM 1.0 (SBB Berlin) + CC0-1.0 (OpenScore Lieder)",
+   "p1_measures": 17,
+   "system_boxes": [
+    [
+     61,
+     204,
+     1177,
+     593
+    ],
+    [
+     61,
+     593,
+     1177,
+     982
+    ],
+    [
+     61,
+     982,
+     1177,
+     1371
+    ],
+    [
+     61,
+     1371,
+     1177,
+     1761
+    ]
+   ],
+   "clean": {
+    "file": "hw/clean/hw-cornelius-botschaft-d-b.png",
+    "sha256": "5fa3ef6c15a3debcd70ea2a13a429552c1f0b16d9dde4ffa7ec0368cf438e86b",
+    "bytes": 2831490
+   },
+   "photo": {
+    "file": "hw/photo/hw-cornelius-botschaft-d-b.png",
+    "sha256": "466e76ac3722d33ccba90b4720ac1f6eb43771fa0160cba3cf694b7280889f3d",
+    "bytes": 1013178
+   },
+   "gt": {
+    "file": "hw/gt/gt-p1-hw-cornelius-botschaft-d-b.musicxml",
+    "sha256": "b7b1185d5ccc50b5c0aa69efe0926352f7e22d670e85c320bbe1fba886321bc2",
+    "bytes": 97893
+   }
+  },
+  {
+   "slug": "hw-hensel-im-herbste-d-b",
+   "work_id": "hensel-im-herbste-d-b",
+   "handwritten": true,
+   "orientation": "portrait",
+   "source": "openscore-lieder-pdm",
+   "library": "SBB Berlin",
+   "material_type": "Autograph manuscript",
+   "page_index": 1,
+   "rism_url": "https://rism.online/sources/462003205",
+   "iiif_manifest": "https://content.staatsbibliothek-berlin.de/dc/PPN72189903X/manifest",
+   "work": "Im Herbste (p.1)",
+   "composer": "Hensel, Fanny",
+   "license": "PDM 1.0 (SBB Berlin) + CC0-1.0 (OpenScore Lieder)",
+   "p1_measures": 18,
+   "system_boxes": [
+    [
+     74,
+     163,
+     1408,
+     588
+    ],
+    [
+     74,
+     588,
+     1408,
+     1013
+    ],
+    [
+     74,
+     1013,
+     1408,
+     1438
+    ],
+    [
+     74,
+     1438,
+     1408,
+     1863
+    ]
+   ],
+   "clean": {
+    "file": "hw/clean/hw-hensel-im-herbste-d-b.png",
+    "sha256": "75442e05ca766bc1548c187402bb6a0652ed1c86585465f13ae9e88180af5b3b",
+    "bytes": 3719553
+   },
+   "photo": {
+    "file": "hw/photo/hw-hensel-im-herbste-d-b.png",
+    "sha256": "ee01d3ce03a845e024f81f17b90da26cc180923a757adb6b3115858d2f5650ff",
+    "bytes": 902954
+   },
+   "gt": {
+    "file": "hw/gt/gt-p1-hw-hensel-im-herbste-d-b.musicxml",
+    "sha256": "9dc710ed1934875ff6b9893a4c7aa5b0faec59305411fc450e14b939c7ada780",
+    "bytes": 125181
    }
   }
  ]
