@@ -702,7 +702,10 @@ def extract_curved_systems(
         return []
 
     # Merge same-row horizontal fragments split by stains, creases, or folds.
-    merged_frags = _merge_horizontal_fragments(raw_frags, sp_tol_factor=0.5)
+    # Two distinct staves are >= 4.5 sp apart vertically, whereas broken ends
+    # of a tilted/curved staff at 512x384 (1 heatmap px ~= 0.5 sp) routinely
+    # extrapolate within 0.6-1.5 sp across a gap.
+    merged_frags = _merge_horizontal_fragments(raw_frags, sp_tol_factor=1.6)
 
     # Relative width threshold: max(min_width_floor_frac * wp, min_width_frac * median_w).
     floor_cols = max(4, int(round(min_width_floor_frac * wp)))

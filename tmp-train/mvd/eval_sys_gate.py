@@ -538,9 +538,13 @@ def main():
     use_heatnet = (extra == heat_features.EXTRA_CHANS) and not args.no_heatnet
 
     has_foveal = any(k.startswith('foveal_proj.') for k in state)
+    has_comer = any(k.startswith('comer_bias.') for k in state)
+    has_gdcm = any(k.startswith('gdcm_head.') for k in state)
+    has_s18 = any(k.startswith('s18_head.') for k in state)
     net = model.MvdNet(vocab=len(data.VOCAB) + 3, anisotropic=True,
                        stride=args.stride, extra_chans=extra,
-                       foveal_tap=has_foveal)
+                       foveal_tap=has_foveal, use_comer=has_comer,
+                       use_gdcm=has_gdcm, use_s18=has_s18)
     try:
         # Compat loader (train.load_weights_compat): strict when shapes
         # match, aux-fresh for pre-S13b ckpts, stem/vocab transplants
