@@ -233,10 +233,30 @@ impl Score {
         self.beats as i64 * self.divisions as i64 * 4 / self.beat_type as i64
     }
 
+    /// Per-measure `[start_ticks, end_ticks)` windows respecting any
+    /// mid-stream time-signature changes in `measure_attrs`.
+    pub fn measure_windows(&self) -> Vec<(i64, i64)> {
+        let end = self.parts.iter().map(|p| p.end_ticks).max().unwrap_or(0).max(1);
+        let mut windows = Vec::new();
+        let mut cur = 0i64;
+        let mut beats = self.beats;
+        let mut beat_type = self.beat_type;
+        let mut m = 1u32;
+        while cur < end {
+            if let Some(t) = measure_attr(self, m).and_then(|a| a.time) {
+                beats = t.beats;
+                beat_type = t.beat_type;
+            }
+            let mlen = (beats as i64 * self.divisions as i64 * 4 / beat_type.max(1) as i64).max(1);
+            windows.push((cur, cur + mlen));
+            cur += mlen;
+            m += 1;
+        }
+        windows
+    }
+
     pub fn measure_count(&self) -> usize {
-        let end = self.parts.iter().map(|p| p.end_ticks).max().unwrap_or(0);
-        let m = self.measure_ticks();
-        (end.max(1) + m - 1) as usize / m as usize
+        self.measure_windows().len()
     }
 }
 
@@ -889,13 +909,10 @@ fn layout_part(
     part: &Part,
     losses: &mut LossTable,
 ) -> Vec<Vec<(u32, Vec<Segment>)>> {
-    let mlen = score.measure_ticks();
-    let nmeas = score.measure_count();
+    let windows = score.measure_windows();
     // voice -> sorted (start, end, member_idx, group_idx)
     let mut result: Vec<Vec<(u32, Vec<Segment>)>> = Vec::new();
-    for m in 0..nmeas {
-        let m0 = m as i64 * mlen;
-        let m1 = m0 + mlen;
+    for (m, &(m0, m1)) in windows.iter().enumerate() {
         let mut voices: Vec<(u32, Vec<Segment>)> = Vec::new();
         for v in &part.voices {
             let mut segs: Vec<Segment> = Vec::new();
@@ -1297,10 +1314,15 @@ pub fn to_musicxml(score: &Score, losses: &mut LossTable) -> String {
     }
     out.push_str("  </part-list>\n");
 
+    let windows = score.measure_windows();
     for (i, part) in score.parts.iter().enumerate() {
         out.push_str(&format!("  <part id=\"P{}\">\n", i + 1));
         let layout = layout_part(score, part, losses);
         for (m, voices) in layout.iter().enumerate() {
+            let mlen = windows
+                .get(m)
+                .map(|&(a, b)| b - a)
+                .unwrap_or_else(|| score.measure_ticks());
             out.push_str(&format!("    <measure number=\"{}\">\n", m + 1));
             let attrs = measure_attr(score, m as u32 + 1);
             if m == 0 {
@@ -1364,8 +1386,7 @@ pub fn to_musicxml(score: &Score, losses: &mut LossTable) -> String {
                 let _ = voice;
                 if vi > 0 {
                     out.push_str(&format!(
-                        "      <backup><duration>{}</duration></backup>\n",
-                        score.measure_ticks()
+                        "      <backup><duration>{mlen}</duration></backup>\n",
                     ));
                 }
                 for s in segs {
@@ -1951,7 +1972,7 @@ pub fn validate_musicxml(xml: &str) -> Vec<Issue> {
         ));
         return out;
     }
-    let expected = beats * divisions * 4 / beat_type;
+    let mut expected = beats * divisions * 4 / beat_type;
     let mut pos = 0;
     let mut mnum = 0;
     let mut note_count = 0;
@@ -1969,6 +1990,14 @@ pub fn validate_musicxml(xml: &str) -> Vec<Issue> {
             }
         };
         let body = &xml[mstart..mend];
+        if let (Some((mb, _)), Some((mbt, _))) = (
+            read_tag_value(body, 0, "beats"),
+            read_tag_value(body, 0, "beat-type"),
+        ) {
+            if mb > 0 && mbt > 0 {
+                expected = mb * divisions * 4 / mbt;
+            }
+        }
         let mut t = 0i64;
         let mut k = 0;
         let mut ctx = 0u8; // 0 none, 1 note, 2 backup, 3 forward, 4 attributes(skip)

@@ -61,6 +61,59 @@ class TestLossSharedParity(unittest.TestCase):
         )
         self.assertLess(max_gdiff, 1e-4, f'gradient mismatch: {max_gdiff}')
 
+    def test_exp2b_s18_comer_gdcm_cpu_forward_backward_and_kv_parity(self):
+        torch.manual_seed(7)
+        v = len(data.VOCAB) + 3
+        net = model.MvdNet(
+            vocab=v, d_model=64, layers=2, heads=4, dim_ff=128,
+            extra_chans=1, foveal_tap=True,
+            use_comer=True, use_gdcm=True, use_s18=True)
+        net.train()
+        imgs = torch.randn(2, 4, 64, 128)
+        seq0 = data.encode(['clef-G-2', 'key+0', 'time-4-4', 'quarter', 'C', '4', 'dot', 'bar']) + [data.EOS_ID]
+        seq1 = data.encode(['clef-F-4', 'half', 'G', '3', 'rest', 'bar']) + [data.EOS_ID]
+        n = max(len(seq0), len(seq1))
+        tgt = torch.full((2, n), data.PAD_ID, dtype=torch.long)
+        tgt[0, :len(seq0)] = torch.tensor(seq0, dtype=torch.long)
+        tgt[1, :len(seq1)] = torch.tensor(seq1, dtype=torch.long)
+
+        # Single-pass shared forward: CE + S18 + GDCM + CoMER (1 encoder + 1 decoder).
+        net.zero_grad(set_to_none=True)
+        ce, ap, xc, h, gdcm_loss = net.loss_shared(
+            imgs, tgt, need_aux=False, need_coord=False,
+            return_hidden=True, need_gdcm=True)
+        self.assertIsNone(ap)
+        self.assertIsNone(xc)
+        self.assertIsNotNone(gdcm_loss)
+        s18_loss, s18_metrics = net.s18_head.loss_from_tokens(
+            h, tgt, pad_id=net.pad_id, eos_id=net.eos_id)
+        self.assertIn('s18_total', s18_metrics)
+        total = ce + 0.25 * s18_loss + 0.1 * gdcm_loss
+        self.assertTrue(bool(torch.isfinite(total)))
+        total.backward()
+
+        # Gradients must reach trunk, decoder, CoMER, GDCM, and S18.
+        for prefix in ('encoder.', 'decoder.', 'comer_bias.', 'gdcm_head.', 's18_head.'):
+            grads = [p.grad for n_p, p in net.named_parameters()
+                     if n_p.startswith(prefix) and p.grad is not None]
+            self.assertTrue(len(grads) > 0, f'no gradients for {prefix}')
+            self.assertTrue(
+                all(bool(torch.isfinite(g).all()) for g in grads),
+                f'non-finite grad in {prefix}')
+
+        # Verify CoMER batched greedy == incremental greedy_kv even with non-zero conv_out!
+        with torch.no_grad():
+            torch.nn.init.normal_(net.comer_bias.conv_out.weight, std=0.2)
+            torch.nn.init.normal_(net.comer_bias.conv_out.bias, std=0.1)
+        net.eval()
+        with torch.no_grad():
+            g_batched = net.greedy(imgs[:1], max_len=8, constrain=False)
+            g_kv = net.greedy_kv(imgs[:1], max_len=8, constrain=False)
+            self.assertTrue(torch.equal(g_batched, g_kv),
+                            f'CoMER greedy vs greedy_kv mismatch: {g_batched} vs {g_kv}')
+            beams = net.beam_search(imgs[:1], max_len=8, beam=2, constrain=False)
+            self.assertEqual(beams.shape[0], 1)
+
 
 if __name__ == '__main__':
     unittest.main()

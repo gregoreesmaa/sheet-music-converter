@@ -400,6 +400,7 @@ fn decode_inner(tokens: &str, merge_ties: bool) -> Result<ScoreInput, String> {
         });
     };
 
+    let mut bar_start = 0.0f64;
     let mut barlen = time.beats as f64 * 4.0 / time.beat_type.max(1) as f64;
     while i < toks.len() {
         let t = toks[i];
@@ -411,6 +412,7 @@ fn decode_inner(tokens: &str, merge_ties: bool) -> Result<ScoreInput, String> {
                 attr_for(&mut measure_attrs, measure + 1).barline_right =
                     Some(style.to_string());
             }
+            bar_start += barlen;
             measure += 1;
             voices = vec![0.0];
             seg = 0;
@@ -492,6 +494,7 @@ fn decode_inner(tokens: &str, merge_ties: bool) -> Result<ScoreInput, String> {
             } else {
                 attr_for(&mut measure_attrs, measure + 1).time =
                     Some(TimeSig { beats, beat_type });
+                barlen = beats as f64 * 4.0 / beat_type.max(1) as f64;
             }
             i += 1;
             continue;
@@ -601,7 +604,7 @@ fn decode_inner(tokens: &str, merge_ties: bool) -> Result<ScoreInput, String> {
             }
             // Whole-bar rest: emit with full-bar duration (unscored),
             // jump this voice to the bar end.
-            let onset = measure as f64 * barlen + voices[seg];
+            let onset = bar_start + voices[seg];
             push_rest(
                 &mut notes,
                 onset,
@@ -698,7 +701,7 @@ fn decode_inner(tokens: &str, merge_ties: bool) -> Result<ScoreInput, String> {
         spans[seg].extend(pending_spans.drain(..));
         let scale = scale_of(&spans, seg);
         let performed = dur_written * scale;
-        let base = measure as f64 * barlen;
+        let base = bar_start;
         if chord {
             let onset = last_onset[seg]
                 .ok_or_else(|| format!("dangling chord marker in measure {measure}"))?;
@@ -2288,5 +2291,111 @@ mod tests {
         let (score, _) = parse_score(&input).unwrap();
         let hyp = to_musicxml(&score, &mut LossTable::default());
         assert_events_close(&events_keyed(&hyp), &events_keyed(xml));
+    }
+
+    #[test]
+    fn pickup_and_midstream_1_32_time_change_preserves_clock() {
+        // Anacrusis pickup in 4/4 followed by a 1/32 bar and return to 4/4
+        // (fiddle-strathspey pattern): decode_bekern must advance bar_start
+        // by each measure's active time signature (4.0, 0.125, 4.0) so it
+        // matches score_input_from_musicxml, and to_musicxml + validate_musicxml
+        // must preserve the 1/32 measure without bogus rest padding.
+        use super::super::bekern::to_bekern;
+        use super::super::musicxml_import::{
+            bekern_events, score_input_from_musicxml, staff_headers,
+        };
+        use super::super::{parse_score, to_musicxml, validate_musicxml, LossTable};
+        use super::decode_bekern_unmerged;
+        let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<score-partwise version="3.1">
+  <part-list><score-part id="P1"><part-name>Fiddle</part-name></score-part></part-list>
+  <part id="P1">
+    <measure number="0">
+      <attributes><divisions>480</divisions><key><fifths>0</fifths></key><time><beats>4</beats><beat-type>4</beat-type></time><clef><sign>G</sign><line>2</line></clef></attributes>
+      <note><pitch><step>E</step><octave>5</octave></pitch><duration>240</duration><voice>1</voice><type>eighth</type></note>
+    </measure>
+    <measure number="1">
+      <attributes><time><beats>1</beats><beat-type>32</beat-type></time></attributes>
+      <note><pitch><step>B</step><octave>4</octave></pitch><duration>60</duration><voice>1</voice><type>32nd</type></note>
+    </measure>
+    <measure number="2">
+      <attributes><time><beats>4</beats><beat-type>4</beat-type></time></attributes>
+      <note><pitch><step>A</step><octave>4</octave></pitch><duration>480</duration><voice>1</voice><type>quarter</type></note>
+    </measure>
+  </part>
+</score-partwise>"#;
+        let headers = staff_headers(xml).unwrap();
+        let events = bekern_events(xml).unwrap();
+        let (toks, _) = to_bekern(&events, &headers).unwrap();
+        let dec = decode_bekern(&toks.join(" ")).unwrap();
+        let imp = score_input_from_musicxml(xml).unwrap();
+        let dec_onsets: Vec<(String, f64)> = dec.parts[0]
+            .notes
+            .iter()
+            .filter(|n| !n.rest)
+            .map(|n| (n.pitch.clone().unwrap(), n.onset))
+            .collect();
+        let imp_onsets: Vec<(String, f64)> = imp.parts[0]
+            .notes
+            .iter()
+            .filter(|n| !n.rest)
+            .map(|n| (n.pitch.clone().unwrap(), n.onset))
+            .collect();
+        assert_eq!(dec_onsets.len(), 3);
+        assert!(approx(dec_onsets[0].1, 0.0));
+        assert!(approx(dec_onsets[1].1, 4.0));
+        assert!(approx(dec_onsets[2].1, 4.125));
+        assert_eq!(dec_onsets, imp_onsets, "decode_bekern matches import onsets");
+
+        let unmerged = decode_bekern_unmerged(&toks.join(" ")).unwrap();
+        let (score, _) = parse_score(&unmerged).unwrap();
+        assert_eq!(score.measure_windows(), vec![(0, 1920), (1920, 1980), (1980, 3900)]);
+        let hyp = to_musicxml(&score, &mut LossTable::default());
+        let issues = validate_musicxml(&hyp);
+        assert!(
+            issues.iter().all(|i| i.severity != "error"),
+            "validates cleanly: {issues:?}"
+        );
+        assert_events_close(&events_keyed(&hyp), &events_keyed(xml));
+    }
+
+    #[test]
+    fn midstream_4_16_and_1_16_time_change_preserves_clock() {
+        // Mid-stream 2/4 -> 4/16 -> 1/16 -> 2/4 time-signature transitions
+        // (oneills-tune pattern): cumulative bar_start must advance by
+        // 2.0, 1.0, 0.25, 2.0 beats.
+        use super::super::{parse_score, to_musicxml, validate_musicxml, LossTable};
+        use super::decode_bekern_unmerged;
+        let stream = concat!(
+            "clef-G-2 key-2 time-2-4 ",
+            "voice-1 quarter G 4 quarter A 4 bar ",
+            "time-4-16 voice-1 16th B 4 16th C 5 16th D 5 16th E 5 bar ",
+            "time-1-16 voice-1 16th F 5 bar ",
+            "time-2-4 voice-1 half G 5 bar"
+        );
+        let dec = decode_bekern(stream).unwrap();
+        let pitched: Vec<(String, f64)> = dec.parts[0]
+            .notes
+            .iter()
+            .filter(|n| !n.rest)
+            .map(|n| (n.pitch.clone().unwrap(), n.onset))
+            .collect();
+        assert!(approx(pitched[0].1, 0.0)); // G4 in 2/4
+        assert!(approx(pitched[2].1, 2.0)); // B4 in 4/16
+        assert!(approx(pitched[6].1, 3.0)); // F5 in 1/16
+        assert!(approx(pitched[7].1, 3.25)); // G5 back in 2/4
+
+        let unmerged = decode_bekern_unmerged(stream).unwrap();
+        let (score, _) = parse_score(&unmerged).unwrap();
+        assert_eq!(
+            score.measure_windows(),
+            vec![(0, 960), (960, 1440), (1440, 1560), (1560, 2520)]
+        );
+        let xml = to_musicxml(&score, &mut LossTable::default());
+        let issues = validate_musicxml(&xml);
+        assert!(
+            issues.iter().all(|i| i.severity != "error"),
+            "validates cleanly: {issues:?}"
+        );
     }
 }

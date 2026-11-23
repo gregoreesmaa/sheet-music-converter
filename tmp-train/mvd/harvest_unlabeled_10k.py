@@ -255,12 +255,14 @@ CLIP_PROMPTS: Tuple[str, ...] = (
     # music_sheet (indices 0, 1)
     "sheet music score with musical staves and notes",
     "handwritten musical manuscript score with staff lines",
-    # text_page (indices 2, 3)
+    # text_page (indices 2, 3, 4)
     "a book page of printed prose text paragraphs",
     "a table of contents, preface, or index page with words",
-    # cover_or_blank (indices 4, 5)
-    "a vintage book cover, title page, or decorative illustration",
-    "a blank empty white paper page",
+    "a handwritten letter, cursive notes, or archival document page",
+    # cover_or_blank (indices 5, 6, 7)
+    "a vintage book cover, title page, frontispiece, or decorative illustration",
+    "a library stamp, archival label, cover sheet, or blank flyleaf page",
+    "a blank empty white or aged paper page",
 )
 
 
@@ -316,8 +318,8 @@ class ClipPageClassifier:
         results: List[Tuple[bool, Dict[str, Any]]] = []
         for p in probs:
             p_music = float(p[0] + p[1])
-            p_text = float(p[2] + p[3])
-            p_cover = float(p[4] + p[5])
+            p_text = float(p[2] + p[3] + p[4])
+            p_cover = float(p[5] + p[6] + p[7])
             if p_music >= max(p_text, p_cover):
                 page_class = "music_sheet"
             elif p_text >= p_cover:

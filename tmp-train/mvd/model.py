@@ -18,8 +18,10 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torchvision.models import convnext_tiny
 
+import comer_gdcm
 import data
 import grammar
+import s18_factored
 
 
 def _sinusoidal_1d(n, dim, device):
@@ -125,6 +127,90 @@ def _layer_step(layer, p, x, kc, vc, mem_kv, mem_mask=None):
     f = layer.linear2(layer.dropout(layer.activation(layer.linear1(x))))
     x = layer.norm3(x + layer.dropout3(f))
     return x, kc, vc
+
+
+def _layer_step_comer(layer, p, x, kc, vc, mem_kv, mem_mask,
+                      comer_bias, cum_cov, h_mem, w_mem):
+    """One incremental decoder-layer step with CoMER coverage bias.
+
+    Bit-consistent with :func:`_decoder_layer_comer`: computes raw
+    cross-attention weights from ``q2``/``km``, injects
+    ``comer_bias.step_coverage_bias(cum_cov, h_mem, w_mem)`` into the
+    cross-attention logits, and accumulates ``raw_attn`` into
+    ``cum_cov``. When ``comer_bias.conv_out`` is zero-initialized,
+    step 0 is mathematically identical to :func:`_layer_step`.
+    """
+    (wq, wk, wv, bq, bk, bv, ow, ob, h), \
+        (xq, _, _, xbq, _, _, xow, xob, _) = p
+    b, _, d = x.shape
+    dh = d // h
+    q = (x @ wq.t() + bq).view(b, 1, h, dh).transpose(1, 2)
+    k1 = x @ wk.t() + bk
+    v1 = x @ wv.t() + bv
+    kc = k1 if kc is None else torch.cat([kc, k1], 1)
+    vc = v1 if vc is None else torch.cat([vc, v1], 1)
+    kh = kc.view(b, -1, h, dh).transpose(1, 2)
+    vh = vc.view(b, -1, h, dh).transpose(1, 2)
+    a = F.scaled_dot_product_attention(q, kh, vh)
+    sa = a.transpose(1, 2).reshape(b, 1, d) @ ow.t() + ob
+    x = layer.norm1(x + layer.dropout1(sa))
+    q2 = (x @ xq.t() + xbq).view(b, 1, h, dh).transpose(1, 2)
+    km, vm = mem_kv
+    scores = (q2.float() @ km.float().transpose(-2, -1)) / math.sqrt(dh)
+    if mem_mask is not None:
+        scores = scores.masked_fill(mem_mask[:, None, None, :], float('-inf'))
+    raw_attn = scores.softmax(dim=-1)
+    cov_bias = comer_bias.step_coverage_bias(
+        cum_cov, h_mem, w_mem, mem_mask=mem_mask, detach_cov=True)
+    biased = scores + cov_bias.float()
+    if mem_mask is not None:
+        biased = biased.masked_fill(mem_mask[:, None, None, :], float('-inf'))
+    attn_w = biased.softmax(dim=-1)
+    m = (attn_w.to(vm.dtype) @ vm).transpose(1, 2).reshape(b, 1, d) @ xow.t() + xob
+    new_cov = comer_bias.update_coverage(
+        cum_cov, raw_attn.to(cum_cov.dtype), detach=True)
+    x = layer.norm2(x + layer.dropout2(m))
+    f = layer.linear2(layer.dropout(layer.activation(layer.linear1(x))))
+    x = layer.norm3(x + layer.dropout3(f))
+    return x, kc, vc, new_cov
+
+
+def _decoder_layer_comer(layer, x, mem, tgt_mask, mem_mask,
+                         comer_bias, h_mem, w_mem):
+    """Batched teacher-forced decoder layer with CoMER shifted coverage bias.
+
+    Uses ``layer.self_attn`` on the fast SDPA path and injects
+    ``comer_bias.compute_shifted_coverage_bias`` into cross-attention.
+    Step ``t`` sees cumulative raw attention over strictly past steps
+    ``0..t-1``, matching :func:`_layer_step_comer` step-for-step.
+    """
+    sa = layer.self_attn(x, x, x, attn_mask=tgt_mask, need_weights=False)[0]
+    x = layer.norm1(x + layer.dropout1(sa))
+    attn = layer.multihead_attn
+    wq, wk, wv, bq, bk, bv, ow, ob, nh = _split_qkv(attn)
+    b, t, d = x.shape
+    s = mem.shape[1]
+    dh = d // nh
+    qq = (x @ wq.t() + bq).view(b, t, nh, dh).transpose(1, 2)
+    kk = (mem @ wk.t() + bk).view(b, s, nh, dh).transpose(1, 2)
+    vv = (mem @ wv.t() + bv).view(b, s, nh, dh).transpose(1, 2)
+    scores = (qq.float() @ kk.float().transpose(-2, -1)) / math.sqrt(dh)
+    if mem_mask is not None:
+        scores = scores.masked_fill(mem_mask[:, None, None, :], float('-inf'))
+    raw_attn = scores.softmax(dim=-1)
+    cov_bias = comer_bias.compute_shifted_coverage_bias(
+        raw_attn.to(x.dtype), h_mem, w_mem, mem_mask=mem_mask, detach_cov=True)
+    biased = scores + cov_bias.float()
+    if mem_mask is not None:
+        biased = biased.masked_fill(mem_mask[:, None, None, :], float('-inf'))
+    attn_w = biased.softmax(dim=-1)
+    if attn.dropout > 0.0 and layer.training:
+        attn_w = F.dropout(attn_w, p=attn.dropout, training=True)
+    m = (attn_w.to(vv.dtype) @ vv).transpose(1, 2).reshape(b, t, d) @ ow.t() + ob
+    x = layer.norm2(x + layer.dropout2(m))
+    f = layer.linear2(layer.dropout(layer.activation(layer.linear1(x))))
+    x = layer.norm3(x + layer.dropout3(f))
+    return x
 
 
 def stride_grid_scale(stride):
@@ -383,7 +469,9 @@ class MvdNet(nn.Module):
     def __init__(self, vocab, d_model=256, layers=4, heads=8,
                  dim_ff=1024, dropout=0.1, anisotropic=True,
                  pretrained=False, extra_chans: int = 0,
-                 stride: str = '8x16', foveal_tap: bool = False):
+                 stride: str = '8x16', foveal_tap: bool = False,
+                 use_comer: bool = False, use_gdcm: bool = False,
+                 use_s18: bool = False):
         # NOTE: no max_tgt — target positions are runtime sinusoids
         # (corpus pages reach 4414 tokens; a fixed table crashes).
         # anisotropic=True (v2): 8x vertical / 16x horizontal encoder
@@ -410,11 +498,16 @@ class MvdNet(nn.Module):
         self.bos_id = vocab - 2
         self.eos_id = vocab - 1
         self.d_model = d_model
+        self.heads = heads
         self.anisotropic = anisotropic
         self.stride = stride
         self.pretrained = pretrained
         self.extra_chans = int(extra_chans or 0)
         self.foveal_tap = bool(foveal_tap)
+        self.use_comer = bool(use_comer)
+        self.use_gdcm = bool(use_gdcm)
+        self.use_s18 = bool(use_s18)
+        self._last_hw_mem = None
 
         trunk = convnext_tiny()
         self.encoder = trunk.features  # [B, 768, H/8, W/16] if
@@ -459,6 +552,15 @@ class MvdNet(nn.Module):
         self.decoder = nn.TransformerDecoder(layer, num_layers=layers)
         self.tok_emb = nn.Embedding(vocab, d_model)
         self.out = nn.Linear(d_model, vocab)
+        if self.use_gdcm:
+            self.gdcm_head = comer_gdcm.GlobalDynamicCountingHead(
+                d_model=d_model)
+        if self.use_comer:
+            self.comer_bias = comer_gdcm.CoverageAttentionBias(n_heads=heads)
+        if self.use_s18:
+            self.s18_head = s18_factored.S18FactoredHead(
+                d_model=d_model, vocab_size=vocab,
+                consistency_weight=0.0, eos_id=self.eos_id)
 
     def _expand_stem(self, extra):
         """Widen the stem conv to ``3 + extra`` input channels.
@@ -531,8 +633,15 @@ class MvdNet(nn.Module):
         feats[6] = nn.Sequential(
             norm4, _PadConv(conv4, (0, 1, 0, 1)))
 
-    def _encode_with_feats(self, images, mem_mask=None):
-        """Encode images once, returning ``(mem_seq, raw_feats, h_mem, w_mem)``."""
+    def _encode_with_feats(self, images, mem_mask=None, return_counts=False):
+        """Encode images once, returning ``(mem_seq, raw_feats, h_mem, w_mem)``.
+
+        When ``self.use_gdcm`` is enabled, predicts 6 strip-level counts from
+        ``mem_seq`` and adds the zero-init ``count_to_mem_cond(pred_counts)``
+        conditioning vector (100% identity at step 0 on warm-start). When
+        ``return_counts=True``, appends ``pred_counts`` (or ``None`` if GDCM
+        is disabled) to the returned tuple.
+        """
         if mem_mask is not None and not mem_mask.any():
             mem_mask = None
         if self.foveal_tap:
@@ -557,9 +666,16 @@ class MvdNet(nn.Module):
             proj = proj - (proj * active).sum(dim=(2, 3),
                                               keepdim=True) / n
         b, d, h, w = proj.shape
+        self._last_hw_mem = (h, w)
         y_scale, x_scale = stride_grid_scale(self.stride)
         pos = _sinusoidal_2d(h, w, d, proj.device, y_scale, x_scale)
         seq = self.mem_norm(proj.permute(0, 2, 3, 1).reshape(b, h * w, d)) + pos.reshape(1, h * w, d)
+        pred_counts = None
+        if self.use_gdcm:
+            pred_counts = self.gdcm_head(seq, mem_mask=mem_mask)
+            seq = seq + self.gdcm_head.count_to_mem_cond(pred_counts)
+        if return_counts:
+            return seq, feats, h, w, pred_counts
         return seq, feats, h, w
 
     def encode(self, images, mem_mask=None):
@@ -646,39 +762,50 @@ class MvdNet(nn.Module):
         ``mem_mask`` is an optional bool [B, S] memory_key_padding_mask
         (True = ignore) for batches with width-padded images.
         """
-        mem = self.encode(images, mem_mask)
-        n = tgt_in.shape[1]
-        emb = self.tok_emb(tgt_in) + _sinusoidal_1d(
-            n, self.d_model, tgt_in.device)[None]
-        mask = nn.Transformer.generate_square_subsequent_mask(
-            n, device=tgt_in.device)
-        h = self.decoder(emb, mem, tgt_mask=mask,
-                         memory_key_padding_mask=mem_mask)
-        return self.out(h)
+        mem, _, h_mem, w_mem = self._encode_with_feats(images, mem_mask)
+        return self.out(self.decode_hidden(
+            mem, tgt_in, mem_mask, hw_mem=(h_mem, w_mem)))
 
-    def decode_hidden(self, mem, tgt_in, mem_mask=None):
+    def decode_hidden(self, mem, tgt_in, mem_mask=None, hw_mem=None):
         """Decoder-only hidden states ``[B, T, d_model]`` for precomputed memory.
 
         Shared by :meth:`decode_logits` and :meth:`loss_shared` so
         factored heads (e.g. ``S18FactoredHead``) can share one decoder
         pass with ``self.out(h)``. ``tgt_in`` includes the BOS prefix.
+        When ``self.use_comer=False``, runs the untouched fast SDPA
+        ``self.decoder`` path.
         """
         n = tgt_in.shape[1]
         emb = self.tok_emb(tgt_in) + _sinusoidal_1d(
             n, self.d_model, tgt_in.device)[None]
         mask = nn.Transformer.generate_square_subsequent_mask(
             n, device=tgt_in.device)
-        return self.decoder(emb, mem, tgt_mask=mask,
-                            memory_key_padding_mask=mem_mask)
+        if not self.use_comer:
+            return self.decoder(emb, mem, tgt_mask=mask,
+                                memory_key_padding_mask=mem_mask)
+        if hw_mem is None:
+            if (self._last_hw_mem is not None
+                    and self._last_hw_mem[0] * self._last_hw_mem[1] == mem.shape[1]):
+                hw_mem = self._last_hw_mem
+            else:
+                hw_mem = (1, mem.shape[1])
+        h_mem, w_mem = hw_mem
+        x = emb
+        for layer in self.decoder.layers:
+            x = _decoder_layer_comer(
+                layer, x, mem, mask, mem_mask, self.comer_bias, h_mem, w_mem)
+        if self.decoder.norm is not None:
+            x = self.decoder.norm(x)
+        return x
 
-    def decode_logits(self, mem, tgt_in, mem_mask=None):
+    def decode_logits(self, mem, tgt_in, mem_mask=None, hw_mem=None):
         """Decoder-only logits ``[B, T, V]`` for precomputed memory.
 
         Same math as :meth:`forward` minus the encode, so spike-S3
         sibling scoring (one encode + many teacher-forcing passes)
         stays cheap. ``tgt_in`` includes the BOS prefix.
         """
-        return self.out(self.decode_hidden(mem, tgt_in, mem_mask))
+        return self.out(self.decode_hidden(mem, tgt_in, mem_mask, hw_mem=hw_mem))
 
     def loss(self, images, tgt, sample_p=0.0, mem_mask=None,
                tok_weight=1.0, weight_ids=(), tok_dropout=0.0,
@@ -745,22 +872,25 @@ class MvdNet(nn.Module):
                     tok_weight=1.0, weight_ids=(), tok_dropout=0.0,
                     content_ids=(), need_aux=False, need_coord=False,
                     coord_layer=-1, augment=None,
-                    return_hidden=False, return_logits=False):
-        """Single-pass ``(ce_loss, aux_pred, x_centroids[, h][, logits])`` sharing 1 encoder + 1 decoder.
+                    return_hidden=False, return_logits=False,
+                    need_gdcm=False):
+        """Single-pass ``(ce_loss, aux_pred, x_centroids[, h][, logits][, gdcm_loss])`` sharing 1 encoder + 1 decoder.
 
         Eliminates the 3x ConvNeXt-Tiny encoder + 2x Transformer decoder
         redundant autograd graphs when ``aux_weight > 0`` and/or
         ``coord_weight > 0`` (~2.5x faster, ~2.7x lower peak VRAM, identical
         forward/gradient math when ``tok_dropout == 0``). When
-        ``return_hidden=True`` and/or ``return_logits=True``, appends the
-        shared decoder hidden states ``h`` and/or output ``logits`` to the
-        returned tuple so ``S18FactoredHead`` and ``logit_jsd_consistency``
-        reuse the same decoder pass.
+        ``return_hidden=True``, ``return_logits=True``, and/or
+        ``need_gdcm=True``, appends the shared decoder hidden states ``h``,
+        output ``logits``, and/or ``gdcm_loss`` to the returned tuple in that
+        order so ``S18FactoredHead``, ``logit_jsd_consistency``, and GDCM
+        reuse the same encoder + decoder pass.
         """
         if augment is not None:
             raise ValueError('spike-S8 latent SpecAugment was removed; '
                              'pass augment=None')
-        mem, feats, h_mem, w_mem = self._encode_with_feats(images, mem_mask)
+        mem, feats, h_mem, w_mem, pred_counts = self._encode_with_feats(
+            images, mem_mask, return_counts=True)
         apred = self.aux_head(feats) if need_aux else None
 
         bos = torch.full_like(tgt[:, :1], self.bos_id)
@@ -784,7 +914,8 @@ class MvdNet(nn.Module):
         dec_in = inp
         if sample_p > 0.0:
             with torch.no_grad():
-                probe = self.decode_logits(mem, inp, mem_mask)
+                probe = self.decode_logits(
+                    mem, inp, mem_mask, hw_mem=(h_mem, w_mem))
                 pred = probe.argmax(-1)
                 keep = (torch.rand_like(inp.float()) >= sample_p)
                 keep[:, 0] = True
@@ -802,7 +933,7 @@ class MvdNet(nn.Module):
                 held['q'] = out.detach().float()
             handle = top.norm2.register_forward_hook(_hook)
         try:
-            h = self.decode_hidden(mem, dec_in, mem_mask)
+            h = self.decode_hidden(mem, dec_in, mem_mask, hw_mem=(h_mem, w_mem))
             logits = self.out(h)
         finally:
             if handle is not None:
@@ -820,11 +951,19 @@ class MvdNet(nn.Module):
             xs = (torch.arange(w_mem, device=w_att.device).float() + 0.5) / w_mem
             xc = (w_att.reshape(b, t, h_mem, w_mem) * xs).sum(dim=(2, 3))
 
+        gdcm_loss = None
+        if need_gdcm and self.use_gdcm and pred_counts is not None:
+            tgt_counts = comer_gdcm.extract_strip_counts(
+                tgt, pad_id=self.pad_id).to(mem.device)
+            gdcm_loss = self.gdcm_head.compute_loss(pred_counts, tgt_counts)
+
         out = (ce, apred, xc)
         if return_hidden:
             out = out + (h,)
         if return_logits:
             out = out + (logits,)
+        if need_gdcm:
+            out = out + (gdcm_loss,)
         return out
 
     @torch.no_grad()
@@ -839,21 +978,15 @@ class MvdNet(nn.Module):
         ``memory_key_padding_mask``. None keeps the exact legacy path.
         """
         self.eval()
-        mem = self.encode(images, mem_mask)
+        mem, _, h_mem, w_mem = self._encode_with_feats(images, mem_mask)
         b = images.shape[0]
         device = images.device
         out = torch.full((b, 1), self.bos_id, dtype=torch.long,
                          device=device)
         finished = torch.zeros(b, dtype=torch.bool, device=device)
         for _ in range(max_len):
-            n = out.shape[1]
-            emb = self.tok_emb(out) + _sinusoidal_1d(
-                n, self.d_model, device)[None]
-            mask = nn.Transformer.generate_square_subsequent_mask(
-                n, device=device)
-            nxt = self.out(self.decoder(
-                emb, mem, tgt_mask=mask,
-                memory_key_padding_mask=mem_mask))[:, -1]
+            nxt = self.out(self.decode_hidden(
+                mem, out, mem_mask, hw_mem=(h_mem, w_mem)))[:, -1]
             if constrain:
                 for r in range(b):
                     if finished[r]:
@@ -883,16 +1016,26 @@ class MvdNet(nn.Module):
         mems = [_mem_kv(mem, xa) for (_, xa) in params]
         return params, mems
 
-    def _cached_step(self, params, mems, tok, pos, caches, mem_mask=None):
+    def _cached_step(self, params, mems, tok, pos, caches, mem_mask=None,
+                     cum_covs=None, hw_mem=None):
         """Advance every layer by one position; returns final hidden."""
         device = tok.device
         x = self.tok_emb(tok) + _sinusoidal_1d_pos(
             pos, self.d_model, device)[None, None, :]
         outs = []
+        use_c = self.use_comer and cum_covs is not None and hw_mem is not None
+        if use_c:
+            h_mem, w_mem = hw_mem
         for li, layer in enumerate(self.decoder.layers):
             kc, vc = caches[li]
-            x, kc, vc = _layer_step(layer, params[li], x, kc, vc,
-                                   mems[li], mem_mask)
+            if use_c:
+                x, kc, vc, new_cov = _layer_step_comer(
+                    layer, params[li], x, kc, vc, mems[li], mem_mask,
+                    self.comer_bias, cum_covs[li], h_mem, w_mem)
+                cum_covs[li] = new_cov
+            else:
+                x, kc, vc = _layer_step(layer, params[li], x, kc, vc,
+                                        mems[li], mem_mask)
             outs.append((kc, vc))
         return x, outs
 
@@ -976,11 +1119,17 @@ class MvdNet(nn.Module):
         cross-attention steps. None keeps the exact legacy path.
         """
         self.eval()
-        mem = self.encode(images, mem_mask)
+        mem, _, h_mem, w_mem = self._encode_with_feats(images, mem_mask)
         b = images.shape[0]
         device = images.device
         params, mems = self._cached_setup(mem)
         caches = [(None, None) for _ in self.decoder.layers]
+        cum_covs = (
+            [self.comer_bias.init_coverage(b, h_mem, w_mem,
+                                           device=device, dtype=mem.dtype)
+             for _ in self.decoder.layers]
+            if self.use_comer else None
+        )
         out = torch.full((b, 1), self.bos_id, dtype=torch.long,
                          device=device)
         rows = [{'state': grammar.PrefixState(strict=strict), 'hist': [],
@@ -989,7 +1138,8 @@ class MvdNet(nn.Module):
         finished = torch.zeros(b, dtype=torch.bool, device=device)
         for pos in range(max_len):
             x, caches = self._cached_step(
-                params, mems, out[:, -1:], pos, caches, mem_mask)
+                params, mems, out[:, -1:], pos, caches, mem_mask,
+                cum_covs=cum_covs, hw_mem=(h_mem, w_mem))
             nxt = self.out(x)[:, -1, :]
             if constrain:
                 self._apply_knobs(nxt, rows, min_len, eos_bias,
@@ -1044,7 +1194,7 @@ class MvdNet(nn.Module):
         the exact legacy path.
         """
         self.eval()
-        mem = self.encode(images, mem_mask)
+        mem, _, h_mem, w_mem = self._encode_with_feats(images, mem_mask)
         if adapt_steps is not None and adapt_steps > 0:
             raise ValueError('dropped spike S9 (tt_adapter) was removed; '
                              'pass adapt_steps=0')
@@ -1057,6 +1207,12 @@ class MvdNet(nn.Module):
         params, mems = self._cached_setup(mem_k)
         caches = [(None, None) for _ in self.decoder.layers]
         b = nb * K
+        cum_covs = (
+            [self.comer_bias.init_coverage(b, h_mem, w_mem,
+                                           device=device, dtype=mem.dtype)
+             for _ in self.decoder.layers]
+            if self.use_comer else None
+        )
         out = torch.full((b, 1), self.bos_id, dtype=torch.long,
                          device=device)
         rows = [{'state': grammar.PrefixState(strict=strict), 'hist': [],
@@ -1068,7 +1224,8 @@ class MvdNet(nn.Module):
         fanned = False
         for pos in range(max_len):
             x, caches = self._cached_step(
-                params, mems, out[:, -1:], pos, caches, mask_k)
+                params, mems, out[:, -1:], pos, caches, mask_k,
+                cum_covs=cum_covs, hw_mem=(h_mem, w_mem))
             nxt = self.out(x)[:, -1, :]
             if constrain:
                 self._apply_knobs(nxt, rows, min_len, eos_bias,
@@ -1089,6 +1246,8 @@ class MvdNet(nn.Module):
                            else None,
                            vc.index_select(0, order) if vc is not None
                            else None) for kc, vc in caches]
+                if cum_covs is not None:
+                    cum_covs = [cc.index_select(0, order) for cc in cum_covs]
                 mems = [(km.index_select(0, order),
                          vm.index_select(0, order)) for km, vm in mems]
                 if mask_k is not None:
@@ -1150,6 +1309,8 @@ class MvdNet(nn.Module):
             order = sel_src
             caches = [(kc.index_select(0, order),
                        vc.index_select(0, order)) for kc, vc in caches]
+            if cum_covs is not None:
+                cum_covs = [cc.index_select(0, order) for cc in cum_covs]
             out = torch.cat([out.index_select(0, order),
                              sel_tok[:, None]], 1)
             new_rows = []

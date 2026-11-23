@@ -139,6 +139,47 @@ def load_real_hw_hybrid_index(hw_dir):
     return load_hybrid_index(str(jpath))
 
 
+def parse_extra_data_dirs(raw):
+    """Normalize repeatable/comma-separated ``--extra-data-dir`` values."""
+    if not raw:
+        return []
+    items = [raw] if isinstance(raw, str) else list(raw)
+    out = []
+    for item in items:
+        if not item:
+            continue
+        for part in str(item).split(','):
+            p = part.strip()
+            if p:
+                out.append(p)
+    return out
+
+
+def load_extra_data_dir(dir_path, exclude=(), include_degraded=True,
+                        include_handink=False, include_simshots=False):
+    """Load pairs + optional ``hybrid_staff.jsonl`` from one extra data dir.
+
+    Supports both flat layout (PNGs, ``*-bekern.txt``, and optional
+    ``hybrid_staff.jsonl`` directly inside ``dir_path``) and split layout
+    (``<dir_path>/renders/`` + ``<dir_path>/targets/``).
+    """
+    root = Path(dir_path)
+    if not root.is_dir():
+        raise FileNotFoundError('extra-data-dir %s does not exist' % root)
+    if (root / 'renders').is_dir() and (root / 'targets').is_dir():
+        renders, targets = root / 'renders', root / 'targets'
+    else:
+        renders, targets = root, root
+    extra_pairs = list_pairs(
+        str(renders), str(targets), exclude=exclude,
+        include_degraded=include_degraded,
+        include_handink=include_handink,
+        include_simshots=include_simshots)
+    jpath = root / 'hybrid_staff.jsonl'
+    extra_hidx = load_hybrid_index(str(jpath)) if jpath.exists() else {}
+    return extra_pairs, extra_hidx
+
+
 def filter_pages(pairs, substrings=None, exact_file=None):
     """Select training pairs by page stem.
 
@@ -172,7 +213,9 @@ META_KEYS = ('vocab', 'pages', 'height', 'lr', 'seed', 'exclude',
              'epoch_aug_p', 'epoch_aug_clean_p', 'epoch_aug_geom',
              'epoch_redraw_dir', 'optics_profile', 'jsd_weight',
              'jsd_every', 'bf16', 'channels_last', 'width_bucket',
-             'prefetch', 'real_hw_dir', 'real_hw_repeat')
+             'prefetch', 'real_hw_dir', 'real_hw_repeat',
+             's18_weight', 'comer', 'gdcm_weight', 'extra_data_dir',
+             'max_tokens')
 
 # Values new flags had implicitly before they existed. An old
 # meta.json missing one of these keys resumes iff the current run uses
@@ -199,6 +242,11 @@ LEGACY_DEFAULTS = {
     'optics_profile': 'default',
     'jsd_weight': 0.0,
     'jsd_every': 4,
+    's18_weight': 0.0,
+    'comer': False,
+    'gdcm_weight': 0.0,
+    'extra_data_dir': None,
+    'max_tokens': 768,
 }
 
 # Exact fingerprint enforced on --resume (T0.2): every key here must
@@ -218,7 +266,9 @@ RESUME_KEYS = ('vocab', 'pages', 'height', 'lr', 'seed', 'exclude',
                'epoch_aug_p', 'epoch_aug_clean_p', 'epoch_aug_geom',
                'epoch_redraw_dir', 'optics_profile', 'jsd_weight',
                'jsd_every', 'bf16', 'channels_last', 'width_bucket',
-               'prefetch', 'real_hw_dir', 'real_hw_repeat')
+               'prefetch', 'real_hw_dir', 'real_hw_repeat',
+               's18_weight', 'comer', 'gdcm_weight', 'extra_data_dir',
+               'max_tokens')
 
 _LOCK_HELD = []
 
@@ -458,6 +508,13 @@ def build_meta(args, pairs):
         'prefetch': getattr(args, 'prefetch', 0),
         'real_hw_dir': getattr(args, 'real_hw_dir', None),
         'real_hw_repeat': getattr(args, 'real_hw_repeat', 1),
+        's18_weight': getattr(args, 's18_weight', 0.0),
+        'comer': getattr(args, 'comer', False),
+        'gdcm_weight': getattr(args, 'gdcm_weight', 0.0),
+        'extra_data_dir': (
+            parse_extra_data_dirs(getattr(args, 'extra_data_dir', None))
+            or None),
+        'max_tokens': getattr(args, 'max_tokens', 768),
     }
 
 
@@ -950,10 +1007,14 @@ def load_sidecar(img_path, height, hybrid_index=None):
     raise FileNotFoundError(str(lpath))
 
 
-def encode_targets(batch):
+def encode_targets(batch, max_tokens=0):
     """Batch bekern targets with EOS + PAD (shared by both collates)."""
-    ids = [data.encode(data.load_bekern(b)) + [data.EOS_ID]
-           for _, b, _ in batch]
+    ids = []
+    for _, b, _ in batch:
+        seq = data.encode(data.load_bekern(b)) + [data.EOS_ID]
+        if max_tokens and max_tokens > 0 and len(seq) > max_tokens:
+            seq = seq[:max_tokens - 1] + [data.EOS_ID]
+        ids.append(seq)
     n = max(len(x) for x in ids)
     tgt = torch.full((len(ids), n), data.PAD_ID, dtype=torch.long)
     for i, x in enumerate(ids):
@@ -961,7 +1022,8 @@ def encode_targets(batch):
     return tgt
 
 
-def collate_hybrid(batch, height, stride='8x16', hybrid_index=None):
+def collate_hybrid(batch, height, stride='8x16', hybrid_index=None,
+                   max_tokens=0):
     """Batch rectified sidecar strips: pad widths, pad targets, mask memory.
 
     Mirrors :func:`collate` exactly (same ``W_max``-to-16 padding, same
@@ -1017,12 +1079,15 @@ def collate_hybrid(batch, height, stride='8x16', hybrid_index=None):
         for i, (w, s) in enumerate(zip(widths, nslots)):
             valid = _mem_width_aniso(w, stride)
             pad_cols = torch.arange(w_mem) >= valid
-            pad_rows = torch.arange(h_mem) >= slot_rows * s
+            pad_rows = (
+                torch.arange(h_mem) >= slot_rows * s
+                if s < 4 else torch.zeros(h_mem, dtype=torch.bool)
+            )
             key_mask[i] = (pad_rows.unsqueeze(1)
                            | pad_cols.unsqueeze(0)).reshape(-1)
         if not key_mask.any():
             key_mask = None
-    return rgb, encode_targets(batch), key_mask, gray, staff
+    return rgb, encode_targets(batch, max_tokens=max_tokens), key_mask, gray, staff
 
 
 def hybrid_model_input(heat_net, pair, height, device, stride='8x16',
@@ -1091,7 +1156,7 @@ def _mem_width_aniso(w, stride='8x16'):
     return ((w // 4) // 2) // 2
 
 
-def collate(batch, height, stride='8x16'):
+def collate(batch, height, stride='8x16', max_tokens=0):
     """Batch variable-width strips: pad widths, pad targets, mask memory.
 
     Images are padded on the right to the batch ``W_max`` (rounded up to
@@ -1133,27 +1198,25 @@ def collate(batch, height, stride='8x16'):
                            .reshape(-1))
     # Every target ends with EOS: without it the model never observes a
     # stop signal and greedy decoding always runs to max_len.
-    ids = [data.encode(data.load_bekern(b)) + [data.EOS_ID]
-           for _, b, _ in batch]
-    n = max(len(x) for x in ids)
-    tgt = torch.full((len(ids), n), data.PAD_ID, dtype=torch.long)
-    for i, x in enumerate(ids):
-        tgt[i, :len(x)] = torch.tensor(x, dtype=torch.long)
-    return imgs, tgt, key_mask
+    return imgs, encode_targets(batch, max_tokens=max_tokens), key_mask
 
 
 def build_optimizer(net, lr, trunk_mult=1.0, warmup=0, cosine=False,
-                    total_updates=1):
-    """Four-group AdamW (trunk/dec x decay/plain) + warmup/cosine.
+                    total_updates=1, fresh_lr_mult=2.5):
+    """Multi-group AdamW (trunk / dec / fresh-heads x decay/plain) + warmup/cosine.
 
     Trunk groups (``encoder.*``, ``proj.*``) run at ``lr * trunk_mult``;
-    decoder groups at ``lr``. ``plain`` groups hold 1D params, biases,
+    decoder groups at ``lr``; fresh Exp-2B heads (``s18_head.*``,
+    ``comer_bias.*``, ``gdcm_head.*``) run at ``lr * fresh_lr_mult`` (2.5x
+    default) when present so newly attached heads adapt quickly during
+    warm-starting. ``plain`` groups hold 1D params, biases,
     ``layer_scale`` and ``norm.weight`` at ``weight_decay=0.0`` (T1.6a);
     ``decay`` groups keep the legacy 0.01. The LambdaLR schedule counts
     OPTIMIZER
     updates (post-accum flushes): linear warmup over ``warmup`` updates,
     then optional cosine decay to ~0 over ``total_updates``. Defaults
-    (mult 1.0, no warmup, no cosine) reproduce the legacy single-LR run.
+    (mult 1.0, no warmup, no cosine, no fresh heads) reproduce the legacy
+    single-LR run.
 
     Scheduler state IS checkpointed (``opt-<step>.pt`` sidecar next to
     each ``ckpt-<step>.pt``): --resume restores optimizer momentum and
@@ -1168,32 +1231,43 @@ def build_optimizer(net, lr, trunk_mult=1.0, warmup=0, cosine=False,
                 or name.endswith('bias') or name.endswith('norm.weight'))
 
     splits = {'trunk_decay': [], 'trunk_plain': [],
-              'dec_decay': [], 'dec_plain': []}
+              'dec_decay': [], 'dec_plain': [],
+              'fresh_decay': [], 'fresh_plain': []}
     for _n, _p in net.named_parameters():
         if not _p.requires_grad:
             continue
-        _trunk = _n.startswith(('encoder.', 'proj.'))
-        _key = 'trunk_' if _trunk else 'dec_'
+        if _n.startswith(('s18_head.', 'comer_bias.', 'gdcm_head.')):
+            _key = 'fresh_'
+        elif _n.startswith(('encoder.', 'proj.')):
+            _key = 'trunk_'
+        else:
+            _key = 'dec_'
         _key += 'plain' if _no_decay(_n, _p) else 'decay'
         splits[_key].append(_p)
     grouped = [(splits['trunk_decay'], trunk_mult, 0.01),
                (splits['dec_decay'], 1.0, 0.01),
                (splits['trunk_plain'], trunk_mult, 0.0),
-               (splits['dec_plain'], 1.0, 0.0)]
+               (splits['dec_plain'], 1.0, 0.0),
+               (splits['fresh_decay'], fresh_lr_mult, 0.01),
+               (splits['fresh_plain'], fresh_lr_mult, 0.0)]
     grouped = [(ps, m, w) for ps, m, w in grouped if ps]
     assert splits['trunk_decay'] and splits['dec_decay'], \
         'param-group split is empty'
     assert (sum(len(v) for v in splits.values())
-            == sum(1 for _ in net.parameters())), 'param overlap/leak'
+            == sum(1 for _p in net.parameters() if _p.requires_grad)), \
+        'param overlap/leak'
+    use_sched = (warmup > 0 or cosine)
     all_cuda = all(p.is_cuda for ps, _, _ in grouped for p in ps)
     opt_kw = {'fused': True} if all_cuda else {}
+    param_groups = [
+        {'params': ps, 'lr': (lr if use_sched else lr * m), 'weight_decay': w}
+        for ps, m, w in grouped
+    ]
     try:
-        opt = torch.optim.AdamW([{'params': ps, 'lr': lr, 'weight_decay': w}
-                                 for ps, _, w in grouped], **opt_kw)
+        opt = torch.optim.AdamW(param_groups, **opt_kw)
     except (RuntimeError, TypeError):
-        opt = torch.optim.AdamW([{'params': ps, 'lr': lr, 'weight_decay': w}
-                                 for ps, _, w in grouped])
-    if warmup <= 0 and not cosine:
+        opt = torch.optim.AdamW(param_groups)
+    if not use_sched:
         return opt, None
 
     def make_mult(mult):
@@ -1375,8 +1449,23 @@ def load_weights_compat(net, state):
     state_foveal = {k for k in state if k.startswith('foveal_proj.')}
     foveal_fresh = bool(own_foveal and not state_foveal)
 
+    # Gracefully keep fresh Exp-2B heads (s18_head.*, comer_bias.*, gdcm_head.*)
+    # when warm-starting from a pre-Exp-2B checkpoint (e.g. exp2A ckpt-15000).
+    own_s18 = {k for k in own if k.startswith('s18_head.')}
+    state_s18 = {k for k in state if k.startswith('s18_head.')}
+    s18_fresh = bool(own_s18 and not state_s18)
+
+    own_comer = {k for k in own if k.startswith('comer_bias.')}
+    state_comer = {k for k in state if k.startswith('comer_bias.')}
+    comer_fresh = bool(own_comer and not state_comer)
+
+    own_gdcm = {k for k in own if k.startswith('gdcm_head.')}
+    state_gdcm = {k for k in state if k.startswith('gdcm_head.')}
+    gdcm_fresh = bool(own_gdcm and not state_gdcm)
+
     # Legacy strict+aux-fresh fast path (preserves exact return string).
     if (not stem_mismatch and not vocab_mismatch and not foveal_fresh
+            and not s18_fresh and not comer_fresh and not gdcm_fresh
             and own_aux and not state_aux
             and all(k in state and tuple(state[k].shape) == tuple(own[k].shape)
                     for k in own if k not in own_aux)
@@ -1388,13 +1477,19 @@ def load_weights_compat(net, state):
                 else 'strict+aux-fresh')
 
     if not (padconv or stem_mismatch or vocab_mismatch or aux_skipped
-            or foveal_fresh):
+            or foveal_fresh or s18_fresh or comer_fresh or gdcm_fresh):
         net.load_state_dict(state)  # re-raise the original error
 
     skip_own = set(skip_own_aux)
     skip_state = set(skip_state_aux)
     if foveal_fresh:
         skip_own |= own_foveal
+    if s18_fresh:
+        skip_own |= own_s18
+    if comer_fresh:
+        skip_own |= own_comer
+    if gdcm_fresh:
+        skip_own |= own_gdcm
     if stem_mismatch:
         skip_own |= {stem_w, stem_b}
         skip_state |= {stem_w, stem_b}
@@ -1447,6 +1542,12 @@ def load_weights_compat(net, state):
         parts.append('aux-fresh')
     if foveal_fresh:
         parts.append('foveal-fresh')
+    if s18_fresh:
+        parts.append('s18-fresh')
+    if comer_fresh:
+        parts.append('comer-fresh')
+    if gdcm_fresh:
+        parts.append('gdcm-fresh')
     if padconv:
         parts.append('padconv')
     return '+'.join(parts)
@@ -1715,6 +1816,28 @@ def main():
     ap.add_argument('--real-hw-repeat', type=int, default=1,
                     help='deterministic repeat factor for --real-hw-dir pairs '
                          '(default 1). Recorded in meta.json and enforced on --resume.')
+    ap.add_argument('--s18-weight', type=float, default=0.0,
+                    help='Exp-2B S18 factored event-tuple auxiliary head loss '
+                         'weight (0.0 = off, legacy). Shares the single decoder '
+                         'hidden state pass. Recorded in meta.json and enforced '
+                         'on --resume.')
+    ap.add_argument('--comer', action='store_true',
+                    help='Exp-2B CoMER coverage-guided cross-attention bias '
+                         '(zero-init for lossless warm-start). Recorded in '
+                         'meta.json and enforced on --resume.')
+    ap.add_argument('--gdcm-weight', type=float, default=0.0,
+                    help='Exp-2B GDCM global dynamic counting head loss weight '
+                         '(0.0 = off, legacy; zero-init memory conditioning). '
+                         'Recorded in meta.json and enforced on --resume.')
+    ap.add_argument('--extra-data-dir', action='append', default=None,
+                    help='repeatable or comma-separated extra data directories '
+                         '(each containing strip PNGs, *-bekern.txt, and optional '
+                         'hybrid_staff.jsonl) merged into pairs and hybrid_index. '
+                         'Recorded in meta.json and enforced on --resume.')
+    ap.add_argument('--max-tokens', type=int, default=768,
+                    help='maximum target token sequence length (default 768; '
+                         '0 = unlimited). Recorded in meta.json and enforced on '
+                         '--resume.')
     args = ap.parse_args()
 
     torch.manual_seed(args.seed)
@@ -1735,6 +1858,18 @@ def main():
         print('real-hw pairs: +%d from %s (repeat=%d)'
               % (len(hw_pairs), args.real_hw_dir, args.real_hw_repeat))
         pairs = pairs + hw_pairs
+    extra_hidxs = []
+    for edir in parse_extra_data_dirs(args.extra_data_dir):
+        epairs, ehidx = load_extra_data_dir(
+            edir, exclude=args.exclude,
+            include_degraded=not args.no_degraded,
+            include_handink=args.handink,
+            include_simshots=args.simshots)
+        print('extra-data-dir: +%d pairs (+%d hybrid rows) from %s'
+              % (len(epairs), len(ehidx), edir))
+        pairs = pairs + epairs
+        if ehidx:
+            extra_hidxs.append(ehidx)
     assert pairs, 'no training pairs selected'
     hybrid_index = None
     use_hybrid = bool(args.hybrid_cache)
@@ -1757,6 +1892,8 @@ def main():
             if hw_hidx:
                 hybrid_index.update(hw_hidx)
                 print('real-hw hybrid index: +%d validated strips' % len(hw_hidx))
+        for ehidx in extra_hidxs:
+            hybrid_index.update(ehidx)
         print('hybrid index: %d validated strips in %s'
               % (len(hybrid_index), args.hybrid_cache))
         pairs, drop_clean, drop_deg = filter_hybrid_pairs(
@@ -1772,21 +1909,32 @@ def main():
         random.Random(args.seed).shuffle(pairs)
     print('pairs:', len(pairs))
 
+    use_gdcm = args.gdcm_weight > 0
+    use_s18 = args.s18_weight > 0
     if args.pretrained:
         net = model.MvdNet(vocab=len(data.VOCAB) + 3, anisotropic=True,
                            pretrained=True, stride=args.stride,
                            extra_chans=args.extra_chans,
-                           foveal_tap=args.foveal_tap).to(device)
+                           foveal_tap=args.foveal_tap,
+                           use_comer=args.comer,
+                           use_gdcm=use_gdcm,
+                           use_s18=use_s18).to(device)
         print('MvdNet v2: anisotropic %s encoder + timm pretrained trunk'
               % args.stride
               + (' + %d hybrid extra chans' % args.extra_chans
                  if args.extra_chans else '')
-              + (' + foveal_tap' if args.foveal_tap else ''))
+              + (' + foveal_tap' if args.foveal_tap else '')
+              + (' + CoMER' if args.comer else '')
+              + (' + GDCM' if use_gdcm else '')
+              + (' + S18' if use_s18 else ''))
     else:
         net = model.MvdNet(vocab=len(data.VOCAB) + 3,
                            stride=args.stride,
                            extra_chans=args.extra_chans,
-                           foveal_tap=args.foveal_tap).to(device)
+                           foveal_tap=args.foveal_tap,
+                           use_comer=args.comer,
+                           use_gdcm=use_gdcm,
+                           use_s18=use_s18).to(device)
     K0 = max(1, args.accum)
     total_updates = (args.steps // K0 + 2 * (args.steps //
                      max(1, args.eval_every) + 1) + 2)
@@ -1940,9 +2088,11 @@ def main():
 
     def _collate_step(_st, _ep, batch):
         if not use_hybrid:
-            return collate(batch, args.height, args.stride)
+            return collate(batch, args.height, args.stride,
+                           max_tokens=args.max_tokens)
         return collate_hybrid(batch, args.height, args.stride,
-                              hybrid_index=hybrid_index)
+                              hybrid_index=hybrid_index,
+                              max_tokens=args.max_tokens)
 
     non_block = (device == 'cuda' and args.prefetch > 0)
     if args.prefetch > 0:
@@ -2038,6 +2188,8 @@ def main():
                 args.specaug_p, args.specaug_slope)
         need_aux = (args.aux_weight > 0 and step % max(1, args.aux_every) == 0)
         need_coord = (args.coord_weight > 0 and step % max(1, args.coord_every) == 0)
+        need_s18 = (args.s18_weight > 0)
+        need_gdcm = (args.gdcm_weight > 0)
         # Width-aware micro-chunking: at H=256 and B=4, batches wider than
         # 2176 px exceed 16 GB VRAM and spill into Windows WDDM (triggering
         # slow paging or TDR driver resets). Splitting wide batches into
@@ -2052,6 +2204,8 @@ def main():
             _loss_acc = 0.0
             _aux_acc = 0.0 if need_aux else None
             _coord_acc = 0.0 if need_coord else None
+            _s18_acc = 0.0 if need_s18 else None
+            _gdcm_acc = 0.0 if need_gdcm else None
             mterm = wterm = aterm = jterm = None
             for _s in range(0, _b_cur, _mb):
                 _e = min(_b_cur, _s + _mb)
@@ -2060,14 +2214,21 @@ def main():
                 _tg = tgt[_s:_e]
                 _km = key_mask[_s:_e] if key_mask is not None else None
                 with torch.amp.autocast('cuda', enabled=amp, dtype=amp_dtype):
-                    _ce, _ap, _xc = net.loss_shared(
+                    _sh = net.loss_shared(
                         _im, _tg, sample_p=args.sample_p,
                         mem_mask=_km, tok_weight=args.tok_weight,
                         weight_ids=STRUCT_WEIGHT_IDS,
                         tok_dropout=args.tok_dropout,
                         content_ids=CONTENT_IDS,
                         need_aux=need_aux, need_coord=need_coord,
-                        augment=aug)
+                        augment=aug, return_hidden=need_s18,
+                        need_gdcm=need_gdcm)
+                    _ce, _ap, _xc = _sh[0], _sh[1], _sh[2]
+                    _si = 3
+                    _h = _sh[_si] if need_s18 else None
+                    if need_s18:
+                        _si += 1
+                    _gd = _sh[_si] if need_gdcm else None
                     _sub = _ce * (_wf / K)
                     if need_aux:
                         _at = aux_tgt[_s:_e]
@@ -2087,11 +2248,21 @@ def main():
                             _xc, _tg, model.VOICE_IDS, net.pad_id)
                         _sub = _sub + args.coord_weight * _ct * (_wf / K)
                         _coord_acc += float(_ct.detach().item()) * _wf
+                    if need_s18:
+                        _s18l, _ = net.s18_head.loss_from_tokens(
+                            _h, _tg, pad_id=net.pad_id, eos_id=net.eos_id)
+                        _sub = _sub + args.s18_weight * _s18l * (_wf / K)
+                        _s18_acc += float(_s18l.detach().item()) * _wf
+                    if need_gdcm and _gd is not None:
+                        _sub = _sub + args.gdcm_weight * _gd * (_wf / K)
+                        _gdcm_acc += float(_gd.detach().item()) * _wf
                 scaler.scale(_sub).backward()
                 _loss_acc += float(_sub.detach().item())
             loss = torch.tensor(_loss_acc)
             auxterm = torch.tensor(_aux_acc) if _aux_acc is not None else None
             cterm = torch.tensor(_coord_acc) if _coord_acc is not None else None
+            s18term = torch.tensor(_s18_acc) if _s18_acc is not None else None
+            gterm = torch.tensor(_gdcm_acc) if _gdcm_acc is not None else None
         else:
             with torch.amp.autocast('cuda', enabled=amp, dtype=amp_dtype):
                 shared_out = net.loss_shared(
@@ -2101,13 +2272,28 @@ def main():
                     tok_dropout=args.tok_dropout,
                     content_ids=CONTENT_IDS,
                     need_aux=need_aux, need_coord=need_coord,
-                    augment=aug, return_logits=need_jsd)
+                    augment=aug, return_hidden=need_s18,
+                    return_logits=need_jsd, need_gdcm=need_gdcm)
+                ce_loss, apred_shared, xc_shared = (
+                    shared_out[0], shared_out[1], shared_out[2])
+                _si = 3
+                h_shared = shared_out[_si] if need_s18 else None
+                if need_s18:
+                    _si += 1
+                logits_shared = shared_out[_si] if need_jsd else None
                 if need_jsd:
-                    ce_loss, apred_shared, xc_shared, logits_shared = shared_out
-                else:
-                    ce_loss, apred_shared, xc_shared = shared_out
-                    logits_shared = None
+                    _si += 1
+                gdcm_shared = shared_out[_si] if need_gdcm else None
                 loss = ce_loss / K
+                s18term = None
+                if need_s18:
+                    s18term, _ = net.s18_head.loss_from_tokens(
+                        h_shared, tgt, pad_id=net.pad_id, eos_id=net.eos_id)
+                    loss = loss + args.s18_weight * s18term / K
+                gterm = None
+                if need_gdcm and gdcm_shared is not None:
+                    gterm = gdcm_shared
+                    loss = loss + args.gdcm_weight * gterm / K
                 jterm = None
                 if need_jsd and clean_imgs_jsd is not None:
                     b_jsd = clean_imgs_jsd.shape[0]
@@ -2237,6 +2423,10 @@ def main():
                 msg += ' coord %.4f' % float(cterm.item())
             if jterm is not None:
                 msg += ' jsd %.4f' % float(jterm.item())
+            if s18term is not None:
+                msg += ' s18 %.4f' % float(s18term.item())
+            if gterm is not None:
+                msg += ' gdcm %.4f' % float(gterm.item())
             if aug is not None:
                 msg += ' aug'
             _res, _alc = cuda_mem_stats(device)

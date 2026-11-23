@@ -677,6 +677,11 @@ class TestNewFlagsLegacyResume(unittest.TestCase):
         'jsd_weight': 0.0,
         'jsd_every': 4,
         'no_heatnet': False,
+        's18_weight': 0.0,
+        'comer': False,
+        'gdcm_weight': 0.0,
+        'extra_data_dir': None,
+        'max_tokens': 768,
     }
 
     def test_old_meta_without_new_keys_resumes_at_defaults_and_refuses_nondefault(self):
@@ -699,13 +704,135 @@ class TestNewFlagsLegacyResume(unittest.TestCase):
                                ('optics_profile', 'calibrated'),
                                ('jsd_weight', 0.2),
                                ('jsd_every', 2),
-                               ('no_heatnet', True)):
+                               ('no_heatnet', True),
+                               ('s18_weight', 0.25),
+                               ('comer', True),
+                               ('gdcm_weight', 0.1),
+                               ('extra_data_dir', ['D:/tmp/extra']),
+                               ('max_tokens', 512)):
                 with self.subTest(key=k):
                     mut = dict(base)
                     mut[k] = bad_val
                     msg = train.check_resume(str(out), mut)
                     self.assertIsNotNone(msg)
                     self.assertIn(repr(k), msg)
+
+
+class TestExp2BWarmStartAndOptimizer(unittest.TestCase):
+    """Warm-starting CoMER + GDCM + S18 from a plain 4-ch checkpoint."""
+
+    def test_warm_start_from_4ch_is_exact_step0_identity_and_fresh_lr_group(self):
+        import torch
+        import data
+        import model
+        v = len(data.VOCAB) + 3
+        torch.manual_seed(42)
+        base = model.MvdNet(
+            vocab=v, d_model=64, layers=2, heads=4, dim_ff=128,
+            extra_chans=1, foveal_tap=True)
+        exp2b = model.MvdNet(
+            vocab=v, d_model=64, layers=2, heads=4, dim_ff=128,
+            extra_chans=1, foveal_tap=True,
+            use_comer=True, use_gdcm=True, use_s18=True)
+        how = train.load_weights_compat(exp2b, base.state_dict())
+        self.assertIn('s18-fresh', how)
+        self.assertIn('comer-fresh', how)
+        self.assertIn('gdcm-fresh', how)
+
+        base.eval()
+        exp2b.eval()
+        imgs = torch.randn(2, 4, 64, 128)
+        tgt_in = torch.tensor([
+            [base.bos_id, data.TOKEN_TO_ID['clef-G-2'], data.TOKEN_TO_ID['quarter'],
+             data.TOKEN_TO_ID['C'], data.TOKEN_TO_ID['4'], data.TOKEN_TO_ID['bar']],
+            [base.bos_id, data.TOKEN_TO_ID['clef-F-4'], data.TOKEN_TO_ID['half'],
+             data.TOKEN_TO_ID['G'], data.TOKEN_TO_ID['3'], data.TOKEN_TO_ID['bar']],
+        ], dtype=torch.long)
+        with torch.no_grad():
+            mem_base = base.encode(imgs)
+            mem_2b = exp2b.encode(imgs)
+            self.assertTrue(torch.allclose(mem_base, mem_2b, atol=1e-6),
+                            'GDCM zero-init must be step-0 identity on encode()')
+            logits_base = base(imgs, tgt_in)
+            logits_2b = exp2b(imgs, tgt_in)
+            max_diff = float((logits_base - logits_2b).abs().max())
+            self.assertLess(max_diff, 1e-5,
+                            f'CoMER+GDCM zero-init must match base logits (diff={max_diff})')
+            kv_base = base.greedy_kv(imgs[:1], max_len=6, constrain=False)
+            kv_2b = exp2b.greedy_kv(imgs[:1], max_len=6, constrain=False)
+            self.assertTrue(torch.equal(kv_base, kv_2b),
+                            'greedy_kv must match base at step 0')
+
+        # Optimizer 3rd param group: 2.5x LR for fresh heads.
+        opt_no_sched, sched_none = train.build_optimizer(
+            exp2b, lr=1e-4, trunk_mult=0.5, warmup=0, cosine=False)
+        self.assertIsNone(sched_none)
+        lrs = sorted({round(g['lr'], 10) for g in opt_no_sched.param_groups})
+        self.assertEqual(lrs, sorted([0.5e-4, 1.0e-4, 2.5e-4]))
+
+        opt_sched, sched = train.build_optimizer(
+            exp2b, lr=1e-4, trunk_mult=0.5, warmup=10, cosine=True,
+            total_updates=100)
+        self.assertIsNotNone(sched)
+        # At step 0 of warmup (u=0): mult * 1/10 -> 2.5x group is 2.5x decoder group.
+        sched_lrs = sorted({round(lr_v, 10) for lr_v in sched.get_last_lr()})
+        self.assertAlmostEqual(sched_lrs[-1] / sched_lrs[1], 2.5, places=5)
+
+
+class TestExtraDataDirAndMaxTokens(unittest.TestCase):
+    """--extra-data-dir parsing, pair+hybrid merging, and --max-tokens cap."""
+
+    def test_parse_and_load_extra_data_dirs_and_max_tokens(self):
+        from PIL import Image
+        import data
+        self.assertEqual(train.parse_extra_data_dirs(None), [])
+        self.assertEqual(
+            train.parse_extra_data_dirs(['a,b', ' c ', 'd,']),
+            ['a', 'b', 'c', 'd'])
+
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            d1 = root / 'extra_flat'
+            d2 = root / 'extra_split'
+            d1.mkdir()
+            (d2 / 'renders').mkdir(parents=True)
+            (d2 / 'targets').mkdir(parents=True)
+
+            Image.new('RGB', (64, 64), 'white').save(d1 / 'e1-s0.png')
+            toks = ['clef-G-2', 'quarter', 'C', '4', 'bar'] * 4
+            (d1 / 'e1-s0-bekern.txt').write_text(' '.join(toks) + '\n', encoding='utf-8')
+            (d1 / 'hybrid_staff.jsonl').write_text(
+                json.dumps({'img': 'e1-s0.png', 'S': 1, 'table': {'staves': [{}]}}) + '\n',
+                encoding='utf-8')
+
+            Image.new('RGB', (64, 64), 'white').save(d2 / 'renders' / 'e2-s0.png')
+            (d2 / 'targets' / 'e2-s0-bekern.txt').write_text('quarter C 4 bar\n', encoding='utf-8')
+            (d2 / 'hybrid_staff.jsonl').write_text(
+                json.dumps({'img': 'e2-s0.png', 'S': 2, 'table': {'staves': [{}, {}]}}) + '\n',
+                encoding='utf-8')
+
+            p1, h1 = train.load_extra_data_dir(str(d1))
+            p2, h2 = train.load_extra_data_dir(str(d2))
+            self.assertEqual(len(p1), 1)
+            self.assertEqual(p1[0][2], 'e1-s0')
+            self.assertIn('e1-s0.png', h1)
+            self.assertEqual(len(p2), 1)
+            self.assertEqual(p2[0][2], 'e2-s0')
+            self.assertIn('e2-s0.png', h2)
+
+            merged_pairs = p1 + p2
+            merged_hidx = {}
+            merged_hidx.update(h1)
+            merged_hidx.update(h2)
+            kept, dc, dd = train.filter_hybrid_pairs(
+                merged_pairs, hybrid_index=merged_hidx, allow_on_the_fly=True)
+            self.assertEqual(len(kept), 2)
+            self.assertEqual((dc, dd), (0, 0))
+
+            # --max-tokens truncation preserves EOS at the end.
+            tgt_capped = train.encode_targets(p1, max_tokens=8)
+            self.assertEqual(tuple(tgt_capped.shape), (1, 8))
+            self.assertEqual(int(tgt_capped[0, -1]), data.EOS_ID)
 
 if __name__ == '__main__':
     unittest.main()

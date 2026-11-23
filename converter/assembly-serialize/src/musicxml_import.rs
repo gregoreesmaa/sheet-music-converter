@@ -250,6 +250,8 @@ fn parse_document(xml: &str) -> Result<Doc, String> {
             }
             let barlen = beats as i64 * file_div as i64 * 4 / beat_type.max(1) as i64;
             let mstart = cursor.max(nominal);
+            let bar_end = mstart + barlen.max(0);
+            let mut pitched_mend = mstart;
             // Per-voice (next start, last onset): chord tones reuse the
             // last onset instead of the advanced cursor. Deliberately
             // NOT staff-qualified (unlike `ties`): this map is the
@@ -332,9 +334,23 @@ fn parse_document(xml: &str) -> Result<Doc, String> {
                         }
                         let (pitch, rest) = match n.pitch {
                             Some((st, al, oc)) => {
+                                pitched_mend = pitched_mend.max(start + dur);
                                 (Some(format!("{st}{}{oc}", accidental_suffix(al)?)), false)
                             }
                             None => (None, true),
+                        };
+                        // Bar-overflow spacing rests (e.g. Finale's trailing
+                        // `print-object="no"` rests starting at or past the
+                        // nominal bar end) advance `ends` so `<backup>` rewinds
+                        // cleanly, but must not be emitted or push the next
+                        // measure off the nominal barline grid (matches bekern).
+                        let emit_dur = if rest {
+                            if start >= bar_end {
+                                continue;
+                            }
+                            dur.min(bar_end - start)
+                        } else {
+                            dur
                         };
                         dp.notes.push(RawNote {
                             page,
@@ -342,7 +358,7 @@ fn parse_document(xml: &str) -> Result<Doc, String> {
                                 pitch,
                                 rest,
                                 onset: ticks_to_beats(start, dp.divisions),
-                                dur: ticks_to_beats(dur, dp.divisions),
+                                dur: ticks_to_beats(emit_dur, dp.divisions),
                                 voice,
                                 lyric: None,
                                 grace: false,
@@ -363,8 +379,7 @@ fn parse_document(xml: &str) -> Result<Doc, String> {
                 }
             }
             first_header = false;
-            let mend = ends.values().map(|v| v.0).max().unwrap_or(mstart);
-            cursor = mend.max(cursor);
+            cursor = pitched_mend.max(cursor);
             nominal += barlen.max(0);
         }
         doc.parts.push(dp);
@@ -2814,5 +2829,45 @@ mod tests {
         let decoded = decode_bekern(&toks.join(" ")).expect("measures 6..9 decode");
         let n: usize = decoded.parts.iter().map(|p| p.notes.len()).sum();
         assert!(n > 0, "decoded span holds notes");
+    }
+
+    #[test]
+    fn import_ignores_bar_overflow_spacing_rests_for_grid() {
+        // Finale/music21 exports trailing `print-object="no"` spacing rests
+        // past the nominal bar end (e.g. weber-concertino Piano m1: 30240
+        // ticks of 3/4 + 1260-tick invisible 32nd rest, followed by
+        // `<backup><duration>31500</duration></backup>`). Those rests must
+        // keep `<backup>` aligned inside m1 without pushing m2 off the
+        // 3.0-beat nominal grid.
+        let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<score-partwise version="3.1">
+  <part-list><score-part id="P1"><part-name>Piano</part-name></score-part></part-list>
+  <part id="P1">
+    <measure number="1">
+      <attributes>
+        <divisions>10080</divisions>
+        <key><fifths>-3</fifths></key>
+        <time><beats>3</beats><beat-type>4</beat-type></time>
+        <staves>2</staves>
+        <clef number="1"><sign>G</sign><line>2</line></clef>
+        <clef number="2"><sign>F</sign><line>4</line></clef>
+      </attributes>
+      <note><pitch><step>C</step><octave>5</octave></pitch><duration>30240</duration><voice>1</voice><type>half</type><dot/><staff>1</staff></note>
+      <note print-object="no" print-spacing="yes"><rest/><duration>1260</duration><voice>1</voice><type>32nd</type><staff>1</staff></note>
+      <backup><duration>31500</duration></backup>
+      <note><pitch><step>C</step><octave>3</octave></pitch><duration>30240</duration><voice>2</voice><type>half</type><dot/><staff>2</staff></note>
+      <note print-object="no" print-spacing="yes"><rest/><duration>1260</duration><voice>2</voice><type>32nd</type><staff>2</staff></note>
+    </measure>
+    <measure number="2">
+      <note><pitch><step>G</step><octave>4</octave></pitch><duration>10080</duration><voice>1</voice><type>quarter</type><staff>1</staff></note>
+    </measure>
+  </part>
+</score-partwise>"#;
+        let input = score_input_from_musicxml(xml).expect("import parses");
+        let notes = &input.parts[0].notes;
+        assert_eq!(notes.len(), 3, "overflow spacing rests are not emitted");
+        assert_eq!((notes[0].pitch.as_deref(), notes[0].onset), (Some("C5"), 0.0));
+        assert_eq!((notes[1].pitch.as_deref(), notes[1].onset), (Some("C3"), 0.0));
+        assert_eq!((notes[2].pitch.as_deref(), notes[2].onset), (Some("G4"), 3.0));
     }
 }
