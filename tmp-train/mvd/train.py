@@ -41,6 +41,7 @@ import heat_features  # noqa: E402
 import compact_sidecar  # noqa: E402
 import epoch_aug  # noqa: E402
 import fast_loader  # noqa: E402
+import optics_losses  # noqa: E402
 
 
 def list_pairs(renders, targets, exclude=(), include_degraded=True,
@@ -108,6 +109,36 @@ def list_pairs(renders, targets, exclude=(), include_degraded=True,
     return pairs
 
 
+def load_real_hw_pairs(hw_dir, exclude=(), include_degraded=True, repeat=1):
+    """Load real handwritten training pairs from ``<hw_dir>/{renders,targets}``.
+
+    Follows the exact ``list_pairs`` contract (``quarantine.txt``,
+    ``exclude``, clean ``.png`` + optional ``_d*.jpg`` degraded variants,
+    deterministic sorted order). ``repeat >= 1`` deterministically tiles
+    the sorted pair list (no RNG) so a small real handwritten subset can
+    be upsampled cleanly in the mix.
+    """
+    if repeat < 1:
+        raise ValueError('real_hw_repeat must be >= 1, got %r' % repeat)
+    root = Path(hw_dir)
+    renders = root / 'renders'
+    targets = root / 'targets'
+    if not renders.is_dir() or not targets.is_dir():
+        raise FileNotFoundError(
+            'real-hw-dir %s must contain renders/ and targets/' % root)
+    base = list_pairs(str(renders), str(targets), exclude=exclude,
+                      include_degraded=include_degraded)
+    return base * int(repeat)
+
+
+def load_real_hw_hybrid_index(hw_dir):
+    """Load optional ``<hw_dir>/hybrid_staff.jsonl`` for real HW strips."""
+    jpath = Path(hw_dir) / 'hybrid_staff.jsonl'
+    if not jpath.exists():
+        return {}
+    return load_hybrid_index(str(jpath))
+
+
 def filter_pages(pairs, substrings=None, exact_file=None):
     """Select training pairs by page stem.
 
@@ -135,11 +166,13 @@ META_KEYS = ('vocab', 'pages', 'height', 'lr', 'seed', 'exclude',
              'shuffle', 'no_amp', 'accum', 'init_from', 'trunk_lr_mult',
              'warmup', 'cosine', 'sample_p', 'pages_file', 'batch_size',
              'pretrained', 'no_degraded', 'tok_weight', 'tok_dropout',
-             'extra_chans', 'hybrid_cache', 'heat_pt', 'stride',
-             'aux_weight', 'aux_every', 'heat_dropout',
-             'coord_weight', 'coord_every', 'simshots',
-             'epoch_aug_p', 'epoch_aug_clean_p', 'epoch_aug_geom', 'epoch_redraw_dir',
-             'bf16', 'channels_last', 'width_bucket', 'prefetch')
+             'extra_chans', 'hybrid_cache', 'heat_pt', 'no_heatnet',
+             'stride', 'foveal_tap', 'aux_weight', 'aux_every',
+             'heat_dropout', 'coord_weight', 'coord_every', 'simshots',
+             'epoch_aug_p', 'epoch_aug_clean_p', 'epoch_aug_geom',
+             'epoch_redraw_dir', 'optics_profile', 'jsd_weight',
+             'jsd_every', 'bf16', 'channels_last', 'width_bucket',
+             'prefetch', 'real_hw_dir', 'real_hw_repeat')
 
 # Values new flags had implicitly before they existed. An old
 # meta.json missing one of these keys resumes iff the current run uses
@@ -159,6 +192,13 @@ LEGACY_DEFAULTS = {
     'channels_last': False,
     'width_bucket': False,
     'prefetch': 0,
+    'real_hw_dir': None,
+    'real_hw_repeat': 1,
+    'no_heatnet': False,
+    'foveal_tap': False,
+    'optics_profile': 'default',
+    'jsd_weight': 0.0,
+    'jsd_every': 4,
 }
 
 # Exact fingerprint enforced on --resume (T0.2): every key here must
@@ -168,15 +208,17 @@ RESUME_KEYS = ('vocab', 'pages', 'height', 'lr', 'seed', 'exclude',
                'shuffle', 'no_amp', 'accum', 'trunk_lr_mult', 'warmup',
                'cosine', 'sample_p', 'batch_size', 'pretrained',
                'no_degraded', 'tok_weight', 'tok_dropout', 'extra_chans',
-               'hybrid_cache', 'heat_pt', 'stride', 'aux_weight',
-               'aux_every', 'heat_dropout', 'coord_weight', 'coord_every',
-               'margin_weight',
+               'hybrid_cache', 'heat_pt', 'no_heatnet', 'stride',
+               'foveal_tap', 'aux_weight', 'aux_every', 'heat_dropout',
+               'coord_weight', 'coord_every', 'margin_weight',
                'margin_siblings', 'margin', 'margin_every',
                'mwer_weight', 'mwer_beams', 'mwer_every',
                'mwer_maxlen', 'action_weight', 'action_every',
                'specaug_p', 'specaug_slope', 'handink', 'simshots',
-               'epoch_aug_p', 'epoch_aug_clean_p', 'epoch_aug_geom', 'epoch_redraw_dir',
-               'bf16', 'channels_last', 'width_bucket', 'prefetch')
+               'epoch_aug_p', 'epoch_aug_clean_p', 'epoch_aug_geom',
+               'epoch_redraw_dir', 'optics_profile', 'jsd_weight',
+               'jsd_every', 'bf16', 'channels_last', 'width_bucket',
+               'prefetch', 'real_hw_dir', 'real_hw_repeat')
 
 _LOCK_HELD = []
 
@@ -399,16 +441,23 @@ def build_meta(args, pairs):
         'coord_every': getattr(args, 'coord_every', 1),
         'hybrid_cache': getattr(args, 'hybrid_cache', None),
         'heat_pt': getattr(args, 'heat_pt', None),
+        'no_heatnet': getattr(args, 'no_heatnet', False),
+        'foveal_tap': getattr(args, 'foveal_tap', False),
         'handink': getattr(args, 'handink', False),
         'simshots': getattr(args, 'simshots', False),
         'epoch_aug_p': getattr(args, 'epoch_aug_p', 0.0),
         'epoch_aug_clean_p': getattr(args, 'epoch_aug_clean_p', 0.0),
         'epoch_aug_geom': getattr(args, 'epoch_aug_geom', 0.0),
         'epoch_redraw_dir': getattr(args, 'epoch_redraw_dir', None),
+        'optics_profile': getattr(args, 'optics_profile', 'default'),
+        'jsd_weight': getattr(args, 'jsd_weight', 0.0),
+        'jsd_every': getattr(args, 'jsd_every', 4),
         'bf16': getattr(args, 'bf16', False),
         'channels_last': getattr(args, 'channels_last', False),
         'width_bucket': getattr(args, 'width_bucket', False),
         'prefetch': getattr(args, 'prefetch', 0),
+        'real_hw_dir': getattr(args, 'real_hw_dir', None),
+        'real_hw_repeat': getattr(args, 'real_hw_repeat', 1),
     }
 
 
@@ -978,21 +1027,26 @@ def collate_hybrid(batch, height, stride='8x16', hybrid_index=None):
 
 def hybrid_model_input(heat_net, pair, height, device, stride='8x16',
                        hybrid_index=None):
-    """Single-pair ``[1, 11, H, W]`` model input for eval/probes (T2.4)."""
+    """Single-pair ``[1, 11 or 4, H, W]`` model input for eval/probes (T2.4)."""
     rgb, _, _, gray, staff = collate_hybrid([pair], height, stride,
                                             hybrid_index=hybrid_index)
-    return assemble_hybrid_batch(heat_net, rgb.to(device),
-                                 gray.to(device), staff.to(device))
+    return assemble_hybrid_batch(
+        heat_net, rgb.to(device),
+        gray.to(device) if heat_net is not None else None,
+        staff.to(device))
 
 
 def assemble_hybrid_batch(heat_net, rgb, gray, staff):
-    """``(B,3,H,W)`` + gray + staff -> ``(B,11,H,W)`` model input.
+    """``(B,3,H,W)`` + gray + staff -> ``(B,11,H,W)`` or ``(B,4,H,W)`` model input.
 
-    One batched HeatNet forward (fp32, no_grad inside
-    :meth:`heat_features.HeatNet.probs`; call OUTSIDE the AMP
-    autocast block) + staff-grid concat. Shapes must already match
-    (padded by :func:`collate_hybrid`).
+    When ``heat_net`` is provided: one batched HeatNet forward (fp32, no_grad
+    inside :meth:`heat_features.HeatNet.probs`; call OUTSIDE the AMP autocast
+    block) + staff-grid concat (11-ch). When ``heat_net is None`` (4-ch
+    ``--extra-chans 1 --no-heatnet`` mode): concatenates RGB + canonical staff
+    grid directly without running HeatNet.
     """
+    if heat_net is None:
+        return torch.cat([rgb, staff.to(rgb.device).float()], dim=1)
     heat7 = heat_net.probs(gray)
     return torch.cat([rgb, heat7.to(rgb.device).float(),
                       staff.to(rgb.device).float()], dim=1)
@@ -1259,35 +1313,34 @@ def load_weights_compat(net, state):
         state = dict(state)
         for k, ck in renamed.items():
             state[k] = state.pop(ck)
-    # S13b: pre-aux checkpoints carry every trunk/decoder tensor but no
-    # ``aux_head.*`` keys (the head is always fresh-init then). Any
-    # other diff falls through to the stem/vocab paths below, which
-    # re-raise the original error when nothing matches.
-    own = net.state_dict()
-    aux_keys = {k for k in own if k.startswith('aux_head.')}
-    if (aux_keys and not (aux_keys & set(state))
-            and all(k in state and tuple(state[k].shape) == tuple(own[k].shape)
-                    for k in own if k not in aux_keys)
-            and not (set(state) - set(own))):
-        topped = dict(state)
-        topped.update({k: own[k] for k in aux_keys})
-        net.load_state_dict(topped)
-        return ('strict+aux-fresh+padconv' if padconv
-                else 'strict+aux-fresh')
+    # Detect stem transplant / slicing modes:
+    #   * widen:       3 -> >3  (RGB copied, extras keep zero init)
+    #   * slice-11to4: 11 -> 4  (RGB [:3] + canonical staff grid [10:11] -> [3:4])
+    #   * slice-11to3: 11 -> 3  (RGB [:3] only)
     stem_w, stem_b = 'encoder.0.0.weight', 'encoder.0.0.bias'
     emb_w, out_w, out_b = 'tok_emb.weight', 'out.weight', 'out.bias'
     own = net.state_dict()
-    stem_mismatch = (
-        stem_w in state and stem_w in own
-        and len(state[stem_w].shape) == 4
-        and len(own[stem_w].shape) == 4
-        and state[stem_w].shape[0] == own[stem_w].shape[0]
-        and state[stem_w].shape[1] == 3
-        and own[stem_w].shape[1] > 3
-        and state[stem_w].shape[2:] == own[stem_w].shape[2:])
-    if stem_mismatch and stem_b in state and stem_b in own:
-        if tuple(state[stem_b].shape) != tuple(own[stem_b].shape):
-            stem_mismatch = False
+    stem_mode = None
+    if (stem_w in state and stem_w in own
+            and len(state[stem_w].shape) == 4
+            and len(own[stem_w].shape) == 4
+            and state[stem_w].shape[0] == own[stem_w].shape[0]
+            and state[stem_w].shape[2:] == own[stem_w].shape[2:]):
+        state_ch = int(state[stem_w].shape[1])
+        own_ch = int(own[stem_w].shape[1])
+        bias_ok = (
+            stem_b not in state or stem_b not in own
+            or tuple(state[stem_b].shape) == tuple(own[stem_b].shape)
+        )
+        if bias_ok:
+            if state_ch == 3 and own_ch > 3:
+                stem_mode = 'widen'
+            elif state_ch == 11 and own_ch == 4:
+                stem_mode = 'slice-11to4'
+            elif state_ch == 11 and own_ch == 3:
+                stem_mode = 'slice-11to3'
+    stem_mismatch = stem_mode is not None
+
     n_old = None
     if all(k in state and k in own for k in (emb_w, out_w, out_b)):
         ce, ne = state[emb_w].shape, own[emb_w].shape
@@ -1301,20 +1354,63 @@ def load_weights_compat(net, state):
                 and ce[0] < ne[0]):
             n_old = ce[0]
     vocab_mismatch = n_old is not None
-    if not stem_mismatch and not vocab_mismatch:
+
+    # Gracefully skip mismatched/missing aux_head.* weights (e.g. pre-aux
+    # ckpts, 8-ch -> 1-ch aux_head on 4-ch models, or disabled aux_head).
+    own_aux = {k for k in own if k.startswith('aux_head.')}
+    state_aux = {k for k in state if k.startswith('aux_head.')}
+    skip_own_aux = {
+        k for k in own_aux
+        if k not in state or tuple(state[k].shape) != tuple(own[k].shape)
+    }
+    skip_state_aux = {
+        k for k in state_aux
+        if k not in own or tuple(state[k].shape) != tuple(own[k].shape)
+    }
+    aux_skipped = bool(skip_own_aux or skip_state_aux)
+
+    # Gracefully keep fresh zero-init foveal_proj.* weights when warm-starting
+    # a --foveal-tap model from a pre-tap checkpoint.
+    own_foveal = {k for k in own if k.startswith('foveal_proj.')}
+    state_foveal = {k for k in state if k.startswith('foveal_proj.')}
+    foveal_fresh = bool(own_foveal and not state_foveal)
+
+    # Legacy strict+aux-fresh fast path (preserves exact return string).
+    if (not stem_mismatch and not vocab_mismatch and not foveal_fresh
+            and own_aux and not state_aux
+            and all(k in state and tuple(state[k].shape) == tuple(own[k].shape)
+                    for k in own if k not in own_aux)
+            and not (set(state) - set(own))):
+        topped = dict(state)
+        topped.update({k: own[k] for k in own_aux})
+        net.load_state_dict(topped)
+        return ('strict+aux-fresh+padconv' if padconv
+                else 'strict+aux-fresh')
+
+    if not (padconv or stem_mismatch or vocab_mismatch or aux_skipped
+            or foveal_fresh):
         net.load_state_dict(state)  # re-raise the original error
-    skip = set()
+
+    skip_own = set(skip_own_aux)
+    skip_state = set(skip_state_aux)
+    if foveal_fresh:
+        skip_own |= own_foveal
     if stem_mismatch:
-        skip |= {stem_w, stem_b}
+        skip_own |= {stem_w, stem_b}
+        skip_state |= {stem_w, stem_b}
     if vocab_mismatch:
-        skip |= {emb_w, out_w, out_b}
-    # S13b: pre-aux checkpoints in a stem/vocab transplant keep the
-    # fresh-init aux head (same rule as the strict+aux-fresh path).
-    skip |= ({k for k in own if k.startswith('aux_head.')} - set(state))
+        skip_own |= {emb_w, out_w, out_b}
+        skip_state |= {emb_w, out_w, out_b}
     with torch.no_grad():
         if stem_mismatch:
             stem = net.encoder[0][0]
-            stem.weight[:, :3].copy_(state[stem_w])
+            if stem_mode == 'widen':
+                stem.weight[:, :3].copy_(state[stem_w])
+            elif stem_mode == 'slice-11to4':
+                stem.weight[:, :3].copy_(state[stem_w][:, :3])
+                stem.weight[:, 3:4].copy_(state[stem_w][:, 10:11])
+            elif stem_mode == 'slice-11to3':
+                stem.weight[:, :3].copy_(state[stem_w][:, :3])
             if stem.bias is not None and stem_b in state:
                 stem.bias.copy_(state[stem_b])
         if vocab_mismatch:
@@ -1334,16 +1430,26 @@ def load_weights_compat(net, state):
                                state[out_w].to(dev)), 'head prefix shifted'
             assert torch.equal(net.out.bias[:n_old],
                                state[out_b].to(dev)), 'bias prefix shifted'
-    rest = {k: v for k, v in state.items() if k not in skip}
+    rest = {k: v for k, v in state.items() if k not in skip_state}
     missing, unexpected = net.load_state_dict(rest, strict=False)
     assert not unexpected, unexpected
-    assert set(missing) == (skip & set(own)), missing
-    if stem_mismatch and vocab_mismatch:
-        return ('stem-transplant+vocab-expand+padconv' if padconv
-                else 'stem-transplant+vocab-expand')
+    assert set(missing) == (skip_own & set(own)), missing
+    parts = []
+    if stem_mode == 'widen':
+        parts.append('stem-transplant')
+    elif stem_mode is not None:
+        parts.append('stem-' + stem_mode)
     if vocab_mismatch:
-        return 'vocab-expand+padconv' if padconv else 'vocab-expand'
-    return 'stem-transplant+padconv' if padconv else 'stem-transplant'
+        parts.append('vocab-expand')
+    if not parts:
+        parts.append('strict')
+    if aux_skipped and not (stem_mode == 'widen' or vocab_mismatch):
+        parts.append('aux-fresh')
+    if foveal_fresh:
+        parts.append('foveal-fresh')
+    if padconv:
+        parts.append('padconv')
+    return '+'.join(parts)
 
 
 def main():
@@ -1549,6 +1655,28 @@ def main():
                     help='HeatNet .pt checkpoint for --hybrid-cache '
                          '(CUDA when available; loaded once, eval mode). '
                          'Recorded in meta.json and enforced on --resume.')
+    ap.add_argument('--no-heatnet', action='store_true',
+                    help='skip loading/running frozen HeatNet in '
+                         '--hybrid-cache mode (auto-enabled with '
+                         '--extra-chans 1 for 4-ch RGB+staff). '
+                         'Recorded in meta.json and enforced on --resume.')
+    ap.add_argument('--foveal-tap', action='store_true',
+                    help='enable Stage-0 (P2, 4x4) avg+max foveal tap '
+                         'residual in MvdNet for micro-glyph survival. '
+                         'Recorded in meta.json and enforced on --resume.')
+    ap.add_argument('--optics-profile', default='default',
+                    choices=('default', 'calibrated'),
+                    help='epoch_aug camera/optics profile (default or '
+                         'calibrated). Recorded in meta.json and enforced '
+                         'on --resume.')
+    ap.add_argument('--jsd-weight', type=float, default=0.0,
+                    help='Batch 4-B5 clean-vs-degraded logit JSD consistency '
+                         'weight (0.0 = off, legacy; runs clean teacher under '
+                         'no_grad on B_jsd=2, skipped when W > 2176). '
+                         'Recorded in meta.json and enforced on --resume.')
+    ap.add_argument('--jsd-every', type=int, default=4,
+                    help='Batch 4-B5 logit JSD cadence in steps (default 4). '
+                         'Recorded in meta.json and enforced on --resume.')
     ap.add_argument('--epoch-aug-p', type=float, default=0.0,
                     help='per-epoch deterministic physical aug probability on '
                          'already-degraded _d* strips (default 0.0 to avoid '
@@ -1580,6 +1708,13 @@ def main():
     ap.add_argument('--prefetch', type=int, default=4,
                     help='async background collate prefetch depth (default 4; '
                          '0 = synchronous legacy collate).')
+    ap.add_argument('--real-hw-dir', default=None,
+                    help='optional root of permissive real handwritten training '
+                         'strips ({renders/, targets/, hybrid_staff.jsonl}); '
+                         'appended deterministically to training pairs.')
+    ap.add_argument('--real-hw-repeat', type=int, default=1,
+                    help='deterministic repeat factor for --real-hw-dir pairs '
+                         '(default 1). Recorded in meta.json and enforced on --resume.')
     args = ap.parse_args()
 
     torch.manual_seed(args.seed)
@@ -1592,14 +1727,36 @@ def main():
                        include_handink=args.handink,
                        include_simshots=args.simshots)
     pairs = filter_pages(pairs, args.pages, args.pages_file)
+    if args.real_hw_dir:
+        hw_pairs = load_real_hw_pairs(
+            args.real_hw_dir, exclude=args.exclude,
+            include_degraded=not args.no_degraded,
+            repeat=args.real_hw_repeat)
+        print('real-hw pairs: +%d from %s (repeat=%d)'
+              % (len(hw_pairs), args.real_hw_dir, args.real_hw_repeat))
+        pairs = pairs + hw_pairs
     assert pairs, 'no training pairs selected'
     hybrid_index = None
-    if args.hybrid_cache:
-        if args.extra_chans != heat_features.EXTRA_CHANS:
-            sys.exit('refusing: --hybrid-cache requires --extra-chans %d '
-                     '(got %d)' % (heat_features.EXTRA_CHANS,
-                                   args.extra_chans))
+    use_hybrid = bool(args.hybrid_cache)
+    use_heatnet = (
+        use_hybrid and (args.extra_chans == heat_features.EXTRA_CHANS)
+        and not args.no_heatnet
+    )
+    if use_hybrid:
+        if args.extra_chans not in (1, heat_features.EXTRA_CHANS):
+            sys.exit('refusing: --hybrid-cache requires --extra-chans 1 '
+                     '(RGB+staff) or %d (RGB+HeatNet+staff), got %d'
+                     % (heat_features.EXTRA_CHANS, args.extra_chans))
+        if args.no_heatnet and args.extra_chans == heat_features.EXTRA_CHANS:
+            sys.exit('refusing: --no-heatnet cannot be combined with '
+                     '--extra-chans %d (use --extra-chans 1 for 4-ch '
+                     'RGB+staff)' % heat_features.EXTRA_CHANS)
         hybrid_index = load_hybrid_index(args.hybrid_cache)
+        if args.real_hw_dir:
+            hw_hidx = load_real_hw_hybrid_index(args.real_hw_dir)
+            if hw_hidx:
+                hybrid_index.update(hw_hidx)
+                print('real-hw hybrid index: +%d validated strips' % len(hw_hidx))
         print('hybrid index: %d validated strips in %s'
               % (len(hybrid_index), args.hybrid_cache))
         pairs, drop_clean, drop_deg = filter_hybrid_pairs(
@@ -1608,7 +1765,7 @@ def main():
               'degraded=%d without sidecars/tables)'
               % (len(pairs), drop_clean, drop_deg))
         assert pairs, 'no training pairs with sidecars or tables selected'
-    if args.aux_weight > 0 and not args.hybrid_cache:
+    if args.aux_weight > 0 and not use_hybrid:
         sys.exit('refusing: --aux-weight needs --hybrid-cache (aux '
                  'targets are the hybrid-extra channels)')
     if args.shuffle:
@@ -1618,15 +1775,18 @@ def main():
     if args.pretrained:
         net = model.MvdNet(vocab=len(data.VOCAB) + 3, anisotropic=True,
                            pretrained=True, stride=args.stride,
-                           extra_chans=args.extra_chans).to(device)
+                           extra_chans=args.extra_chans,
+                           foveal_tap=args.foveal_tap).to(device)
         print('MvdNet v2: anisotropic %s encoder + timm pretrained trunk'
               % args.stride
               + (' + %d hybrid extra chans' % args.extra_chans
-                 if args.extra_chans else ''))
+                 if args.extra_chans else '')
+              + (' + foveal_tap' if args.foveal_tap else ''))
     else:
         net = model.MvdNet(vocab=len(data.VOCAB) + 3,
                            stride=args.stride,
-                           extra_chans=args.extra_chans).to(device)
+                           extra_chans=args.extra_chans,
+                           foveal_tap=args.foveal_tap).to(device)
     K0 = max(1, args.accum)
     total_updates = (args.steps // K0 + 2 * (args.steps //
                      max(1, args.eval_every) + 1) + 2)
@@ -1648,14 +1808,19 @@ def main():
     if args.channels_last and device == 'cuda':
         net.encoder = net.encoder.to(memory_format=torch.channels_last)
         net.proj = net.proj.to(memory_format=torch.channels_last)
+        if args.foveal_tap and hasattr(net, 'foveal_proj'):
+            net.foveal_proj = net.foveal_proj.to(memory_format=torch.channels_last)
         print('memory format: channels_last (NHWC) on encoder+proj')
     scaler = torch.amp.GradScaler('cuda', enabled=(amp and amp_dtype == torch.float16))
     heat_net = None
-    if args.hybrid_cache:
+    if use_heatnet:
         heat_net = heat_features.HeatNet(args.heat_pt, device=device)
         print('HeatNet: %s on %s (%d bytes)'
               % (args.heat_pt, heat_net.device,
                  heat_net.param_bytes()), flush=True)
+    elif use_hybrid:
+        print('hybrid 4-ch mode: RGB + canonical staff grid (HeatNet skipped)',
+              flush=True)
 
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
@@ -1774,7 +1939,7 @@ def main():
                 raw_b, ep, args.epoch_redraw_dir))
 
     def _collate_step(_st, _ep, batch):
-        if heat_net is None:
+        if not use_hybrid:
             return collate(batch, args.height, args.stride)
         return collate_hybrid(batch, args.height, args.stride,
                               hybrid_index=hybrid_index)
@@ -1797,25 +1962,31 @@ def main():
 
     with stream_ctx as batch_stream:
       for step, epoch, batch, collated in batch_stream:
-        if heat_net is None:
+        clean_imgs_jsd = None
+        if not use_hybrid:
             imgs, tgt, key_mask = collated
             imgs = imgs.to(device, non_blocking=non_block)
             tgt = tgt.to(device, non_blocking=non_block)
+            need_jsd = (
+                args.jsd_weight > 0
+                and step % max(1, args.jsd_every) == 0
+                and imgs.shape[-1] <= 2176
+            )
+            if need_jsd:
+                b_jsd = min(2, imgs.shape[0])
+                clean_imgs_jsd = imgs[:b_jsd].clone()
             if args.epoch_aug_p > 0 or args.epoch_aug_clean_p > 0:
                 imgs, _ = epoch_aug.augment_standardized_batch(
                     imgs, batch, args.seed, epoch,
                     aug_p=args.epoch_aug_p, clean_p=args.epoch_aug_clean_p,
-                    geom_strength=args.epoch_aug_geom)
+                    geom_strength=args.epoch_aug_geom,
+                    optics_profile=args.optics_profile)
         else:
-            # Hybrid: rectified RGB + staff from sidecars, heat from one
-            # batched fp32 HeatNet forward OUTSIDE autocast (probs() is
-            # no_grad; deterministic given weights).
+            # Hybrid: rectified RGB + staff from sidecars; when HeatNet is
+            # active (11-ch), heat comes from one batched fp32 HeatNet forward
+            # OUTSIDE autocast. In 4-ch mode (--extra-chans 1), HeatNet is
+            # skipped completely and imgs = [rgb, staff].
             rgb, tgt, key_mask, grayb, staffb = collated
-            # Batch-width guard: a monster strip would OOM inside the
-            # HeatNet forward below (and worse, inside the aux+coord
-            # triple forward on even steps). Skips are deterministic
-            # (same pairs -> same skips), so the fixed step->batch
-            # map stays resume-exact.
             if batch_too_wide(rgb.shape[-1]):
                 print('skip step %d: batch width %d > cap %d'
                       % (step, rgb.shape[-1], BATCH_WIDTH_CAP),
@@ -1823,14 +1994,27 @@ def main():
                 continue
             tgt = tgt.to(device, non_blocking=non_block)
             rgb_d = rgb.to(device, non_blocking=non_block)
-            gray_d = grayb.to(device, non_blocking=non_block)
+            gray_d = (grayb.to(device, non_blocking=non_block)
+                      if heat_net is not None else None)
             staff_d = staffb.to(device, non_blocking=non_block)
+            need_jsd = (
+                args.jsd_weight > 0
+                and step % max(1, args.jsd_every) == 0
+                and rgb_d.shape[-1] <= 2176
+            )
+            if need_jsd:
+                b_jsd = min(2, rgb_d.shape[0])
+                clean_imgs_jsd = assemble_hybrid_batch(
+                    heat_net, rgb_d[:b_jsd].clone(),
+                    gray_d[:b_jsd].clone() if gray_d is not None else None,
+                    staff_d[:b_jsd].clone())
             if args.epoch_aug_p > 0 or args.epoch_aug_clean_p > 0:
                 rgb_d, gray_d, staff_d = epoch_aug.augment_standardized_batch(
                     rgb_d, batch, args.seed, epoch,
                     aug_p=args.epoch_aug_p, clean_p=args.epoch_aug_clean_p,
                     grayb=gray_d, staffb=staff_d,
-                    geom_strength=args.epoch_aug_geom)
+                    geom_strength=args.epoch_aug_geom,
+                    optics_profile=args.optics_profile)
             imgs = assemble_hybrid_batch(
                 heat_net, rgb_d, gray_d, staff_d)
             # S13b: aux targets are the UNDROPPED extras (denoising:
@@ -1840,6 +2024,8 @@ def main():
                 imgs = heat_channel_dropout(imgs, args.heat_dropout)
         if args.channels_last and device == 'cuda':
             imgs = imgs.to(memory_format=torch.channels_last)
+            if clean_imgs_jsd is not None:
+                clean_imgs_jsd = clean_imgs_jsd.to(memory_format=torch.channels_last)
         if key_mask is not None:
             key_mask = key_mask.to(device, non_blocking=non_block)
         aug = None
@@ -1860,13 +2046,13 @@ def main():
         _b_cur = imgs.shape[0]
         _no_extra_terms = (
             args.margin_weight <= 0 and args.mwer_weight <= 0
-            and args.action_weight <= 0)
+            and args.action_weight <= 0 and not need_jsd)
         if (_b_cur > 2 and imgs.shape[-1] > 2176 and _no_extra_terms):
             _mb = 2
             _loss_acc = 0.0
             _aux_acc = 0.0 if need_aux else None
             _coord_acc = 0.0 if need_coord else None
-            mterm = wterm = aterm = None
+            mterm = wterm = aterm = jterm = None
             for _s in range(0, _b_cur, _mb):
                 _e = min(_b_cur, _s + _mb)
                 _wf = (_e - _s) / float(_b_cur)
@@ -1908,15 +2094,33 @@ def main():
             cterm = torch.tensor(_coord_acc) if _coord_acc is not None else None
         else:
             with torch.amp.autocast('cuda', enabled=amp, dtype=amp_dtype):
-                ce_loss, apred_shared, xc_shared = net.loss_shared(
+                shared_out = net.loss_shared(
                     imgs, tgt, sample_p=args.sample_p,
                     mem_mask=key_mask, tok_weight=args.tok_weight,
                     weight_ids=STRUCT_WEIGHT_IDS,
                     tok_dropout=args.tok_dropout,
                     content_ids=CONTENT_IDS,
                     need_aux=need_aux, need_coord=need_coord,
-                    augment=aug)
+                    augment=aug, return_logits=need_jsd)
+                if need_jsd:
+                    ce_loss, apred_shared, xc_shared, logits_shared = shared_out
+                else:
+                    ce_loss, apred_shared, xc_shared = shared_out
+                    logits_shared = None
                 loss = ce_loss / K
+                jterm = None
+                if need_jsd and clean_imgs_jsd is not None:
+                    b_jsd = clean_imgs_jsd.shape[0]
+                    with torch.no_grad():
+                        _cbos = torch.full_like(tgt[:b_jsd, :1], net.bos_id)
+                        _cinp = torch.cat([_cbos, tgt[:b_jsd, :-1]], dim=1)
+                        _ckm = key_mask[:b_jsd] if key_mask is not None else None
+                        logits_clean = net(clean_imgs_jsd, _cinp, _ckm)
+                    _jpad = (tgt[:b_jsd] == net.pad_id)
+                    jterm = optics_losses.logit_jsd_consistency(
+                        logits_clean, logits_shared[:b_jsd],
+                        pad_mask=_jpad, detach_clean=True)
+                    loss = loss + args.jsd_weight * jterm / K
                 mterm = None
                 if args.margin_weight > 0 and step % max(
                         1, args.margin_every) == 0:
@@ -2031,6 +2235,8 @@ def main():
                 msg += ' aux %.4f' % float(auxterm.item())
             if cterm is not None:
                 msg += ' coord %.4f' % float(cterm.item())
+            if jterm is not None:
+                msg += ' jsd %.4f' % float(jterm.item())
             if aug is not None:
                 msg += ' aug'
             _res, _alc = cuda_mem_stats(device)
@@ -2052,7 +2258,7 @@ def main():
             # eval TER incomparable across steps.
             net.eval()
             with torch.no_grad():
-                if heat_net is None:
+                if not use_hybrid:
                     eimgs, etgt, _ = collate([pairs[0]], args.height,
                                              args.stride)
                     eimgs = eimgs.to(device)
@@ -2066,7 +2272,7 @@ def main():
                 # distance still guards the collapse mode (identical mem
                 # for all pages -> ~0). ConvNeXt uses LayerNorm (no batch
                 # interaction), so sequential == batched per page.
-                if heat_net is None:
+                if not use_hybrid:
                     m0 = net.encode(load_image(
                         pairs[0][0], args.height).unsqueeze(0).to(device))
                     m1 = net.encode(load_image(
@@ -2077,7 +2283,8 @@ def main():
                         [pairs[0]], args.height, args.stride,
                         hybrid_index=hybrid_index)
                     eimgs = assemble_hybrid_batch(
-                        heat_net, ergb.to(device), egray.to(device),
+                        heat_net, ergb.to(device),
+                        egray.to(device) if heat_net is not None else None,
                         erstaff.to(device))
                     m0 = net.encode(eimgs)
                     m1 = net.encode(hybrid_model_input(
@@ -2102,11 +2309,11 @@ def main():
             _std = torch.tensor([0.229, 0.224, 0.225]).view(3, 1, 1)
             _blank = torch.full((3, args.height, args.height), 1.0)
             _blank = _blank.sub_(_mean).div_(_std).unsqueeze(0).to(device)
-            if heat_net is not None:
+            if args.extra_chans > 0:
                 # White page carries no staff lines and no keypoints:
-                # the 8 extra channels are exact zeros.
+                # the extra channels are exact zeros.
                 _blank = torch.cat(
-                    [_blank, torch.zeros(1, heat_features.EXTRA_CHANS,
+                    [_blank, torch.zeros(1, args.extra_chans,
                                          args.height, args.height,
                                          device=device)], dim=1)
             _mb = net.encode(_blank)

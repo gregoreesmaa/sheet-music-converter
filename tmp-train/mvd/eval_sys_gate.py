@@ -41,6 +41,7 @@ import strip_staff as sst  # noqa: E402
 import build_hybrid_cache as bhc  # noqa: E402
 import build_gate20_sys_dev as bgate  # noqa: E402
 import measure_decode as mdec  # noqa: E402
+import page_prep  # noqa: E402
 import numpy as np  # noqa: E402
 from PIL import Image  # noqa: E402
 
@@ -68,6 +69,121 @@ def split_head_body(toks):
     return toks[:i], toks[i:]
 
 
+_STEPS = frozenset('ABCDEFG')
+_OCTAVES = frozenset(str(d) for d in range(10))
+_DURS = frozenset(('long', 'breve', 'whole', 'half', 'quarter', 'eighth',
+                   '16th', '32nd', '64th', '128th'))
+_NON_TAIL_PREFIXES = ('clef-', 'key', 'time-', 'voice-', 'bar', 'dyn-',
+                      'hairpin-', 'tuplet-')
+_NON_TAIL_EXACT = (_STEPS | _OCTAVES | _DURS
+                   | frozenset(('rest', 'bar-rest', 'chord', 'grace')))
+
+
+def _is_alter(tok):
+    return (len(tok) >= 2 and tok[0] == 'a'
+            and (tok[1:].isdigit()
+                 or (tok[1] == '-' and len(tok) >= 3 and tok[2:].isdigit())))
+
+
+def _is_tail_tok(tok):
+    if tok in _NON_TAIL_EXACT:
+        return False
+    return not tok.startswith(_NON_TAIL_PREFIXES)
+
+
+def canonicalize_bekern_tail_order(toks):
+    """Canonicalize note/rest tail token order to match ``decode.rs``.
+
+    ``assembly-serialize bekern-decode`` requires pitched-note tails in
+    ``[alter] [dot*] [slurs/mods/ties]`` order and rest tails in
+    ``[dot*] [slurs/mods]`` order. When beam search emits an accidental
+    or dot after a slur/articulation on the same note (e.g.
+    ``16th A 4 slur-stop stacc a-1 dot`` on ``ryans-jig`` / ``airds-air``),
+    ``bekern-decode`` exits 1 (``unexpected token "a-1"``) and zeroes the
+    entire page. Moving out-of-order alter/dot tokens to their canonical
+    slot within the same event is semantics-preserving and a strict no-op
+    on already-canonical streams.
+    """
+    toks = list(toks)
+    out = []
+    i, n = 0, len(toks)
+    while i < n:
+        t = toks[i]
+        # Pitched note pitch pair: <step> <octave>
+        if t in _STEPS and i + 1 < n and toks[i + 1] in _OCTAVES:
+            out.append(t)
+            out.append(toks[i + 1])
+            i += 2
+            alters, dots, mods = [], [], []
+            while i < n and _is_tail_tok(toks[i]):
+                tt = toks[i]
+                if _is_alter(tt):
+                    alters.append(tt)
+                elif tt == 'dot':
+                    dots.append(tt)
+                else:
+                    mods.append(tt)
+                i += 1
+            if alters:
+                out.append(alters[0])
+            out.extend(dots)
+            out.extend(mods)
+        # Plain rest: rest <dur>
+        elif t == 'rest' and i + 1 < n and toks[i + 1] in _DURS:
+            out.append(t)
+            out.append(toks[i + 1])
+            i += 2
+            dots, mods = [], []
+            while i < n and _is_tail_tok(toks[i]):
+                tt = toks[i]
+                if tt == 'dot':
+                    dots.append(tt)
+                elif not _is_alter(tt):
+                    mods.append(tt)
+                i += 1
+            out.extend(dots)
+            out.extend(mods)
+        else:
+            out.append(t)
+            i += 1
+    return out
+
+
+def trim_max_len_repeat_loop(toks, max_len=564, min_period=8, min_repeats=4):
+    """Trim an infinite verbatim repeating tail ONLY when a strip hit max_len.
+
+    Does nothing for normal strips (``len(toks) < min(max_len, 564) - 2``)
+    or non-repeating max-length strips. When a strip hits the decode length
+    cap with a verbatim ``>=min_period``-token block repeated at least
+    ``min_repeats`` times at the tail (allowing a partial final copy cut by
+    ``max_len``), keeps the prefix through the first copy of the loop and
+    trims the runaway copies.
+    """
+    toks = list(toks)
+    cap = min(int(max_len), 564)
+    if len(toks) < cap - 2:
+        return toks
+    n = len(toks)
+    max_p = n // min_repeats
+    for p in range(min_period, max_p + 1):
+        match_len = 0
+        idx = n - 1
+        while idx >= p and toks[idx] == toks[idx - p]:
+            match_len += 1
+            idx -= 1
+        if match_len >= (min_repeats - 1) * p:
+            # First occurrence of the repeating period starts at loop_start
+            # = n - match_len - p; keep one complete copy of the period.
+            # If the backward match walked across a shared trailing 'bar'
+            # from the preceding measure, step one token right so we end
+            # cleanly on the barline.
+            cut = n - match_len
+            if cut < n and toks[cut] == 'bar':
+                cut += 1
+            return toks[:cut]
+    return toks
+
+
 def stitch_page_toks(sys_toks_list):
     """Page token stream from per-system token lists.
 
@@ -84,7 +200,8 @@ def stitch_page_toks(sys_toks_list):
         bodies.append(b)
     if not heads and sys_toks_list:
         heads, _b = split_head_body(sys_toks_list[0])
-    return list(heads) + [t for b in bodies for t in b]
+    return canonicalize_bekern_tail_order(
+        list(heads) + [t for b in bodies for t in b])
 
 
 def run_cli(args, timeout=600):
@@ -276,7 +393,20 @@ def decode_system(net, img_path, height, max_len, beam, device, workdir, stem):
     (workdir / (stem + '-bekern.txt')).write_text(' '.join(toks) + '\n',
                                                   encoding='utf-8')
     return {'tokens': toks, 'ntokens': len(toks), 'eos_miss': eos_miss,
-            'vocab_valid': valid, 'decode_secs': secs}
+            'vocab_valid': valid, 'decode_secs': secs, 'loop_trimmed': False}
+
+
+def detect_ckpt_extra_chans(state):
+    """Infer ``extra_chans`` from checkpoint stem ``encoder.0.0.weight``.
+
+    Returns ``in_chans - 3`` (0 for 3ch RGB, 1 for 4ch RGB+staff, 8 for
+    11ch RGB+HeatNet+staff), or ``None`` if the stem weight is absent.
+    """
+    sd = state.get('model', state) if isinstance(state, dict) else {}
+    w = sd.get('encoder.0.0.weight')
+    if w is None or getattr(w, 'ndim', 0) < 2:
+        return None
+    return max(0, int(w.shape[1]) - 3)
 
 
 def main():
@@ -290,6 +420,17 @@ def main():
     ap.add_argument('--device', default=None)
     ap.add_argument('--hybrid', action='store_true',
                     help='T2.4: 11ch rectified+HeatNet input, extra_chans=8')
+    ap.add_argument('--extra-chans', type=int, default=None,
+                    help='extra encoder input channels beyond RGB: 0 (3ch RGB), '
+                         '1 (4ch RGB+staff, no HeatNet), 8 (11ch RGB+HeatNet+staff); '
+                         'default: auto-detect from checkpoint stem')
+    ap.add_argument('--no-heatnet', action='store_true',
+                    help='disable HeatNet (4ch RGB+staff with --rectify/--hybrid '
+                         'or 3ch RGB; never loads HeatNet weights)')
+    ap.add_argument('--blind-photo', action='store_true',
+                    help='strict blind photo eval on suite31: no GT s_ref, no '
+                         'scaled-clean box fallback (misses score 0.0), and no '
+                         'clean-crop pairing in strip staff detection')
     ap.add_argument('--stride', default='8x16', choices=('8x16', '4x8'),
                     help='S13: encoder grid stride of the checkpoint. '
                          'Defaults to the legacy 8x16 path.')
@@ -329,14 +470,29 @@ def main():
                     help='Spike S9: SGD learning rate for the per-strip '
                     'adapter fit')
     ap.add_argument('--suite31-dir', default=str(SUITE31_DEFAULT))
+    ap.add_argument('--suite31-manifest', default=None,
+                    help='optional path to an alternate Suite31 manifest JSON '
+                         '(e.g. suite31_hw_manifest.json); defaults to '
+                         '<suite31-dir>/suite31_manifest.json')
+    ap.add_argument('--suite31-only', action='store_true',
+                    help='evaluate only the Suite31 manifest (skip gate20 '
+                         'sys-dev loop; test_pages_touched stays 0)')
+    ap.add_argument('--use-manifest-boxes', action='store_true',
+                    help='if blind staff grouping fails on a piece, fall back '
+                         'to manifest-supplied system_boxes (off by default)')
     ap.add_argument('--limit-systems', type=int, default=None,
                     help='smoke-test: cap sys-dev systems')
     ap.add_argument('--limit-pieces', type=int, default=None,
                     help='smoke-test: cap suite31 pieces')
+    ap.add_argument('--pieces', default=None,
+                    help='smoke-test: comma-separated suite31 piece slugs '
+                         'to evaluate (preserves manifest order)')
     args = ap.parse_args()
+    if args.suite31_only:
+        args.suite31 = True
     if args.hybrid:
         args.rectify = True
-        if not args.hybrid_cache:
+        if not args.hybrid_cache and not args.suite31_only:
             ap.error('--hybrid requires --hybrid-cache')
     assert args.max_len >= 564, 'max_len must cover sys-dev token_max 564'
 
@@ -349,10 +505,33 @@ def main():
     systems = sorted(manifest['systems'],
                      key=lambda s: (s['id'], s['sys_idx']))
 
-    extra = heat_features.EXTRA_CHANS if args.hybrid else 0
+    state = torch.load(args.ckpt, map_location='cpu', weights_only=True)
+    ckpt_extra = detect_ckpt_extra_chans(state)
+    if args.extra_chans is not None:
+        extra = int(args.extra_chans)
+    elif args.no_heatnet:
+        if args.hybrid or args.rectify:
+            extra = 1
+        elif ckpt_extra in (0, 1):
+            extra = ckpt_extra
+        else:
+            extra = 0
+    elif ckpt_extra is not None:
+        extra = ckpt_extra
+    else:
+        extra = heat_features.EXTRA_CHANS if args.hybrid else 0
+    if extra not in (0, 1, heat_features.EXTRA_CHANS):
+        raise SystemExit(
+            'unsupported extra_chans=%d (expected 0, 1, or %d)'
+            % (extra, heat_features.EXTRA_CHANS))
+    if args.no_heatnet and extra == heat_features.EXTRA_CHANS:
+        ap.error('--no-heatnet is incompatible with extra_chans=%d' % extra)
+    if extra > 0:
+        args.rectify = True
+    use_heatnet = (extra == heat_features.EXTRA_CHANS) and not args.no_heatnet
+
     net = model.MvdNet(vocab=len(data.VOCAB) + 3, anisotropic=True,
                        stride=args.stride, extra_chans=extra)
-    state = torch.load(args.ckpt, map_location='cpu', weights_only=True)
     try:
         # Compat loader (train.load_weights_compat): strict when shapes
         # match, aux-fresh for pre-S13b ckpts, stem/vocab transplants
@@ -373,7 +552,7 @@ def main():
         geom_index = load_geometry_index(args.hybrid_cache)
         print('geometry index: %d validated strips in %s'
               % (len(geom_index), args.hybrid_cache), flush=True)
-    if args.hybrid:
+    if use_heatnet:
         heat_net = heat_features.HeatNet(args.heat_pt, device=device)
         print('HeatNet: %s on %s' % (args.heat_pt, heat_net.device),
               flush=True)
@@ -385,7 +564,9 @@ def main():
     gate_sha = sha256_file(GATE20 / 'gate_manifest.json')
 
     sys_rows, page_groups = [], {}
-    if args.limit_systems:
+    if args.suite31_only:
+        systems = []
+    elif args.limit_systems:
         systems = systems[:args.limit_systems]
     for s in systems:
         for domain, key in (('clean', 'clean'), ('degraded', 'degraded')):
@@ -402,7 +583,8 @@ def main():
                         ilme_lambda=args.ilme_lambda,
                         lattice_repair=args.lattice_repair,
                         adapt_steps=args.adapt_steps,
-                        adapt_lr=args.adapt_lr, stride=args.stride)
+                        adapt_lr=args.adapt_lr, stride=args.stride,
+                        extra_chans=extra)
                 else:
                     dec = decode_system(net, img, args.height, args.max_len,
                                         args.beam, device, workdir,
@@ -423,6 +605,7 @@ def main():
                    'geom': dec.get('geom', 'legacy') if args.rectify else 'legacy',
                    'ref_tokens': s['tokens'],
                    'ntokens': dec['ntokens'], 'eos_miss': dec['eos_miss'],
+                   'loop_trimmed': bool(dec.get('loop_trimmed', False)),
                    'decode_secs': dec['decode_secs'],
                    'slice_fallback_page': s['id'] == 'sq8438915-5'}
             p = run_cli([ASER, 'bekern-decode', '--input', str(hyp_txt),
@@ -515,6 +698,10 @@ def main():
                 d.update({'ser': 1.0, 'f1': 0.0, 'f1_zeroed': True,
                           'f1_zero_reason': 'page-decode-failure',
                           'crashed_systems': crashed})
+                if not args.no_notation:
+                    d.update({'notation_f1': 0.0, 'notation_drift': 0.0,
+                              'notation_zeroed': True,
+                              'notation_zero_reason': 'page-decode-failure'})
             else:
                 sc = score_notes_pair(ref_notes, hyp_notes, workdir,
                                       '%s-%s-page' % (page_id, domain),
@@ -589,13 +776,17 @@ def main():
             [p['domains']['degraded'].get('ser') for p in page_rows]),
         'degraded_page_proxy_fixes_median': med(
             [p['domains']['degraded'].get('proxy_fixes') for p in page_rows]),
-        'degraded_mscz_valid_rate': sum(
-            1 for p in page_rows
-            if p['domains']['degraded'].get('mscz_valid')) / len(page_rows),
-        'clean_mscz_valid_rate': sum(
-            1 for p in page_rows
-            if p['domains']['clean'].get('mscz_valid')) / len(page_rows),
+        'degraded_mscz_valid_rate': (
+            sum(1 for p in page_rows
+                if p['domains']['degraded'].get('mscz_valid')) / len(page_rows)
+            if page_rows else None),
+        'clean_mscz_valid_rate': (
+            sum(1 for p in page_rows
+                if p['domains']['clean'].get('mscz_valid')) / len(page_rows)
+            if page_rows else None),
         'secs_per_page_median': med([p['secs_per_page'] for p in page_rows]),
+        'sysdev_loop_trimmed': sum(
+            1 for r in sys_rows if r.get('loop_trimmed')),
     }
     summary['gate2_pass'] = (
         summary['degraded_sys_ser_median'] is not None
@@ -616,26 +807,32 @@ def main():
                    'RowNet fallback, legacy on skip)')
     else:
         preproc = 'train.load_image (LANCZOS, ImageNet)'
-    if args.hybrid:
+    if extra == heat_features.EXTRA_CHANS:
         preproc += ' + HeatNet-7ch + staff-grid (11ch input)'
+        preproc += '; measure-fallback beam (T2.3)'
+    elif extra == 1:
+        preproc += ' + staff-grid (4ch input, no HeatNet)'
         preproc += '; measure-fallback beam (T2.3)'
     elif args.rectify:
         preproc += '; measure-fallback beam (T2.3)'
     suite31_rows, suite31_summary = [], {}
     if args.suite31:
         suite31_rows, suite31_summary = run_suite31(
-            args, net, heat_net, workdir, device)
+            args, net, heat_net, workdir, device, extra_chans=extra)
         summary.update(suite31_summary)
     report = {
         'gate': 'gate20-sys-v2',
         'gate_manifest_sha256': gate_sha,
         'test_pages_touched': 0,
+        'blind_photo': bool(args.blind_photo),
         'ckpt': args.ckpt,
         'ckpt_bytes': os.path.getsize(args.ckpt),
         'hybrid': {'enabled': args.hybrid,
                    'extra_chans': extra,
+                   'no_heatnet': not use_heatnet,
+                   'blind_photo': bool(args.blind_photo),
                    'hybrid_cache': args.hybrid_cache,
-                   'heat_pt': args.heat_pt if args.hybrid else None,
+                   'heat_pt': args.heat_pt if use_heatnet else None,
                    'rectify': args.rectify,
                    'suite31': args.suite31,
                    'suite31_dir': args.suite31_dir if args.suite31 else None},
@@ -749,57 +946,53 @@ def rect_staves_for(img_path, row):
 
 
 def rectified_input_tensor(img_path, staves, heat_net, device, height,
-                           hybrid):
-    """Rectified ``[1, C, H, W]`` model input (C=11 hybrid, C=3 plain).
+                           hybrid, extra_chans=None):
+    """Rectified ``[1, C, H, W]`` model input (C=11 hybrid, C=4 staff, C=3 RGB).
 
     No sidecar reads, no gate writes: rectify in memory via ``rectify.py``,
-    HeatNet 7-ch from the persistent session, staff grid from the
-    canonical reference channel.
+    optional HeatNet 7-ch from the persistent session, and optional staff
+    grid from the canonical reference channel.
     """
-    import torch
+    if extra_chans is None:
+        extra_chans = heat_features.EXTRA_CHANS if hybrid else 0
     img = Image.open(img_path).convert('RGB')
     rect_img, ref = rect_mod.rectify_system_strip(
         img, staves, target_sp=10.0, height=height)
-    arr = np.asarray(rect_img, dtype=np.float32) / 255.0
-    if hybrid:
-        rgb = train.standardize_rgb(
-            torch.from_numpy(arr).permute(2, 0, 1)).unsqueeze(0)
-        gray = torch.from_numpy(
-            (np.asarray(rect_img.convert('L'), dtype=np.float32)
-             / 255.0)).unsqueeze(0).unsqueeze(0)
-        staff = (ref > 0.5).float().unsqueeze(0)
-        with torch.no_grad():
-            heat7 = heat_net.probs(gray.to(device))
-        ten = torch.cat([rgb.to(device), heat7.float(),
-                         staff.to(device)], dim=1)
-    else:
-        ten = train.standardize_rgb(
-            torch.from_numpy(arr).permute(2, 0, 1)).unsqueeze(0).to(device)
-    return ten
+    return rectified_input_tensor_from_rect(
+        rect_img, ref, heat_net, device, extra_chans=extra_chans)
 
 
-def hybrid_extra_fn(heat_net, device):
-    """``measure_decode`` extra_fn: rectified RGB + HeatNet + staff grid."""
+def hybrid_extra_fn(heat_net, device, extra_chans=None):
+    """``measure_decode`` extra_fn for 3ch, 4ch (RGB+staff), or 11ch hybrid."""
     def _fn(rect_img, ref):
         return rectified_input_tensor_from_rect(
-            rect_img, ref, heat_net, device)
+            rect_img, ref, heat_net, device, extra_chans=extra_chans)
     return _fn
 
 
-def rectified_input_tensor_from_rect(rect_img, ref, heat_net, device):
+def rectified_input_tensor_from_rect(rect_img, ref, heat_net, device,
+                                     extra_chans=None):
     """Same as :func:`rectified_input_tensor` from an in-memory rectify."""
     import torch
+    if extra_chans is None:
+        extra_chans = (heat_features.EXTRA_CHANS
+                       if heat_net is not None else 0)
     arr = np.asarray(rect_img, dtype=np.float32) / 255.0
     rgb = train.standardize_rgb(
-        torch.from_numpy(arr).permute(2, 0, 1)).unsqueeze(0)
+        torch.from_numpy(arr).permute(2, 0, 1)).unsqueeze(0).to(device)
+    if extra_chans == 0:
+        return rgb
+    staff = (ref > 0.5).float().unsqueeze(0).to(device)
+    if staff.ndim == 3:
+        staff = staff.unsqueeze(1)
+    if extra_chans == 1:
+        return torch.cat([rgb, staff], dim=1)
     gray = torch.from_numpy(
         (np.asarray(rect_img.convert('L'), dtype=np.float32)
          / 255.0)).unsqueeze(0).unsqueeze(0)
-    staff = (ref > 0.5).float().unsqueeze(0)
     with torch.no_grad():
         heat7 = heat_net.probs(gray.to(device))
-    return torch.cat([rgb.to(device), heat7.float(),
-                      staff.to(device)], dim=1)
+    return torch.cat([rgb, heat7.float(), staff], dim=1)
 
 
 def write_hyp_bekern(workdir, stem, toks):
@@ -830,29 +1023,33 @@ def hyp_tokens_valid(toks):
 def decode_system_v2(net, img_path, row, heat_net, device, height, beam,
                      max_len, hybrid, workdir, stem, ink_eos_veto=False,
                      ilme_lambda=0.0, lattice_repair=False,
-                     adapt_steps=0, adapt_lr=0.1, stride='8x16'):
-    """T2.4 decode: rectified (+hybrid) input, measure-fallback beam search.
+                     adapt_steps=0, adapt_lr=0.1, stride='8x16',
+                     extra_chans=None):
+    """T2.4 decode: rectified (+hybrid/4ch) input, measure-fallback beam search.
 
     Geometry from the cache row (fallback: RowNet detect, then legacy
     ``train.load_image``). ``S > 4`` staves route through
     ``measure_decode.decode_multi_staff_system`` chunking. Returns the
-    same dict shape as :func:`decode_system` plus a ``geom`` source tag.
+    same dict shape as :func:`decode_system` plus a ``geom`` source tag
+    and ``loop_trimmed`` bool.
     Train/inference mask parity: the ``<= 4`` path builds the slot
     memory mask from the known staff count ``S`` (train-matched
     inactive-slot masking); the chunked path builds one per chunk.
     """
     import torch
+    if extra_chans is None:
+        extra_chans = heat_features.EXTRA_CHANS if hybrid else 0
     t0 = time.time()
     staves, geom = rect_staves_for(img_path, row)
     if staves is None:
-        if hybrid:
-            # No validated geometry and no detection: an 11ch net cannot
+        if extra_chans > 0:
+            # No validated geometry and no detection: a 4ch/11ch net cannot
             # consume a 3ch strip (and zero-filled extras would lie to
             # the gate), so record an explicit no-geometry zero.
             write_hyp_bekern(workdir, stem, [])
             return {'tokens': [], 'ntokens': 0, 'eos_miss': True,
                     'vocab_valid': True, 'decode_secs': 0.0,
-                    'geom': 'no-geometry'}
+                    'loop_trimmed': False, 'geom': 'no-geometry'}
         dec = decode_system(net, img_path, height, max_len, beam, device,
                             workdir, stem)
         dec['geom'] = 'legacy'
@@ -860,14 +1057,8 @@ def decode_system_v2(net, img_path, row, heat_net, device, height, beam,
     img = Image.open(img_path).convert('RGB')
     with torch.no_grad():
         if len(staves) > rect_mod.MAX_STAVES:
-            if hybrid:
-                extra = hybrid_extra_fn(heat_net, device)
-            else:
-                def extra(rect_img, _ref):
-                    arr = np.asarray(rect_img, dtype=np.float32) / 255.0
-                    return train.standardize_rgb(
-                        torch.from_numpy(arr).permute(2, 0, 1)
-                        ).unsqueeze(0).to(device)
+            extra = hybrid_extra_fn(heat_net, device,
+                                    extra_chans=extra_chans)
             toks = mdec.decode_multi_staff_system(
                 net, img, staves, beam=beam, extra_fn=extra,
                 ink_eos_veto=ink_eos_veto, ilme_lambda=ilme_lambda,
@@ -875,7 +1066,8 @@ def decode_system_v2(net, img_path, row, heat_net, device, height, beam,
                 adapt_lr=adapt_lr, stride=stride)
         else:
             ten = rectified_input_tensor(img_path, staves, heat_net,
-                                         device, height, hybrid)
+                                         device, height, hybrid,
+                                         extra_chans=extra_chans)
             toks = mdec.decode_system_with_measure_fallback(
                 net, ten, beam=beam,
                 mem_mask=mdec.mask_for_strip(
@@ -885,9 +1077,15 @@ def decode_system_v2(net, img_path, row, heat_net, device, height, beam,
                 adapt_lr=adapt_lr)
     secs = time.time() - t0
     valid = hyp_tokens_valid(toks)
+    loop_trimmed = False
+    if valid:
+        trimmed = trim_max_len_repeat_loop(toks, max_len=max_len)
+        loop_trimmed = len(trimmed) < len(toks)
+        toks = canonicalize_bekern_tail_order(trimmed)
     write_hyp_bekern(workdir, stem, toks if valid else [])
-    return {'tokens': toks if valid else [], 'ntokens': len(toks),
+    return {'tokens': toks if valid else [], 'ntokens': len(toks) if valid else 0,
             'eos_miss': False, 'vocab_valid': valid, 'decode_secs': secs,
+            'loop_trimmed': loop_trimmed,
             'geom': geom if len(staves) <= rect_mod.MAX_STAVES
             else geom + '+chunked'}
 
@@ -973,19 +1171,22 @@ def pad_staff_boxes(groups, space, w, h):
     return boxes
 
 
-def suite31_page_boxes(clean_path, photo_path, gt_path, s_ref=None):
+def suite31_page_boxes(clean_path, photo_path, gt_path, s_ref=None,
+                       blind_photo=False):
     """Visual system boxes for a suite31 piece (clean + photo).
 
     Tries the proven span-based grouping first (pieces whose GT carries
     print breaks); falls back to gap-rule visual grouping. Photo boxes
     prefer own-page detection (count-matched) else scaled clean boxes.
-    ``s_ref`` (reference header staff count) forwards to the gap-rule
-    fallback for both clean and photo detections. Returns
-    ``(clean_boxes, photo_boxes, box_source)``; ``None`` pieces are
-    skipped by the caller.
+    When ``blind_photo=True``, photo detection receives ``s_ref=None``,
+    does NOT require matching ``len(clean_boxes)``, and NEVER falls back
+    to scaled clean boxes (returns ``(clean_boxes, None, 'blind-miss')``
+    on failure).
+    Returns ``(clean_boxes, photo_boxes, box_source)``; ``None`` pieces
+    are skipped by the caller.
     """
-    import build_sys_data as bsd
-    cw, ch = Image.open(clean_path).size
+    with Image.open(clean_path) as im:
+        cw, ch = im.size
     clean_boxes = None
     try:
         spans = bgate.run_system_breaks(str(gt_path))
@@ -996,7 +1197,7 @@ def suite31_page_boxes(clean_path, photo_path, gt_path, s_ref=None):
         pass
     if clean_boxes is None:
         try:
-            staves, space = bsd.neural_detect_staves(str(clean_path))
+            staves, space = bgate.detect_staves_with_short_tail(str(clean_path))
         except (OSError, ValueError):
             return None
         groups = visual_system_groups(staves, space, s_ref=s_ref)
@@ -1005,16 +1206,21 @@ def suite31_page_boxes(clean_path, photo_path, gt_path, s_ref=None):
         clean_boxes = pad_staff_boxes(groups, space, cw, ch)
         if clean_boxes is None:
             return None
-    dw, dh = Image.open(photo_path).size
+    with Image.open(photo_path) as im:
+        dw, dh = im.size
+    photo_s_ref = None if blind_photo else s_ref
     try:
-        dstaves, dspace = bsd.neural_detect_staves(str(photo_path))
-        dgroups = visual_system_groups(dstaves, dspace, s_ref=s_ref)
-        if dgroups is not None and len(dgroups) == len(clean_boxes):
+        dstaves, dspace = bgate.detect_staves_with_short_tail(str(photo_path))
+        dgroups = visual_system_groups(dstaves, dspace, s_ref=photo_s_ref)
+        if dgroups is not None and (blind_photo
+                                    or len(dgroups) == len(clean_boxes)):
             deg_boxes = pad_staff_boxes(dgroups, dspace, dw, dh)
             if deg_boxes is not None:
                 return clean_boxes, deg_boxes, 'detected'
     except (OSError, ValueError):
         pass
+    if blind_photo:
+        return clean_boxes, None, 'blind-miss'
     sx, sy = dw / cw, dh / ch
     deg_boxes = []
     for b in clean_boxes:
@@ -1029,7 +1235,8 @@ def suite31_page_boxes(clean_path, photo_path, gt_path, s_ref=None):
 def decode_row_system(net, img_file, row, heat_net, device, height, beam,
                       max_len, hybrid, workdir, stem, ink_eos_veto=False,
                       ilme_lambda=0.0, lattice_repair=False,
-                      adapt_steps=0, adapt_lr=0.1, stride='8x16'):
+                      adapt_steps=0, adapt_lr=0.1, stride='8x16',
+                      extra_chans=None):
     """Decode one eval strip file with its geometry row (T2.4 shared tail)."""
     return decode_system_v2(net, img_file, row, heat_net, device, height,
                             beam, max_len, hybrid, workdir, stem,
@@ -1037,35 +1244,72 @@ def decode_row_system(net, img_file, row, heat_net, device, height, beam,
                             ilme_lambda=ilme_lambda,
                             lattice_repair=lattice_repair,
                             adapt_steps=adapt_steps,
-                            adapt_lr=adapt_lr, stride=stride)
+                            adapt_lr=adapt_lr, stride=stride,
+                            extra_chans=extra_chans)
 
 
-def run_suite31(args, net, heat_net, workdir, device):
+def run_suite31(args, net, heat_net, workdir, device, extra_chans=None):
     """Suite31 photo+clean page eval (T2.4): boxes, rectify, decode, stitch.
 
     Pages land in ``workdir`` crops only; ``suite31/`` is read-only.
     Multi-staff systems (5-7 staves) decode via T2.3 chunked merging.
     Returns ``(piece_rows, summary_dict)``.
     """
+    blind_photo = bool(getattr(args, 'blind_photo', False))
     suite = Path(args.suite31_dir)
-    manifest = json.loads((suite / 'suite31_manifest.json').read_text(
-        encoding='utf-8'))
-    pieces = manifest['pieces'][:args.limit_pieces or len(manifest['pieces'])]
+    manifest_path = (Path(args.suite31_manifest)
+                     if getattr(args, 'suite31_manifest', None)
+                     else (suite / 'suite31_manifest.json'))
+    manifest = json.loads(manifest_path.read_text(encoding='utf-8'))
+    pieces = manifest['pieces']
+    if getattr(args, 'pieces', None):
+        wanted = {s.strip() for s in args.pieces.split(',') if s.strip()}
+        pieces = [p for p in pieces if p['slug'] in wanted]
+    pieces = pieces[:args.limit_pieces or len(pieces)]
     piece_rows = []
+    clean_loop_trimmed = 0
+    photo_loop_trimmed = 0
     for piece in pieces:
         slug = piece['slug']
-        prow = {'piece': slug}
+        prow = {'piece': slug, 'handwritten': bool(piece.get('handwritten', False))}
         try:
             gt = suite / piece['gt']['file']
             clean = suite / piece['clean']['file']
             photo = suite / piece['photo']['file']
+            prepped_photo_img, prep_meta = page_prep.prep_page(photo)
+            photo_eval = workdir / ('s31-%s-photo-prepped.png' % slug)
+            prepped_photo_img.save(photo_eval)
+            prow['photo_prep_meta'] = {
+                'skew_deg': prep_meta['skew_deg'],
+                'border_crop_box': prep_meta['border_crop_box'],
+                'applied': prep_meta['applied'],
+            }
             ref_page_toks, page_ref_notes = suite31_page_refs(
                 gt, 's31-' + slug, workdir)
             ref_head, _ref_body = split_head_body(ref_page_toks)
             s_ref = sum(1 for _t in ref_head
                         if _t.startswith('clef-')) or None
-            got = suite31_page_boxes(str(clean), str(photo), str(gt),
-                                     s_ref=s_ref)
+            got = suite31_page_boxes(str(clean), str(photo_eval), str(gt),
+                                     s_ref=s_ref, blind_photo=blind_photo)
+            if (got is None and getattr(args, 'use_manifest_boxes', False)
+                    and piece.get('system_boxes')):
+                cboxes = piece['system_boxes']
+                if blind_photo:
+                    got = (cboxes, None, 'blind-miss')
+                else:
+                    with Image.open(clean) as im:
+                        cw, ch = im.size
+                    with Image.open(photo_eval) as im:
+                        dw, dh = im.size
+                    sx, sy = dw / cw, dh / ch
+                    dboxes = [
+                        [max(0, min(int(round(b[0] * sx)), dw - 1)),
+                         max(0, min(int(round(b[1] * sy)), dh - 1)),
+                         max(1, min(int(round(b[2] * sx)), dw)),
+                         max(1, min(int(round(b[3] * sy)), dh))]
+                        for b in cboxes
+                    ]
+                    got = (cboxes, dboxes, 'manifest-boxes')
             if got is None:
                 prow.update({'skipped': True,
                              'reason': 'system-grouping-ambiguous'})
@@ -1075,14 +1319,30 @@ def run_suite31(args, net, heat_net, workdir, device):
             clean_boxes, deg_boxes, deg_src = got
             for domain, page_img, boxes in (
                     ('clean', clean, clean_boxes),
-                    ('photo', photo, deg_boxes)):
+                    ('photo', photo_eval, deg_boxes)):
                 dskey = domain
+                if boxes is None:
+                    prow[dskey + '_f1'] = 0.0
+                    prow[dskey + '_ser'] = 1.0
+                    prow[dskey + '_zero_reason'] = deg_src
+                    prow[dskey + '_mod_f1'] = modifier_f1(ref_page_toks, [])
+                    prow[dskey + '_loop_trimmed'] = 0
+                    if not args.no_notation:
+                        prow[dskey + '_notation_f1'] = 0.0
+                        prow[dskey + '_notation_drift'] = 0.0
+                        prow[dskey + '_notation_zeroed'] = True
+                        prow[dskey + '_notation_zero_reason'] = deg_src
+                    print('%s [%s] f1=0.0000 ser=1.0000 (%s)' % (
+                        slug, domain, deg_src), flush=True)
+                    continue
                 hyps_toks = []
+                domain_trimmed = 0
                 for i, box in enumerate(boxes):
                     crop = workdir / ('s31-%s-s%d-%s.png' % (slug, i, domain))
                     bgate.crop_box(str(page_img), str(crop), box)
                     clean_name = 's31-%s-s%d-clean.png' % (slug, i)
-                    if domain == 'photo' and (workdir / clean_name).exists():
+                    if (domain == 'photo' and not blind_photo
+                            and (workdir / clean_name).exists()):
                         # Photo strips pair against the clean crop
                         # (written by the clean pass above) so
                         # mapped-refine transfers clean truth onto the
@@ -1112,7 +1372,8 @@ def run_suite31(args, net, heat_net, workdir, device):
                             ilme_lambda=args.ilme_lambda,
                             lattice_repair=args.lattice_repair,
                             adapt_steps=args.adapt_steps,
-                            adapt_lr=args.adapt_lr, stride=args.stride)
+                            adapt_lr=args.adapt_lr, stride=args.stride,
+                            extra_chans=extra_chans)
                     except Exception as e:  # noqa: BLE001 - record, continue
                         prow['%s_s%d_error' % (domain, i)] = (
                             'decode-crash: %s' % e)
@@ -1123,6 +1384,14 @@ def run_suite31(args, net, heat_net, workdir, device):
                     hyps_toks.append(ht)
                     prow['%s_s%d_ntok' % (domain, i)] = len(ht)
                     prow['%s_s%d_geom' % (domain, i)] = dec.get('geom')
+                    if dec.get('loop_trimmed'):
+                        prow['%s_s%d_loop_trimmed' % (domain, i)] = True
+                        domain_trimmed += 1
+                prow[dskey + '_loop_trimmed'] = domain_trimmed
+                if domain == 'clean':
+                    clean_loop_trimmed += domain_trimmed
+                else:
+                    photo_loop_trimmed += domain_trimmed
                 # stitch + score at page level
                 hyp_page = stitch_page_toks(hyps_toks)
                 hyp_txt = workdir / ('s31-%s-%s-page-hyp-bekern.txt'
@@ -1151,6 +1420,12 @@ def run_suite31(args, net, heat_net, workdir, device):
                         p.returncode)
                     prow[dskey + '_mod_f1'] = modifier_f1(
                         ref_page_toks, hyp_page)
+                    if not args.no_notation:
+                        prow[dskey + '_notation_f1'] = 0.0
+                        prow[dskey + '_notation_drift'] = 0.0
+                        prow[dskey + '_notation_zeroed'] = True
+                        prow[dskey + '_notation_zero_reason'] = (
+                            'page-decode-rc-%d' % p.returncode)
                 else:
                     sc = score_notes_pair(page_ref_notes, hyp_notes,
                                           workdir,
@@ -1186,36 +1461,58 @@ def run_suite31(args, net, heat_net, workdir, device):
         xs = [x for x in xs if x is not None]
         return sum(xs) / len(xs) if xs else None
 
+    scored_rows = [r for r in piece_rows if not r.get('skipped')]
     summary = {
         'n_pieces': len(pieces),
-        'n_scored': sum(1 for r in piece_rows if not r.get('skipped')),
+        'n_scored': len(scored_rows),
+        'blind_photo': blind_photo,
+        'blind_photo_detected_rate': (
+            sum(1 for r in scored_rows
+                if r.get('deg_box_source') == 'detected') / len(scored_rows)
+            if scored_rows else None),
+        'clean_loop_trimmed': clean_loop_trimmed,
+        'photo_loop_trimmed': photo_loop_trimmed,
         'suite31_photo_f1_mean': _mean(
-            [r.get('photo_f1') for r in piece_rows
-             if not r.get('skipped')]),
+            [r.get('photo_f1') for r in scored_rows]),
         'suite31_clean_f1_mean': _mean(
-            [r.get('clean_f1') for r in piece_rows
-             if not r.get('skipped')]),
+            [r.get('clean_f1') for r in scored_rows]),
         'suite31_photo_mod_f1_mean': _mean(
-            [r.get('photo_mod_f1') for r in piece_rows
-             if not r.get('skipped')]),
+            [r.get('photo_mod_f1') for r in scored_rows]),
         'suite31_clean_mod_f1_mean': _mean(
-            [r.get('clean_mod_f1') for r in piece_rows
-             if not r.get('skipped')]),
+            [r.get('clean_mod_f1') for r in scored_rows]),
         'suite31_photo_notation_f1_mean': _mean(
-            [r.get('photo_notation_f1') for r in piece_rows
-             if not r.get('skipped')]),
+            [r.get('photo_notation_f1') for r in scored_rows]),
         'suite31_clean_notation_f1_mean': _mean(
-            [r.get('clean_notation_f1') for r in piece_rows
-             if not r.get('skipped')]),
+            [r.get('clean_notation_f1') for r in scored_rows]),
         'suite31_photo_fixes_median': (
             statistics.median(
-                [r['photo_fixes'] for r in piece_rows
-                 if not r.get('skipped')
-                 and r.get('photo_fixes') is not None])
-            if any(not r.get('skipped')
-                   and r.get('photo_fixes') is not None
-                   for r in piece_rows) else None),
+                [r['photo_fixes'] for r in scored_rows
+                 if r.get('photo_fixes') is not None])
+            if any(r.get('photo_fixes') is not None
+                   for r in scored_rows) else None),
     }
+    hw_rows = [r for r in piece_rows if r.get('handwritten')]
+    if hw_rows:
+        hw_ok = [r for r in hw_rows if not r.get('skipped')]
+        summary.update({
+            'suite31_hw_n_pieces': len(hw_rows),
+            'suite31_hw_n_scored': len(hw_ok),
+            'suite31_hw_clean_f1_mean': _mean([r.get('clean_f1') for r in hw_ok]),
+            'suite31_hw_photo_f1_mean': _mean([r.get('photo_f1') for r in hw_ok]),
+            'suite31_hw_clean_notation_f1_mean': _mean([r.get('clean_notation_f1') for r in hw_ok]),
+            'suite31_hw_photo_notation_f1_mean': _mean([r.get('photo_notation_f1') for r in hw_ok]),
+        })
+        ts_rows = [r for r in piece_rows if not r.get('handwritten')]
+        if ts_rows:
+            ts_ok = [r for r in ts_rows if not r.get('skipped')]
+            summary.update({
+                'suite31_typeset_n_pieces': len(ts_rows),
+                'suite31_typeset_n_scored': len(ts_ok),
+                'suite31_typeset_clean_f1_mean': _mean([r.get('clean_f1') for r in ts_ok]),
+                'suite31_typeset_photo_f1_mean': _mean([r.get('photo_f1') for r in ts_ok]),
+                'suite31_typeset_clean_notation_f1_mean': _mean([r.get('clean_notation_f1') for r in ts_ok]),
+                'suite31_typeset_photo_notation_f1_mean': _mean([r.get('photo_notation_f1') for r in ts_ok]),
+            })
     return piece_rows, summary
 
 

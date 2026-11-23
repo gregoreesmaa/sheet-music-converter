@@ -360,5 +360,526 @@ class TestDecodeSystemV2KeepsStringHypotheses(unittest.TestCase):
             self.assertGreater(len(on_disk), 0)
 
 
+class TestCanonicalizeBekernTailOrder(unittest.TestCase):
+    """Regression tests for ryans-jig & airds-air page-decode-rc-1 crashes."""
+
+    def test_reorders_alter_and_dot_before_note_modifiers(self):
+        # Exact failing snippet from ryans-jig s1
+        ryans = (
+            'clef-G-2 key-2 time-2-4 voice-1 16th A 4 slur-stop stacc '
+            'a-1 dot slur-start bar'
+        ).split()
+        fixed = esg.canonicalize_bekern_tail_order(ryans)
+        self.assertEqual(
+            fixed,
+            'clef-G-2 key-2 time-2-4 voice-1 16th A 4 a-1 dot slur-stop '
+            'stacc slur-start bar'.split(),
+        )
+        # Exact failing snippet from airds-air s1
+        airds = (
+            'clef-G-2 key+1 time-6-8 voice-1 quarter G 5 slur-stop '
+            'stacc a1 bar'
+        ).split()
+        fixed_a = esg.canonicalize_bekern_tail_order(airds)
+        self.assertEqual(
+            fixed_a,
+            'clef-G-2 key+1 time-6-8 voice-1 quarter G 5 a1 slur-stop '
+            'stacc bar'.split(),
+        )
+
+    def test_already_canonical_stream_is_unchanged(self):
+        canon = (
+            'clef-G-2 key+0 time-4-4 voice-1 quarter C 4 a-1 dot '
+            'slur-start stacc tie-start rest eighth dot slur-stop bar'
+        ).split()
+        self.assertEqual(esg.canonicalize_bekern_tail_order(canon), canon)
+
+    def test_stitched_ryans_and_airds_snippets_decode_rc0(self):
+        if not ASER_EXE.exists():
+            self.skipTest('release binary missing: %s' % ASER_EXE)
+        stitched = esg.stitch_page_toks([
+            'clef-G-2 key-2 time-2-4 voice-1 16th A 4 slur-stop stacc a-1 dot slur-start bar'.split(),
+            'clef-G-2 key+1 time-6-8 voice-1 quarter G 5 slur-stop stacc a1 bar'.split(),
+        ])
+        with tempfile.TemporaryDirectory(prefix='t_canon_') as tmp:
+            txt = Path(tmp) / 'page.txt'
+            out = Path(tmp) / 'page.json'
+            txt.write_text(' '.join(stitched) + '\n', encoding='utf-8')
+            p = esg.run_cli([ASER_EXE, 'bekern-decode', '--input', str(txt),
+                             '--out', str(out)])
+            self.assertEqual(p.returncode, 0, p.stderr)
+            self.assertTrue(out.exists())
+
+
+class TestTrimMaxLenRepeatLoop(unittest.TestCase):
+    """Trim infinite verbatim repeating tail ONLY when strip hits max_len."""
+
+    def test_short_repeating_stream_untouched(self):
+        bar = ['voice-1', 'quarter', 'C', '4', 'quarter', 'D', '4', 'bar']
+        toks = ['clef-G-2', 'key+0', 'time-2-4'] + bar * 5
+        self.assertEqual(esg.trim_max_len_repeat_loop(toks, max_len=564), toks)
+
+    def test_max_len_non_repeating_stream_untouched(self):
+        import random
+        rng = random.Random(42)
+        toks = ['clef-G-2', 'key+0', 'time-4-4']
+        steps = ['A', 'B', 'C', 'D', 'E', 'F', 'G']
+        durs = ['quarter', 'eighth', 'half', '16th']
+        while len(toks) < 564:
+            toks.extend([rng.choice(durs), rng.choice(steps),
+                         str(rng.randint(3, 5))])
+        toks = toks[:564]
+        self.assertEqual(esg.trim_max_len_repeat_loop(toks, max_len=564), toks)
+
+    def test_max_len_verbatim_loop_trimmed_to_one_copy(self):
+        prefix = ['clef-G-2', 'key+0', 'time-4-4', 'voice-1', 'half', 'G', '4', 'bar']
+        loop_bar = ['voice-1', 'quarter', 'C', '4', 'quarter', 'E', '4',
+                    'quarter', 'G', '4', 'quarter', 'C', '5', 'bar']  # 14 toks
+        # Repeat until hitting 564 tokens (cut mid-bar at the end)
+        toks = list(prefix)
+        while len(toks) < 564:
+            toks.extend(loop_bar)
+        toks = toks[:564]
+        trimmed = esg.trim_max_len_repeat_loop(toks, max_len=564)
+        self.assertEqual(trimmed, prefix + loop_bar)
+
+
+class TestDetectShortTrailingStaves(unittest.TestCase):
+    """Recover short partial-width final systems without false positives."""
+
+    def test_recovers_short_20pct_final_staff(self):
+        import build_gate20_sys_dev as bgate
+        from PIL import ImageDraw
+        w, h, space = 1000, 1200, 17
+        img = Image.new('RGB', (w, h), (255, 255, 255))
+        d = ImageDraw.Draw(img)
+        full_staves = []
+        for idx, top in enumerate((180, 390, 600)):
+            for i in range(5):
+                y = top + i * space
+                d.line([(48, y), (950, y)], fill=(0, 0, 0), width=2)
+            full_staves.append({'x1': 48.0, 'y1': float(top),
+                                'x2': 950.0, 'y2': float(top + 4 * space)})
+        # Short 20% trailing staff at y=800
+        for i in range(5):
+            y = 800 + i * space
+            d.line([(48, y), (250, y)], fill=(0, 0, 0), width=2)
+        with tempfile.TemporaryDirectory(prefix='t_short_tail_') as tmp:
+            p = str(Path(tmp) / 'page.png')
+            img.save(p)
+            got = bgate.detect_short_trailing_staves(p, full_staves, float(space))
+        self.assertEqual(len(got), 4)
+        self.assertAlmostEqual(got[-1]['y1'], 800.0, delta=2.0)
+        self.assertLess(got[-1]['x2'], 300.0)
+
+    def test_ignores_dashed_text_footer_below_last_staff(self):
+        import build_gate20_sys_dev as bgate
+        from PIL import ImageDraw
+        w, h, space = 1000, 1200, 17
+        img = Image.new('RGB', (w, h), (255, 255, 255))
+        d = ImageDraw.Draw(img)
+        full_staves = []
+        for top in (180, 390, 600):
+            for i in range(5):
+                y = top + i * space
+                d.line([(48, y), (950, y)], fill=(0, 0, 0), width=2)
+            full_staves.append({'x1': 48.0, 'y1': float(top),
+                                'x2': 950.0, 'y2': float(top + 4 * space)})
+        # Dashed footer text (short glyphs with 10px gaps) at y=800..880
+        for i in range(5):
+            y = 800 + i * space
+            for x0 in range(50, 400, 20):
+                d.line([(x0, y), (x0 + 8, y)], fill=(0, 0, 0), width=2)
+        with tempfile.TemporaryDirectory(prefix='t_footer_') as tmp:
+            p = str(Path(tmp) / 'page.png')
+            img.save(p)
+            got = bgate.detect_short_trailing_staves(p, full_staves, float(space))
+        self.assertEqual(len(got), 3)
+
+
+def _make_suite31_fixture(root, slugs=('p1',)):
+    """Build a minimal synthetic suite31 directory + manifest for unit tests."""
+    import json
+    root.mkdir(parents=True, exist_ok=True)
+    pieces = []
+    for slug in slugs:
+        for sub in ('gt.musicxml', 'clean.png', 'photo.png'):
+            p = root / ('%s_%s' % (slug, sub))
+            if sub.endswith('.png'):
+                Image.new('RGB', (200, 300), (255, 255, 255)).save(p)
+            else:
+                p.write_text('<score-partwise/>', encoding='utf-8')
+        pieces.append({
+            'slug': slug,
+            'gt': {'file': '%s_gt.musicxml' % slug},
+            'clean': {'file': '%s_clean.png' % slug},
+            'photo': {'file': '%s_photo.png' % slug},
+        })
+    (root / 'suite31_manifest.json').write_text(
+        json.dumps({'pieces': pieces}), encoding='utf-8')
+    return root
+
+
+def _suite31_args(suite_dir, blind_photo=False, no_notation=False):
+    import types
+    return types.SimpleNamespace(
+        suite31_dir=str(suite_dir),
+        suite31_manifest=None,
+        pieces=None,
+        limit_pieces=None,
+        blind_photo=blind_photo,
+        use_manifest_boxes=False,
+        no_notation=no_notation,
+        height=256,
+        beam=3,
+        max_len=576,
+        hybrid=False,
+        ink_veto=False,
+        ilme_lambda=0.0,
+        lattice_repair=False,
+        adapt_steps=0,
+        adapt_lr=0.1,
+        stride='8x16',
+    )
+
+
+class TestNotationF1DecodeFailureZeroed(unittest.TestCase):
+    """Decode failure must set notation_f1=0.0 so _mean() never drops it."""
+
+    def test_bekern_decode_failure_zeros_notation_f1_in_mean(self):
+        with tempfile.TemporaryDirectory(prefix='t_notf1_') as tmp:
+            tmpd = Path(tmp)
+            suite = _make_suite31_fixture(tmpd / 'suite', slugs=('ok_p', 'fail_p'))
+            workdir = tmpd / 'work'
+            workdir.mkdir()
+            ref_toks = ['clef-G-2', 'key+0', 'time-4-4', 'quarter', 'C', '4', 'bar']
+            ref_notes = workdir / 'ref_notes.json'
+            ref_notes.write_text('{}', encoding='utf-8')
+
+            def fake_decode_row(net, img_file, row, heat_net, device, height,
+                                beam, max_len, hybrid, wd, stem, **kw):
+                esg.write_hyp_bekern(wd, stem, ref_toks)
+                return {'tokens': ref_toks, 'ntokens': len(ref_toks),
+                        'eos_miss': False, 'vocab_valid': True,
+                        'decode_secs': 0.01, 'loop_trimmed': False,
+                        'geom': 'test'}
+
+            def fake_run_cli(cmd, **kw):
+                out_idx = cmd.index('--out') + 1
+                out_path = Path(cmd[out_idx])
+                # Fail bekern-decode on fail_p photo only
+                if 'fail_p-photo-page-hyp-notes.json' in str(out_path):
+                    return mock.Mock(returncode=1, stderr='bad token')
+                out_path.write_text('{}', encoding='utf-8')
+                return mock.Mock(returncode=0, stderr='')
+
+            with mock.patch.object(esg.page_prep, 'prep_page',
+                                   side_effect=lambda p: (
+                                       Image.open(p).convert('RGB'),
+                                       {'skew_deg': 0.0, 'border_crop_box': None,
+                                        'applied': False})), \
+                 mock.patch.object(esg, 'suite31_page_refs',
+                                   return_value=(ref_toks, ref_notes)), \
+                 mock.patch.object(esg, 'suite31_page_boxes',
+                                   return_value=([[0, 0, 200, 100]],
+                                                 [[0, 0, 200, 100]], 'detected')), \
+                 mock.patch.object(esg.bhc, '_sysdev_one',
+                                   return_value=({'skip': True}, {'skip': True})), \
+                 mock.patch.object(esg, 'decode_row_system',
+                                   side_effect=fake_decode_row), \
+                 mock.patch.object(esg, 'run_cli', side_effect=fake_run_cli), \
+                 mock.patch.object(esg, 'score_notes_pair',
+                                   return_value={'f1': 0.8, 'ser': 0.2,
+                                                 'proxy_fixes': 2,
+                                                 'zeroed': False,
+                                                 'zero_reason': None}), \
+                 mock.patch.object(esg, 'score_notation_bekerns',
+                                   return_value={'notation_f1': 0.8,
+                                                 'notation_drift': 0.8,
+                                                 'notation_zeroed': False,
+                                                 'notation_zero_reason': None}):
+                rows, summary = esg.run_suite31(
+                    _suite31_args(suite, blind_photo=False, no_notation=False),
+                    None, None, workdir, 'cpu')
+
+            by_slug = {r['piece']: r for r in rows}
+            self.assertEqual(by_slug['fail_p']['photo_f1'], 0.0)
+            self.assertEqual(by_slug['fail_p']['photo_notation_f1'], 0.0)
+            self.assertTrue(by_slug['fail_p']['photo_notation_zeroed'])
+            # Average of 0.8 (ok_p) and 0.0 (fail_p) MUST be 0.4, NOT 0.8
+            self.assertAlmostEqual(summary['suite31_photo_notation_f1_mean'], 0.4)
+            self.assertAlmostEqual(summary['suite31_clean_notation_f1_mean'], 0.8)
+
+
+class TestBlindPhotoMode(unittest.TestCase):
+    """--blind-photo: no s_ref, no scaled clean fallback, no clean-crop pairing."""
+
+    def test_blind_photo_boxes_never_use_s_ref_or_scaled_fallback(self):
+        # 4 staves evenly spaced: s_ref=2 would chunk into 2 groups,
+        # whereas s_ref=None (factor=3.5) keeps all 4 in 1 group.
+        staves = [{'x1': 0.0, 'y1': float(i * 52), 'x2': 100.0,
+                   'y2': float(i * 52 + 40)} for i in range(4)]
+        with tempfile.TemporaryDirectory(prefix='t_blind_box_') as tmp:
+            clean = Path(tmp) / 'clean.png'
+            photo = Path(tmp) / 'photo.png'
+            Image.new('RGB', (200, 300), (255, 255, 255)).save(clean)
+            Image.new('RGB', (200, 300), (255, 255, 255)).save(photo)
+
+            # Case 1: photo detection succeeds -> s_ref is NOT applied to photo,
+            # and mismatched count vs clean_boxes still returns 'detected'.
+            with mock.patch.object(esg.bgate, 'run_system_breaks',
+                                   side_effect=RuntimeError('no spans')), \
+                 mock.patch.object(esg.bgate, 'detect_staves_with_short_tail',
+                                   return_value=(staves, 8.0)):
+                got = esg.suite31_page_boxes(
+                    str(clean), str(photo), 'dummy.musicxml',
+                    s_ref=2, blind_photo=True)
+            self.assertIsNotNone(got)
+            clean_boxes, deg_boxes, src = got
+            self.assertEqual(len(clean_boxes), 2)
+            self.assertEqual(len(deg_boxes), 1)
+            self.assertEqual(src, 'detected')
+
+            # Case 2: photo detection fails -> returns (clean_boxes, None, 'blind-miss'),
+            # NEVER 'scaled'.
+            def detect_clean_only(path):
+                if 'photo' in path:
+                    raise ValueError('no staves on photo')
+                return staves, 8.0
+
+            with mock.patch.object(esg.bgate, 'run_system_breaks',
+                                   side_effect=RuntimeError('no spans')), \
+                 mock.patch.object(esg.bgate, 'detect_staves_with_short_tail',
+                                   side_effect=detect_clean_only):
+                got_miss = esg.suite31_page_boxes(
+                    str(clean), str(photo), 'dummy.musicxml',
+                    s_ref=2, blind_photo=True)
+            self.assertIsNotNone(got_miss)
+            self.assertEqual(len(got_miss[0]), 2)
+            self.assertIsNone(got_miss[1])
+            self.assertEqual(got_miss[2], 'blind-miss')
+
+    def test_blind_photo_run_suite31_scores_miss_zero_and_never_pairs_clean(self):
+        with tempfile.TemporaryDirectory(prefix='t_blind_run_') as tmp:
+            tmpd = Path(tmp)
+            suite = _make_suite31_fixture(tmpd / 'suite', slugs=('hit', 'miss'))
+            workdir = tmpd / 'work'
+            workdir.mkdir()
+            ref_toks = ['clef-G-2', 'key+0', 'time-4-4', 'quarter', 'C', '4', 'bar']
+            ref_notes = workdir / 'ref_notes.json'
+            ref_notes.write_text('{}', encoding='utf-8')
+            sysdev_calls = []
+
+            def fake_boxes(cpath, ppath, gtpath, s_ref=None, blind_photo=False):
+                self.assertTrue(blind_photo)
+                if 'miss' in cpath:
+                    return [[0, 0, 200, 100]], None, 'blind-miss'
+                return [[0, 0, 200, 100]], [[0, 0, 200, 100]], 'detected'
+
+            def fake_sysdev_one(arg):
+                _wd, s = arg
+                sysdev_calls.append(dict(s))
+                return {'skip': True}, {'skip': True}
+
+            def fake_decode_row(net, img_file, row, heat_net, device, height,
+                                beam, max_len, hybrid, wd, stem, **kw):
+                esg.write_hyp_bekern(wd, stem, ref_toks)
+                return {'tokens': ref_toks, 'ntokens': len(ref_toks),
+                        'eos_miss': False, 'vocab_valid': True,
+                        'decode_secs': 0.01, 'loop_trimmed': False,
+                        'geom': 'test'}
+
+            def fake_run_cli(cmd, **kw):
+                out_path = Path(cmd[cmd.index('--out') + 1])
+                out_path.write_text('{}', encoding='utf-8')
+                return mock.Mock(returncode=0, stderr='')
+
+            with mock.patch.object(esg.page_prep, 'prep_page',
+                                   side_effect=lambda p: (
+                                       Image.open(p).convert('RGB'),
+                                       {'skew_deg': 0.0, 'border_crop_box': None,
+                                        'applied': False})), \
+                 mock.patch.object(esg, 'suite31_page_refs',
+                                   return_value=(ref_toks, ref_notes)), \
+                 mock.patch.object(esg, 'suite31_page_boxes',
+                                   side_effect=fake_boxes), \
+                 mock.patch.object(esg.bhc, '_sysdev_one',
+                                   side_effect=fake_sysdev_one), \
+                 mock.patch.object(esg, 'decode_row_system',
+                                   side_effect=fake_decode_row), \
+                 mock.patch.object(esg, 'run_cli', side_effect=fake_run_cli), \
+                 mock.patch.object(esg, 'score_notes_pair',
+                                   return_value={'f1': 0.9, 'ser': 0.1,
+                                                 'proxy_fixes': 1,
+                                                 'zeroed': False,
+                                                 'zero_reason': None}), \
+                 mock.patch.object(esg, 'score_notation_bekerns',
+                                   return_value={'notation_f1': 0.9,
+                                                 'notation_drift': 0.9,
+                                                 'notation_zeroed': False,
+                                                 'notation_zero_reason': None}):
+                rows, summary = esg.run_suite31(
+                    _suite31_args(suite, blind_photo=True, no_notation=False),
+                    None, None, workdir, 'cpu')
+
+            by_slug = {r['piece']: r for r in rows}
+            # 'miss' is scored (not skipped) with photo=0.0 and deg_box_source='blind-miss'
+            self.assertFalse(by_slug['miss'].get('skipped'))
+            self.assertEqual(by_slug['miss']['deg_box_source'], 'blind-miss')
+            self.assertEqual(by_slug['miss']['photo_f1'], 0.0)
+            self.assertEqual(by_slug['miss']['photo_notation_f1'], 0.0)
+            self.assertAlmostEqual(summary['blind_photo_detected_rate'], 0.5)
+            self.assertAlmostEqual(summary['suite31_photo_f1_mean'], 0.45)
+            self.assertAlmostEqual(summary['suite31_photo_notation_f1_mean'], 0.45)
+            # Photo strip in 'hit' MUST be paired with itself, never clean crop
+            photo_calls = [c for c in sysdev_calls if 'photo' in c['degraded']]
+            self.assertEqual(len(photo_calls), 1)
+            self.assertEqual(photo_calls[0]['clean'], photo_calls[0]['degraded'])
+
+
+class TestLoopTrimmedTracking(unittest.TestCase):
+    """Repeat-loop trimming must be counted in decode_system_v2 and summary."""
+
+    def test_decode_system_v2_sets_loop_trimmed_flag(self):
+        prefix = ['clef-G-2', 'key+0', 'time-4-4', 'voice-1', 'half', 'G', '4', 'bar']
+        loop_bar = ['voice-1', 'quarter', 'C', '4', 'quarter', 'E', '4',
+                    'quarter', 'G', '4', 'quarter', 'C', '5', 'bar']
+        toks = list(prefix)
+        while len(toks) < 564:
+            toks.extend(loop_bar)
+        toks = toks[:564]
+        with tempfile.TemporaryDirectory(prefix='t_loop_v2_') as tmp:
+            tmpd = Path(tmp)
+            img_path = tmpd / 'strip.png'
+            Image.new('RGB', (64, 64), (255, 255, 255)).save(img_path)
+            staves = [[50.0, 60.0, 70.0, 80.0, 90.0]]
+            with mock.patch.object(esg, 'rect_staves_for',
+                                   return_value=(staves, 'test')), \
+                 mock.patch.object(esg, 'rectified_input_tensor',
+                                   return_value=torch.zeros(1, 3, 256, 64)), \
+                 mock.patch.object(esg.mdec, 'decode_system_with_measure_fallback',
+                                   return_value=toks):
+                dec = esg.decode_system_v2(
+                    None, str(img_path), {'img': 'strip.png'}, None,
+                    'cpu', 256, 3, 576, False, tmpd, 'strip-hyp')
+            self.assertTrue(dec['loop_trimmed'])
+            self.assertEqual(dec['tokens'], prefix + loop_bar)
+
+            with mock.patch.object(esg, 'rect_staves_for',
+                                   return_value=(staves, 'test')), \
+                 mock.patch.object(esg, 'rectified_input_tensor',
+                                   return_value=torch.zeros(1, 3, 256, 64)), \
+                 mock.patch.object(esg.mdec, 'decode_system_with_measure_fallback',
+                                   return_value=prefix):
+                dec2 = esg.decode_system_v2(
+                    None, str(img_path), {'img': 'strip.png'}, None,
+                    'cpu', 256, 3, 576, False, tmpd, 'strip-hyp2')
+            self.assertFalse(dec2['loop_trimmed'])
+
+    def test_run_suite31_counts_clean_and_photo_loop_trimmed(self):
+        with tempfile.TemporaryDirectory(prefix='t_loop_s31_') as tmp:
+            tmpd = Path(tmp)
+            suite = _make_suite31_fixture(tmpd / 'suite', slugs=('p1',))
+            workdir = tmpd / 'work'
+            workdir.mkdir()
+            ref_toks = ['clef-G-2', 'key+0', 'time-4-4', 'quarter', 'C', '4', 'bar']
+            ref_notes = workdir / 'ref_notes.json'
+            ref_notes.write_text('{}', encoding='utf-8')
+
+            def fake_decode_row(net, img_file, row, heat_net, device, height,
+                                beam, max_len, hybrid, wd, stem, **kw):
+                esg.write_hyp_bekern(wd, stem, ref_toks)
+                is_photo = '-photo-' in stem
+                return {'tokens': ref_toks, 'ntokens': len(ref_toks),
+                        'eos_miss': False, 'vocab_valid': True,
+                        'decode_secs': 0.01, 'loop_trimmed': is_photo,
+                        'geom': 'test'}
+
+            def fake_run_cli(cmd, **kw):
+                out_path = Path(cmd[cmd.index('--out') + 1])
+                out_path.write_text('{}', encoding='utf-8')
+                return mock.Mock(returncode=0, stderr='')
+
+            with mock.patch.object(esg.page_prep, 'prep_page',
+                                   side_effect=lambda p: (
+                                       Image.open(p).convert('RGB'),
+                                       {'skew_deg': 0.0, 'border_crop_box': None,
+                                        'applied': False})), \
+                 mock.patch.object(esg, 'suite31_page_refs',
+                                   return_value=(ref_toks, ref_notes)), \
+                 mock.patch.object(esg, 'suite31_page_boxes',
+                                   return_value=([[0, 0, 200, 100]],
+                                                 [[0, 0, 200, 100], [0, 100, 200, 200]],
+                                                 'detected')), \
+                 mock.patch.object(esg.bhc, '_sysdev_one',
+                                   return_value=({'skip': True}, {'skip': True})), \
+                 mock.patch.object(esg, 'decode_row_system',
+                                   side_effect=fake_decode_row), \
+                 mock.patch.object(esg, 'run_cli', side_effect=fake_run_cli), \
+                 mock.patch.object(esg, 'score_notes_pair',
+                                   return_value={'f1': 1.0, 'ser': 0.0,
+                                                 'proxy_fixes': 0,
+                                                 'zeroed': False,
+                                                 'zero_reason': None}), \
+                 mock.patch.object(esg, 'score_notation_bekerns',
+                                   return_value={'notation_f1': 1.0,
+                                                 'notation_drift': 1.0,
+                                                 'notation_zeroed': False,
+                                                 'notation_zero_reason': None}):
+                _rows, summary = esg.run_suite31(
+                    _suite31_args(suite, blind_photo=True, no_notation=False),
+                    None, None, workdir, 'cpu')
+            self.assertEqual(summary['clean_loop_trimmed'], 0)
+            self.assertEqual(summary['photo_loop_trimmed'], 2)
+
+
+class TestExtraChans4chAnd3ch(unittest.TestCase):
+    """Support 4ch (RGB+staff, no HeatNet) and 3ch (RGB) checkpoints."""
+
+    def test_detect_ckpt_extra_chans(self):
+        self.assertEqual(
+            esg.detect_ckpt_extra_chans({'encoder.0.0.weight': torch.zeros(96, 3, 4, 4)}),
+            0)
+        self.assertEqual(
+            esg.detect_ckpt_extra_chans({'encoder.0.0.weight': torch.zeros(96, 4, 4, 4)}),
+            1)
+        self.assertEqual(
+            esg.detect_ckpt_extra_chans({'encoder.0.0.weight': torch.zeros(96, 11, 4, 4)}),
+            8)
+        self.assertIsNone(esg.detect_ckpt_extra_chans({}))
+
+    def test_rectified_input_tensor_4ch_and_3ch_without_heatnet(self):
+        rect_img = Image.new('RGB', (64, 32), (200, 200, 200))
+        ref = torch.zeros(1, 32, 64)
+        ref[0, 10, :] = 1.0
+
+        ten4 = esg.rectified_input_tensor_from_rect(
+            rect_img, ref, heat_net=None, device='cpu', extra_chans=1)
+        self.assertEqual(tuple(ten4.shape), (1, 4, 32, 64))
+        self.assertEqual(float(ten4[0, 3, 10, 0]), 1.0)
+        self.assertEqual(float(ten4[0, 3, 0, 0]), 0.0)
+
+        ten3 = esg.rectified_input_tensor_from_rect(
+            rect_img, ref, heat_net=None, device='cpu', extra_chans=0)
+        self.assertEqual(tuple(ten3.shape), (1, 3, 32, 64))
+
+        fn4 = esg.hybrid_extra_fn(None, 'cpu', extra_chans=1)
+        self.assertEqual(tuple(fn4(rect_img, ref).shape), (1, 4, 32, 64))
+
+    def test_decode_system_v2_4ch_no_geometry_returns_zero(self):
+        with tempfile.TemporaryDirectory(prefix='t_4ch_nogeom_') as tmp:
+            tmpd = Path(tmp)
+            img_path = tmpd / 'strip.png'
+            Image.new('RGB', (64, 64), (255, 255, 255)).save(img_path)
+            with mock.patch.object(esg, 'rect_staves_for',
+                                   return_value=(None, 'legacy')):
+                dec = esg.decode_system_v2(
+                    None, str(img_path), None, None, 'cpu', 256, 3, 576,
+                    False, tmpd, 'strip-4ch', extra_chans=1)
+            self.assertEqual(dec['geom'], 'no-geometry')
+            self.assertEqual(dec['ntokens'], 0)
+            self.assertFalse(dec['loop_trimmed'])
+
+
 if __name__ == '__main__':
     unittest.main()

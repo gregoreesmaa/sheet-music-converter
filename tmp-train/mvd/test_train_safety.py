@@ -576,5 +576,136 @@ class TestBatchWidthGuard(unittest.TestCase):
         self.assertFalse(train.batch_too_wide(2288))
         self.assertFalse(train.batch_too_wide(0))
 
+
+class TestWarmStartStemSlicing(unittest.TestCase):
+    """Warm-start stem-slicing (11->4 RGB+staff and 11->3 RGB-only) + aux/foveal compat."""
+
+    def test_slice_11ch_to_4ch_copies_rgb_and_staff_skips_mismatched_aux(self):
+        import torch
+        import data
+        import model
+        v = len(data.VOCAB) + 3
+        torch.manual_seed(11)
+        src = model.MvdNet(vocab=v, d_model=64, layers=1, heads=4,
+                           dim_ff=128, extra_chans=8)
+        dst = model.MvdNet(vocab=v, d_model=64, layers=1, heads=4,
+                           dim_ff=128, extra_chans=1, foveal_tap=True)
+        src_sd = src.state_dict()
+        how = train.load_weights_compat(dst, src_sd)
+        self.assertIn('stem-slice-11to4', how)
+        self.assertIn('foveal-fresh', how)
+        got = dst.state_dict()
+        # RGB [:3] and canonical staff grid [10:11] -> [3:4] exact copy.
+        self.assertTrue(torch.equal(
+            got['encoder.0.0.weight'][:, :3],
+            src_sd['encoder.0.0.weight'][:, :3]))
+        self.assertTrue(torch.equal(
+            got['encoder.0.0.weight'][:, 3:4],
+            src_sd['encoder.0.0.weight'][:, 10:11]))
+        self.assertTrue(torch.equal(
+            got['encoder.0.0.bias'], src_sd['encoder.0.0.bias']))
+        # Trunk/decoder weights copied verbatim.
+        self.assertTrue(torch.equal(got['proj.weight'], src_sd['proj.weight']))
+        self.assertTrue(torch.equal(got['out.weight'], src_sd['out.weight']))
+        # aux_head.2 has 1 ch on dst vs 8 ch on src -> gracefully skipped.
+        self.assertEqual(tuple(got['aux_head.2.weight'].shape), (1, 128, 1, 1))
+        # foveal_proj final conv stays zero-init for bit-identical step-0.
+        self.assertTrue(bool((got['foveal_proj.2.weight'] == 0).all()))
+
+    def test_slice_11ch_to_3ch_copies_rgb_and_handles_missing_aux(self):
+        import torch
+        import data
+        import model
+        v = len(data.VOCAB) + 3
+        torch.manual_seed(12)
+        src = model.MvdNet(vocab=v, d_model=64, layers=1, heads=4,
+                           dim_ff=128, extra_chans=8)
+        dst = model.MvdNet(vocab=v, d_model=64, layers=1, heads=4,
+                           dim_ff=128, extra_chans=0)
+        src_sd = src.state_dict()
+        how = train.load_weights_compat(dst, src_sd)
+        self.assertIn('stem-slice-11to3', how)
+        got = dst.state_dict()
+        self.assertTrue(torch.equal(
+            got['encoder.0.0.weight'], src_sd['encoder.0.0.weight'][:, :3]))
+        self.assertTrue(torch.equal(
+            got['encoder.0.0.bias'], src_sd['encoder.0.0.bias']))
+        self.assertTrue(torch.equal(got['out.weight'], src_sd['out.weight']))
+
+
+class TestFourChannelNoHeatnet(unittest.TestCase):
+    """extra_chans=1 4-ch assembly/forward without HeatNet + shared hidden/logits."""
+
+    def test_assemble_and_forward_4ch_without_heatnet(self):
+        import torch
+        import data
+        import model
+        torch.manual_seed(7)
+        rgb = torch.randn(2, 3, 64, 128)
+        staff = torch.randint(0, 2, (2, 1, 64, 128)).float()
+        imgs = train.assemble_hybrid_batch(None, rgb, None, staff)
+        self.assertEqual(tuple(imgs.shape), (2, 4, 64, 128))
+        self.assertTrue(torch.equal(imgs[:, :3], rgb))
+        self.assertTrue(torch.equal(imgs[:, 3:4], staff))
+
+        v = len(data.VOCAB) + 3
+        net = model.MvdNet(vocab=v, d_model=64, layers=1, heads=4,
+                           dim_ff=128, extra_chans=1, foveal_tap=True)
+        tgt = torch.randint(0, len(data.VOCAB), (2, 10), dtype=torch.long)
+        ce, ap, xc, h, logits = net.loss_shared(
+            imgs, tgt, need_aux=False, need_coord=False,
+            return_hidden=True, return_logits=True)
+        self.assertIsNone(ap)
+        self.assertIsNone(xc)
+        self.assertTrue(bool(torch.isfinite(ce)))
+        self.assertEqual(tuple(h.shape), (2, 10, 64))
+        self.assertEqual(tuple(logits.shape), (2, 10, v))
+        self.assertTrue(torch.allclose(net.out(h), logits, atol=1e-6))
+
+        # beam_search pads with pad_id (never bos_id = eos_id - 1).
+        beams = net.beam_search(imgs, max_len=6, beam=2, constrain=False)
+        self.assertEqual(beams.shape[0], 2)
+        self.assertFalse(bool((beams == net.bos_id).any()))
+
+
+class TestNewFlagsLegacyResume(unittest.TestCase):
+    """New flags must be in META_KEYS, RESUME_KEYS, and LEGACY_DEFAULTS."""
+
+    NEW_DEFAULTS = {
+        'foveal_tap': False,
+        'optics_profile': 'default',
+        'jsd_weight': 0.0,
+        'jsd_every': 4,
+        'no_heatnet': False,
+    }
+
+    def test_old_meta_without_new_keys_resumes_at_defaults_and_refuses_nondefault(self):
+        for k, v in self.NEW_DEFAULTS.items():
+            self.assertIn(k, train.META_KEYS, k)
+            self.assertIn(k, train.RESUME_KEYS, k)
+            self.assertIn(k, train.LEGACY_DEFAULTS, k)
+            self.assertEqual(train.LEGACY_DEFAULTS[k], v, k)
+
+        base = {k: 'v-%s' % k for k in train.RESUME_KEYS}
+        base.update(train.LEGACY_DEFAULTS)
+        old = {k: v for k, v in base.items() if k not in self.NEW_DEFAULTS}
+        with tempfile.TemporaryDirectory() as d:
+            out = Path(d)
+            (out / 'meta.json').write_text(json.dumps(old), encoding='utf-8')
+            self.assertIsNone(train.check_resume(str(out), dict(base)))
+
+            # Any non-default value must be refused.
+            for k, bad_val in (('foveal_tap', True),
+                               ('optics_profile', 'calibrated'),
+                               ('jsd_weight', 0.2),
+                               ('jsd_every', 2),
+                               ('no_heatnet', True)):
+                with self.subTest(key=k):
+                    mut = dict(base)
+                    mut[k] = bad_val
+                    msg = train.check_resume(str(out), mut)
+                    self.assertIsNotNone(msg)
+                    self.assertIn(repr(k), msg)
+
 if __name__ == '__main__':
     unittest.main()

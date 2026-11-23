@@ -1,0 +1,2803 @@
+{
+ "suite": "suite31+hw",
+ "generated_by": "tmp-train/mvd/build_real_hw_suite.py",
+ "pieces_expected": 36,
+ "sources": {
+  "clean_root": "C:\\Users\\grego\\AppData\\Local\\Temp\\ours",
+  "photo_root": "C:\\Users\\grego\\AppData\\Local\\Temp\\oursph",
+  "gt_root": "C:\\Users\\grego\\AppData\\Local\\Temp\\omrleg",
+  "bundle_root": "C:\\Users\\grego\\AppData\\Local\\Temp\\sheetly\\bundle\\bundle"
+ },
+ "bundle_files": {
+  "manifest.json": {
+   "file": "manifest.json",
+   "sha256": "7814fb6aae1af26c18ea334d259df19fa747e03818b683296345ba438e283972"
+  },
+  "benchmark-results.json": {
+   "file": "benchmark-results.json",
+   "sha256": "a428314b5c63918abf566a7fb78c1c8d54be93b87918b0223b387cba17637cc0"
+  }
+ },
+ "pieces": [
+  {
+   "slug": "repeats-melody",
+   "p1_measures": 16,
+   "clean": {
+    "file": "clean/repeats-melody.png",
+    "sha256": "70968b5078b4ada5758e85951ee4ce03e821a6d803e6596713502fcd70740ca2",
+    "bytes": 46617
+   },
+   "photo": {
+    "file": "photo/repeats-melody.png",
+    "sha256": "497262498ba28027a36b3a0f4c30332a13c0362909157103673e7d0e36fe136d",
+    "bytes": 62588
+   },
+   "gt": {
+    "file": "gt/gt-p1-repeats-melody.musicxml",
+    "sha256": "c685091618f54e06d0aa4151593a4b962fa0d90141510d41de99a44536141cdc",
+    "bytes": 26878
+   },
+   "reference": {
+    "clean": {
+     "slug": "repeats-melody",
+     "description": "monophonic melody with ||: :|| and 1st/2nd endings",
+     "gt_notes": 103,
+     "sheetly": 1.0,
+     "audiveris": 0.975,
+     "oemer": 0.748,
+     "sheetly_detail": {
+      "strict_precision": 1.0,
+      "strict_recall": 1.0,
+      "note_f1": 1.0,
+      "staff_acc": 1.0,
+      "spell_acc": 1.0,
+      "measure_exact": 1.0,
+      "omr_notes": 103
+     },
+     "audiveris_detail": {
+      "strict_precision": 1.0,
+      "strict_recall": 0.951,
+      "note_f1": 0.975,
+      "staff_acc": 1.0,
+      "spell_acc": 1.0,
+      "measure_exact": 0.938,
+      "omr_notes": 98
+     },
+     "oemer_detail": {
+      "strict_precision": 0.748,
+      "strict_recall": 0.748,
+      "note_f1": 1.0,
+      "staff_acc": 1.0,
+      "spell_acc": 1.0,
+      "measure_exact": 0.125,
+      "omr_notes": 103
+     }
+    },
+    "photo": {
+     "slug": "repeats-melody",
+     "gt_notes": 103,
+     "sheetly": 1.0,
+     "audiveris": 0.975,
+     "oemer": null,
+     "sheetly_detail": {
+      "strict_precision": 1.0,
+      "strict_recall": 1.0,
+      "note_f1": 1.0,
+      "staff_acc": 1.0,
+      "spell_acc": 1.0,
+      "measure_exact": 1.0,
+      "omr_notes": 103
+     },
+     "audiveris_detail": {
+      "strict_precision": 1.0,
+      "strict_recall": 0.951,
+      "note_f1": 0.975,
+      "staff_acc": 1.0,
+      "spell_acc": 1.0,
+      "measure_exact": 0.938,
+      "omr_notes": 98
+     }
+    }
+   }
+  },
+  {
+   "slug": "fiddle-strathspey",
+   "p1_measures": 27,
+   "clean": {
+    "file": "clean/fiddle-strathspey.png",
+    "sha256": "cbfce22b78c157531d0598d69c5e05cee34429cfcb465343f1a292cd6f54d067",
+    "bytes": 66159
+   },
+   "photo": {
+    "file": "photo/fiddle-strathspey.png",
+    "sha256": "a7095dc49294cf241f5d7bb0ec6f04269aedf65d89b49e40180d60c591398586",
+    "bytes": 89559
+   },
+   "gt": {
+    "file": "gt/gt-p1-fiddle-strathspey.musicxml",
+    "sha256": "75c043aa21712eb5945f3edb03727aa08bf3fb5b124d5ce7b75fd9c90c749ef8",
+    "bytes": 65558
+   },
+   "reference": {
+    "clean": {
+     "slug": "fiddle-strathspey",
+     "description": "fiddle tune with repeat barlines",
+     "gt_notes": 192,
+     "sheetly": 0.927,
+     "audiveris": 0.822,
+     "oemer": 0.611,
+     "sheetly_detail": {
+      "strict_precision": 0.927,
+      "strict_recall": 0.927,
+      "note_f1": 1.0,
+      "staff_acc": 1.0,
+      "spell_acc": 1.0,
+      "measure_exact": 0.889,
+      "omr_notes": 192
+     },
+     "audiveris_detail": {
+      "strict_precision": 0.826,
+      "strict_recall": 0.818,
+      "note_f1": 0.984,
+      "staff_acc": 1.0,
+      "spell_acc": 1.0,
+      "measure_exact": 0.778,
+      "omr_notes": 190
+     },
+     "oemer_detail": {
+      "strict_precision": 0.608,
+      "strict_recall": 0.615,
+      "note_f1": 0.995,
+      "staff_acc": 1.0,
+      "spell_acc": 1.0,
+      "measure_exact": 0.37,
+      "omr_notes": 194
+     }
+    },
+    "photo": {
+     "slug": "fiddle-strathspey",
+     "gt_notes": 192,
+     "sheetly": 1.0,
+     "audiveris": 0.278,
+     "oemer": 0.005,
+     "sheetly_detail": {
+      "strict_precision": 1.0,
+      "strict_recall": 1.0,
+      "note_f1": 1.0,
+      "staff_acc": 1.0,
+      "spell_acc": 1.0,
+      "measure_exact": 1.0,
+      "omr_notes": 192
+     },
+     "audiveris_detail": {
+      "strict_precision": 1.0,
+      "strict_recall": 0.161,
+      "note_f1": 0.278,
+      "staff_acc": 1.0,
+      "spell_acc": 1.0,
+      "measure_exact": 0.185,
+      "omr_notes": 31
+     },
+     "oemer_detail": {
+      "strict_precision": 0.005,
+      "strict_recall": 0.005,
+      "note_f1": 0.536,
+      "staff_acc": 1.0,
+      "spell_acc": 1.0,
+      "measure_exact": 0.0,
+      "omr_notes": 192
+     }
+    }
+   }
+  },
+  {
+   "slug": "bach-bwv66.6",
+   "p1_measures": 10,
+   "clean": {
+    "file": "clean/bach-bwv66.6.png",
+    "sha256": "38dbadbd88951f553a70a671fa1a8bd8750ae0a86a297e1efff99cf8d3a3ad2d",
+    "bytes": 55458
+   },
+   "photo": {
+    "file": "photo/bach-bwv66.6.png",
+    "sha256": "76d64c63af5652d52fc2e0c937485cc34bf84210cd274a3a41fb7f2ba3fc5ffc",
+    "bytes": 83196
+   },
+   "gt": {
+    "file": "gt/gt-p1-bach-bwv66.6.musicxml",
+    "sha256": "7efe2d8f9c95be0f34468eaf181135587ca1bd67e859417ec02955edd213cc6c",
+    "bytes": 48783
+   },
+   "reference": {
+    "clean": {
+     "slug": "bach-bwv66.6",
+     "description": "4-voice chorale (4 staves/system)",
+     "gt_notes": 165,
+     "sheetly": 1.0,
+     "audiveris": 1.0,
+     "oemer": null,
+     "sheetly_detail": {
+      "strict_precision": 1.0,
+      "strict_recall": 1.0,
+      "note_f1": 1.0,
+      "staff_acc": 1.0,
+      "spell_acc": 1.0,
+      "measure_exact": 1.0,
+      "omr_notes": 165
+     },
+     "audiveris_detail": {
+      "strict_precision": 1.0,
+      "strict_recall": 1.0,
+      "note_f1": 1.0,
+      "staff_acc": 1.0,
+      "spell_acc": 1.0,
+      "measure_exact": 1.0,
+      "omr_notes": 165
+     }
+    },
+    "photo": {
+     "slug": "bach-bwv66.6",
+     "gt_notes": 165,
+     "sheetly": 1.0,
+     "audiveris": null,
+     "oemer": null,
+     "sheetly_detail": {
+      "strict_precision": 1.0,
+      "strict_recall": 1.0,
+      "note_f1": 1.0,
+      "staff_acc": 1.0,
+      "spell_acc": 1.0,
+      "measure_exact": 1.0,
+      "omr_notes": 165
+     }
+    }
+   }
+  },
+  {
+   "slug": "joplin-maple-leaf",
+   "p1_measures": 29,
+   "clean": {
+    "file": "clean/joplin-maple-leaf.png",
+    "sha256": "4564fd7d069cf700841cf5e8479a5bb697a8dd75489db46c372225494dd81fce",
+    "bytes": 89818
+   },
+   "photo": {
+    "file": "photo/joplin-maple-leaf.png",
+    "sha256": "1ad90c70a84512c5beab7e731a9083e5f14a346819418be41c1287d2a7c52c7a",
+    "bytes": 130828
+   },
+   "gt": {
+    "file": "gt/gt-p1-joplin-maple-leaf.musicxml",
+    "sha256": "0f866da60b53c61836fd2afee62c4d837b4aa30545d464cb9059c18b35a9d979",
+    "bytes": 209518
+   },
+   "reference": {
+    "clean": {
+     "slug": "joplin-maple-leaf",
+     "description": "two-hand ragtime piano (advanced)",
+     "gt_notes": 518,
+     "sheetly": 1.0,
+     "audiveris": 0.92,
+     "oemer": 0.723,
+     "sheetly_detail": {
+      "strict_precision": 1.0,
+      "strict_recall": 1.0,
+      "note_f1": 1.0,
+      "staff_acc": 1.0,
+      "spell_acc": 1.0,
+      "measure_exact": 1.0,
+      "omr_notes": 518
+     },
+     "audiveris_detail": {
+      "strict_precision": 0.919,
+      "strict_recall": 0.921,
+      "note_f1": 0.939,
+      "staff_acc": 1.0,
+      "spell_acc": 1.0,
+      "measure_exact": 0.724,
+      "omr_notes": 519
+     },
+     "oemer_detail": {
+      "strict_precision": 0.725,
+      "strict_recall": 0.722,
+      "note_f1": 0.944,
+      "staff_acc": 1.0,
+      "spell_acc": 1.0,
+      "measure_exact": 0.207,
+      "omr_notes": 516
+     }
+    },
+    "photo": {
+     "slug": "joplin-maple-leaf",
+     "gt_notes": 518,
+     "sheetly": 0.992,
+     "audiveris": 0.695,
+     "oemer": 0.069,
+     "sheetly_detail": {
+      "strict_precision": 0.992,
+      "strict_recall": 0.992,
+      "note_f1": 1.0,
+      "staff_acc": 1.0,
+      "spell_acc": 1.0,
+      "measure_exact": 0.966,
+      "omr_notes": 518
+     },
+     "audiveris_detail": {
+      "strict_precision": 0.879,
+      "strict_recall": 0.575,
+      "note_f1": 0.756,
+      "staff_acc": 1.0,
+      "spell_acc": 1.0,
+      "measure_exact": 0.172,
+      "omr_notes": 339
+     },
+     "oemer_detail": {
+      "strict_precision": 0.069,
+      "strict_recall": 0.069,
+      "note_f1": 0.573,
+      "staff_acc": 1.0,
+      "spell_acc": 1.0,
+      "measure_exact": 0.0,
+      "omr_notes": 518
+     }
+    }
+   }
+  },
+  {
+   "slug": "schoenberg-op19-2",
+   "p1_measures": 9,
+   "clean": {
+    "file": "clean/schoenberg-op19-2.png",
+    "sha256": "1179ae32d9688807faaf68e8851efe192fea1df5630f82f2a09bf44d0f3769da",
+    "bytes": 63066
+   },
+   "photo": {
+    "file": "photo/schoenberg-op19-2.png",
+    "sha256": "14b431d25b3807129ccceb50da195571de631af11c037b895d90921157b02eb1",
+    "bytes": 84310
+   },
+   "gt": {
+    "file": "gt/gt-p1-schoenberg-op19-2.musicxml",
+    "sha256": "0a4a9fa86dc16e7b0e74827d01d78e10c80cb181935b8c8819a8ac9ea9c4077d",
+    "bytes": 59979
+   },
+   "reference": {
+    "clean": {
+     "slug": "schoenberg-op19-2",
+     "description": "atonal piano \u2014 accidentals everywhere (extreme)",
+     "gt_notes": 102,
+     "sheetly": 1.0,
+     "audiveris": 0.752,
+     "oemer": 0.529,
+     "sheetly_detail": {
+      "strict_precision": 1.0,
+      "strict_recall": 1.0,
+      "note_f1": 1.0,
+      "staff_acc": 1.0,
+      "spell_acc": 1.0,
+      "measure_exact": 1.0,
+      "omr_notes": 102
+     },
+     "audiveris_detail": {
+      "strict_precision": 0.76,
+      "strict_recall": 0.745,
+      "note_f1": 0.752,
+      "staff_acc": 1.0,
+      "spell_acc": 1.0,
+      "measure_exact": 0.556,
+      "omr_notes": 100
+     },
+     "oemer_detail": {
+      "strict_precision": 0.529,
+      "strict_recall": 0.529,
+      "note_f1": 0.706,
+      "staff_acc": 1.0,
+      "spell_acc": 1.0,
+      "measure_exact": 0.111,
+      "omr_notes": 102
+     }
+    },
+    "photo": {
+     "slug": "schoenberg-op19-2",
+     "gt_notes": 102,
+     "sheetly": 0.971,
+     "audiveris": 0.419,
+     "oemer": 0.059,
+     "sheetly_detail": {
+      "strict_precision": 0.971,
+      "strict_recall": 0.971,
+      "note_f1": 0.971,
+      "staff_acc": 1.0,
+      "spell_acc": 1.0,
+      "measure_exact": 0.778,
+      "omr_notes": 102
+     },
+     "audiveris_detail": {
+      "strict_precision": 0.407,
+      "strict_recall": 0.431,
+      "note_f1": 0.533,
+      "staff_acc": 1.0,
+      "spell_acc": 1.0,
+      "measure_exact": 0.0,
+      "omr_notes": 108
+     },
+     "oemer_detail": {
+      "strict_precision": 0.059,
+      "strict_recall": 0.059,
+      "note_f1": 0.5,
+      "staff_acc": 0.333,
+      "spell_acc": 1.0,
+      "measure_exact": 0.0,
+      "omr_notes": 102
+     }
+    }
+   }
+  },
+  {
+   "slug": "beethoven-grosse-fuge",
+   "p1_measures": 23,
+   "clean": {
+    "file": "clean/beethoven-grosse-fuge.png",
+    "sha256": "44cf6d93958ae5eeee8b1a49e9be2b0ee08141434510c4cad653d7d27abb97ec",
+    "bytes": 92993
+   },
+   "photo": {
+    "file": "photo/beethoven-grosse-fuge.png",
+    "sha256": "b3f8bea5a9194fc69f559439b8a994a96e1265eb23caf74010240482b88d44a5",
+    "bytes": 127786
+   },
+   "gt": {
+    "file": "gt/gt-p1-beethoven-grosse-fuge.musicxml",
+    "sha256": "e8c7667b5372ad678d9c6741c4e6d06e142966e1eb4da659b21d3753548f41e6",
+    "bytes": 115944
+   },
+   "reference": {
+    "clean": {
+     "slug": "beethoven-grosse-fuge",
+     "description": "Grosse Fuge string quartet \u2014 dense 4-part (extreme)",
+     "gt_notes": 174,
+     "sheetly": 1.0,
+     "audiveris": 0.945,
+     "oemer": null,
+     "sheetly_detail": {
+      "strict_precision": 1.0,
+      "strict_recall": 1.0,
+      "note_f1": 1.0,
+      "staff_acc": 1.0,
+      "spell_acc": 1.0,
+      "measure_exact": 1.0,
+      "omr_notes": 174
+     },
+     "audiveris_detail": {
+      "strict_precision": 0.953,
+      "strict_recall": 0.937,
+      "note_f1": 0.968,
+      "staff_acc": 1.0,
+      "spell_acc": 1.0,
+      "measure_exact": 0.913,
+      "omr_notes": 171
+     }
+    },
+    "photo": {
+     "slug": "beethoven-grosse-fuge",
+     "gt_notes": 174,
+     "sheetly": 1.0,
+     "audiveris": 0.925,
+     "oemer": null,
+     "sheetly_detail": {
+      "strict_precision": 1.0,
+      "strict_recall": 1.0,
+      "note_f1": 1.0,
+      "staff_acc": 1.0,
+      "spell_acc": 1.0,
+      "measure_exact": 1.0,
+      "omr_notes": 174
+     },
+     "audiveris_detail": {
+      "strict_precision": 0.93,
+      "strict_recall": 0.92,
+      "note_f1": 0.942,
+      "staff_acc": 1.0,
+      "spell_acc": 1.0,
+      "measure_exact": 0.739,
+      "omr_notes": 172
+     }
+    }
+   }
+  },
+  {
+   "slug": "mozart-k155-2",
+   "p1_measures": 13,
+   "clean": {
+    "file": "clean/mozart-k155-2.png",
+    "sha256": "b02abafd285c629b458a4434edd4fc568ed49b48dc76c114042dc4343a7a0e2c",
+    "bytes": 79220
+   },
+   "photo": {
+    "file": "photo/mozart-k155-2.png",
+    "sha256": "87809f36c5d97c7c7abd134d4687f79c9222275a0bc65c40079e532eeafcc5a5",
+    "bytes": 114586
+   },
+   "gt": {
+    "file": "gt/gt-p1-mozart-k155-2.musicxml",
+    "sha256": "125fa588ece4790b5855bcd61f390b190553d33f59cbcfbc3f6e41d94d556c10",
+    "bytes": 100818
+   },
+   "reference": {
+    "clean": {
+     "slug": "mozart-k155-2",
+     "description": "quartet slow mvt \u2014 triplets + graces",
+     "gt_notes": 258,
+     "sheetly": 1.0,
+     "audiveris": 0.922,
+     "oemer": null,
+     "sheetly_detail": {
+      "strict_precision": 1.0,
+      "strict_recall": 1.0,
+      "note_f1": 1.0,
+      "staff_acc": 1.0,
+      "spell_acc": 1.0,
+      "measure_exact": 1.0,
+      "omr_notes": 258
+     },
+     "audiveris_detail": {
+      "strict_precision": 0.926,
+      "strict_recall": 0.919,
+      "note_f1": 0.957,
+      "staff_acc": 1.0,
+      "spell_acc": 1.0,
+      "measure_exact": 0.769,
+      "omr_notes": 256
+     }
+    },
+    "photo": {
+     "slug": "mozart-k155-2",
+     "gt_notes": 258,
+     "sheetly": 1.0,
+     "audiveris": 0.781,
+     "oemer": null,
+     "sheetly_detail": {
+      "strict_precision": 1.0,
+      "strict_recall": 1.0,
+      "note_f1": 1.0,
+      "staff_acc": 1.0,
+      "spell_acc": 1.0,
+      "measure_exact": 1.0,
+      "omr_notes": 258
+     },
+     "audiveris_detail": {
+      "strict_precision": 0.95,
+      "strict_recall": 0.663,
+      "note_f1": 0.804,
+      "staff_acc": 1.0,
+      "spell_acc": 1.0,
+      "measure_exact": 0.462,
+      "omr_notes": 180
+     }
+    }
+   }
+  },
+  {
+   "slug": "mozart-k458-1",
+   "p1_measures": 17,
+   "clean": {
+    "file": "clean/mozart-k458-1.png",
+    "sha256": "bb324d82a869d6df0263ee3e00ea676b556502b472574ca41c1bbe819af51cec",
+    "bytes": 81306
+   },
+   "photo": {
+    "file": "photo/mozart-k458-1.png",
+    "sha256": "e0a53c580c78f09663c070b4cf952e6aa372426538a23c8114f96cb3bd8b9a6e",
+    "bytes": 126249
+   },
+   "gt": {
+    "file": "gt/gt-p1-mozart-k458-1.musicxml",
+    "sha256": "bdb2bc32f7276d80be4d9883a22ada38c344d3650578a454d06e432089487b36",
+    "bytes": 94513
+   },
+   "reference": {
+    "clean": {
+     "slug": "mozart-k458-1",
+     "description": "Hunt quartet opener \u2014 6/8 with pickup",
+     "gt_notes": 257,
+     "sheetly": 1.0,
+     "audiveris": 0.996,
+     "oemer": null,
+     "sheetly_detail": {
+      "strict_precision": 1.0,
+      "strict_recall": 1.0,
+      "note_f1": 1.0,
+      "staff_acc": 1.0,
+      "spell_acc": 1.0,
+      "measure_exact": 1.0,
+      "omr_notes": 257
+     },
+     "audiveris_detail": {
+      "strict_precision": 1.0,
+      "strict_recall": 0.992,
+      "note_f1": 0.996,
+      "staff_acc": 1.0,
+      "spell_acc": 1.0,
+      "measure_exact": 0.882,
+      "omr_notes": 255
+     }
+    },
+    "photo": {
+     "slug": "mozart-k458-1",
+     "gt_notes": 257,
+     "sheetly": 1.0,
+     "audiveris": 0.065,
+     "oemer": null,
+     "sheetly_detail": {
+      "strict_precision": 1.0,
+      "strict_recall": 1.0,
+      "note_f1": 1.0,
+      "staff_acc": 1.0,
+      "spell_acc": 1.0,
+      "measure_exact": 1.0,
+      "omr_notes": 257
+     },
+     "audiveris_detail": {
+      "strict_precision": 0.189,
+      "strict_recall": 0.039,
+      "note_f1": 0.181,
+      "staff_acc": 0.8,
+      "spell_acc": 1.0,
+      "measure_exact": 0.0,
+      "omr_notes": 53
+     }
+    }
+   }
+  },
+  {
+   "slug": "beethoven-op18n1-1",
+   "p1_measures": 20,
+   "clean": {
+    "file": "clean/beethoven-op18n1-1.png",
+    "sha256": "cc5d2e0ecb19658015f47ab3784e3cbc18bb7fb8eb0920348f3731d52a12aa46",
+    "bytes": 83238
+   },
+   "photo": {
+    "file": "photo/beethoven-op18n1-1.png",
+    "sha256": "e1fb4ba884f316051bf577cb3b12a8ef3892dd3487e03bd851a0bd6926ad1450",
+    "bytes": 120534
+   },
+   "gt": {
+    "file": "gt/gt-p1-beethoven-op18n1-1.musicxml",
+    "sha256": "e8f3fa3e1c5f2ede4c76ca8a7b8698c76dd23ab07f72ab141c2e85524fb2563a",
+    "bytes": 98447
+   },
+   "reference": {
+    "clean": {
+     "slug": "beethoven-op18n1-1",
+     "description": "long sonata-form quartet mvt",
+     "gt_notes": 215,
+     "sheetly": 0.977,
+     "audiveris": 0.943,
+     "oemer": null,
+     "sheetly_detail": {
+      "strict_precision": 0.981,
+      "strict_recall": 0.972,
+      "note_f1": 0.981,
+      "staff_acc": 1.0,
+      "spell_acc": 1.0,
+      "measure_exact": 0.95,
+      "omr_notes": 213
+     },
+     "audiveris_detail": {
+      "strict_precision": 0.957,
+      "strict_recall": 0.93,
+      "note_f1": 0.958,
+      "staff_acc": 0.995,
+      "spell_acc": 1.0,
+      "measure_exact": 0.85,
+      "omr_notes": 209
+     }
+    },
+    "photo": {
+     "slug": "beethoven-op18n1-1",
+     "gt_notes": 215,
+     "sheetly": 1.0,
+     "audiveris": null,
+     "oemer": null,
+     "sheetly_detail": {
+      "strict_precision": 1.0,
+      "strict_recall": 1.0,
+      "note_f1": 1.0,
+      "staff_acc": 1.0,
+      "spell_acc": 1.0,
+      "measure_exact": 1.0,
+      "omr_notes": 215
+     }
+    }
+   }
+  },
+  {
+   "slug": "haydn-op74n1-1",
+   "p1_measures": 14,
+   "clean": {
+    "file": "clean/haydn-op74n1-1.png",
+    "sha256": "e29895771d33fdc5324be6f27b49c1606a06c82114570f40de0b2efc6be1508d",
+    "bytes": 75070
+   },
+   "photo": {
+    "file": "photo/haydn-op74n1-1.png",
+    "sha256": "b555fd052de9080ce97c35a3f8e1c3887eb1ebd0401b8ca393097cb8b4ff5108",
+    "bytes": 131050
+   },
+   "gt": {
+    "file": "gt/gt-p1-haydn-op74n1-1.musicxml",
+    "sha256": "ed58086c2dbba73488e1cec314269f330ad4ff93fb9da9ca655ad7dc528b15be",
+    "bytes": 75713
+   },
+   "reference": {
+    "clean": {
+     "slug": "haydn-op74n1-1",
+     "description": "classical quartet allegro",
+     "gt_notes": 198,
+     "sheetly": 1.0,
+     "audiveris": 0.964,
+     "oemer": null,
+     "sheetly_detail": {
+      "strict_precision": 1.0,
+      "strict_recall": 1.0,
+      "note_f1": 1.0,
+      "staff_acc": 1.0,
+      "spell_acc": 1.0,
+      "measure_exact": 1.0,
+      "omr_notes": 198
+     },
+     "audiveris_detail": {
+      "strict_precision": 0.979,
+      "strict_recall": 0.949,
+      "note_f1": 0.974,
+      "staff_acc": 1.0,
+      "spell_acc": 1.0,
+      "measure_exact": 0.714,
+      "omr_notes": 192
+     }
+    },
+    "photo": {
+     "slug": "haydn-op74n1-1",
+     "gt_notes": 198,
+     "sheetly": 1.0,
+     "audiveris": null,
+     "oemer": null,
+     "sheetly_detail": {
+      "strict_precision": 1.0,
+      "strict_recall": 1.0,
+      "note_f1": 1.0,
+      "staff_acc": 1.0,
+      "spell_acc": 1.0,
+      "measure_exact": 1.0,
+      "omr_notes": 198
+     }
+    }
+   }
+  },
+  {
+   "slug": "chopin-mazurka06-2",
+   "p1_measures": 36,
+   "clean": {
+    "file": "clean/chopin-mazurka06-2.png",
+    "sha256": "1c685339875e67934a5d84749f41ad8e5e5e7c5874105245a06f6bb523692419",
+    "bytes": 82293
+   },
+   "photo": {
+    "file": "photo/chopin-mazurka06-2.png",
+    "sha256": "90411872db149041ab2b5f121bfbc183fc77759036cb6ff653263f73f3f1daeb",
+    "bytes": 121473
+   },
+   "gt": {
+    "file": "gt/gt-p1-chopin-mazurka06-2.musicxml",
+    "sha256": "d890c4e5c3625d52b58e91e1a050633d234ab14078c3c9effcc4a8d92b2d41ce",
+    "bytes": 133649
+   },
+   "reference": {
+    "clean": {
+     "slug": "chopin-mazurka06-2",
+     "description": "mazurka \u2014 ornamented romantic piano",
+     "gt_notes": 359,
+     "sheetly": 0.975,
+     "audiveris": 0.966,
+     "oemer": 0.497,
+     "sheetly_detail": {
+      "strict_precision": 0.975,
+      "strict_recall": 0.975,
+      "note_f1": 0.994,
+      "staff_acc": 1.0,
+      "spell_acc": 1.0,
+      "measure_exact": 0.944,
+      "omr_notes": 359
+     },
+     "audiveris_detail": {
+      "strict_precision": 0.975,
+      "strict_recall": 0.958,
+      "note_f1": 0.978,
+      "staff_acc": 1.0,
+      "spell_acc": 1.0,
+      "measure_exact": 0.861,
+      "omr_notes": 353
+     },
+     "oemer_detail": {
+      "strict_precision": 0.497,
+      "strict_recall": 0.496,
+      "note_f1": 0.591,
+      "staff_acc": 0.096,
+      "spell_acc": 1.0,
+      "measure_exact": 0.0,
+      "omr_notes": 358
+     }
+    },
+    "photo": {
+     "slug": "chopin-mazurka06-2",
+     "gt_notes": 359,
+     "sheetly": 0.964,
+     "audiveris": 0.872,
+     "oemer": 0.538,
+     "sheetly_detail": {
+      "strict_precision": 0.964,
+      "strict_recall": 0.964,
+      "note_f1": 0.983,
+      "staff_acc": 1.0,
+      "spell_acc": 1.0,
+      "measure_exact": 0.861,
+      "omr_notes": 359
+     },
+     "audiveris_detail": {
+      "strict_precision": 0.912,
+      "strict_recall": 0.836,
+      "note_f1": 0.901,
+      "staff_acc": 1.0,
+      "spell_acc": 1.0,
+      "measure_exact": 0.083,
+      "omr_notes": 329
+     },
+     "oemer_detail": {
+      "strict_precision": 0.539,
+      "strict_recall": 0.538,
+      "note_f1": 0.748,
+      "staff_acc": 1.0,
+      "spell_acc": 1.0,
+      "measure_exact": 0.306,
+      "omr_notes": 358
+     }
+    }
+   }
+  },
+  {
+   "slug": "schubert-lindenbaum",
+   "p1_measures": 18,
+   "clean": {
+    "file": "clean/schubert-lindenbaum.png",
+    "sha256": "4931d3f41fc270a4d090710a74e339c98fe3c72c3afbde4631c3ced24efb9735",
+    "bytes": 86358
+   },
+   "photo": {
+    "file": "photo/schubert-lindenbaum.png",
+    "sha256": "f98bb91d160195d330dc53f126812ecc34da953a25d323a1894fe9cca144bc76",
+    "bytes": 125252
+   },
+   "gt": {
+    "file": "gt/gt-p1-schubert-lindenbaum.musicxml",
+    "sha256": "e83e5171845dc1cd1531c077d4b207f6003bf539ffc0520507607c6d9439eb37",
+    "bytes": 197586
+   },
+   "reference": {
+    "clean": {
+     "slug": "schubert-lindenbaum",
+     "description": "lied \u2014 triplet accompaniment, key change, lyrics",
+     "gt_notes": 342,
+     "sheetly": 1.0,
+     "audiveris": 0.98,
+     "oemer": 0.486,
+     "sheetly_detail": {
+      "strict_precision": 1.0,
+      "strict_recall": 1.0,
+      "note_f1": 1.0,
+      "staff_acc": 1.0,
+      "spell_acc": 1.0,
+      "measure_exact": 0.611,
+      "omr_notes": 342
+     },
+     "audiveris_detail": {
+      "strict_precision": 0.98,
+      "strict_recall": 0.98,
+      "note_f1": 1.0,
+      "staff_acc": 0.994,
+      "spell_acc": 1.0,
+      "measure_exact": 0.5,
+      "omr_notes": 342
+     },
+     "oemer_detail": {
+      "strict_precision": 0.487,
+      "strict_recall": 0.485,
+      "note_f1": 0.843,
+      "staff_acc": 0.361,
+      "spell_acc": 1.0,
+      "measure_exact": 0.0,
+      "omr_notes": 341
+     }
+    },
+    "photo": {
+     "slug": "schubert-lindenbaum",
+     "gt_notes": 342,
+     "sheetly": 1.0,
+     "audiveris": 0.514,
+     "oemer": 0.099,
+     "sheetly_detail": {
+      "strict_precision": 1.0,
+      "strict_recall": 1.0,
+      "note_f1": 1.0,
+      "staff_acc": 1.0,
+      "spell_acc": 1.0,
+      "measure_exact": 0.611,
+      "omr_notes": 342
+     },
+     "audiveris_detail": {
+      "strict_precision": 0.917,
+      "strict_recall": 0.357,
+      "note_f1": 0.556,
+      "staff_acc": 0.951,
+      "spell_acc": 1.0,
+      "measure_exact": 0.056,
+      "omr_notes": 133
+     },
+     "oemer_detail": {
+      "strict_precision": 0.099,
+      "strict_recall": 0.099,
+      "note_f1": 0.699,
+      "staff_acc": 0.265,
+      "spell_acc": 1.0,
+      "measure_exact": 0.0,
+      "omr_notes": 342
+     }
+    }
+   }
+  },
+  {
+   "slug": "schumann-dichterliebe-2",
+   "p1_measures": 18,
+   "clean": {
+    "file": "clean/schumann-dichterliebe-2.png",
+    "sha256": "af87f3e34c6dfcfe04d29aeb677b6f5949082ccc505d2a1ca12d7c2d0312f9e8",
+    "bytes": 90671
+   },
+   "photo": {
+    "file": "photo/schumann-dichterliebe-2.png",
+    "sha256": "90f162460808a1ce594fe558108dea40068d71dcd9f169a61bd23bf22aa64983",
+    "bytes": 134482
+   },
+   "gt": {
+    "file": "gt/gt-p1-schumann-dichterliebe-2.musicxml",
+    "sha256": "211e4d0f351bc776471d0c0d6124ba879f5da245a6b4b221e3e654f089545e9b",
+    "bytes": 122706
+   },
+   "reference": {
+    "clean": {
+     "slug": "schumann-dichterliebe-2",
+     "description": "lied with pickup + lyrics",
+     "gt_notes": 254,
+     "sheetly": 0.958,
+     "audiveris": 0.759,
+     "oemer": 0.443,
+     "sheetly_detail": {
+      "strict_precision": 0.979,
+      "strict_recall": 0.937,
+      "note_f1": 0.978,
+      "staff_acc": 0.992,
+      "spell_acc": 1.0,
+      "measure_exact": 0.556,
+      "omr_notes": 243
+     },
+     "audiveris_detail": {
+      "strict_precision": 0.828,
+      "strict_recall": 0.701,
+      "note_f1": 0.844,
+      "staff_acc": 0.972,
+      "spell_acc": 1.0,
+      "measure_exact": 0.556,
+      "omr_notes": 215
+     },
+     "oemer_detail": {
+      "strict_precision": 0.453,
+      "strict_recall": 0.433,
+      "note_f1": 0.696,
+      "staff_acc": 0.409,
+      "spell_acc": 1.0,
+      "measure_exact": 0.0,
+      "omr_notes": 243
+     }
+    },
+    "photo": {
+     "slug": "schumann-dichterliebe-2",
+     "gt_notes": 254,
+     "sheetly": 0.962,
+     "audiveris": 0.164,
+     "oemer": 0.298,
+     "sheetly_detail": {
+      "strict_precision": 0.984,
+      "strict_recall": 0.941,
+      "note_f1": 0.978,
+      "staff_acc": 0.992,
+      "spell_acc": 1.0,
+      "measure_exact": 0.556,
+      "omr_notes": 243
+     },
+     "audiveris_detail": {
+      "strict_precision": 0.852,
+      "strict_recall": 0.091,
+      "note_f1": 0.192,
+      "staff_acc": 0.435,
+      "spell_acc": 1.0,
+      "measure_exact": 0.0,
+      "omr_notes": 27
+     },
+     "oemer_detail": {
+      "strict_precision": 0.305,
+      "strict_recall": 0.291,
+      "note_f1": 0.559,
+      "staff_acc": 0.257,
+      "spell_acc": 1.0,
+      "measure_exact": 0.0,
+      "omr_notes": 243
+     }
+    }
+   }
+  },
+  {
+   "slug": "schumann-op41n1-3",
+   "p1_measures": 17,
+   "clean": {
+    "file": "clean/schumann-op41n1-3.png",
+    "sha256": "488a7dc476bdf8698dc11ea626c0342d94ad44dddc6f470f021ba63ce9777168",
+    "bytes": 76814
+   },
+   "photo": {
+    "file": "photo/schumann-op41n1-3.png",
+    "sha256": "b6d580fcb420c644c5872206931dc821ad16e6340deef4634a5a1dad5510b008",
+    "bytes": 118182
+   },
+   "gt": {
+    "file": "gt/gt-p1-schumann-op41n1-3.musicxml",
+    "sha256": "d302d4816dc5105d9d4e5875c04f7dca35df52550f29b86ea7551b1a7d209fde",
+    "bytes": 62447
+   },
+   "reference": {
+    "clean": {
+     "slug": "schumann-op41n1-3",
+     "description": "quartet mvt in cut time w/ meter change",
+     "gt_notes": 151,
+     "sheetly": 0.98,
+     "audiveris": 0.99,
+     "oemer": null,
+     "sheetly_detail": {
+      "strict_precision": 0.98,
+      "strict_recall": 0.98,
+      "note_f1": 0.98,
+      "staff_acc": 1.0,
+      "spell_acc": 1.0,
+      "measure_exact": 0.824,
+      "omr_notes": 151
+     },
+     "audiveris_detail": {
+      "strict_precision": 0.993,
+      "strict_recall": 0.987,
+      "note_f1": 0.99,
+      "staff_acc": 0.993,
+      "spell_acc": 1.0,
+      "measure_exact": 0.882,
+      "omr_notes": 150
+     }
+    },
+    "photo": {
+     "slug": "schumann-op41n1-3",
+     "gt_notes": 151,
+     "sheetly": 1.0,
+     "audiveris": 0.667,
+     "oemer": null,
+     "sheetly_detail": {
+      "strict_precision": 1.0,
+      "strict_recall": 1.0,
+      "note_f1": 1.0,
+      "staff_acc": 1.0,
+      "spell_acc": 1.0,
+      "measure_exact": 1.0,
+      "omr_notes": 151
+     },
+     "audiveris_detail": {
+      "strict_precision": 0.94,
+      "strict_recall": 0.517,
+      "note_f1": 0.667,
+      "staff_acc": 0.987,
+      "spell_acc": 1.0,
+      "measure_exact": 0.059,
+      "omr_notes": 83
+     }
+    }
+   }
+  },
+  {
+   "slug": "clara-polonaise-op1n1",
+   "p1_measures": 23,
+   "clean": {
+    "file": "clean/clara-polonaise-op1n1.png",
+    "sha256": "1a753dfd17fdc60a1aaaedcef7d1e57f49732b0d952d1f4bcbde4e93c5bc0895",
+    "bytes": 101495
+   },
+   "photo": {
+    "file": "photo/clara-polonaise-op1n1.png",
+    "sha256": "67db17f2d04f02f2c352d46a391425fb95884398d3012b4d524323a4d8815f1b",
+    "bytes": 147515
+   },
+   "gt": {
+    "file": "gt/gt-p1-clara-polonaise-op1n1.musicxml",
+    "sha256": "e957e4c6ec1961dc2407054b67b80575fd9a81a53777810cc4c16d542a743c2c",
+    "bytes": 228882
+   },
+   "reference": {
+    "clean": {
+     "slug": "clara-polonaise-op1n1",
+     "description": "romantic piano polonaise w/ key change",
+     "gt_notes": 508,
+     "sheetly": 0.982,
+     "audiveris": 0.726,
+     "oemer": 0.436,
+     "sheetly_detail": {
+      "strict_precision": 0.986,
+      "strict_recall": 0.978,
+      "note_f1": 0.982,
+      "staff_acc": 1.0,
+      "spell_acc": 1.0,
+      "measure_exact": 0.739,
+      "omr_notes": 504
+     },
+     "audiveris_detail": {
+      "strict_precision": 0.727,
+      "strict_recall": 0.724,
+      "note_f1": 0.832,
+      "staff_acc": 1.0,
+      "spell_acc": 1.0,
+      "measure_exact": 0.565,
+      "omr_notes": 506
+     },
+     "oemer_detail": {
+      "strict_precision": 0.438,
+      "strict_recall": 0.435,
+      "note_f1": 0.9,
+      "staff_acc": 1.0,
+      "spell_acc": 1.0,
+      "measure_exact": 0.174,
+      "omr_notes": 505
+     }
+    },
+    "photo": {
+     "slug": "clara-polonaise-op1n1",
+     "gt_notes": 508,
+     "sheetly": 0.982,
+     "audiveris": 0.596,
+     "oemer": 0.063,
+     "sheetly_detail": {
+      "strict_precision": 0.986,
+      "strict_recall": 0.978,
+      "note_f1": 0.982,
+      "staff_acc": 1.0,
+      "spell_acc": 1.0,
+      "measure_exact": 0.739,
+      "omr_notes": 504
+     },
+     "audiveris_detail": {
+      "strict_precision": 0.669,
+      "strict_recall": 0.537,
+      "note_f1": 0.734,
+      "staff_acc": 1.0,
+      "spell_acc": 1.0,
+      "measure_exact": 0.435,
+      "omr_notes": 408
+     },
+     "oemer_detail": {
+      "strict_precision": 0.063,
+      "strict_recall": 0.063,
+      "note_f1": 0.719,
+      "staff_acc": 0.844,
+      "spell_acc": 1.0,
+      "measure_exact": 0.0,
+      "omr_notes": 505
+     }
+    }
+   }
+  },
+  {
+   "slug": "clara-op17-3",
+   "p1_measures": 14,
+   "clean": {
+    "file": "clean/clara-op17-3.png",
+    "sha256": "580659f69faa703d3740ce4e9ef2881cc82d813ca80d4ae03e828e3f44d16788",
+    "bytes": 76651
+   },
+   "photo": {
+    "file": "photo/clara-op17-3.png",
+    "sha256": "c349dbf5829b05f58659e830cc99cdda0fa327212af5a59ab960f5db88d6f893",
+    "bytes": 121210
+   },
+   "gt": {
+    "file": "gt/gt-p1-clara-op17-3.musicxml",
+    "sha256": "e39466fd5df955c51a43ee7201b8c956fdfbb2f658d6f83e8ac10fc6a47ec0f8",
+    "bytes": 125687
+   },
+   "reference": {
+    "clean": {
+     "slug": "clara-op17-3",
+     "description": "piano trio mvt in 6/8",
+     "gt_notes": 276,
+     "sheetly": 0.978,
+     "audiveris": 0.731,
+     "oemer": 0.241,
+     "sheetly_detail": {
+      "strict_precision": 0.978,
+      "strict_recall": 0.978,
+      "note_f1": 0.982,
+      "staff_acc": 1.0,
+      "spell_acc": 1.0,
+      "measure_exact": 0.786,
+      "omr_notes": 276
+     },
+     "audiveris_detail": {
+      "strict_precision": 0.766,
+      "strict_recall": 0.699,
+      "note_f1": 0.837,
+      "staff_acc": 0.073,
+      "spell_acc": 1.0,
+      "measure_exact": 0.5,
+      "omr_notes": 252
+     },
+     "oemer_detail": {
+      "strict_precision": 0.244,
+      "strict_recall": 0.239,
+      "note_f1": 0.768,
+      "staff_acc": 0.015,
+      "spell_acc": 0.985,
+      "measure_exact": 0.062,
+      "omr_notes": 271
+     }
+    },
+    "photo": {
+     "slug": "clara-op17-3",
+     "gt_notes": 276,
+     "sheetly": 0.98,
+     "audiveris": 0.661,
+     "oemer": null,
+     "sheetly_detail": {
+      "strict_precision": 0.982,
+      "strict_recall": 0.978,
+      "note_f1": 0.984,
+      "staff_acc": 1.0,
+      "spell_acc": 1.0,
+      "measure_exact": 0.786,
+      "omr_notes": 275
+     },
+     "audiveris_detail": {
+      "strict_precision": 0.796,
+      "strict_recall": 0.565,
+      "note_f1": 0.758,
+      "staff_acc": 0.994,
+      "spell_acc": 1.0,
+      "measure_exact": 0.0,
+      "omr_notes": 196
+     }
+    }
+   }
+  },
+  {
+   "slug": "weber-concertino",
+   "p1_measures": 20,
+   "clean": {
+    "file": "clean/weber-concertino.png",
+    "sha256": "98f85db1027760d09404c90719ee574392a8408b8d1636aa01e8f8c2db33fe2e",
+    "bytes": 86445
+   },
+   "photo": {
+    "file": "photo/weber-concertino.png",
+    "sha256": "ca52ebbaad9f410692df848eecebd1a1e0881a47af7779bb065b9bf5348e36e5",
+    "bytes": 119578
+   },
+   "gt": {
+    "file": "gt/gt-p1-weber-concertino.musicxml",
+    "sha256": "46b447b54b857c6573f13165d801ab79f668632b1458013197d61809d7d4a748",
+    "bytes": 135681
+   },
+   "reference": {
+    "clean": {
+     "slug": "weber-concertino",
+     "description": "clarinet concertino \u2014 3 meters, 2 keys, runs",
+     "gt_notes": 337,
+     "sheetly": 0.985,
+     "audiveris": 0.936,
+     "oemer": 0.521,
+     "sheetly_detail": {
+      "strict_precision": 0.985,
+      "strict_recall": 0.985,
+      "note_f1": 0.994,
+      "staff_acc": 1.0,
+      "spell_acc": 1.0,
+      "measure_exact": 0.85,
+      "omr_notes": 337
+     },
+     "audiveris_detail": {
+      "strict_precision": 0.935,
+      "strict_recall": 0.938,
+      "note_f1": 0.978,
+      "staff_acc": 1.0,
+      "spell_acc": 1.0,
+      "measure_exact": 0.7,
+      "omr_notes": 338
+     },
+     "oemer_detail": {
+      "strict_precision": 0.536,
+      "strict_recall": 0.507,
+      "note_f1": 0.723,
+      "staff_acc": 0.409,
+      "spell_acc": 1.0,
+      "measure_exact": 0.0,
+      "omr_notes": 319
+     }
+    },
+    "photo": {
+     "slug": "weber-concertino",
+     "gt_notes": 337,
+     "sheetly": 0.976,
+     "audiveris": 0.0,
+     "oemer": null,
+     "sheetly_detail": {
+      "strict_precision": 0.976,
+      "strict_recall": 0.976,
+      "note_f1": 0.994,
+      "staff_acc": 1.0,
+      "spell_acc": 1.0,
+      "measure_exact": 0.8,
+      "omr_notes": 337
+     },
+     "audiveris_detail": {
+      "strict_precision": 0.0,
+      "strict_recall": 0.0,
+      "note_f1": 0.0,
+      "staff_acc": null,
+      "spell_acc": null,
+      "measure_exact": 0.0,
+      "omr_notes": 0
+     }
+    }
+   }
+  },
+  {
+   "slug": "verdi-la-donna",
+   "p1_measures": 35,
+   "clean": {
+    "file": "clean/verdi-la-donna.png",
+    "sha256": "cd3bd49688a167833e1910eaad86aec780177a1011894926c337636c97fb3110",
+    "bytes": 100915
+   },
+   "photo": {
+    "file": "photo/verdi-la-donna.png",
+    "sha256": "a070288a79ad4c213ca70b790987081e53e20a16e35f38d1052b24cc8f5b5101",
+    "bytes": 143336
+   },
+   "gt": {
+    "file": "gt/gt-p1-verdi-la-donna.musicxml",
+    "sha256": "0c2b796603fa8f18b51eede53cd6485d229dc97d77b5d6021706b0007ec47a5f",
+    "bytes": 178545
+   },
+   "reference": {
+    "clean": {
+     "slug": "verdi-la-donna",
+     "description": "aria in 3/8 with lyrics",
+     "gt_notes": 370,
+     "sheetly": 0.999,
+     "audiveris": 0.814,
+     "oemer": null,
+     "sheetly_detail": {
+      "strict_precision": 0.997,
+      "strict_recall": 1.0,
+      "note_f1": 0.999,
+      "staff_acc": 1.0,
+      "spell_acc": 1.0,
+      "measure_exact": 0.971,
+      "omr_notes": 371
+     },
+     "audiveris_detail": {
+      "strict_precision": 0.814,
+      "strict_recall": 0.814,
+      "note_f1": 0.968,
+      "staff_acc": 0.223,
+      "spell_acc": 1.0,
+      "measure_exact": 0.686,
+      "omr_notes": 370
+     }
+    },
+    "photo": {
+     "slug": "verdi-la-donna",
+     "gt_notes": 370,
+     "sheetly": 0.992,
+     "audiveris": 0.793,
+     "oemer": null,
+     "sheetly_detail": {
+      "strict_precision": 0.992,
+      "strict_recall": 0.992,
+      "note_f1": 0.997,
+      "staff_acc": 1.0,
+      "spell_acc": 1.0,
+      "measure_exact": 0.971,
+      "omr_notes": 370
+     },
+     "audiveris_detail": {
+      "strict_precision": 0.847,
+      "strict_recall": 0.746,
+      "note_f1": 0.899,
+      "staff_acc": 0.254,
+      "spell_acc": 1.0,
+      "measure_exact": 0.486,
+      "omr_notes": 326
+     }
+    }
+   }
+  },
+  {
+   "slug": "cpebach-h186",
+   "p1_measures": 12,
+   "clean": {
+    "file": "clean/cpebach-h186.png",
+    "sha256": "03e8acd847a3fbf6f701d14d44034b067918dd4139ace7c14d065beb2036eda3",
+    "bytes": 89688
+   },
+   "photo": {
+    "file": "photo/cpebach-h186.png",
+    "sha256": "c6f0c4f75666583beb4847be65ff9660af951dfd9bbafbfe38591972943a973c",
+    "bytes": 128620
+   },
+   "gt": {
+    "file": "gt/gt-p1-cpebach-h186.musicxml",
+    "sha256": "732ce87eceb937f58a1f8c4c80b588cfab6248540f453163be0dd7eb726ed332",
+    "bytes": 156949
+   },
+   "reference": {
+    "clean": {
+     "slug": "cpebach-h186",
+     "description": "galant keyboard piece",
+     "gt_notes": 300,
+     "sheetly": 0.865,
+     "audiveris": 0.894,
+     "oemer": 0.397,
+     "sheetly_detail": {
+      "strict_precision": 0.864,
+      "strict_recall": 0.867,
+      "note_f1": 0.975,
+      "staff_acc": 1.0,
+      "spell_acc": 1.0,
+      "measure_exact": 0.5,
+      "omr_notes": 301
+     },
+     "audiveris_detail": {
+      "strict_precision": 0.904,
+      "strict_recall": 0.883,
+      "note_f1": 0.948,
+      "staff_acc": 1.0,
+      "spell_acc": 1.0,
+      "measure_exact": 0.5,
+      "omr_notes": 293
+     },
+     "oemer_detail": {
+      "strict_precision": 0.395,
+      "strict_recall": 0.4,
+      "note_f1": 0.821,
+      "staff_acc": 1.0,
+      "spell_acc": 1.0,
+      "measure_exact": 0.167,
+      "omr_notes": 304
+     }
+    },
+    "photo": {
+     "slug": "cpebach-h186",
+     "gt_notes": 300,
+     "sheetly": 0.922,
+     "audiveris": 0.6,
+     "oemer": 0.247,
+     "sheetly_detail": {
+      "strict_precision": 0.923,
+      "strict_recall": 0.92,
+      "note_f1": 0.972,
+      "staff_acc": 1.0,
+      "spell_acc": 1.0,
+      "measure_exact": 0.583,
+      "omr_notes": 299
+     },
+     "audiveris_detail": {
+      "strict_precision": 0.838,
+      "strict_recall": 0.467,
+      "note_f1": 0.681,
+      "staff_acc": 1.0,
+      "spell_acc": 1.0,
+      "measure_exact": 0.25,
+      "omr_notes": 167
+     },
+     "oemer_detail": {
+      "strict_precision": 0.257,
+      "strict_recall": 0.237,
+      "note_f1": 0.566,
+      "staff_acc": 0.789,
+      "spell_acc": 1.0,
+      "measure_exact": 0.0,
+      "omr_notes": 276
+     }
+    }
+   }
+  },
+  {
+   "slug": "beach-prayer",
+   "p1_measures": 7,
+   "clean": {
+    "file": "clean/beach-prayer.png",
+    "sha256": "64bede3471b8a964ccdb876fd4df1617afd03b2bf67e92c53a5e2dfb3c48d25b",
+    "bytes": 108002
+   },
+   "photo": {
+    "file": "photo/beach-prayer.png",
+    "sha256": "e8e0f2b22a9630942e8c515cec64897edc767c8191fe368351f9343bc28d222d",
+    "bytes": 169159
+   },
+   "gt": {
+    "file": "gt/gt-p1-beach-prayer.musicxml",
+    "sha256": "0f025aee59bd8ef7b476db1d8bb9069b7e02cb539be89d17ae30dd8a0831bc13",
+    "bytes": 124526
+   },
+   "reference": {
+    "clean": {
+     "slug": "beach-prayer",
+     "description": "choral + piano \u2014 lyrics everywhere",
+     "gt_notes": 263,
+     "sheetly": 0.902,
+     "audiveris": 0.941,
+     "oemer": 0.127,
+     "sheetly_detail": {
+      "strict_precision": 1.0,
+      "strict_recall": 0.821,
+      "note_f1": 0.902,
+      "staff_acc": 0.861,
+      "spell_acc": 1.0,
+      "measure_exact": 0.0,
+      "omr_notes": 216
+     },
+     "audiveris_detail": {
+      "strict_precision": 0.939,
+      "strict_recall": 0.943,
+      "note_f1": 0.975,
+      "staff_acc": 0.992,
+      "spell_acc": 1.0,
+      "measure_exact": 0.429,
+      "omr_notes": 264
+     },
+     "oemer_detail": {
+      "strict_precision": 0.138,
+      "strict_recall": 0.118,
+      "note_f1": 0.422,
+      "staff_acc": 0.0,
+      "spell_acc": 1.0,
+      "measure_exact": 0.0,
+      "omr_notes": 225
+     }
+    },
+    "photo": {
+     "slug": "beach-prayer",
+     "gt_notes": 263,
+     "sheetly": 0.9,
+     "audiveris": 0.883,
+     "oemer": 0.108,
+     "sheetly_detail": {
+      "strict_precision": 0.995,
+      "strict_recall": 0.821,
+      "note_f1": 0.9,
+      "staff_acc": 0.861,
+      "spell_acc": 1.0,
+      "measure_exact": 0.0,
+      "omr_notes": 217
+     },
+     "audiveris_detail": {
+      "strict_precision": 0.94,
+      "strict_recall": 0.833,
+      "note_f1": 0.927,
+      "staff_acc": 0.973,
+      "spell_acc": 1.0,
+      "measure_exact": 0.429,
+      "omr_notes": 233
+     },
+     "oemer_detail": {
+      "strict_precision": 0.12,
+      "strict_recall": 0.099,
+      "note_f1": 0.213,
+      "staff_acc": 0.038,
+      "spell_acc": 1.0,
+      "measure_exact": 0.0,
+      "omr_notes": 217
+     }
+    }
+   }
+  },
+  {
+   "slug": "handel-lascia",
+   "p1_measures": 16,
+   "clean": {
+    "file": "clean/handel-lascia.png",
+    "sha256": "a436cab35f6dbd9093ea80d0f6c35fdb8c641dde1d9ecfa555b3be0a5a67de95",
+    "bytes": 93116
+   },
+   "photo": {
+    "file": "photo/handel-lascia.png",
+    "sha256": "6de42ff4d36f7f5f4f5103879b48dcc8954818f4924a5ae6f49e576b5f4d723a",
+    "bytes": 129182
+   },
+   "gt": {
+    "file": "gt/gt-p1-handel-lascia.musicxml",
+    "sha256": "2a632cec9d2b9b32f56ace9d4041a401d247ab7be4c40dcc295129672e3f8ce6",
+    "bytes": 83484
+   },
+   "reference": {
+    "clean": {
+     "slug": "handel-lascia",
+     "description": "aria \u2014 meter + key change, lyrics",
+     "gt_notes": 175,
+     "sheetly": 0.974,
+     "audiveris": 0.959,
+     "oemer": 0.529,
+     "sheetly_detail": {
+      "strict_precision": 0.977,
+      "strict_recall": 0.971,
+      "note_f1": 0.991,
+      "staff_acc": 1.0,
+      "spell_acc": 1.0,
+      "measure_exact": 0.938,
+      "omr_notes": 174
+     },
+     "audiveris_detail": {
+      "strict_precision": 0.982,
+      "strict_recall": 0.937,
+      "note_f1": 0.971,
+      "staff_acc": 0.994,
+      "spell_acc": 1.0,
+      "measure_exact": 0.688,
+      "omr_notes": 167
+     },
+     "oemer_detail": {
+      "strict_precision": 0.532,
+      "strict_recall": 0.526,
+      "note_f1": 0.736,
+      "staff_acc": 0.228,
+      "spell_acc": 1.0,
+      "measure_exact": 0.0,
+      "omr_notes": 173
+     }
+    },
+    "photo": {
+     "slug": "handel-lascia",
+     "gt_notes": 175,
+     "sheetly": 0.974,
+     "audiveris": 0.419,
+     "oemer": null,
+     "sheetly_detail": {
+      "strict_precision": 0.977,
+      "strict_recall": 0.971,
+      "note_f1": 0.991,
+      "staff_acc": 1.0,
+      "spell_acc": 1.0,
+      "measure_exact": 0.938,
+      "omr_notes": 174
+     },
+     "audiveris_detail": {
+      "strict_precision": 0.831,
+      "strict_recall": 0.28,
+      "note_f1": 0.479,
+      "staff_acc": 1.0,
+      "spell_acc": 1.0,
+      "measure_exact": 0.0,
+      "omr_notes": 59
+     }
+    }
+   }
+  },
+  {
+   "slug": "luca-gloria",
+   "p1_measures": 34,
+   "clean": {
+    "file": "clean/luca-gloria.png",
+    "sha256": "2952ab8083d079aba2a61da1d5bc55eda4a50019c7a92d97bdf654027e851e62",
+    "bytes": 83953
+   },
+   "photo": {
+    "file": "photo/luca-gloria.png",
+    "sha256": "7e1aa2851e4ee87c509a2fb890c70d413ee9dea2684ebeeb9b29694565f10fe4",
+    "bytes": 119024
+   },
+   "gt": {
+    "file": "gt/gt-p1-luca-gloria.musicxml",
+    "sha256": "ca4f49823ae11247f4ac5fe2dd417f65bc7b82faca1a1a891a7ec585db7b7410",
+    "bytes": 100848
+   },
+   "reference": {
+    "clean": {
+     "slug": "luca-gloria",
+     "description": "medieval gloria \u2014 3 meter changes",
+     "gt_notes": 231,
+     "sheetly": 0.983,
+     "audiveris": 0.961,
+     "oemer": 0.357,
+     "sheetly_detail": {
+      "strict_precision": 0.983,
+      "strict_recall": 0.983,
+      "note_f1": 0.983,
+      "staff_acc": 1.0,
+      "spell_acc": 1.0,
+      "measure_exact": 0.912,
+      "omr_notes": 231
+     },
+     "audiveris_detail": {
+      "strict_precision": 0.961,
+      "strict_recall": 0.961,
+      "note_f1": 0.974,
+      "staff_acc": 0.991,
+      "spell_acc": 1.0,
+      "measure_exact": 0.853,
+      "omr_notes": 231
+     },
+     "oemer_detail": {
+      "strict_precision": 0.355,
+      "strict_recall": 0.359,
+      "note_f1": 0.387,
+      "staff_acc": 0.964,
+      "spell_acc": 1.0,
+      "measure_exact": 0.0,
+      "omr_notes": 234
+     }
+    },
+    "photo": {
+     "slug": "luca-gloria",
+     "gt_notes": 231,
+     "sheetly": 0.983,
+     "audiveris": 0.062,
+     "oemer": null,
+     "sheetly_detail": {
+      "strict_precision": 0.983,
+      "strict_recall": 0.983,
+      "note_f1": 0.983,
+      "staff_acc": 1.0,
+      "spell_acc": 1.0,
+      "measure_exact": 0.912,
+      "omr_notes": 231
+     },
+     "audiveris_detail": {
+      "strict_precision": 0.06,
+      "strict_recall": 0.065,
+      "note_f1": 0.458,
+      "staff_acc": 0.0,
+      "spell_acc": 1.0,
+      "measure_exact": 0.0,
+      "omr_notes": 249
+     }
+    }
+   }
+  },
+  {
+   "slug": "aloha-oe",
+   "p1_measures": 10,
+   "clean": {
+    "file": "clean/aloha-oe.png",
+    "sha256": "ded55217c40f79f55fa7802e03103887bb46a7ac2474c396a684342e11a4e31d",
+    "bytes": 65084
+   },
+   "photo": {
+    "file": "photo/aloha-oe.png",
+    "sha256": "2c76252d55d98a404db7237bf6db576c06744bf1b067561f66e2ef7fb0e4ac5f",
+    "bytes": 90008
+   },
+   "gt": {
+    "file": "gt/gt-p1-aloha-oe.musicxml",
+    "sha256": "23700670f797aa00af665413c5e1277403d8d10e260b049f728910e233210c7c",
+    "bytes": 73714
+   },
+   "reference": {
+    "clean": {
+     "slug": "aloha-oe",
+     "description": "song with pickup, many staves",
+     "gt_notes": 115,
+     "sheetly": 1.0,
+     "audiveris": 1.0,
+     "oemer": 0.47,
+     "sheetly_detail": {
+      "strict_precision": 1.0,
+      "strict_recall": 1.0,
+      "note_f1": 1.0,
+      "staff_acc": 1.0,
+      "spell_acc": 1.0,
+      "measure_exact": 1.0,
+      "omr_notes": 115
+     },
+     "audiveris_detail": {
+      "strict_precision": 1.0,
+      "strict_recall": 1.0,
+      "note_f1": 1.0,
+      "staff_acc": 1.0,
+      "spell_acc": 1.0,
+      "measure_exact": 1.0,
+      "omr_notes": 115
+     },
+     "oemer_detail": {
+      "strict_precision": 0.47,
+      "strict_recall": 0.47,
+      "note_f1": 0.748,
+      "staff_acc": 0.0,
+      "spell_acc": 1.0,
+      "measure_exact": 0.0,
+      "omr_notes": 115
+     }
+    },
+    "photo": {
+     "slug": "aloha-oe",
+     "gt_notes": 115,
+     "sheetly": 1.0,
+     "audiveris": 1.0,
+     "oemer": 0.53,
+     "sheetly_detail": {
+      "strict_precision": 1.0,
+      "strict_recall": 1.0,
+      "note_f1": 1.0,
+      "staff_acc": 1.0,
+      "spell_acc": 1.0,
+      "measure_exact": 1.0,
+      "omr_notes": 115
+     },
+     "audiveris_detail": {
+      "strict_precision": 1.0,
+      "strict_recall": 1.0,
+      "note_f1": 1.0,
+      "staff_acc": 1.0,
+      "spell_acc": 1.0,
+      "measure_exact": 1.0,
+      "omr_notes": 115
+     },
+     "oemer_detail": {
+      "strict_precision": 0.53,
+      "strict_recall": 0.53,
+      "note_f1": 0.748,
+      "staff_acc": 0.0,
+      "spell_acc": 1.0,
+      "measure_exact": 0.0,
+      "omr_notes": 115
+     }
+    }
+   }
+  },
+  {
+   "slug": "foster-leadsheet",
+   "p1_measures": 35,
+   "clean": {
+    "file": "clean/foster-leadsheet.png",
+    "sha256": "fd4134f6e7ce1ba7b4bfb73f7541491703852cb638e6a34d01e539b2cd462dc7",
+    "bytes": 80840
+   },
+   "photo": {
+    "file": "photo/foster-leadsheet.png",
+    "sha256": "08cd17a84afe6444a576c2bfab0c1c83d4c90b9b22ada881cbeca1ca2acfd212",
+    "bytes": 106432
+   },
+   "gt": {
+    "file": "gt/gt-p1-foster-leadsheet.musicxml",
+    "sha256": "9ddf749d868be1df156f8b4b9bd7669f64c70e7ae55732c1ec2e7dfec3ebc33e",
+    "bytes": 59161
+   },
+   "reference": {
+    "clean": {
+     "slug": "foster-leadsheet",
+     "description": "lead sheet \u2014 melody + lyrics",
+     "gt_notes": 95,
+     "sheetly": 1.0,
+     "audiveris": 0.288,
+     "oemer": 0.821,
+     "sheetly_detail": {
+      "strict_precision": 1.0,
+      "strict_recall": 1.0,
+      "note_f1": 1.0,
+      "staff_acc": 1.0,
+      "spell_acc": 1.0,
+      "measure_exact": 1.0,
+      "omr_notes": 95
+     },
+     "audiveris_detail": {
+      "strict_precision": 1.0,
+      "strict_recall": 0.168,
+      "note_f1": 0.288,
+      "staff_acc": 1.0,
+      "spell_acc": 1.0,
+      "measure_exact": 0.2,
+      "omr_notes": 16
+     },
+     "oemer_detail": {
+      "strict_precision": 0.821,
+      "strict_recall": 0.821,
+      "note_f1": 1.0,
+      "staff_acc": 1.0,
+      "spell_acc": 1.0,
+      "measure_exact": 0.171,
+      "omr_notes": 95
+     }
+    },
+    "photo": {
+     "slug": "foster-leadsheet",
+     "gt_notes": 95,
+     "sheetly": 1.0,
+     "audiveris": 0.273,
+     "oemer": 0.274,
+     "sheetly_detail": {
+      "strict_precision": 1.0,
+      "strict_recall": 1.0,
+      "note_f1": 1.0,
+      "staff_acc": 1.0,
+      "spell_acc": 1.0,
+      "measure_exact": 1.0,
+      "omr_notes": 95
+     },
+     "audiveris_detail": {
+      "strict_precision": 1.0,
+      "strict_recall": 0.158,
+      "note_f1": 0.273,
+      "staff_acc": 1.0,
+      "spell_acc": 1.0,
+      "measure_exact": 0.171,
+      "omr_notes": 15
+     },
+     "oemer_detail": {
+      "strict_precision": 0.274,
+      "strict_recall": 0.274,
+      "note_f1": 0.674,
+      "staff_acc": 0.654,
+      "spell_acc": 1.0,
+      "measure_exact": 0.0,
+      "omr_notes": 95
+     }
+    }
+   }
+  },
+  {
+   "slug": "palestrina-agnus",
+   "p1_measures": 10,
+   "clean": {
+    "file": "clean/palestrina-agnus.png",
+    "sha256": "971764a540ae3541638f34d015620b2302bdac4a330353f5fff3c02a222afe68",
+    "bytes": 54596
+   },
+   "photo": {
+    "file": "photo/palestrina-agnus.png",
+    "sha256": "91bf0404af9ca1958164e53455600479c54a0df6e36762c176cbb6450e14a337",
+    "bytes": 96804
+   },
+   "gt": {
+    "file": "gt/gt-p1-palestrina-agnus.musicxml",
+    "sha256": "a49b96571255a7ee5dc4d99da7996d0b0e9edff09256c60b1af37fca46766eab",
+    "bytes": 36338
+   },
+   "reference": {
+    "clean": {
+     "slug": "palestrina-agnus",
+     "description": "renaissance 5-voice mass mvt",
+     "gt_notes": 97,
+     "sheetly": 1.0,
+     "audiveris": 0.901,
+     "oemer": 0.29,
+     "sheetly_detail": {
+      "strict_precision": 1.0,
+      "strict_recall": 1.0,
+      "note_f1": 1.0,
+      "staff_acc": 1.0,
+      "spell_acc": 1.0,
+      "measure_exact": 1.0,
+      "omr_notes": 97
+     },
+     "audiveris_detail": {
+      "strict_precision": 0.915,
+      "strict_recall": 0.887,
+      "note_f1": 0.901,
+      "staff_acc": 1.0,
+      "spell_acc": 1.0,
+      "measure_exact": 0.4,
+      "omr_notes": 94
+     },
+     "oemer_detail": {
+      "strict_precision": 0.292,
+      "strict_recall": 0.289,
+      "note_f1": 0.342,
+      "staff_acc": 0.071,
+      "spell_acc": 1.0,
+      "measure_exact": 0.0,
+      "omr_notes": 96
+     }
+    },
+    "photo": {
+     "slug": "palestrina-agnus",
+     "gt_notes": 97,
+     "sheetly": 1.0,
+     "audiveris": 0.438,
+     "oemer": 0.0,
+     "sheetly_detail": {
+      "strict_precision": 1.0,
+      "strict_recall": 1.0,
+      "note_f1": 1.0,
+      "staff_acc": 1.0,
+      "spell_acc": 1.0,
+      "measure_exact": 1.0,
+      "omr_notes": 97
+     },
+     "audiveris_detail": {
+      "strict_precision": 0.653,
+      "strict_recall": 0.33,
+      "note_f1": 0.521,
+      "staff_acc": 0.938,
+      "spell_acc": 1.0,
+      "measure_exact": 0.0,
+      "omr_notes": 49
+     },
+     "oemer_detail": {
+      "strict_precision": 0.0,
+      "strict_recall": 0.0,
+      "note_f1": 0.018,
+      "staff_acc": null,
+      "spell_acc": null,
+      "measure_exact": 0.0,
+      "omr_notes": 14
+     }
+    }
+   }
+  },
+  {
+   "slug": "ryans-jig",
+   "p1_measures": 18,
+   "clean": {
+    "file": "clean/ryans-jig.png",
+    "sha256": "e3d42db9c5f0ec2d381f7eedd0efb1d9d9af5bba0b9e3abe134d3ecce3d3a64c",
+    "bytes": 51211
+   },
+   "photo": {
+    "file": "photo/ryans-jig.png",
+    "sha256": "ccb44986d82662a1bb129e9f50f8f4c45ef974fff6eb8b4d9bdfdbe47d364358",
+    "bytes": 66730
+   },
+   "gt": {
+    "file": "gt/gt-p1-ryans-jig.musicxml",
+    "sha256": "37e17adb1287e21a436f7b527a296a55cde941a63f467a509ae59c43c38f9568",
+    "bytes": 44007
+   },
+   "reference": {
+    "clean": {
+     "slug": "ryans-jig",
+     "description": "6/8 jig with repeats",
+     "gt_notes": 119,
+     "sheetly": 0.933,
+     "audiveris": 0.93,
+     "oemer": 0.569,
+     "sheetly_detail": {
+      "strict_precision": 0.933,
+      "strict_recall": 0.933,
+      "note_f1": 1.0,
+      "staff_acc": 1.0,
+      "spell_acc": 1.0,
+      "measure_exact": 0.889,
+      "omr_notes": 119
+     },
+     "audiveris_detail": {
+      "strict_precision": 0.972,
+      "strict_recall": 0.891,
+      "note_f1": 0.947,
+      "staff_acc": 1.0,
+      "spell_acc": 1.0,
+      "measure_exact": 0.722,
+      "omr_notes": 109
+     },
+     "oemer_detail": {
+      "strict_precision": 0.567,
+      "strict_recall": 0.571,
+      "note_f1": 0.954,
+      "staff_acc": 1.0,
+      "spell_acc": 1.0,
+      "measure_exact": 0.389,
+      "omr_notes": 120
+     }
+    },
+    "photo": {
+     "slug": "ryans-jig",
+     "gt_notes": 119,
+     "sheetly": 0.874,
+     "audiveris": 0.363,
+     "oemer": 0.658,
+     "sheetly_detail": {
+      "strict_precision": 0.874,
+      "strict_recall": 0.874,
+      "note_f1": 0.992,
+      "staff_acc": 1.0,
+      "spell_acc": 1.0,
+      "measure_exact": 0.833,
+      "omr_notes": 119
+     },
+     "audiveris_detail": {
+      "strict_precision": 0.435,
+      "strict_recall": 0.311,
+      "note_f1": 0.549,
+      "staff_acc": 1.0,
+      "spell_acc": 1.0,
+      "measure_exact": 0.056,
+      "omr_notes": 85
+     },
+     "oemer_detail": {
+      "strict_precision": 0.661,
+      "strict_recall": 0.655,
+      "note_f1": 0.928,
+      "staff_acc": 1.0,
+      "spell_acc": 1.0,
+      "measure_exact": 0.444,
+      "omr_notes": 118
+     }
+    }
+   }
+  },
+  {
+   "slug": "ryans-hornpipe",
+   "p1_measures": 18,
+   "clean": {
+    "file": "clean/ryans-hornpipe.png",
+    "sha256": "b922c6466ad5779b9aa23b2450cd22caba511950abad651dc07e90c062d13f7c",
+    "bytes": 53799
+   },
+   "photo": {
+    "file": "photo/ryans-hornpipe.png",
+    "sha256": "62e696d4438a11432f3efdfe9589feb4769ba593f00598374462635a85c47be3",
+    "bytes": 82686
+   },
+   "gt": {
+    "file": "gt/gt-p1-ryans-hornpipe.musicxml",
+    "sha256": "563321e7eb59b78d1821738034c04551dd6ae5def7376337fe18c28c978f581d",
+    "bytes": 45853
+   },
+   "reference": {
+    "clean": {
+     "slug": "ryans-hornpipe",
+     "description": "dotted hornpipe with repeats",
+     "gt_notes": 123,
+     "sheetly": 0.992,
+     "audiveris": 0.992,
+     "oemer": 0.526,
+     "sheetly_detail": {
+      "strict_precision": 0.992,
+      "strict_recall": 0.992,
+      "note_f1": 0.992,
+      "staff_acc": 1.0,
+      "spell_acc": 1.0,
+      "measure_exact": 0.944,
+      "omr_notes": 123
+     },
+     "audiveris_detail": {
+      "strict_precision": 0.992,
+      "strict_recall": 0.992,
+      "note_f1": 0.992,
+      "staff_acc": 1.0,
+      "spell_acc": 1.0,
+      "measure_exact": 0.944,
+      "omr_notes": 123
+     },
+     "oemer_detail": {
+      "strict_precision": 0.524,
+      "strict_recall": 0.528,
+      "note_f1": 0.939,
+      "staff_acc": 1.0,
+      "spell_acc": 1.0,
+      "measure_exact": 0.111,
+      "omr_notes": 124
+     }
+    },
+    "photo": {
+     "slug": "ryans-hornpipe",
+     "gt_notes": 123,
+     "sheetly": 0.959,
+     "audiveris": 0.452,
+     "oemer": 0.0,
+     "sheetly_detail": {
+      "strict_precision": 0.959,
+      "strict_recall": 0.959,
+      "note_f1": 0.992,
+      "staff_acc": 1.0,
+      "spell_acc": 1.0,
+      "measure_exact": 0.889,
+      "omr_notes": 123
+     },
+     "audiveris_detail": {
+      "strict_precision": 0.51,
+      "strict_recall": 0.407,
+      "note_f1": 0.851,
+      "staff_acc": 1.0,
+      "spell_acc": 1.0,
+      "measure_exact": 0.056,
+      "omr_notes": 98
+     },
+     "oemer_detail": {
+      "strict_precision": 0.0,
+      "strict_recall": 0.0,
+      "note_f1": 0.366,
+      "staff_acc": null,
+      "spell_acc": null,
+      "measure_exact": 0.0,
+      "omr_notes": 90
+     }
+    }
+   }
+  },
+  {
+   "slug": "oneills-tune",
+   "p1_measures": 26,
+   "clean": {
+    "file": "clean/oneills-tune.png",
+    "sha256": "be6739d4a0e0d5caa5e6251312075b18c9928b6fe7e75b7b560e93c190debef6",
+    "bytes": 56085
+   },
+   "photo": {
+    "file": "photo/oneills-tune.png",
+    "sha256": "17eb83ec90044c4618875c870584ede8975a58f340fdaa2f6c40d42134488eaa",
+    "bytes": 78403
+   },
+   "gt": {
+    "file": "gt/gt-p1-oneills-tune.musicxml",
+    "sha256": "5e7b305235c2bc17b142a45f6fed68b12977b2cd43c60eb322bdd9f3235654b9",
+    "bytes": 45639
+   },
+   "reference": {
+    "clean": {
+     "slug": "oneills-tune",
+     "description": "O'Neill's collection tune (pinned GT)",
+     "gt_notes": 133,
+     "sheetly": 0.925,
+     "audiveris": 0.773,
+     "oemer": 0.33,
+     "sheetly_detail": {
+      "strict_precision": 0.925,
+      "strict_recall": 0.925,
+      "note_f1": 0.97,
+      "staff_acc": 1.0,
+      "spell_acc": 1.0,
+      "measure_exact": 0.885,
+      "omr_notes": 133
+     },
+     "audiveris_detail": {
+      "strict_precision": 0.876,
+      "strict_recall": 0.692,
+      "note_f1": 0.84,
+      "staff_acc": 1.0,
+      "spell_acc": 1.0,
+      "measure_exact": 0.077,
+      "omr_notes": 105
+     },
+     "oemer_detail": {
+      "strict_precision": 0.328,
+      "strict_recall": 0.331,
+      "note_f1": 0.876,
+      "staff_acc": 1.0,
+      "spell_acc": 1.0,
+      "measure_exact": 0.038,
+      "omr_notes": 134
+     }
+    },
+    "photo": {
+     "slug": "oneills-tune",
+     "gt_notes": 133,
+     "sheetly": 0.895,
+     "audiveris": 0.441,
+     "oemer": 0.0,
+     "sheetly_detail": {
+      "strict_precision": 0.895,
+      "strict_recall": 0.895,
+      "note_f1": 0.97,
+      "staff_acc": 1.0,
+      "spell_acc": 1.0,
+      "measure_exact": 0.846,
+      "omr_notes": 133
+     },
+     "audiveris_detail": {
+      "strict_precision": 0.551,
+      "strict_recall": 0.368,
+      "note_f1": 0.694,
+      "staff_acc": 1.0,
+      "spell_acc": 1.0,
+      "measure_exact": 0.038,
+      "omr_notes": 89
+     },
+     "oemer_detail": {
+      "strict_precision": 0.0,
+      "strict_recall": 0.0,
+      "note_f1": 0.496,
+      "staff_acc": null,
+      "spell_acc": null,
+      "measure_exact": 0.0,
+      "omr_notes": 133
+     }
+    }
+   }
+  },
+  {
+   "slug": "airds-air",
+   "p1_measures": 18,
+   "clean": {
+    "file": "clean/airds-air.png",
+    "sha256": "f935dbb64b1eb6d9f5e13394df9279f4267c5e654a8270bcdf59b3575129b65e",
+    "bytes": 44100
+   },
+   "photo": {
+    "file": "photo/airds-air.png",
+    "sha256": "40326f08d4bdb2d23b33eecc23cdf7715cf3374ba22932a48f214ac69f4639b0",
+    "bytes": 58058
+   },
+   "gt": {
+    "file": "gt/gt-p1-airds-air.musicxml",
+    "sha256": "4d1f588985470d712891c3cbdbcc7a6b138d038b47bc3ae5a45ec6bae0858a01",
+    "bytes": 21920
+   },
+   "reference": {
+    "clean": {
+     "slug": "airds-air",
+     "description": "Aird's Airs highland tune (pinned GT)",
+     "gt_notes": 84,
+     "sheetly": 0.988,
+     "audiveris": 0.812,
+     "oemer": 0.852,
+     "sheetly_detail": {
+      "strict_precision": 0.988,
+      "strict_recall": 0.988,
+      "note_f1": 1.0,
+      "staff_acc": 1.0,
+      "spell_acc": 1.0,
+      "measure_exact": 0.944,
+      "omr_notes": 84
+     },
+     "audiveris_detail": {
+      "strict_precision": 0.827,
+      "strict_recall": 0.798,
+      "note_f1": 0.958,
+      "staff_acc": 1.0,
+      "spell_acc": 1.0,
+      "measure_exact": 0.833,
+      "omr_notes": 81
+     },
+     "oemer_detail": {
+      "strict_precision": 0.847,
+      "strict_recall": 0.857,
+      "note_f1": 0.994,
+      "staff_acc": 1.0,
+      "spell_acc": 1.0,
+      "measure_exact": 0.389,
+      "omr_notes": 85
+     }
+    },
+    "photo": {
+     "slug": "airds-air",
+     "gt_notes": 84,
+     "sheetly": 0.988,
+     "audiveris": 0.777,
+     "oemer": 0.06,
+     "sheetly_detail": {
+      "strict_precision": 0.988,
+      "strict_recall": 0.988,
+      "note_f1": 1.0,
+      "staff_acc": 1.0,
+      "spell_acc": 1.0,
+      "measure_exact": 0.944,
+      "omr_notes": 84
+     },
+     "audiveris_detail": {
+      "strict_precision": 0.836,
+      "strict_recall": 0.726,
+      "note_f1": 0.904,
+      "staff_acc": 1.0,
+      "spell_acc": 1.0,
+      "measure_exact": 0.222,
+      "omr_notes": 73
+     },
+     "oemer_detail": {
+      "strict_precision": 0.06,
+      "strict_recall": 0.06,
+      "note_f1": 0.94,
+      "staff_acc": 1.0,
+      "spell_acc": 1.0,
+      "measure_exact": 0.0,
+      "omr_notes": 84
+     }
+    }
+   }
+  },
+  {
+   "slug": "essen-altdeu",
+   "p1_measures": 22,
+   "clean": {
+    "file": "clean/essen-altdeu.png",
+    "sha256": "0dcdfd0ab295cf12ed466946c7fce1ffb76fe8a6a720339277e4440a3e237602",
+    "bytes": 45387
+   },
+   "photo": {
+    "file": "photo/essen-altdeu.png",
+    "sha256": "0805453e9d9a3c469e446ff952f5b6d17c845a792327e0b8f66a9322dd9e4225",
+    "bytes": 62997
+   },
+   "gt": {
+    "file": "gt/gt-p1-essen-altdeu.musicxml",
+    "sha256": "01eb6491d267a07e7793b17961fc4d90f5a2ec2a157ee359d508bba41daa931b",
+    "bytes": 15683
+   },
+   "reference": {
+    "clean": {
+     "slug": "essen-altdeu",
+     "description": "Essen folksong \u2014 old German (pinned GT)",
+     "gt_notes": 60,
+     "sheetly": 0.917,
+     "audiveris": 0.878,
+     "oemer": 0.65,
+     "sheetly_detail": {
+      "strict_precision": 0.917,
+      "strict_recall": 0.917,
+      "note_f1": 0.917,
+      "staff_acc": 1.0,
+      "spell_acc": 1.0,
+      "measure_exact": 0.818,
+      "omr_notes": 60
+     },
+     "audiveris_detail": {
+      "strict_precision": 0.857,
+      "strict_recall": 0.9,
+      "note_f1": 0.894,
+      "staff_acc": 1.0,
+      "spell_acc": 1.0,
+      "measure_exact": 0.773,
+      "omr_notes": 63
+     },
+     "oemer_detail": {
+      "strict_precision": 0.65,
+      "strict_recall": 0.65,
+      "note_f1": 0.917,
+      "staff_acc": 1.0,
+      "spell_acc": 1.0,
+      "measure_exact": 0.045,
+      "omr_notes": 60
+     }
+    },
+    "photo": {
+     "slug": "essen-altdeu",
+     "gt_notes": 60,
+     "sheetly": 0.917,
+     "audiveris": 0.823,
+     "oemer": 0.033,
+     "sheetly_detail": {
+      "strict_precision": 0.917,
+      "strict_recall": 0.917,
+      "note_f1": 0.917,
+      "staff_acc": 1.0,
+      "spell_acc": 1.0,
+      "measure_exact": 0.818,
+      "omr_notes": 60
+     },
+     "audiveris_detail": {
+      "strict_precision": 0.797,
+      "strict_recall": 0.85,
+      "note_f1": 0.839,
+      "staff_acc": 1.0,
+      "spell_acc": 1.0,
+      "measure_exact": 0.591,
+      "omr_notes": 64
+     },
+     "oemer_detail": {
+      "strict_precision": 0.033,
+      "strict_recall": 0.033,
+      "note_f1": 0.867,
+      "staff_acc": 1.0,
+      "spell_acc": 1.0,
+      "measure_exact": 0.0,
+      "omr_notes": 60
+     }
+    }
+   }
+  },
+  {
+   "slug": "essen-ballad",
+   "p1_measures": 9,
+   "clean": {
+    "file": "clean/essen-ballad.png",
+    "sha256": "55092b58ea1d8846b53e099ffab9e2cf56a09ba72a251ec2faba542b4cce9f79",
+    "bytes": 39907
+   },
+   "photo": {
+    "file": "photo/essen-ballad.png",
+    "sha256": "483c1d2e046a1921bbf79918e58736e73ea8f4c458299e91bb7e2ed972dc2820",
+    "bytes": 50784
+   },
+   "gt": {
+    "file": "gt/gt-p1-essen-ballad.musicxml",
+    "sha256": "e8109998ada3e05fc0f2214c4834d30dd144bd067cebe66e28e812b01a924055",
+    "bytes": 9752
+   },
+   "reference": {
+    "clean": {
+     "slug": "essen-ballad",
+     "description": "Essen folksong \u2014 ballad (pinned GT)",
+     "gt_notes": 36,
+     "sheetly": 0.944,
+     "audiveris": 0.944,
+     "oemer": 0.767,
+     "sheetly_detail": {
+      "strict_precision": 0.944,
+      "strict_recall": 0.944,
+      "note_f1": 0.944,
+      "staff_acc": 1.0,
+      "spell_acc": 1.0,
+      "measure_exact": 0.889,
+      "omr_notes": 36
+     },
+     "audiveris_detail": {
+      "strict_precision": 0.944,
+      "strict_recall": 0.944,
+      "note_f1": 0.944,
+      "staff_acc": 1.0,
+      "spell_acc": 1.0,
+      "measure_exact": 0.889,
+      "omr_notes": 36
+     },
+     "oemer_detail": {
+      "strict_precision": 0.757,
+      "strict_recall": 0.778,
+      "note_f1": 0.932,
+      "staff_acc": 1.0,
+      "spell_acc": 1.0,
+      "measure_exact": 0.667,
+      "omr_notes": 37
+     }
+    },
+    "photo": {
+     "slug": "essen-ballad",
+     "gt_notes": 36,
+     "sheetly": 0.944,
+     "audiveris": 0.698,
+     "oemer": null,
+     "sheetly_detail": {
+      "strict_precision": 0.944,
+      "strict_recall": 0.944,
+      "note_f1": 0.944,
+      "staff_acc": 1.0,
+      "spell_acc": 1.0,
+      "measure_exact": 0.889,
+      "omr_notes": 36
+     },
+     "audiveris_detail": {
+      "strict_precision": 0.815,
+      "strict_recall": 0.611,
+      "note_f1": 0.794,
+      "staff_acc": 1.0,
+      "spell_acc": 1.0,
+      "measure_exact": 0.0,
+      "omr_notes": 27
+     }
+    }
+   }
+  },
+  {
+   "slug": "hw-beethoven-op135",
+   "handwritten": true,
+   "work": "String Quartet No.16 in F major, Op.135 (Mvt I p.1)",
+   "composer": "Beethoven, Ludwig van",
+   "license": "Public Domain (IMSLP) + CC0-1.0 (OpenScore)",
+   "p1_measures": 10,
+   "system_boxes": [
+    [
+     125,
+     116,
+     2250,
+     928
+    ],
+    [
+     125,
+     928,
+     2250,
+     1740
+    ]
+   ],
+   "clean": {
+    "file": "hw/clean/hw-beethoven-op135.png",
+    "sha256": "f15c689c4d24e6ea1d319b65d15d61cea8cfdde0a2562bc4966b3f60fca53579",
+    "bytes": 8156718
+   },
+   "photo": {
+    "file": "hw/photo/hw-beethoven-op135.png",
+    "sha256": "99f08a532319873d3c1833c236bf620ac590c7433518d826e32ebdbaabe570e9",
+    "bytes": 4871846
+   },
+   "gt": {
+    "file": "hw/gt/gt-p1-hw-beethoven-op135.musicxml",
+    "sha256": "1a8a1ea56d0e5c918a9a1bbb07edae45cd0a921b6ff066b7572377923f942c28",
+    "bytes": 86284
+   }
+  },
+  {
+   "slug": "hw-mozart-k464",
+   "handwritten": true,
+   "work": "String Quartet No.18 in A major, K.464 (Mvt I p.1)",
+   "composer": "Mozart, Wolfgang Amadeus",
+   "license": "Public Domain (IMSLP) + CC0-1.0 (OpenScore)",
+   "p1_measures": 39,
+   "system_boxes": [
+    [
+     59,
+     50,
+     1071,
+     285
+    ],
+    [
+     59,
+     285,
+     1071,
+     520
+    ],
+    [
+     59,
+     520,
+     1071,
+     756
+    ]
+   ],
+   "clean": {
+    "file": "hw/clean/hw-mozart-k464.png",
+    "sha256": "4b7ee5376a087a783bcaed46d3db45d4ff97a38df5a1a60382e3682a9e3a0358",
+    "bytes": 2075744
+   },
+   "photo": {
+    "file": "hw/photo/hw-mozart-k464.png",
+    "sha256": "30bdb8e4caf5a9c9cbfd5b8888419c3e7476e823fd235aadd8854ce636dc6e21",
+    "bytes": 844436
+   },
+   "gt": {
+    "file": "hw/gt/gt-p1-hw-mozart-k464.musicxml",
+    "sha256": "21f8098b19be8c6cc3ff58c07d7398732acfe8f5f8cb3785a2e1f1cd9069ee2e",
+    "bytes": 209719
+   }
+  },
+  {
+   "slug": "hw-mozart-k387",
+   "handwritten": true,
+   "work": "String Quartet No.14 in G major, K.387 (Mvt I p.1)",
+   "composer": "Mozart, Wolfgang Amadeus",
+   "license": "Public Domain (IMSLP) + CC0-1.0 (OpenScore)",
+   "p1_measures": 28,
+   "system_boxes": [
+    [
+     59,
+     51,
+     1071,
+     289
+    ],
+    [
+     59,
+     289,
+     1071,
+     528
+    ],
+    [
+     59,
+     528,
+     1071,
+     767
+    ]
+   ],
+   "clean": {
+    "file": "hw/clean/hw-mozart-k387.png",
+    "sha256": "945a27aec60a18518946ef5c5d4913ea0ffc0babb9a59123bb24186cb52f15e4",
+    "bytes": 2129909
+   },
+   "photo": {
+    "file": "hw/photo/hw-mozart-k387.png",
+    "sha256": "160666e56dae23ce44d81b137444edf53240da32c226a4487b0d43b6f89bb12c",
+    "bytes": 1046141
+   },
+   "gt": {
+    "file": "hw/gt/gt-p1-hw-mozart-k387.musicxml",
+    "sha256": "011bb770818702075175fcb35ea65998f5231a015f2538e244b730992546ddab",
+    "bytes": 242395
+   }
+  },
+  {
+   "slug": "hw-mozart-k421",
+   "handwritten": true,
+   "work": "String Quartet No.15 in D minor, K.421 (Mvt I p.1)",
+   "composer": "Mozart, Wolfgang Amadeus",
+   "license": "Public Domain (IMSLP) + CC0-1.0 (OpenScore)",
+   "p1_measures": 32,
+   "system_boxes": [
+    [
+     59,
+     50,
+     1071,
+     283
+    ],
+    [
+     59,
+     283,
+     1071,
+     517
+    ],
+    [
+     59,
+     517,
+     1071,
+     751
+    ]
+   ],
+   "clean": {
+    "file": "hw/clean/hw-mozart-k421.png",
+    "sha256": "54e9d3439177c68403215d8571cb847c0720044cf71dda22c82bee72a2002ea1",
+    "bytes": 2077454
+   },
+   "photo": {
+    "file": "hw/photo/hw-mozart-k421.png",
+    "sha256": "af98f7df16d06c72ef7de3467abcf0d34dfde0598aaca1d595fb1431a85f9f26",
+    "bytes": 851762
+   },
+   "gt": {
+    "file": "hw/gt/gt-p1-hw-mozart-k421.musicxml",
+    "sha256": "0b9ae72dd08e3cb9a8bd59028db88da0ba1cf1e671c8ecc9e6fd08e15ac2e020",
+    "bytes": 451375
+   }
+  },
+  {
+   "slug": "hw-schubert-d810",
+   "handwritten": true,
+   "work": "String Quartet in D minor, D.810 (Mvt I p.1)",
+   "composer": "Schubert, Franz",
+   "license": "Public Domain (IMSLP) + CC0-1.0 (OpenScore)",
+   "p1_measures": 30,
+   "system_boxes": [
+    [
+     123,
+     134,
+     2216,
+     605
+    ],
+    [
+     123,
+     605,
+     2216,
+     1076
+    ],
+    [
+     123,
+     1076,
+     2216,
+     1547
+    ],
+    [
+     123,
+     1547,
+     2216,
+     2019
+    ]
+   ],
+   "clean": {
+    "file": "hw/clean/hw-schubert-d810.png",
+    "sha256": "aaa9f1c68c2fbfd5c1e93432e8dd987eb31ce50abb2d1c87f12b31c972185def",
+    "bytes": 7598868
+   },
+   "photo": {
+    "file": "hw/photo/hw-schubert-d810.png",
+    "sha256": "30643d04dd41c56661905cfb7637a7af5f07682e54bd308766477ca52176b36c",
+    "bytes": 3547599
+   },
+   "gt": {
+    "file": "hw/gt/gt-p1-hw-schubert-d810.musicxml",
+    "sha256": "2364a83941fd53a64df8135ec4ea21c96906f84e130556362fa25cc2951fcb20",
+    "bytes": 247419
+   }
+  }
+ ]
+}

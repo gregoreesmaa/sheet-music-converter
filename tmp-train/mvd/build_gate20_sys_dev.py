@@ -233,6 +233,127 @@ def crop_has_no_peaks(clean_crop_path):
     return len(merged) == 0
 
 
+def _longest_ink_run(row_dark, max_gap=2):
+    """Return ``(length, x1, x2)`` of the longest horizontal dark run.
+
+    Allows tiny 1..``max_gap``-pixel breaks (aliasing / light ink) inside
+    a staff line without bridging across separate text glyphs.
+    """
+    import numpy as np
+    idx = np.nonzero(row_dark)[0]
+    if len(idx) == 0:
+        return 0, 0, 0
+    best_len, best_x1, best_x2 = 0, 0, 0
+    start = int(idx[0])
+    prev = start
+    for x in idx[1:]:
+        xi = int(x)
+        if xi - prev <= max_gap + 1:
+            prev = xi
+        else:
+            run_len = prev - start + 1
+            if run_len > best_len:
+                best_len, best_x1, best_x2 = run_len, start, prev + 1
+            start = prev = xi
+    run_len = prev - start + 1
+    if run_len > best_len:
+        best_len, best_x1, best_x2 = run_len, start, prev + 1
+    return best_len, best_x1, best_x2
+
+
+def detect_short_trailing_staves(page_path, staves, space):
+    """Recover short partial-width final staves missed by RowNet.
+
+    RowNet resizes the full page width to 248 px, so a short final system
+    (20-35% of page width, e.g. ``oneills-tune`` m24 or ``repeats-melody``
+    m16) scores below ``NEURAL_THRESHOLD`` and is dropped. This scans
+    strictly below the last detected staff for 5 evenly-spaced horizontal
+    rules matching ``space`` (within +-1.5 px) and aligned to the page's
+    left staff margin, with a continuous ink run >= max(120, 0.12*full_w).
+    Text/copyright footers lack 5 parallel long rules and are ignored.
+    """
+    if not staves or space <= 2.0:
+        return list(staves)
+    import statistics
+    import numpy as np
+    from PIL import Image
+
+    with gate_open(page_path, 'rb') as f:
+        with Image.open(f) as img:
+            arr = np.asarray(img.convert('L'))
+    h, w = arr.shape
+    ordered = sorted(staves, key=lambda s: s['y1'])
+    x_left = min(s['x1'] for s in ordered)
+    full_w = statistics.median(s['x2'] - s['x1'] for s in ordered)
+    min_run = max(120.0, 0.12 * full_w)
+    x_tol = max(25.0, 3.0 * space)
+    y_cursor = int(round(max(s['y2'] for s in ordered) + max(2.0 * space, 20.0)))
+    y_limit = h - int(round(4.0 * space)) - 3
+    if y_cursor >= y_limit:
+        return ordered
+
+    dark = arr < bsd.BIN_THRESHOLD
+    # Precompute longest horizontal run for candidate rows below y_cursor
+    row_info = {}
+    for r in range(y_cursor, h):
+        # Fast pre-filter: row must have enough dark pixels to hold min_run
+        if int(dark[r].sum()) < min_run * 0.85:
+            continue
+        rlen, rx1, rx2 = _longest_ink_run(dark[r], max_gap=2)
+        if rlen >= min_run and abs(rx1 - x_left) <= x_tol:
+            row_info[r] = (rlen, rx1, rx2)
+
+    if len(row_info) < 5:
+        return ordered
+
+    added = list(ordered)
+    r = y_cursor
+    sp_tol = max(1.5, 0.12 * space)
+    while r <= y_limit:
+        if r not in row_info:
+            r += 1
+            continue
+        # Try matching a 5-line comb starting at r
+        lines = [r]
+        ok = True
+        for k in range(1, 5):
+            target = r + k * space
+            lo = int(round(target - sp_tol))
+            hi = int(round(target + sp_tol))
+            cands = [rr for rr in range(lo, hi + 1) if rr in row_info]
+            if not cands:
+                ok = False
+                break
+            best_rr = max(cands, key=lambda rr: row_info[rr][0])
+            lines.append(best_rr)
+        if not ok:
+            r += 1
+            continue
+        # Verify all 5 lines share consistent x-extent (true staff, not noise)
+        x1s = [row_info[rr][1] for rr in lines]
+        x2s = [row_info[rr][2] for rr in lines]
+        if (max(x1s) - min(x1s) <= x_tol
+                and max(x2s) - min(x2s) <= max(x_tol, 0.15 * full_w)):
+            y1, y2 = lines[0], lines[-1]
+            band = dark[y1:y2 + 1, :]
+            cols = np.nonzero(band.any(axis=0))[0]
+            bx1 = float(cols[0]) if len(cols) else float(min(x1s))
+            bx2 = float(cols[-1] + 1) if len(cols) else float(max(x2s))
+            added.append({'x1': bx1, 'y1': float(y1),
+                          'x2': bx2, 'y2': float(y2)})
+            r = y2 + int(round(max(2.0 * space, 20.0)))
+        else:
+            r += 1
+    return added
+
+
+def detect_staves_with_short_tail(page_path):
+    """Run ``neural_detect_staves`` and recover any short trailing staff."""
+    staves, space = bsd.neural_detect_staves(page_path)
+    staves = detect_short_trailing_staves(page_path, staves, space)
+    return staves, space
+
+
 def tight_group_boxes(page_path, xml_path, spans):
     """Return (boxes, kept_spans, dropped_span, (w, h)) or None.
 
@@ -256,7 +377,7 @@ def tight_group_boxes(page_path, xml_path, spans):
     """
     k = len(spans)
     try:
-        staves, space = neural_detect_staves(page_path)
+        staves, space = detect_staves_with_short_tail(page_path)
     except (OSError, ValueError):
         return None
     try:

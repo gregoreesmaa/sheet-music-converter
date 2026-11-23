@@ -1,0 +1,223 @@
+{
+ "suite": "suite31-hw-only",
+ "generated_by": "tmp-train/mvd/build_real_hw_suite.py",
+ "pieces_expected": 5,
+ "license": "Public Domain (IMSLP holographs) + CC0-1.0 (OpenScore StringQuartets); zero NC data",
+ "pieces": [
+  {
+   "slug": "hw-beethoven-op135",
+   "handwritten": true,
+   "work": "String Quartet No.16 in F major, Op.135 (Mvt I p.1)",
+   "composer": "Beethoven, Ludwig van",
+   "license": "Public Domain (IMSLP) + CC0-1.0 (OpenScore)",
+   "p1_measures": 10,
+   "system_boxes": [
+    [
+     125,
+     116,
+     2250,
+     928
+    ],
+    [
+     125,
+     928,
+     2250,
+     1740
+    ]
+   ],
+   "clean": {
+    "file": "hw/clean/hw-beethoven-op135.png",
+    "sha256": "f15c689c4d24e6ea1d319b65d15d61cea8cfdde0a2562bc4966b3f60fca53579",
+    "bytes": 8156718
+   },
+   "photo": {
+    "file": "hw/photo/hw-beethoven-op135.png",
+    "sha256": "99f08a532319873d3c1833c236bf620ac590c7433518d826e32ebdbaabe570e9",
+    "bytes": 4871846
+   },
+   "gt": {
+    "file": "hw/gt/gt-p1-hw-beethoven-op135.musicxml",
+    "sha256": "1a8a1ea56d0e5c918a9a1bbb07edae45cd0a921b6ff066b7572377923f942c28",
+    "bytes": 86284
+   }
+  },
+  {
+   "slug": "hw-mozart-k464",
+   "handwritten": true,
+   "work": "String Quartet No.18 in A major, K.464 (Mvt I p.1)",
+   "composer": "Mozart, Wolfgang Amadeus",
+   "license": "Public Domain (IMSLP) + CC0-1.0 (OpenScore)",
+   "p1_measures": 39,
+   "system_boxes": [
+    [
+     59,
+     50,
+     1071,
+     285
+    ],
+    [
+     59,
+     285,
+     1071,
+     520
+    ],
+    [
+     59,
+     520,
+     1071,
+     756
+    ]
+   ],
+   "clean": {
+    "file": "hw/clean/hw-mozart-k464.png",
+    "sha256": "4b7ee5376a087a783bcaed46d3db45d4ff97a38df5a1a60382e3682a9e3a0358",
+    "bytes": 2075744
+   },
+   "photo": {
+    "file": "hw/photo/hw-mozart-k464.png",
+    "sha256": "30bdb8e4caf5a9c9cbfd5b8888419c3e7476e823fd235aadd8854ce636dc6e21",
+    "bytes": 844436
+   },
+   "gt": {
+    "file": "hw/gt/gt-p1-hw-mozart-k464.musicxml",
+    "sha256": "21f8098b19be8c6cc3ff58c07d7398732acfe8f5f8cb3785a2e1f1cd9069ee2e",
+    "bytes": 209719
+   }
+  },
+  {
+   "slug": "hw-mozart-k387",
+   "handwritten": true,
+   "work": "String Quartet No.14 in G major, K.387 (Mvt I p.1)",
+   "composer": "Mozart, Wolfgang Amadeus",
+   "license": "Public Domain (IMSLP) + CC0-1.0 (OpenScore)",
+   "p1_measures": 28,
+   "system_boxes": [
+    [
+     59,
+     51,
+     1071,
+     289
+    ],
+    [
+     59,
+     289,
+     1071,
+     528
+    ],
+    [
+     59,
+     528,
+     1071,
+     767
+    ]
+   ],
+   "clean": {
+    "file": "hw/clean/hw-mozart-k387.png",
+    "sha256": "945a27aec60a18518946ef5c5d4913ea0ffc0babb9a59123bb24186cb52f15e4",
+    "bytes": 2129909
+   },
+   "photo": {
+    "file": "hw/photo/hw-mozart-k387.png",
+    "sha256": "160666e56dae23ce44d81b137444edf53240da32c226a4487b0d43b6f89bb12c",
+    "bytes": 1046141
+   },
+   "gt": {
+    "file": "hw/gt/gt-p1-hw-mozart-k387.musicxml",
+    "sha256": "011bb770818702075175fcb35ea65998f5231a015f2538e244b730992546ddab",
+    "bytes": 242395
+   }
+  },
+  {
+   "slug": "hw-mozart-k421",
+   "handwritten": true,
+   "work": "String Quartet No.15 in D minor, K.421 (Mvt I p.1)",
+   "composer": "Mozart, Wolfgang Amadeus",
+   "license": "Public Domain (IMSLP) + CC0-1.0 (OpenScore)",
+   "p1_measures": 32,
+   "system_boxes": [
+    [
+     59,
+     50,
+     1071,
+     283
+    ],
+    [
+     59,
+     283,
+     1071,
+     517
+    ],
+    [
+     59,
+     517,
+     1071,
+     751
+    ]
+   ],
+   "clean": {
+    "file": "hw/clean/hw-mozart-k421.png",
+    "sha256": "54e9d3439177c68403215d8571cb847c0720044cf71dda22c82bee72a2002ea1",
+    "bytes": 2077454
+   },
+   "photo": {
+    "file": "hw/photo/hw-mozart-k421.png",
+    "sha256": "af98f7df16d06c72ef7de3467abcf0d34dfde0598aaca1d595fb1431a85f9f26",
+    "bytes": 851762
+   },
+   "gt": {
+    "file": "hw/gt/gt-p1-hw-mozart-k421.musicxml",
+    "sha256": "0b9ae72dd08e3cb9a8bd59028db88da0ba1cf1e671c8ecc9e6fd08e15ac2e020",
+    "bytes": 451375
+   }
+  },
+  {
+   "slug": "hw-schubert-d810",
+   "handwritten": true,
+   "work": "String Quartet in D minor, D.810 (Mvt I p.1)",
+   "composer": "Schubert, Franz",
+   "license": "Public Domain (IMSLP) + CC0-1.0 (OpenScore)",
+   "p1_measures": 30,
+   "system_boxes": [
+    [
+     123,
+     134,
+     2216,
+     605
+    ],
+    [
+     123,
+     605,
+     2216,
+     1076
+    ],
+    [
+     123,
+     1076,
+     2216,
+     1547
+    ],
+    [
+     123,
+     1547,
+     2216,
+     2019
+    ]
+   ],
+   "clean": {
+    "file": "hw/clean/hw-schubert-d810.png",
+    "sha256": "aaa9f1c68c2fbfd5c1e93432e8dd987eb31ce50abb2d1c87f12b31c972185def",
+    "bytes": 7598868
+   },
+   "photo": {
+    "file": "hw/photo/hw-schubert-d810.png",
+    "sha256": "30643d04dd41c56661905cfb7637a7af5f07682e54bd308766477ca52176b36c",
+    "bytes": 3547599
+   },
+   "gt": {
+    "file": "hw/gt/gt-p1-hw-schubert-d810.musicxml",
+    "sha256": "2364a83941fd53a64df8135ec4ea21c96906f84e130556362fa25cc2951fcb20",
+    "bytes": 247419
+   }
+  }
+ ]
+}

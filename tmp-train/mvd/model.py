@@ -445,14 +445,13 @@ class MvdNet(nn.Module):
             self.foveal_proj = nn.Sequential(
                 nn.Conv2d(192, d_model, 1), nn.GELU(), f_out)
         self.mem_norm = nn.LayerNorm(d_model)
-        # S13b dense auxiliary head: distills the 8 hybrid-extra
-        # channels (frozen HeatNet 7-ch probs + staff grid) from raw
-        # trunk features, giving dense per-cell gradients to early
-        # layers that sparse token CE never supplies. Always present
-        # (old ckpts load via the aux-fresh compat path); unused when
-        # the train loop passes no aux targets.
+        # S13b dense auxiliary head: distills the hybrid-extra channels
+        # (8 in 11-ch HeatNet+staff mode; 1 in 4-ch staff-only mode; 8 in
+        # legacy 3-ch mode for checkpoint compatibility) from raw trunk
+        # features. Unused when the train loop passes no aux targets.
+        aux_ch = 1 if self.extra_chans == 1 else 8
         self.aux_head = nn.Sequential(
-            nn.Conv2d(768, 128, 1), nn.ReLU(), nn.Conv2d(128, 8, 1))
+            nn.Conv2d(768, 128, 1), nn.ReLU(), nn.Conv2d(128, aux_ch, 1))
 
         layer = nn.TransformerDecoderLayer(
             d_model=d_model, nhead=heads, dim_feedforward=dim_ff,
@@ -657,6 +656,21 @@ class MvdNet(nn.Module):
                          memory_key_padding_mask=mem_mask)
         return self.out(h)
 
+    def decode_hidden(self, mem, tgt_in, mem_mask=None):
+        """Decoder-only hidden states ``[B, T, d_model]`` for precomputed memory.
+
+        Shared by :meth:`decode_logits` and :meth:`loss_shared` so
+        factored heads (e.g. ``S18FactoredHead``) can share one decoder
+        pass with ``self.out(h)``. ``tgt_in`` includes the BOS prefix.
+        """
+        n = tgt_in.shape[1]
+        emb = self.tok_emb(tgt_in) + _sinusoidal_1d(
+            n, self.d_model, tgt_in.device)[None]
+        mask = nn.Transformer.generate_square_subsequent_mask(
+            n, device=tgt_in.device)
+        return self.decoder(emb, mem, tgt_mask=mask,
+                            memory_key_padding_mask=mem_mask)
+
     def decode_logits(self, mem, tgt_in, mem_mask=None):
         """Decoder-only logits ``[B, T, V]`` for precomputed memory.
 
@@ -664,14 +678,7 @@ class MvdNet(nn.Module):
         sibling scoring (one encode + many teacher-forcing passes)
         stays cheap. ``tgt_in`` includes the BOS prefix.
         """
-        n = tgt_in.shape[1]
-        emb = self.tok_emb(tgt_in) + _sinusoidal_1d(
-            n, self.d_model, tgt_in.device)[None]
-        mask = nn.Transformer.generate_square_subsequent_mask(
-            n, device=tgt_in.device)
-        h = self.decoder(emb, mem, tgt_mask=mask,
-                         memory_key_padding_mask=mem_mask)
-        return self.out(h)
+        return self.out(self.decode_hidden(mem, tgt_in, mem_mask))
 
     def loss(self, images, tgt, sample_p=0.0, mem_mask=None,
                tok_weight=1.0, weight_ids=(), tok_dropout=0.0,
@@ -737,13 +744,18 @@ class MvdNet(nn.Module):
     def loss_shared(self, images, tgt, sample_p=0.0, mem_mask=None,
                     tok_weight=1.0, weight_ids=(), tok_dropout=0.0,
                     content_ids=(), need_aux=False, need_coord=False,
-                    coord_layer=-1, augment=None):
-        """Single-pass ``(ce_loss, aux_pred, x_centroids)`` sharing 1 encoder + 1 decoder.
+                    coord_layer=-1, augment=None,
+                    return_hidden=False, return_logits=False):
+        """Single-pass ``(ce_loss, aux_pred, x_centroids[, h][, logits])`` sharing 1 encoder + 1 decoder.
 
         Eliminates the 3x ConvNeXt-Tiny encoder + 2x Transformer decoder
         redundant autograd graphs when ``aux_weight > 0`` and/or
         ``coord_weight > 0`` (~2.5x faster, ~2.7x lower peak VRAM, identical
-        forward/gradient math when ``tok_dropout == 0``).
+        forward/gradient math when ``tok_dropout == 0``). When
+        ``return_hidden=True`` and/or ``return_logits=True``, appends the
+        shared decoder hidden states ``h`` and/or output ``logits`` to the
+        returned tuple so ``S18FactoredHead`` and ``logit_jsd_consistency``
+        reuse the same decoder pass.
         """
         if augment is not None:
             raise ValueError('spike-S8 latent SpecAugment was removed; '
@@ -790,7 +802,8 @@ class MvdNet(nn.Module):
                 held['q'] = out.detach().float()
             handle = top.norm2.register_forward_hook(_hook)
         try:
-            logits = self.decode_logits(mem, dec_in, mem_mask)
+            h = self.decode_hidden(mem, dec_in, mem_mask)
+            logits = self.out(h)
         finally:
             if handle is not None:
                 handle.remove()
@@ -807,7 +820,12 @@ class MvdNet(nn.Module):
             xs = (torch.arange(w_mem, device=w_att.device).float() + 0.5) / w_mem
             xc = (w_att.reshape(b, t, h_mem, w_mem) * xs).sum(dim=(2, 3))
 
-        return ce, apred, xc
+        out = (ce, apred, xc)
+        if return_hidden:
+            out = out + (h,)
+        if return_logits:
+            out = out + (logits,)
+        return out
 
     @torch.no_grad()
     def greedy(self, images, max_len=2048, constrain=False, mem_mask=None):
@@ -1186,15 +1204,15 @@ class MvdNet(nn.Module):
             ranked.append([out[gi, 1:].tolist() for _key, gi in cands])
         best = [r[0] for r in ranked]
         L = max(len(x) for x in best)
-        res = torch.full((nb, L), self.eos_id - 1, dtype=torch.long,
-                         device=device)  # PAD_ID == EOS_ID - 1
+        res = torch.full((nb, L), self.pad_id, dtype=torch.long,
+                         device=device)
         for i, x in enumerate(best):
             res[i, :len(x)] = torch.tensor(x, dtype=torch.long,
                                            device=device)
         allr = None
         if return_all:
             La = max(len(x) for r in ranked for x in r)
-            allr = torch.full((nb, K, La), self.eos_id - 1,
+            allr = torch.full((nb, K, La), self.pad_id,
                               dtype=torch.long, device=device)
             for pg, r in enumerate(ranked):
                 for k, x in enumerate(r):

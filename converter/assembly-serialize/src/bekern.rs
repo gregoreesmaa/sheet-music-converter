@@ -8,7 +8,9 @@
 //! changes at any measure start (or mid-measure voice cursor).
 //! Measure dynamics (`dyn-*`), hairpins (`hairpin-*-start|stop`) and an
 //! opening repeat (`bar-repeat-left`) ride at measure scope. Events sort
-//! by (measure, onset, staff, voice, grace-first, midi); chord tones are
+//! canonically by (measure, staff, voice, onset, grace-first, midi) so
+//! every measure emits voice segments in a single strictly monotonic
+//! `voice-1`, `voice-2`, ... sequence; chord tones are
 //! full note tokens each (no spine markers in v1). Grace notes emit
 //! their duration + pitch (zero advance on decode); only grace rests are
 //! un-notatable and skipped (counted). Tuplet members carry written
@@ -344,17 +346,19 @@ pub fn to_bekern(
         }
         evs.push(e);
     }
-    // Grace notes sort before same-onset plain events (after staff
-    // and voice, before MIDI pitch): they steal time from the
-    // following note, so decoding them after it would shift their
-    // onset past it. The sort is stable, so all other ties keep
-    // document order (chord runs stay adjacent).
+    // Canonical per-measure (staff, voice) ordering (I1): group events
+    // contiguously by ascending (staff, voice) within each measure, then
+    // by onset, grace-first, and MIDI pitch. Every measure emits voice
+    // segments in a single strictly monotonic `voice-1`, `voice-2`, ...
+    // sequence independent of XML voice declaration order or late-entry
+    // onsets. The sort is stable, so all other ties keep document order
+    // (chord runs stay adjacent).
     evs.sort_by(|a, b| {
         a.measure
             .cmp(&b.measure)
-            .then(a.onset.partial_cmp(&b.onset).unwrap())
             .then(a.staff.cmp(&b.staff))
             .then(a.voice.cmp(&b.voice))
+            .then(a.onset.partial_cmp(&b.onset).unwrap())
             .then((!a.grace).cmp(&!b.grace))
             .then(midi_key(a).cmp(&midi_key(b)))
     });
@@ -444,35 +448,32 @@ pub fn to_bekern(
             last_visual_start = None;
             last_visual_stop = None;
         }
-        if e.measure != measure {
-            if started {
-                let mut keys: Vec<(u32, u32)> = open.keys().cloned().collect();
-                keys.sort();
-                for key in keys {
-                    if let Some(stack) = open.remove(&key) {
-                        if stack.is_empty() {
-                            continue;
-                        }
-                        // Key had events this measure, so it has a segment:
-                        // seg_of gains an entry for every event (before
-                        // the measure_rest early-continue), and spans
-                        // never cross `bar` by construction. The lookup
-                        // stays graceful in release, but a miss means the
-                        // invariant broke and deserves a loud test failure.
-                        debug_assert!(
-                            seg_of.contains_key(&key),
-                            "open span with no segment this measure"
-                        );
-                        let Some(&seg) = seg_of.get(&key) else {
-                            continue;
-                        };
-                        out.push(format!("voice-{seg}"));
+        let key = (e.staff, e.voice);
+        // When leaving a (staff, voice) run (either switching to the next
+        // canonical voice in the same measure or closing the measure),
+        // close any open tuplet spans for `prev_key` right here while
+        // decode's cursor is still on `prev_key`'s segment. Because
+        // events are contiguous by (staff, voice) within each measure,
+        // `prev_key` will not reappear in this measure — closing now
+        // avoids a non-monotonic `voice-N` jump at bar close.
+        if let Some(pk) = prev_key {
+            if e.measure != measure || pk != key {
+                if let Some(stack) = open.remove(&pk) {
+                    if !stack.is_empty() {
                         for _ in &stack {
                             out.push("tuplet-stop".to_string());
                         }
-                        reopen.insert(key, stack);
+                        reopen.insert(pk, stack);
                     }
                 }
+            }
+        }
+        if e.measure != measure {
+            if started {
+                debug_assert!(
+                    open.values().all(|s| s.is_empty()),
+                    "open span left unclosed at measure boundary"
+                );
                 out.push(pending_right.take().unwrap_or_else(|| "bar".to_string()));
             }
             measure = e.measure;
@@ -530,10 +531,13 @@ pub fn to_bekern(
         if let Some(b) = &e.barline_left {
             out.push(b.clone());
         }
-        let key = (e.staff, e.voice);
-        let seg_n = seg_of.len() as u32 + 1;
-        let seg = *seg_of.entry(key).or_insert(seg_n);
         if prev_key != Some(key) {
+            debug_assert!(
+                !seg_of.contains_key(&key),
+                "canonical (staff, voice) sort guarantees contiguous voice runs per measure"
+            );
+            let seg = seg_of.len() as u32 + 1;
+            seg_of.insert(key, seg);
             out.push(format!("voice-{seg}"));
             prev_key = Some(key);
         }
@@ -1884,14 +1888,13 @@ mod tests {
                 "E",
                 "4",
                 "a1",
-                "voice-2",
-                "rest",
-                "half",
-                "dot",
-                "voice-1",
                 "quarter",
                 "G",
                 "4",
+                "dot",
+                "voice-2",
+                "rest",
+                "half",
                 "dot",
                 "bar",
             ]
@@ -1973,41 +1976,11 @@ mod tests {
                 "E",
                 "4",
                 "a-1",
-                "voice-2",
-                "tuplet-start-3-2",
-                "rest",
-                "eighth",
-                "tuplet-stop",
-                "tuplet-start-3-2",
-                "eighth",
-                "F",
-                "3",
-                "eighth",
-                "A",
-                "3",
-                "a-1",
-                "tuplet-stop",
-                "voice-1",
                 "rest",
                 "quarter",
                 "eighth",
                 "D",
                 "4",
-                "voice-2",
-                "tuplet-start-3-2",
-                "rest",
-                "eighth",
-                "tuplet-stop",
-                "tuplet-start-3-2",
-                "eighth",
-                "F",
-                "3",
-                "eighth",
-                "A",
-                "3",
-                "a-1",
-                "tuplet-stop",
-                "voice-1",
                 "rest",
                 "quarter",
                 // Synthetic precise stop: key A's span closes after its
@@ -2019,6 +1992,33 @@ mod tests {
                 "quarter",
                 "F",
                 "5",
+                "voice-2",
+                "tuplet-start-3-2",
+                "rest",
+                "eighth",
+                "tuplet-stop",
+                "tuplet-start-3-2",
+                "eighth",
+                "F",
+                "3",
+                "eighth",
+                "A",
+                "3",
+                "a-1",
+                "tuplet-stop",
+                "tuplet-start-3-2",
+                "rest",
+                "eighth",
+                "tuplet-stop",
+                "tuplet-start-3-2",
+                "eighth",
+                "F",
+                "3",
+                "eighth",
+                "A",
+                "3",
+                "a-1",
+                "tuplet-stop",
                 "bar",
             ]
             .into_iter()
@@ -2623,8 +2623,8 @@ mod tests {
         );
         assert_eq!(
             toks.iter().filter(|t| t.starts_with("voice-")).count(),
-            128,
-            "one marker per voice run (reappearances re-marked)"
+            55,
+            "one canonical marker per active (staff, voice) per bar"
         );
         // bekern+ marks on page 1 (each verified against the score):
         // 5 slur runs, 2 fermatas, p + mf dynamics, 3 cresc + 4 dim
@@ -2645,7 +2645,7 @@ mod tests {
                 "bekern+ mark {tok}"
             );
         }
-        assert_eq!(toks.len(), 800, "golden token total");
+        assert_eq!(toks.len(), 727, "golden token total");
     }
 
     #[test]
@@ -2799,5 +2799,256 @@ mod tests {
         assert!(!sc.lyrics.is_empty(), "ds0001 is a vocal lied with lyrics");
         assert!(!sc.dynamics.is_empty(), "ds0001 has dynamics");
         assert!(!sc.hairpins.is_empty(), "ds0001 has hairpins");
+    }
+
+    #[test]
+    fn different_xml_voice_orders_emit_bit_identical_canonical_bekern() {
+        use super::super::musicxml_import::{bekern_events, staff_headers};
+        // Voice 1 emitted before Voice 2 in XML document order.
+        let xml_v1_first = r#"<?xml version="1.0" encoding="UTF-8"?>
+<score-partwise version="3.1">
+<part-list><score-part id="P1"><part-name>Piano</part-name></score-part></part-list>
+<part id="P1">
+<measure number="1">
+  <attributes><divisions>4</divisions><staves>2</staves>
+    <clef number="1"><sign>G</sign><line>2</line></clef>
+    <clef number="2"><sign>F</sign><line>4</line></clef>
+    <key><fifths>0</fifths></key>
+    <time><beats>4</beats><beat-type>4</beat-type></time>
+  </attributes>
+  <note><pitch><step>C</step><octave>5</octave></pitch><duration>4</duration><voice>1</voice><staff>1</staff></note>
+  <note><pitch><step>D</step><octave>5</octave></pitch><duration>4</duration><voice>1</voice><staff>1</staff></note>
+  <note><pitch><step>E</step><octave>5</octave></pitch><duration>8</duration><voice>1</voice><staff>1</staff></note>
+  <backup><duration>16</duration></backup>
+  <note><pitch><step>E</step><octave>4</octave></pitch><duration>8</duration><voice>2</voice><staff>1</staff></note>
+  <note><pitch><step>G</step><octave>4</octave></pitch><duration>8</duration><voice>2</voice><staff>1</staff></note>
+  <backup><duration>16</duration></backup>
+  <note><pitch><step>C</step><octave>3</octave></pitch><duration>16</duration><voice>5</voice><staff>2</staff></note>
+</measure>
+</part>
+</score-partwise>"#;
+
+        // Identical musical content, but voices written in reverse XML order
+        // (staff 2 voice 5 first, then staff 1 voice 2, then staff 1 voice 1).
+        let xml_reversed = r#"<?xml version="1.0" encoding="UTF-8"?>
+<score-partwise version="3.1">
+<part-list><score-part id="P1"><part-name>Piano</part-name></score-part></part-list>
+<part id="P1">
+<measure number="1">
+  <attributes><divisions>4</divisions><staves>2</staves>
+    <clef number="1"><sign>G</sign><line>2</line></clef>
+    <clef number="2"><sign>F</sign><line>4</line></clef>
+    <key><fifths>0</fifths></key>
+    <time><beats>4</beats><beat-type>4</beat-type></time>
+  </attributes>
+  <note><pitch><step>C</step><octave>3</octave></pitch><duration>16</duration><voice>5</voice><staff>2</staff></note>
+  <backup><duration>16</duration></backup>
+  <note><pitch><step>E</step><octave>4</octave></pitch><duration>8</duration><voice>2</voice><staff>1</staff></note>
+  <note><pitch><step>G</step><octave>4</octave></pitch><duration>8</duration><voice>2</voice><staff>1</staff></note>
+  <backup><duration>16</duration></backup>
+  <note><pitch><step>C</step><octave>5</octave></pitch><duration>4</duration><voice>1</voice><staff>1</staff></note>
+  <note><pitch><step>D</step><octave>5</octave></pitch><duration>4</duration><voice>1</voice><staff>1</staff></note>
+  <note><pitch><step>E</step><octave>5</octave></pitch><duration>8</duration><voice>1</voice><staff>1</staff></note>
+</measure>
+</part>
+</score-partwise>"#;
+
+        let (toks_a, _) = to_bekern(
+            &bekern_events(xml_v1_first).unwrap(),
+            &staff_headers(xml_v1_first).unwrap(),
+        )
+        .unwrap();
+        let (toks_b, _) = to_bekern(
+            &bekern_events(xml_reversed).unwrap(),
+            &staff_headers(xml_reversed).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            toks_a.join(" "),
+            toks_b.join(" "),
+            "XML voice declaration order must not change canonical bekern output"
+        );
+    }
+
+    #[test]
+    fn multistaff_multivoice_emits_strictly_monotonic_canonical_voices() {
+        // Multi-staff + multi-voice across 2 measures, including a late-entering
+        // voice on staff 0 (voice 1 enters at beat 2.0 while staff 0 voice 2 and
+        // staff 1 voice 5 start at beat 0.0) and a cross-bar tuplet on staff 0.
+        let headers = vec![
+            StaffHeader {
+                staff: 0,
+                clef_sign: 'G',
+                clef_line: 2,
+                key_fifths: 0,
+                beats: 4,
+                beat_type: 4,
+            },
+            StaffHeader {
+                staff: 1,
+                clef_sign: 'F',
+                clef_line: 4,
+                key_fifths: 0,
+                beats: 4,
+                beat_type: 4,
+            },
+        ];
+        let mut tup_m1 = note(1, 3.0, 'G', 4, 0, 1.5, 1, 0);
+        tup_m1.tuplet_ratio = Some((3, 2));
+        tup_m1.tuplet_start = Some(1);
+        let mut tup_m2 = note(2, 0.0, 'A', 4, 0, 1.5, 1, 0);
+        tup_m2.tuplet_ratio = Some((3, 2));
+        tup_m2.tuplet_stop = Some(1);
+
+        let events = vec![
+            // Measure 1: unsorted order, late entry on (staff 0, voice 1)
+            note(1, 0.0, 'C', 3, 0, 2.0, 5, 1),
+            note(1, 2.0, 'G', 3, 0, 2.0, 5, 1),
+            note(1, 0.0, 'E', 3, 0, 4.0, 6, 1),
+            note(1, 0.0, 'E', 4, 0, 2.0, 2, 0),
+            note(1, 2.0, 'F', 4, 0, 2.0, 2, 0),
+            note(1, 2.0, 'C', 5, 0, 1.0, 1, 0),
+            tup_m1,
+            // Measure 2
+            note(2, 0.0, 'C', 3, 0, 4.0, 5, 1),
+            tup_m2,
+            note(2, 1.0, 'B', 4, 0, 3.0, 1, 0),
+        ];
+        let (toks, _) = to_bekern(&events, &headers).unwrap();
+
+        // Check every measure has strictly increasing voice-1, voice-2, ...
+        let mut bar_voices: Vec<Vec<u32>> = Vec::new();
+        let mut cur: Vec<u32> = Vec::new();
+        for t in &toks {
+            if let Some(rest) = t.strip_prefix("voice-") {
+                cur.push(rest.parse::<u32>().unwrap());
+            } else if t == "bar" || t.starts_with("bar-") && t != "bar-rest" && t != "bar-repeat-left" {
+                bar_voices.push(std::mem::take(&mut cur));
+            }
+        }
+        assert_eq!(
+            bar_voices,
+            vec![vec![1, 2, 3, 4], vec![1, 2]],
+            "every bar must emit strictly monotonic 1..=K voice markers; toks={toks:?}"
+        );
+    }
+
+    #[test]
+    fn canonical_bekern_roundtrips_musicxml_preserving_pitches_onsets_durs_ties_voices() {
+        use super::super::decode::{decode_bekern, decode_bekern_unmerged};
+        use super::super::musicxml_import::{
+            bekern_events, score_input_from_musicxml, staff_headers,
+        };
+        use super::super::{parse_score, to_musicxml, validate_musicxml, has_errors};
+
+        let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<score-partwise version="3.1">
+<part-list><score-part id="P1"><part-name>Piano</part-name></score-part></part-list>
+<part id="P1">
+<measure number="1">
+  <attributes><divisions>4</divisions><staves>2</staves>
+    <clef number="1"><sign>G</sign><line>2</line></clef>
+    <clef number="2"><sign>F</sign><line>4</line></clef>
+    <key><fifths>0</fifths></key>
+    <time><beats>4</beats><beat-type>4</beat-type></time>
+  </attributes>
+  <note><pitch><step>C</step><octave>5</octave></pitch><duration>8</duration><voice>1</voice><staff>1</staff></note>
+  <note><pitch><step>E</step><octave>5</octave></pitch><duration>8</duration><voice>1</voice><staff>1</staff><tie type="start"/><notations><tied type="start"/></notations></note>
+  <backup><duration>16</duration></backup>
+  <note><pitch><step>G</step><octave>4</octave></pitch><duration>4</duration><voice>2</voice><staff>1</staff></note>
+  <note><pitch><step>A</step><octave>4</octave></pitch><duration>4</duration><voice>2</voice><staff>1</staff></note>
+  <note><pitch><step>B</step><octave>4</octave></pitch><duration>8</duration><voice>2</voice><staff>1</staff></note>
+  <backup><duration>16</duration></backup>
+  <note><pitch><step>C</step><octave>3</octave></pitch><duration>16</duration><voice>5</voice><staff>2</staff></note>
+</measure>
+<measure number="2">
+  <note><pitch><step>E</step><octave>5</octave></pitch><duration>8</duration><voice>1</voice><staff>1</staff><tie type="stop"/><notations><tied type="stop"/></notations></note>
+  <note><pitch><step>D</step><octave>5</octave></pitch><duration>8</duration><voice>1</voice><staff>1</staff></note>
+  <backup><duration>16</duration></backup>
+  <note><pitch><step>C</step><octave>3</octave></pitch><duration>16</duration><voice>5</voice><staff>2</staff></note>
+</measure>
+</part>
+</score-partwise>"#;
+
+        let headers = staff_headers(xml).unwrap();
+        let events = bekern_events(xml).unwrap();
+        let (toks, graces) = to_bekern(&events, &headers).unwrap();
+        assert_eq!(graces, 0);
+        let bekern_str = toks.join(" ");
+
+        // 1. Merged decode matches reference MusicXML import on every pitched
+        // note's (onset, pitch, duration) — including the cross-bar merged tie.
+        let pitched_multiset = |sc: &super::super::ScoreInput| -> Vec<(i64, String, i64)> {
+            let mut v: Vec<(i64, String, i64)> = sc
+                .parts
+                .iter()
+                .flat_map(|p| p.notes.iter())
+                .filter(|n| !n.rest)
+                .map(|n| {
+                    (
+                        (n.onset * 480.0).round() as i64,
+                        n.pitch.clone().unwrap_or_default(),
+                        (n.dur * 480.0).round() as i64,
+                    )
+                })
+                .collect();
+            v.sort();
+            v
+        };
+        let ref_input = score_input_from_musicxml(xml).unwrap();
+        let dec_merged = decode_bekern(&bekern_str).unwrap();
+        assert_eq!(
+            pitched_multiset(&ref_input),
+            pitched_multiset(&dec_merged),
+            "merged decode must preserve all pitches, onsets, durations, and merged ties"
+        );
+
+        // 2. Unmerged decode -> MusicXML -> re-import preserves tie links,
+        // pitches, onsets, durations, and canonical voice lanes.
+        let dec_unmerged = decode_bekern_unmerged(&bekern_str).unwrap();
+        let (score, mut losses) = parse_score(&dec_unmerged).unwrap();
+        let out_xml = to_musicxml(&score, &mut losses);
+        let issues = validate_musicxml(&out_xml);
+        assert!(!has_errors(&issues), "round-trip MusicXML errors: {issues:?}");
+
+        let reimported = score_input_from_musicxml(&out_xml).unwrap();
+        assert_eq!(
+            pitched_multiset(&ref_input),
+            pitched_multiset(&reimported),
+            "MusicXML -> bekern -> MusicXML round-trip must preserve all pitches, onsets, durations, and ties"
+        );
+        let pitched_with_voice = |sc: &super::super::ScoreInput| -> Vec<(i64, String, i64, u32)> {
+            let mut v: Vec<(i64, String, i64, u32)> = sc
+                .parts
+                .iter()
+                .flat_map(|p| p.notes.iter())
+                .filter(|n| !n.rest)
+                .map(|n| {
+                    (
+                        (n.onset * 480.0).round() as i64,
+                        n.pitch.clone().unwrap_or_default(),
+                        (n.dur * 480.0).round() as i64,
+                        n.voice,
+                    )
+                })
+                .collect();
+            v.sort();
+            v
+        };
+        assert_eq!(
+            pitched_with_voice(&dec_merged),
+            pitched_with_voice(&reimported),
+            "decoded bekern -> MusicXML -> re-import must preserve pitches, onsets, durations, ties, and voices"
+        );
+        // Verify tie link survived in unmerged decode and re-serialized XML.
+        assert!(out_xml.contains(r#"<tie type="start"/>"#));
+        assert!(out_xml.contains(r#"<tie type="stop"/>"#));
+        let voices_m1: std::collections::BTreeSet<u32> = dec_unmerged.parts[0]
+            .notes
+            .iter()
+            .filter(|n| !n.rest && n.onset < 4.0)
+            .map(|n| n.voice)
+            .collect();
+        assert_eq!(voices_m1, [1, 2, 3].into_iter().collect());
     }
 }
