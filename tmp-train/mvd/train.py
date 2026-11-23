@@ -2120,7 +2120,7 @@ def main():
             need_jsd = (
                 args.jsd_weight > 0
                 and step % max(1, args.jsd_every) == 0
-                and imgs.shape[-1] <= 2176
+                and imgs.shape[-1] <= (1600 if args.comer else 2176)
             )
             if need_jsd:
                 b_jsd = min(2, imgs.shape[0])
@@ -2150,7 +2150,7 @@ def main():
             need_jsd = (
                 args.jsd_weight > 0
                 and step % max(1, args.jsd_every) == 0
-                and rgb_d.shape[-1] <= 2176
+                and rgb_d.shape[-1] <= (1600 if args.comer else 2176)
             )
             if need_jsd:
                 b_jsd = min(2, rgb_d.shape[0])
@@ -2199,8 +2199,13 @@ def main():
         _no_extra_terms = (
             args.margin_weight <= 0 and args.mwer_weight <= 0
             and args.action_weight <= 0 and not need_jsd)
-        if (_b_cur > 2 and imgs.shape[-1] > 2176 and _no_extra_terms):
-            _mb = 2
+        _mb = 0
+        if _no_extra_terms:
+            if _b_cur > 1 and imgs.shape[-1] > 2048 and (args.comer or imgs.shape[-1] > 2560):
+                _mb = 1
+            elif _b_cur > 2 and (imgs.shape[-1] > 2176 or (args.comer and imgs.shape[-1] > 1408)):
+                _mb = 2
+        if _mb > 0:
             _loss_acc = 0.0
             _aux_acc = 0.0 if need_aux else None
             _coord_acc = 0.0 if need_coord else None

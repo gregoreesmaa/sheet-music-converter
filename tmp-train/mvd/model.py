@@ -175,12 +175,30 @@ def _layer_step_comer(layer, p, x, kc, vc, mem_kv, mem_mask,
     return x, kc, vc, new_cov
 
 
+def _comer_xattn_chunk(qq_c, kk, vv, cov_in_c, mem_mask, comer_bias,
+                       h_mem, w_mem, dh, drop_p, training):
+    """One query-chunk of CoMER cross-attention (checkpoint-friendly)."""
+    b, nh, tc, _ = qq_c.shape
+    s = kk.shape[2]
+    scores_c = (qq_c.float() @ kk.float().transpose(-2, -1)) / math.sqrt(dh)
+    cov_2d = cov_in_c.transpose(1, 2).reshape(b * tc, nh, h_mem, w_mem)
+    cov_bias_c = comer_bias(cov_2d).reshape(b, tc, nh, s).transpose(1, 2)
+    biased_c = scores_c + cov_bias_c.float()
+    if mem_mask is not None:
+        biased_c = biased_c.masked_fill(mem_mask[:, None, None, :], float('-inf'))
+    attn_w_c = biased_c.softmax(dim=-1)
+    if drop_p > 0.0 and training:
+        attn_w_c = F.dropout(attn_w_c, p=drop_p, training=True)
+    return attn_w_c.to(vv.dtype) @ vv
+
+
 def _decoder_layer_comer(layer, x, mem, tgt_mask, mem_mask,
-                         comer_bias, h_mem, w_mem):
+                         comer_bias, h_mem, w_mem, t_chunk=64):
     """Batched teacher-forced decoder layer with CoMER shifted coverage bias.
 
-    Uses ``layer.self_attn`` on the fast SDPA path and injects
-    ``comer_bias.compute_shifted_coverage_bias`` into cross-attention.
+    Uses ``layer.self_attn`` on the fast SDPA path and streams cross-attention
+    in query chunks of ``t_chunk`` (checkpointed during training) so long/wide
+    strips (``T=768, W=3072``) never materialize a full ``[B, H, T, S]`` tensor.
     Step ``t`` sees cumulative raw attention over strictly past steps
     ``0..t-1``, matching :func:`_layer_step_comer` step-for-step.
     """
@@ -194,19 +212,46 @@ def _decoder_layer_comer(layer, x, mem, tgt_mask, mem_mask,
     qq = (x @ wq.t() + bq).view(b, t, nh, dh).transpose(1, 2)
     kk = (mem @ wk.t() + bk).view(b, s, nh, dh).transpose(1, 2)
     vv = (mem @ wv.t() + bv).view(b, s, nh, dh).transpose(1, 2)
-    scores = (qq.float() @ kk.float().transpose(-2, -1)) / math.sqrt(dh)
-    if mem_mask is not None:
-        scores = scores.masked_fill(mem_mask[:, None, None, :], float('-inf'))
-    raw_attn = scores.softmax(dim=-1)
-    cov_bias = comer_bias.compute_shifted_coverage_bias(
-        raw_attn.to(x.dtype), h_mem, w_mem, mem_mask=mem_mask, detach_cov=True)
-    biased = scores + cov_bias.float()
-    if mem_mask is not None:
-        biased = biased.masked_fill(mem_mask[:, None, None, :], float('-inf'))
-    attn_w = biased.softmax(dim=-1)
-    if attn.dropout > 0.0 and layer.training:
-        attn_w = F.dropout(attn_w, p=attn.dropout, training=True)
-    m = (attn_w.to(vv.dtype) @ vv).transpose(1, 2).reshape(b, t, d) @ ow.t() + ob
+
+    use_ckpt = layer.training and torch.is_grad_enabled()
+    running_cov = torch.zeros((b, nh, 1, s), device=x.device, dtype=torch.float32)
+    out_chunks = []
+    scale = 1.0 / math.sqrt(dh)
+    for t0 in range(0, t, t_chunk):
+        t1 = min(t0 + t_chunk, t)
+        qq_c = qq[:, :, t0:t1, :]
+        # Detached shifted cumulative coverage for this chunk (zero autograd RAM).
+        with torch.no_grad():
+            raw_scores = (qq_c.float() @ kk.float().transpose(-2, -1)) * scale
+            if mem_mask is not None:
+                raw_scores = raw_scores.masked_fill(
+                    mem_mask[:, None, None, :], float('-inf'))
+            raw_c = raw_scores.softmax(dim=-1)
+            if mem_mask is not None:
+                raw_c = raw_c.masked_fill(mem_mask[:, None, None, :], 0.0)
+            tc = t1 - t0
+            if tc == 1:
+                cov_in_c = running_cov.to(x.dtype)
+            else:
+                csum_prev = torch.cumsum(raw_c[:, :, :-1, :], dim=2)
+                cov_in_c = torch.cat(
+                    [running_cov, running_cov + csum_prev], dim=2
+                ).to(x.dtype)
+            running_cov = running_cov + raw_c.sum(dim=2, keepdim=True)
+        if use_ckpt:
+            out_c = torch.utils.checkpoint.checkpoint(
+                _comer_xattn_chunk,
+                qq_c, kk, vv, cov_in_c, mem_mask, comer_bias,
+                h_mem, w_mem, dh, attn.dropout, layer.training,
+                use_reentrant=False,
+            )
+        else:
+            out_c = _comer_xattn_chunk(
+                qq_c, kk, vv, cov_in_c, mem_mask, comer_bias,
+                h_mem, w_mem, dh, attn.dropout, layer.training,
+            )
+        out_chunks.append(out_c)
+    m = torch.cat(out_chunks, dim=2).transpose(1, 2).reshape(b, t, d) @ ow.t() + ob
     x = layer.norm2(x + layer.dropout2(m))
     f = layer.linear2(layer.dropout(layer.activation(layer.linear1(x))))
     x = layer.norm3(x + layer.dropout3(f))
@@ -791,9 +836,17 @@ class MvdNet(nn.Module):
                 hw_mem = (1, mem.shape[1])
         h_mem, w_mem = hw_mem
         x = emb
+        use_ckpt = self.training and torch.is_grad_enabled()
         for layer in self.decoder.layers:
-            x = _decoder_layer_comer(
-                layer, x, mem, mask, mem_mask, self.comer_bias, h_mem, w_mem)
+            if use_ckpt:
+                x = torch.utils.checkpoint.checkpoint(
+                    _decoder_layer_comer,
+                    layer, x, mem, mask, mem_mask, self.comer_bias, h_mem, w_mem,
+                    use_reentrant=False,
+                )
+            else:
+                x = _decoder_layer_comer(
+                    layer, x, mem, mask, mem_mask, self.comer_bias, h_mem, w_mem)
         if self.decoder.norm is not None:
             x = self.decoder.norm(x)
         return x

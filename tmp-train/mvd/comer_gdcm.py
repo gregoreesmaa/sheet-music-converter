@@ -349,7 +349,28 @@ class CoverageAttentionBias(nn.Module):
             cum_cov = torch.cat([zeros, csum], dim=2)
 
         cov_2d = cum_cov.transpose(1, 2).reshape(b * t, h, h_mem, w_mem)
-        bias_bt = self.forward(cov_2d)  # [B * T, H, 1, S]
+        # Process Conv2d in chunks of 64 along B*T (with gradient checkpointing
+        # during training) so wide/long strips (T=768, S=24576) never
+        # materialize a multi-GB [B*T, hidden_dim, H_m, W_m] activation buffer.
+        chunk = 64
+        if cov_2d.shape[0] <= chunk:
+            bias_bt = self.forward(cov_2d)  # [B * T, H, 1, S]
+        else:
+            ckpt = torch.is_grad_enabled() and any(
+                p.requires_grad for p in self.parameters()
+            )
+            parts = []
+            for i in range(0, cov_2d.shape[0], chunk):
+                sl = cov_2d[i : i + chunk]
+                if ckpt:
+                    parts.append(
+                        torch.utils.checkpoint.checkpoint(
+                            self.forward, sl, use_reentrant=False
+                        )
+                    )
+                else:
+                    parts.append(self.forward(sl))
+            bias_bt = torch.cat(parts, dim=0)
         return bias_bt.reshape(b, t, h, s).transpose(1, 2).contiguous()
 
 

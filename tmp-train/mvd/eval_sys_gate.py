@@ -1329,6 +1329,7 @@ def decode_curved_system(net, page_img, curved_sys, heat_net, device, height,
         max_staves=bezier_ribbon.MAX_STAVES,
         target_sp=bezier_ribbon.REF_TARGET_SP,
         height=height,
+        comb_snap=True,
     )
     chunk_streams = []
     with torch.no_grad():
