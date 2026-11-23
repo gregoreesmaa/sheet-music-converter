@@ -109,6 +109,9 @@ class TestBezierRibbon(unittest.TestCase):
         self.assertAlmostEqual(br.canon_y(0, 0), 12.0)
         self.assertAlmostEqual(br.canon_y(0, 4), 52.0)
         self.assertAlmostEqual(br.canon_y(1, 0), 76.0)
+        # Wider-margin height=320 option preserves 4-slot layout without clipping.
+        top320, pitch320, out_h320 = br.canonical_layout(target_sp=10.0, height=320)
+        self.assertEqual((top320, pitch320, out_h320), (20.0, 80.0, 320))
 
     def test_roundtrip_10deg_tilted_2staff(self):
         """10-degree tilted 2-staff system (sq7070319-1 regime) recovers flat <= 1.0 px."""
@@ -308,65 +311,6 @@ class TestBezierRibbon(unittest.TestCase):
             self.assertGreater(float(page.grad.abs().sum()), 0.0)
             self.assertGreater(float(cp.grad.abs().sum()), 0.0)
             self.assertGreater(float(sp.grad.abs().sum()), 0.0)
-
-    def test_comb_snap_recovers_vertical_and_sp_jitter_on_curved_shadowed_page(self):
-        """Comb snap locks perturbed StaffUNet2D curves (< 0.45 px) even with shadow & note blobs."""
-        page_h, page_w = 1024, 1200
-        sp = 12.0
-        x0, x1 = 100.0, 1100.0
-        xs = np.linspace(x0, x1, 64)
-        u = (xs - x0) / (x1 - x0)
-        slope = math.tan(math.radians(7.0))
-
-        gt_staves = []
-        perturbed_staves = []
-        for idx, y_base in enumerate((340.0, 520.0)):
-            ys = y_base + slope * (xs - 600.0) + 14.0 * np.sin(2.0 * math.pi * u)
-            cp_gt = np.stack([np.linspace(x0, x1, 4), su.fit_cubic_bezier_1d(u, ys)], axis=-1).astype(np.float32)
-            gt_staves.append(br.BezierStaff(ctrl_pts=cp_gt, sp_ctrl=sp))
-            # Perturb y by +2.8/-2.4 px + slight tilt and sp by +/-8%.
-            cp_bad = cp_gt.copy()
-            cp_bad[:, 1] += (2.8 if idx == 0 else -2.4) + np.array([-0.8, -0.2, 0.3, 0.9], dtype=np.float32)
-            sp_bad = sp * (1.08 if idx == 0 else 0.93)
-            perturbed_staves.append(br.BezierStaff(ctrl_pts=cp_bad, sp_ctrl=sp_bad))
-
-        page = _render_warped_staff_page(page_h, page_w, gt_staves, offset_mode="normal")
-        # Add realistic uneven lighting ramp + a few dark notehead blobs.
-        yy, xx = np.meshgrid(
-            np.linspace(0.0, 1.0, page_h, dtype=np.float32),
-            np.linspace(0.0, 1.0, page_w, dtype=np.float32),
-            indexing="ij",
-        )
-        shade = 0.72 + 0.25 * (0.5 + 0.5 * np.cos(math.pi * xx) * np.sin(math.pi * yy))
-        degraded = (page * torch.from_numpy(shade[None, :, :])).clamp(0.0, 1.0)
-        # Drop dark noteheads on several columns.
-        for cx in (240, 420, 610, 780, 950):
-            degraded[:, 320:360, cx:cx + 12] *= 0.15
-
-        raw_ribbon, _ = br.sample_bezier_ribbon(degraded, perturbed_staves, target_sp=10.0, height=256, comb_snap=False)
-        snapped_ribbon, _ = br.sample_bezier_ribbon(degraded, perturbed_staves, target_sp=10.0, height=256, comb_snap=True)
-
-        # Measure error on clean page using the raw vs snapped staves.
-        snapped_staves = br.refine_staves_comb(degraded, perturbed_staves, target_sp=10.0, height=256)
-        raw_clean, _ = br.sample_bezier_ribbon(page, perturbed_staves, target_sp=10.0, height=256)
-        snap_clean, _ = br.sample_bezier_ribbon(page, snapped_staves, target_sp=10.0, height=256)
-
-        err_before = _measure_line_errors(raw_clean, n_staves=2)
-        err_after = _measure_line_errors(snap_clean, n_staves=2)
-        self.assertGreater(err_before, 2.0)
-        self.assertLessEqual(err_after, 0.55, f"comb_snap max error {err_after:.3f} px > 0.55 px (was {err_before:.3f})")
-        self.assertEqual(snapped_ribbon.shape[:2], (1, 256))
-
-    def test_comb_snap_blank_page_safe_fallback(self):
-        """Blank/washed-out page leaves input Bezier curves intact (no drift or crash)."""
-        cp = np.array([[80.0, 200.0], [260.0, 200.0], [440.0, 200.0], [620.0, 200.0]], dtype=np.float32)
-        staves = [br.BezierStaff(ctrl_pts=cp, sp_ctrl=10.0)]
-        blank = Image.new("RGB", (700, 400), color=(245, 240, 232))
-        refined = br.refine_staves_comb(blank, staves, target_sp=10.0, height=256)
-        self.assertEqual(len(refined), 1)
-        np.testing.assert_allclose(
-            torch.as_tensor(refined[0].ctrl_pts).numpy(), cp, atol=1e-5
-        )
 
 
 if __name__ == "__main__":

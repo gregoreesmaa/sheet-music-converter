@@ -702,10 +702,7 @@ def extract_curved_systems(
         return []
 
     # Merge same-row horizontal fragments split by stains, creases, or folds.
-    # Two distinct staves are >= 4.5 sp apart vertically, whereas broken ends
-    # of a tilted/curved staff at 512x384 (1 heatmap px ~= 0.5 sp) routinely
-    # extrapolate within 0.6-1.5 sp across a gap.
-    merged_frags = _merge_horizontal_fragments(raw_frags, sp_tol_factor=1.6)
+    merged_frags = _merge_horizontal_fragments(raw_frags, sp_tol_factor=0.5)
 
     # Relative width threshold: max(min_width_floor_frac * wp, min_width_frac * median_w).
     floor_cols = max(4, int(round(min_width_floor_frac * wp)))
@@ -850,157 +847,6 @@ def extract_curved_systems(
 
     systems.sort(key=lambda sys_obj: sys_obj.staves[0].mean_y())
     return systems
-
-
-def _suppress_overlapping_staff_duplicates(
-    staves: list[CurvedStaff],
-    min_center_gap_sp: float = 4.5,
-) -> list[CurvedStaff]:
-    """Suppress vertically overlapping duplicate/split staff fragments (NMS).
-
-    A real 5-line staff spans ``4.0 * sp`` vertically, so two distinct staves
-    sharing horizontal overlap cannot have centerlines closer than ``~4.5 * sp``.
-    When a fold/stain or strong beam triggers a duplicate ``ch1`` ridge inside
-    or adjacent to a staff, keep the higher-confidence/wider one.
-    """
-    if len(staves) <= 1:
-        return list(staves)
-    # Rank by confidence * width so real full-width staves beat short spurious fragments.
-    ranked = sorted(
-        staves,
-        key=lambda s: float(s.confidence) * max(1.0, float(s.x_end - s.x_start)),
-        reverse=True,
-    )
-    kept: list[CurvedStaff] = []
-    for cand in ranked:
-        dup = False
-        for prev in kept:
-            ov0 = max(cand.x_start, prev.x_start)
-            ov1 = min(cand.x_end, prev.x_end)
-            min_w = max(1.0, min(cand.x_end - cand.x_start, prev.x_end - prev.x_start))
-            if (ov1 - ov0) / min_w < 0.25:
-                continue
-            xs = np.linspace(ov0, ov1, 9)
-            dy = float(np.median(np.abs(cand.eval_y_at_x(xs) - prev.eval_y_at_x(xs))))
-            sp = max(4.0, 0.5 * (cand.sp_median + prev.sp_median))
-            if dy < min_center_gap_sp * sp:
-                dup = True
-                break
-        if not dup:
-            kept.append(cand)
-    kept.sort(key=lambda s: s.mean_y())
-    return kept
-
-
-def _has_left_system_connector(
-    gray: np.ndarray,
-    a: CurvedStaff,
-    b: CurvedStaff,
-    min_coverage: float = 0.70,
-) -> bool:
-    """True iff full-res page image has a continuous left-edge system barline between ``a`` and ``b``.
-
-    In Western notation, staves in the same system are linked at their left
-    margin (``x_start``) by a continuous vertical system barline (and often a
-    brace/bracket), whereas separate systems have white paper between them.
-    ``StaffUNet2D`` at ``512x384`` cannot resolve a 1-px vertical barline, so
-    this full-res check cleanly separates single-staff folk melodies and dense
-    5-6 staff choral systems.
-    """
-    h, w = gray.shape
-    sp = max(4.0, 0.5 * (a.sp_median + b.sp_median))
-    if abs(a.x_start - b.x_start) > 6.0 * sp:
-        return False
-    ya = float(a.eval_y_at_x(np.array([a.x_start]))[0]) + 2.3 * sp
-    yb = float(b.eval_y_at_x(np.array([b.x_start]))[0]) - 2.3 * sp
-    if yb - ya < 1.5 * sp:
-        return True
-    x0 = min(a.x_start, b.x_start)
-    dx_min = int(round(-2.5 * sp))
-    dx_max = int(round(1.5 * sp))
-    c_lo = max(0, int(round(x0 + dx_min - 2.0 * sp)))
-    c_hi = min(w, int(round(x0 + dx_max + 4.0 * sp)))
-    r_lo = max(0, int(round(ya)))
-    r_hi = min(h, int(round(yb)) + 1)
-    if c_hi <= c_lo or r_hi <= r_lo:
-        return False
-
-    patch = gray[r_lo:r_hi, c_lo:c_hi]
-    bg = float(np.percentile(patch, 80))
-    # If the gap region is completely washed out / uniform, return False safely.
-    if bg < 0.15:
-        return False
-    thr = max(0.08, 0.22 * bg)
-
-    n_rows = max(12, int(round(yb - ya)))
-    fracs = np.linspace(0.0, 1.0, n_rows)
-    ys = np.clip(np.round(ya + fracs * (yb - ya)).astype(int), 0, h - 1)
-    xs_base = a.x_start + fracs * (b.x_start - a.x_start)
-
-    best_cov = 0.0
-    for dx in range(dx_min, dx_max + 1):
-        xc = np.clip(np.round(xs_base + dx).astype(int), 1, w - 2)
-        dark_band = np.minimum(np.minimum(gray[ys, xc - 1], gray[ys, xc]), gray[ys, xc + 1])
-        cov = float(((bg - dark_band) >= thr).mean())
-        if cov > best_cov:
-            best_cov = cov
-            if best_cov >= min_coverage:
-                return True
-    return False
-
-
-def refine_systems_with_page(
-    page_img: Image.Image | np.ndarray,
-    systems: list[CurvedSystem],
-    min_center_gap_sp: float = 4.5,
-    min_connector_coverage: float = 0.70,
-) -> list[CurvedSystem]:
-    """Refine ``StaffUNet2D`` system grouping using full-res page cues.
-
-    1. Suppresses vertically overlapping duplicate staff fragments (``< 4.5 sp``).
-    2. Regroups staves top-to-bottom using full-res left-edge system barlines
-       (:func:`_has_left_system_connector`), eliminating cross-system merges on
-       single-staff folk pages and 5-6 staff choral pages.
-    """
-    if not systems:
-        return []
-    if isinstance(page_img, Image.Image):
-        gray = np.asarray(page_img.convert("L"), dtype=np.float32) / 255.0
-    else:
-        arr = np.asarray(page_img, dtype=np.float32)
-        if arr.ndim == 3:
-            gray = arr.mean(axis=-1)
-        else:
-            gray = arr
-        if gray.max() > 1.5:
-            gray = gray / 255.0
-
-    all_staves = [st for sys_obj in systems for st in sys_obj.staves]
-    staves = _suppress_overlapping_staff_duplicates(all_staves, min_center_gap_sp=min_center_gap_sp)
-    if not staves:
-        return []
-
-    groups: list[list[CurvedStaff]] = []
-    for st in staves:
-        if not groups:
-            groups.append([st])
-        elif _has_left_system_connector(
-            gray, groups[-1][-1], st, min_coverage=min_connector_coverage
-        ):
-            groups[-1].append(st)
-        else:
-            groups.append([st])
-
-    refined: list[CurvedSystem] = []
-    for grp in groups:
-        grp.sort(key=lambda s: s.mean_y())
-        x0 = min(s.x_start for s in grp)
-        x1 = max(s.x_end for s in grp)
-        poly = _build_system_polygon(grp)
-        conf = float(np.mean([s.confidence for s in grp]))
-        refined.append(CurvedSystem(staves=grp, x_start=x0, x_end=x1, polygon=poly, confidence=conf))
-    refined.sort(key=lambda s: s.staves[0].mean_y())
-    return refined
 
 
 # ---------------------------------------------------------------------------
@@ -1280,9 +1126,13 @@ def _augment_page_and_staves(
 
     Implements:
       - 10% short-coda masking (blank right 65-85% of bottom system + truncate GT ``x1``)
+      - 20% left-margin barline masking on multi-staff systems (paint a narrow
+        ``1-2*sp`` paper-colored vertical band between staves so ``ch2`` learns
+        system grouping from layout/brackets/content rather than printed barlines)
       - 30% sepia/parchment tint + faded brown/gray ink + subtle bleed-through ghost staves
         + stain / blur / JPEG
-      - Synthetic S-curve / sine vertical warp (``+-4% H``)
+      - Synthetic S-curve / sine vertical warp (``+-4% H``) + 35% multi-harmonic
+        hand-drawn wavy staff wobble (``2-6`` cycles, ``+-0.15%-0.65% H``)
       - Perspective keystone
       - ``+-12 deg`` rotation
       - ``0-25%`` random outer desk border (solid dark / wood / noise clutter)
@@ -1347,6 +1197,35 @@ def _augment_page_and_staves(
                     new_pts[k, :, 1] = np.interp(new_x, old_x, pts[k, :, 1])
                 curves[i]["pts"] = new_pts
 
+    # 1b. Left-margin barline masking (20% per multi-staff system): paint a narrow
+    #     1-2*sp paper-colored vertical band between staves over the left margin so
+    #     ch2 learns system grouping from staff layout/brackets/content rather than
+    #     overfitting to a crisp printed left barline (handwritten-safe).
+    if curves and sys_groups:
+        paper_col_bm: np.ndarray | None = None
+        for grp in sys_groups:
+            valid_grp = [i for i in grp if 0 <= i < len(curves)]
+            if len(valid_grp) < 2 or rng.random() >= 0.20:
+                continue
+            if paper_col_bm is None:
+                paper_col_bm = np.median(work.reshape(-1, 3), axis=0).astype(np.float32)
+            valid_grp.sort(key=lambda idx_s: float(curves[idx_s]["pts"][2, :, 1].mean()))
+            band_mult = float(rng.uniform(1.0, 2.0))
+            for top_i, bot_i in zip(valid_grp, valid_grp[1:]):
+                pts_top = curves[top_i]["pts"]
+                pts_bot = curves[bot_i]["pts"]
+                sp_top = float(np.mean(np.diff(pts_top[:, :, 1], axis=0)))
+                sp_bot = float(np.mean(np.diff(pts_bot[:, :, 1], axis=0)))
+                sp_est = max(2.0, 0.5 * (sp_top + sp_bot))
+                x_left = min(float(pts_top[2, 0, 0]), float(pts_bot[2, 0, 0]))
+                half_w = 0.5 * band_mult * sp_est
+                cx0 = max(0, int(math.floor(x_left - half_w)))
+                cx1 = min(w, int(math.ceil(x_left + half_w)))
+                y_lo = max(0, int(math.ceil(float(pts_top[4, 0, 1]) + 0.25 * sp_est)))
+                y_hi = min(h, int(math.floor(float(pts_bot[0, 0, 1]) - 0.25 * sp_est)))
+                if cx1 > cx0 and y_hi > y_lo:
+                    work[y_lo:y_hi, cx0:cx1] = paper_col_bm[None, None, :]
+
     # 2. Photometric / aging / bleed-through (30%): sepia/parchment tint + faded ink
     #    + subtle bleed-through ghost staves + stain / blur / JPEG.
     do_jpeg = False
@@ -1397,16 +1276,33 @@ def _augment_page_and_staves(
             do_jpeg = True
 
     # 3. Composed single-pass geometric warp:
-    #    S-curve (+-4% H) -> Perspective keystone -> +-12 deg rotation -> 0-25% desk border.
+    #    S-curve (+-4% H) + hand-drawn wavy wobble -> Perspective keystone -> +-12 deg rotation -> 0-25% desk border.
     use_sine = bool(rng.random() < 0.65)
     amp = float(rng.uniform(-0.04, 0.04) * h) if use_sine else 0.0
     cycles = float(rng.uniform(0.5, 1.25))
     phase = float(rng.uniform(0.0, 2.0 * math.pi))
 
+    # Multi-harmonic wavy hand-drawn staff wobble (35%): 2-3 smooth local waves
+    # across the page width so StaffUNet2D tracks hand-drawn wavy staves cleanly.
+    wobble_terms: list[tuple[float, float, float]] = []
+    if rng.random() < 0.35:
+        n_harm = int(rng.integers(2, 4))
+        for _ in range(n_harm):
+            w_amp = float(rng.uniform(-0.0045, 0.0045) * h)
+            w_cyc = float(rng.uniform(2.0, 6.0))
+            w_phi = float(rng.uniform(0.0, 2.0 * math.pi))
+            wobble_terms.append((w_amp, w_cyc, w_phi))
+
     def _dy(x_val: np.ndarray) -> np.ndarray:
-        if amp == 0.0:
-            return np.zeros_like(x_val)
-        return amp * np.sin(2.0 * math.pi * cycles * (x_val / max(float(w), 1.0)) + phase)
+        x_norm = x_val / max(float(w), 1.0)
+        dy_val = (
+            amp * np.sin(2.0 * math.pi * cycles * x_norm + phase)
+            if amp != 0.0
+            else np.zeros_like(x_val)
+        )
+        for w_amp, w_cyc, w_phi in wobble_terms:
+            dy_val = dy_val + w_amp * np.sin(2.0 * math.pi * w_cyc * x_norm + w_phi)
+        return dy_val
 
     # Perspective keystone homography H_persp.
     src_corners = np.array([[0.0, 0.0], [w - 1.0, 0.0], [w - 1.0, h - 1.0], [0.0, h - 1.0]], dtype=np.float64)
@@ -1689,6 +1585,7 @@ def train_staff_unet2d(
     device: str | None = None,
     seed: int = 42,
     num_workers: int = 0,
+    bf16: bool = False,
 ) -> Path:
     """Minimal self-contained training loop for ``StaffUNet2D``."""
     torch.manual_seed(seed)
@@ -1724,7 +1621,8 @@ def train_staff_unet2d(
     opt = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
     sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=max(1, epochs))
     use_amp = dev.type == "cuda"
-    scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
+    amp_dtype = torch.bfloat16 if (use_amp and bf16) else torch.float16
+    scaler = torch.amp.GradScaler("cuda", enabled=(use_amp and not bf16))
 
     ckpt_path = out_path / "staff_unet2d.pt"
     n_batches = len(loader)
@@ -1738,7 +1636,7 @@ def train_staff_unet2d(
             x = x.to(dev, non_blocking=use_pin)
             y = y.to(dev, non_blocking=use_pin)
             opt.zero_grad(set_to_none=True)
-            with torch.amp.autocast(dev.type, enabled=use_amp):
+            with torch.amp.autocast(dev.type, dtype=amp_dtype, enabled=use_amp):
                 preds = model(x)
                 loss, _ = criterion(preds, y)
             scaler.scale(loss).backward()
@@ -1792,6 +1690,7 @@ def _main() -> None:
     p.add_argument("--device", default=None)
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--num-workers", type=int, default=0)
+    p.add_argument("--bf16", action="store_true", help="Use bfloat16 AMP on CUDA (no GradScaler)")
     args = p.parse_args()
     ckpt = train_staff_unet2d(
         manifest=args.manifest,
@@ -1808,6 +1707,7 @@ def _main() -> None:
         device=args.device,
         seed=args.seed,
         num_workers=args.num_workers,
+        bf16=args.bf16,
     )
     print(f"Saved checkpoint: {ckpt}", flush=True)
 

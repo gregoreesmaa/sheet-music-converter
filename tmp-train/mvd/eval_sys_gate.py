@@ -1306,9 +1306,8 @@ def extract_page_curved_systems(staff_unet, page_img, device='cpu', meta=None):
         in_channels=in_ch).unsqueeze(0).to(device)
     with torch.no_grad():
         probs = staff_unet.predict_probs(x)
-    systems = staff_unet2d.extract_curved_systems(
+    return staff_unet2d.extract_curved_systems(
         probs, orig_w=orig_w, orig_h=orig_h)
-    return staff_unet2d.refine_systems_with_page(page_img, systems)
 
 
 def decode_curved_system(net, page_img, curved_sys, heat_net, device, height,
@@ -1334,7 +1333,6 @@ def decode_curved_system(net, page_img, curved_sys, heat_net, device, height,
         max_staves=bezier_ribbon.MAX_STAVES,
         target_sp=bezier_ribbon.REF_TARGET_SP,
         height=height,
-        comb_snap=True,
     )
     chunk_streams = []
     with torch.no_grad():

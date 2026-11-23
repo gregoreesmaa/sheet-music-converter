@@ -53,6 +53,17 @@ class TestStaffUNet2DModel(unittest.TestCase):
         out = model(x)
         self.assertEqual(tuple(out.shape), (1, 4, 150, 105))
 
+    def test_highres_1536x1152_forward_cpu(self):
+        model = su.StaffUNet2D(in_channels=3, out_stride=2).eval()
+        x = torch.randn(1, 3, 1536, 1152)
+        with torch.no_grad():
+            out = model(x)
+            probs = model.predict_probs(x)
+        self.assertEqual(tuple(out.shape), (1, 4, 768, 576))
+        self.assertEqual(tuple(probs.shape), (1, 4, 768, 576))
+        self.assertTrue(torch.isfinite(out).all())
+        self.assertTrue(torch.isfinite(probs).all())
+
     def test_anti_aliased_resize_preserves_thin_staff_lines(self):
         # High-res page with 1-px black horizontal staff lines downscaled >3x with BOX.
         hi_w, hi_h = 2400, 3200
@@ -328,35 +339,6 @@ class TestRasterizeAndExtract(unittest.TestCase):
         self.assertEqual(len(systems), 2, "vertical ch2 bleed must not merge two 3-staff systems")
         self.assertEqual([len(s.staves) for s in systems], [3, 3])
 
-    def test_refine_systems_with_page_left_barline_and_duplicate_nms(self):
-        """Left-barline grouping separates 1-staff folk systems, keeps linked multi-staff, and drops <4.5sp dups."""
-        h, w = 800, 600
-        sp = 10.0
-        x0, x1 = 80.0, 520.0
-        # Build a clean synthetic page with:
-        #   - System 0: 2 staves (y=120, y=240) linked by a left barline at x=80
-        #   - System 1: 1 staff (y=420) with NO left barline from y=240
-        #   - System 2: 1 staff (y=580) with NO left barline from y=420
-        page = np.full((h, w), 250, dtype=np.uint8)
-        for yc in (120, 240, 420, 580):
-            for k in range(-2, 3):
-                page[int(yc + k * sp), int(x0):int(x1)] = 20
-        # Draw vertical left system barline connecting staff 0 (top=100) to staff 1 (bot=260).
-        page[100:261, int(x0) - 1:int(x0) + 1] = 15
-
-        def _mk(yc, conf=0.9, xs=x0, xe=x1):
-            cp = np.stack([np.linspace(xs, xe, 4), np.full(4, yc)], axis=-1).astype(np.float64)
-            return su.CurvedStaff(
-                ctrl_pts=cp, sp_ctrl=np.full(4, sp),
-                x_start=xs, x_end=xe, sp_median=sp, confidence=conf,
-            )
-
-        # Feed all 4 real staves + 1 spurious duplicate fragment 2.5*sp below staff 0 as ONE over-merged system.
-        staves = [_mk(120.0, 0.95), _mk(145.0, 0.45, xs=120.0, xe=360.0), _mk(240.0, 0.92), _mk(420.0, 0.90), _mk(580.0, 0.88)]
-        merged = [su.CurvedSystem(staves=staves, x_start=x0, x_end=x1, polygon=np.zeros((4, 2)), confidence=0.8)]
-        refined = su.refine_systems_with_page(Image.fromarray(page, mode="L").convert("RGB"), merged)
-        self.assertEqual([len(s.staves) for s in refined], [2, 1, 1])
-
 
 class TestTrainingSmoke(unittest.TestCase):
     def test_dataset_and_one_epoch_train(self):
@@ -386,6 +368,7 @@ class TestTrainingSmoke(unittest.TestCase):
                 target_w=96,
                 base_channels=16,
                 device="cpu",
+                bf16=True,
             )
             self.assertTrue(ckpt.exists())
 
@@ -450,6 +433,43 @@ class TestTrainingSmoke(unittest.TestCase):
             loss, _ = su.StaffUNetLoss()(model(bx), by)
             self.assertTrue(torch.isfinite(loss))
             loss.backward()
+
+    def test_barline_dropout_augmentation_deterministic_and_finite(self):
+        """Multi-staff left-margin barline masking runs only under augment=True and stays deterministic."""
+        with tempfile.TemporaryDirectory() as td:
+            td_path = Path(td)
+            arr = np.full((320, 256, 3), 248, dtype=np.uint8)
+            staves = [
+                {"y_center": 70.0, "sp": 6.0, "x0": 24.0, "x1": 232.0, "system_id": 0},
+                {"y_center": 130.0, "sp": 6.0, "x0": 24.0, "x1": 232.0, "system_id": 0},
+                {"y_center": 210.0, "sp": 6.0, "x0": 24.0, "x1": 232.0, "system_id": 1},
+                {"y_center": 270.0, "sp": 6.0, "x0": 24.0, "x1": 232.0, "system_id": 1},
+            ]
+            for st in staves:
+                for k in range(-2, 3):
+                    ry = int(round(st["y_center"] + k * st["sp"]))
+                    arr[ry, 24:232, :] = 20
+            # Draw crisp left-margin vertical system barlines connecting both multi-staff systems.
+            arr[58:143, 23:26, :] = 15
+            arr[198:283, 23:26, :] = 15
+            img_path = td_path / "page_barline.png"
+            Image.fromarray(arr, mode="RGB").save(img_path)
+
+            manifest = td_path / "manifest.jsonl"
+            manifest.write_text(json.dumps({"image": "page_barline.png", "staves": staves}) + "\n", encoding="utf-8")
+
+            ds_a = su.StaffUNetDataset(manifest, target_h=160, target_w=128, augment=True, seed=99)
+            ds_b = su.StaffUNetDataset(manifest, target_h=160, target_w=128, augment=True, seed=99)
+            for ep in range(10):
+                ds_a.set_epoch(ep)
+                ds_b.set_epoch(ep)
+                xa, ya = ds_a[0]
+                xb, yb = ds_b[0]
+                self.assertTrue(torch.equal(xa, xb))
+                self.assertTrue(torch.equal(ya, yb))
+                self.assertTrue(torch.isfinite(xa).all())
+                self.assertTrue(torch.isfinite(ya).all())
+                self.assertGreater(float(ya[2].sum()), 0.0)
 
 
 if __name__ == "__main__":

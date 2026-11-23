@@ -41,7 +41,6 @@ __all__ = [
     "staves_from_top_bottom",
     "chunk_staves_for_ribbon",
     "build_ribbon_grid",
-    "refine_staves_comb",
     "sample_bezier_ribbon",
     "sample_curved_system_chunks",
     "BezierRibbonSampler",
@@ -364,215 +363,6 @@ def build_ribbon_grid(
     return grid, active_mask, ref
 
 
-def _fit_cubic_bezier_nd(t_vals: np.ndarray, pts: np.ndarray) -> np.ndarray:
-    """Least-squares fit of 4 cubic Bezier control points ``(4, D)`` to ``pts`` ``(N, D)``."""
-    u = 1.0 - t_vals
-    B = np.stack([u ** 3, 3.0 * u * u * t_vals, 3.0 * u * t_vals * t_vals, t_vals ** 3], axis=-1)
-    ctrl, *_ = np.linalg.lstsq(B, pts, rcond=None)
-    return ctrl.astype(np.float32)
-
-
-def refine_staves_comb(
-    page: torch.Tensor | Image.Image,
-    staves: Any,
-    target_sp: float = REF_TARGET_SP,
-    height: int | None = 256,
-    width: int | None = None,
-    n_slots: int = MAX_STAVES,
-    offset_mode: str = "normal",
-    paper_value: float | None = None,
-    n_chunks: int = 8,
-    max_dy_sp: float = 0.45,
-    max_sp_frac: float = 0.12,
-    min_contrast: float = 0.04,
-) -> list[BezierStaff]:
-    """Full-resolution 5-line vertical comb snap for ``StaffUNet2D`` Bezier curves.
-
-    ``StaffUNet2D`` predicts staff centerlines and local ``sp`` at ``512x384``
-    (~5-7x downsampled from a full page), leaving ~1-3 px vertical ribbon
-    jitter at canonical scale. This fast (~2-4 ms CPU) pass samples the initial
-    ribbon in grayscale, takes horizontal median profiles across ``n_chunks``
-    bins (ignoring noteheads/stems/beams), and maximizes a 5-line-minus-4-gap
-    comb score over ``(dy, sp_scale)`` to lock each staff's 5 lines onto the
-    canonical ``ref_channel`` rows to ``< 0.25 px``.
-
-    Safely falls back to the un-snapped Bezier for any staff with low contrast
-    (blank, extreme washout, or occluded). Always runs under ``torch.no_grad``.
-    """
-    with torch.no_grad():
-        if isinstance(page, Image.Image):
-            arr = np.asarray(page.convert("L"), dtype=np.float32) / 255.0
-            gray_ten = torch.from_numpy(arr[None, None, :, :])
-        elif isinstance(page, torch.Tensor):
-            t_in = page.detach().to(device="cpu", dtype=torch.float32)
-            if t_in.ndim == 3:
-                t_in = t_in.unsqueeze(0)
-            elif t_in.ndim != 4:
-                raise ValueError(f"page tensor must be [C,H,W] or [B,C,H,W], got {tuple(page.shape)}")
-            gray_ten = t_in[:1].mean(dim=1, keepdim=True)
-            if paper_value is not None and float(paper_value) > 1.5:
-                gray_ten = gray_ten / float(paper_value)
-        else:
-            raise TypeError(f"page must be torch.Tensor or PIL.Image, got {type(page).__name__}")
-
-        ctrl_pts, sp_ctrl = _coerce_staves(staves, device=torch.device("cpu"), dtype=torch.float32)
-        n_staff = int(ctrl_pts.shape[0])
-        canon_top, slot_pitch, out_h = canonical_layout(
-            target_sp=target_sp, height=height, n_slots=n_slots
-        )
-
-        init_ribbon, _ = sample_bezier_ribbon(
-            page=gray_ten,
-            staves=staves,
-            target_sp=target_sp,
-            height=height,
-            width=width,
-            n_slots=n_slots,
-            offset_mode=offset_mode,
-            paper_value=1.0,
-        )
-        assert isinstance(init_ribbon, torch.Tensor)
-        rib = init_ribbon[0, 0].cpu().numpy()  # (H_out, W_out) in [0, 1]
-        out_w = rib.shape[1]
-
-        t_cols = _arclength_t(ctrl_pts, n_out=out_w).cpu().numpy()
-        t_dense = torch.linspace(0.0, 1.0, 33, dtype=torch.float32)
-        centers_dense = eval_cubic_bezier(ctrl_pts, t_dense).cpu().numpy()  # (S, 33, 2)
-        sp_dense = eval_cubic_bezier(sp_ctrl.unsqueeze(-1), t_dense).squeeze(-1).clamp(min=1e-3).cpu().numpy()
-        if offset_mode == "normal":
-            tang = eval_cubic_bezier_tangent(ctrl_pts, t_dense)
-            t_hat = tang / torch.linalg.norm(tang, dim=-1, keepdim=True).clamp(min=1e-6)
-            n_hat = torch.stack([-t_hat[..., 1], t_hat[..., 0]], dim=-1)
-            n_hat = (n_hat * torch.where(n_hat[..., 1:2] >= 0, 1.0, -1.0)).cpu().numpy()
-        else:
-            n_hat = np.zeros_like(centers_dense)
-            n_hat[..., 1] = 1.0
-
-        t_dense_np = t_dense.numpy()
-
-        # Candidate grid in canonical ribbon pixels.
-        dy_grid = np.linspace(-max_dy_sp * target_sp, max_dy_sp * target_sp, 37, dtype=np.float32)
-        sc_grid = np.linspace(1.0 - max_sp_frac, 1.0 + max_sp_frac, 13, dtype=np.float32)
-        line_k = np.array([-2.0, -1.0, 0.0, 1.0, 2.0], dtype=np.float32)
-        gap_k = np.array([-1.5, -0.5, 0.5, 1.5], dtype=np.float32)
-
-        # Horizontal chunk bounds (skip outermost 4% margin when strip is wide enough).
-        margin = int(round(0.04 * out_w)) if out_w >= 80 else 0
-        c_edges = np.linspace(margin, max(margin + 1, out_w - margin), max(2, int(n_chunks)) + 1)
-        c_edges = np.round(c_edges).astype(int)
-
-        refined: list[BezierStaff] = []
-        for s in range(n_staff):
-            yc_center = canon_top + slot_pitch * s + 2.0 * float(target_sp)
-            r0 = max(0, int(np.floor(yc_center - 3.2 * target_sp)))
-            r1 = min(out_h, int(np.ceil(yc_center + 3.2 * target_sp)) + 1)
-            if r1 - r0 < int(4 * target_sp):
-                refined.append(BezierStaff(ctrl_pts=ctrl_pts[s].clone(), sp_ctrl=sp_ctrl[s].clone()))
-                continue
-
-            ys_local = np.arange(r0, r1, dtype=np.float32)
-            # Precompute comb sampling coordinates relative to r0: (D, S_sc, 5) and (D, S_sc, 4).
-            y_lines = (
-                yc_center
-                + dy_grid[:, None, None]
-                + float(target_sp) * sc_grid[None, :, None] * line_k[None, None, :]
-                - float(r0)
-            )
-            y_gaps = (
-                yc_center
-                + dy_grid[:, None, None]
-                + float(target_sp) * sc_grid[None, :, None] * gap_k[None, None, :]
-                - float(r0)
-            )
-            p_len = r1 - r0
-
-            obs_t: list[float] = []
-            obs_dy: list[float] = []
-            obs_sc: list[float] = []
-            obs_w: list[float] = []
-
-            for m in range(len(c_edges) - 1):
-                c0, c1 = int(c_edges[m]), int(c_edges[m + 1])
-                if c1 - c0 < 4:
-                    continue
-                patch = rib[r0:r1, c0:c1]
-                prof_gray = np.median(patch, axis=1)
-                bg = float(np.percentile(prof_gray, 80))
-                dark = np.clip(bg - prof_gray, 0.0, 1.0)
-                if float(dark.max()) < min_contrast:
-                    continue
-
-                # Linear interpolation of 1D darkness profile at candidate comb rows.
-                def _interp1(coords: np.ndarray) -> np.ndarray:
-                    c_clamped = np.clip(coords, 0.0, float(p_len - 1) - 1e-5)
-                    i0 = c_clamped.astype(np.int32)
-                    frac = c_clamped - i0
-                    return dark[i0] * (1.0 - frac) + dark[i0 + 1] * frac
-
-                line_val = _interp1(y_lines).mean(axis=-1)  # (D, S_sc)
-                gap_val = _interp1(y_gaps).mean(axis=-1)    # (D, S_sc)
-                scores = line_val - 0.85 * gap_val
-                flat_idx = int(np.argmax(scores))
-                best_score = float(scores.reshape(-1)[flat_idx])
-                if best_score < min_contrast:
-                    continue
-                di, si = divmod(flat_idx, len(sc_grid))
-                c_mid = min(out_w - 1, (c0 + c1) // 2)
-                obs_t.append(float(t_cols[c_mid]))
-                obs_dy.append(float(dy_grid[di]))
-                obs_sc.append(float(sc_grid[si]))
-                obs_w.append(best_score)
-
-            if len(obs_t) < 2:
-                refined.append(BezierStaff(ctrl_pts=ctrl_pts[s].clone(), sp_ctrl=sp_ctrl[s].clone()))
-                continue
-
-            ot = np.asarray(obs_t, dtype=np.float64)
-            ody = np.asarray(obs_dy, dtype=np.float64)
-            osc = np.asarray(obs_sc, dtype=np.float64)
-            ow = np.asarray(obs_w, dtype=np.float64)
-
-            # Robust inlier filter against local stains / dense beams.
-            if len(ot) >= 4:
-                med_dy = float(np.median(ody))
-                med_sc = float(np.median(osc))
-                keep = (np.abs(ody - med_dy) <= 0.25 * target_sp) & (np.abs(osc - med_sc) <= 0.06)
-                if int(keep.sum()) >= 2:
-                    ot, ody, osc, ow = ot[keep], ody[keep], osc[keep], ow[keep]
-
-            # Ridge-regularized quadratic fit for dy(t) and linear fit for sp_scale(t).
-            u_obs = ot - 0.5
-            u_den = t_dense_np.astype(np.float64) - 0.5
-            W = np.diag(ow)
-
-            if len(ot) >= 4:
-                X_dy = np.stack([np.ones_like(u_obs), u_obs, u_obs ** 2], axis=-1)
-                reg_dy = np.diag([0.0, 1e-2, 5e-2])
-                coef_dy = np.linalg.solve(X_dy.T @ W @ X_dy + reg_dy, X_dy.T @ W @ ody)
-                dy_den = coef_dy[0] + coef_dy[1] * u_den + coef_dy[2] * (u_den ** 2)
-            else:
-                X_dy = np.stack([np.ones_like(u_obs), u_obs], axis=-1)
-                reg_dy = np.diag([0.0, 2e-2])
-                coef_dy = np.linalg.solve(X_dy.T @ W @ X_dy + reg_dy, X_dy.T @ W @ ody)
-                dy_den = coef_dy[0] + coef_dy[1] * u_den
-
-            X_sc = np.stack([np.ones_like(u_obs), u_obs], axis=-1)
-            reg_sc = np.diag([0.0, 5e-2])
-            coef_sc = np.linalg.solve(X_sc.T @ W @ X_sc + reg_sc, X_sc.T @ W @ (osc - 1.0))
-            sc_den = np.clip(1.0 + coef_sc[0] + coef_sc[1] * u_den, 1.0 - max_sp_frac, 1.0 + max_sp_frac)
-
-            # Map canonical ribbon dy back to page-space normal shift & refit cubic Beziers.
-            delta_page = dy_den * (sp_dense[s] / float(target_sp))  # (33,)
-            new_centers = centers_dense[s] + delta_page[:, None] * n_hat[s]
-            new_sp = np.clip(sp_dense[s] * sc_den, 2.0, None)
-
-            new_cp = _fit_cubic_bezier_nd(t_dense_np, new_centers)
-            new_sp_ctrl = _fit_cubic_bezier_nd(t_dense_np, new_sp[:, None]).squeeze(-1)
-            refined.append(BezierStaff(ctrl_pts=new_cp, sp_ctrl=new_sp_ctrl))
-
-        return refined
-
-
 def sample_bezier_ribbon(
     page: torch.Tensor | Image.Image,
     staves: Any,
@@ -582,7 +372,6 @@ def sample_bezier_ribbon(
     n_slots: int = MAX_STAVES,
     offset_mode: str = "normal",
     paper_value: float | None = None,
-    comb_snap: bool = False,
 ) -> tuple[torch.Tensor | Image.Image, torch.Tensor]:
     """Sample a canonical rectified strip directly from a full page via ``F.grid_sample``.
 
@@ -603,18 +392,6 @@ def sample_bezier_ribbon(
         (PIL Image -> PIL Image; ``[C, H, W]`` -> ``[C, out_h, out_w]``;
         ``[B, C, H, W]`` -> ``[B, C, out_h, out_w]``).
     """
-    if comb_snap:
-        staves = refine_staves_comb(
-            page=page,
-            staves=staves,
-            target_sp=target_sp,
-            height=height,
-            width=width,
-            n_slots=n_slots,
-            offset_mode=offset_mode,
-            paper_value=paper_value,
-        )
-
     is_pil = isinstance(page, Image.Image)
     if is_pil:
         work = page if page.mode in ("L", "RGB") else page.convert("RGB")
@@ -739,7 +516,6 @@ def sample_curved_system_chunks(
     width: int | None = None,
     offset_mode: str = "normal",
     paper_value: float | None = None,
-    comb_snap: bool = False,
 ) -> list[tuple[torch.Tensor | Image.Image, torch.Tensor, list[int]]]:
     """Sample a curved system of any staff count (including >4) as ``<= max_staves`` ribbons.
 
@@ -763,7 +539,6 @@ def sample_curved_system_chunks(
             n_slots=int(max_staves),
             offset_mode=offset_mode,
             paper_value=paper_value,
-            comb_snap=comb_snap,
         )
         results.append((ribbon, ref, indices))
         start += step
