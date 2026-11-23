@@ -1311,8 +1311,10 @@ def load_staff_unet(ckpt_path, device='cpu'):
         in_ch, base_ch, out_stride, target_h, target_w = 3, 40, 2, 1024, 768
         sp_mode, dyn_res = 'rel_h', False
         pixel_budget, max_side = 1536 * 1152, 2048
+    has_row_ctx = any(k.startswith('row_ctx.') for k in sd)
     net = staff_unet2d.StaffUNet2D(
-        in_channels=in_ch, base_channels=base_ch, out_stride=out_stride)
+        in_channels=in_ch, base_channels=base_ch, out_stride=out_stride,
+        row_ctx=has_row_ctx)
     net.load_state_dict(sd)
     net.to(device).eval()
     meta = {

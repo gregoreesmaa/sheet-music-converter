@@ -136,13 +136,20 @@ class StaffUNet2D(nn.Module):
             512x384 out for 1024x768 in], or 4 for 1/4-res output).
     """
 
-    def __init__(self, in_channels: int = 3, base_channels: int = 40, out_stride: int = 2):
+    def __init__(
+        self,
+        in_channels: int = 3,
+        base_channels: int = 40,
+        out_stride: int = 2,
+        row_ctx: bool = False,
+    ):
         super().__init__()
         if out_stride not in (2, 4):
             raise ValueError(f"out_stride must be 2 or 4, got {out_stride}")
         self.in_channels = int(in_channels)
         self.base_channels = int(base_channels)
         self.out_stride = int(out_stride)
+        self.use_row_ctx = bool(row_ctx)
 
         c1 = base_channels             # 40  @ 1/4
         c2 = int(base_channels * 1.8)  # 72  @ 1/8
@@ -170,7 +177,24 @@ class StaffUNet2D(nn.Module):
         self.pool3 = nn.MaxPool2d(2)
 
         # Horizontal dilation in bottleneck widens receptive field along staves.
-        self.bottleneck = _ConvBlock(c3, c4, dilation=(1, 2))
+        self.bottleneck = _ConvBlock(c3, c4, dilation=(2, 4) if self.use_row_ctx else (1, 2))
+        if self.use_row_ctx:
+            # Global horizontal-mean row context (ONNX-clean ReduceMean + 3x1 vertical conv):
+            # broadcasts left-margin barlines/brackets and inter-system gaps across the full page width.
+            rc_out = nn.Conv2d(c4, c4, kernel_size=1)
+            nn.init.zeros_(rc_out.weight)
+            nn.init.zeros_(rc_out.bias)
+            self.row_ctx = nn.Sequential(
+                nn.Conv2d(c4, c4, kernel_size=(3, 1), padding=(1, 0), bias=False),
+                nn.BatchNorm2d(c4),
+                nn.ReLU(inplace=True),
+                nn.Conv2d(c4, c4, kernel_size=(3, 1), padding=(2, 0), dilation=(2, 1), bias=False),
+                nn.BatchNorm2d(c4),
+                nn.ReLU(inplace=True),
+                rc_out,
+            )
+        else:
+            self.row_ctx = None
 
         self.dec3 = _ConvBlock(c4 + c3, c3)
         self.dec2 = _ConvBlock(c3 + c2, c2)
@@ -204,6 +228,8 @@ class StaffUNet2D(nn.Module):
         s8 = self.enc2(self.pool1(s4))
         s16 = self.enc3(self.pool2(s8))
         b32 = self.bottleneck(self.pool3(s16))
+        if self.row_ctx is not None:
+            b32 = b32 + self.row_ctx(b32.mean(dim=3, keepdim=True))
 
         u16 = F.interpolate(b32, size=s16.shape[-2:], mode="bilinear", align_corners=False)
         d16 = self.dec3(torch.cat([u16, s16], dim=1))
@@ -1257,7 +1283,7 @@ def _augment_page_and_staves(
         paper_col_bm: np.ndarray | None = None
         for grp in sys_groups:
             valid_grp = [i for i in grp if 0 <= i < len(curves)]
-            if len(valid_grp) < 2 or rng.random() >= 0.20:
+            if len(valid_grp) < 2 or rng.random() >= 0.05:
                 continue
             if paper_col_bm is None:
                 paper_col_bm = np.median(work.reshape(-1, 3), axis=0).astype(np.float32)
@@ -1761,6 +1787,7 @@ def train_staff_unet2d(
     sp_mode: str = "rel_h",
     init_from: str | Path | None = None,
     buckets: Sequence[tuple[int, int]] | None = None,
+    row_ctx: bool = False,
 ) -> Path:
     """Minimal self-contained training loop for ``StaffUNet2D``."""
     if sp_mode not in ("rel_h", "log_hm"):
@@ -1812,7 +1839,8 @@ def train_staff_unet2d(
     loader = DataLoader(ds, **loader_kw)
 
     model = StaffUNet2D(
-        in_channels=in_channels, base_channels=base_channels, out_stride=out_stride
+        in_channels=in_channels, base_channels=base_channels,
+        out_stride=out_stride, row_ctx=row_ctx,
     ).to(dev)
     if init_from is not None:
         init_state = torch.load(str(init_from), map_location="cpu", weights_only=True)
@@ -1885,6 +1913,7 @@ def train_staff_unet2d(
             "pixel_budget": int(pixel_budget),
             "max_side": int(max_side),
             "sp_mode": str(sp_mode),
+            "row_ctx": bool(row_ctx),
             "epoch": ep,
             "loss": avg,
         }
@@ -1917,6 +1946,7 @@ def _main() -> None:
     p.add_argument("--max-side", type=int, default=2048, help="Dynamic-res max side length")
     p.add_argument("--sp-mode", default="rel_h", choices=["rel_h", "log_hm"], help="ch3 staff-space parameterization")
     p.add_argument("--init-from", default=None, help="Optional checkpoint path to warm-start from")
+    p.add_argument("--row-ctx", action="store_true", help="Enable global horizontal row-context + (2,4) bottleneck dilation")
     args = p.parse_args()
     ckpt = train_staff_unet2d(
         manifest=args.manifest,
@@ -1939,6 +1969,7 @@ def _main() -> None:
         max_side=args.max_side,
         sp_mode=args.sp_mode,
         init_from=args.init_from,
+        row_ctx=args.row_ctx,
     )
     print(f"Saved checkpoint: {ckpt}", flush=True)
 
