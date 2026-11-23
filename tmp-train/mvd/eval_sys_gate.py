@@ -43,6 +43,7 @@ import build_gate20_sys_dev as bgate  # noqa: E402
 import measure_decode as mdec  # noqa: E402
 import page_prep  # noqa: E402
 import bezier_ribbon  # noqa: E402
+import dynamic_res  # noqa: E402
 import staff_unet2d  # noqa: E402
 import numpy as np  # noqa: E402
 from PIL import Image  # noqa: E402
@@ -449,6 +450,9 @@ def main():
                          'curved-system extraction + Bezier ribbon unwarping '
                          'on full pages (replaces RowNet + page_prep + scaled '
                          'fallback under --blind-photo)')
+    ap.add_argument('--dynamic-staff-unet', action='store_true',
+                    help='Force dynamic aspect-preserving StaffUNet2D '
+                         'inference (even on fixed-res v2 checkpoints)')
     ap.add_argument('--suite31', action='store_true',
                     help='T2.4: also evaluate suite31 clean+photo pages')
     ap.add_argument('--no-notation', action='store_true',
@@ -860,6 +864,7 @@ def main():
                    'hybrid_cache': args.hybrid_cache,
                    'heat_pt': args.heat_pt if use_heatnet else None,
                    'staff_unet_ckpt': args.staff_unet_ckpt,
+                   'dynamic_staff_unet': bool(args.dynamic_staff_unet),
                    'rectify': args.rectify,
                    'suite31': args.suite31,
                    'suite31_dir': args.suite31_dir if args.suite31 else None},
@@ -1263,7 +1268,8 @@ def load_staff_unet(ckpt_path, device='cpu'):
     """Load a ``StaffUNet2D`` checkpoint saved by ``staff_unet2d.train_staff_unet2d``.
 
     Returns ``(model, meta)`` where ``meta`` holds ``in_channels``,
-    ``base_channels``, ``out_stride``, ``target_h``, and ``target_w``.
+    ``base_channels``, ``out_stride``, ``target_h``, ``target_w``,
+    ``sp_mode``, ``dynamic_res``, ``pixel_budget``, and ``max_side``.
     """
     import torch
     state = torch.load(str(ckpt_path), map_location='cpu', weights_only=True)
@@ -1274,9 +1280,15 @@ def load_staff_unet(ckpt_path, device='cpu'):
         out_stride = int(state.get('out_stride', 2))
         target_h = int(state.get('target_h', 1024))
         target_w = int(state.get('target_w', 768))
+        sp_mode = str(state.get('sp_mode', 'rel_h'))
+        dyn_res = bool(state.get('dynamic_res', False))
+        pixel_budget = int(state.get('pixel_budget', 1536 * 1152))
+        max_side = int(state.get('max_side', 2048))
     else:
         sd = state
         in_ch, base_ch, out_stride, target_h, target_w = 3, 40, 2, 1024, 768
+        sp_mode, dyn_res = 'rel_h', False
+        pixel_budget, max_side = 1536 * 1152, 2048
     net = staff_unet2d.StaffUNet2D(
         in_channels=in_ch, base_channels=base_ch, out_stride=out_stride)
     net.load_state_dict(sd)
@@ -1287,27 +1299,50 @@ def load_staff_unet(ckpt_path, device='cpu'):
         'out_stride': out_stride,
         'target_h': target_h,
         'target_w': target_w,
+        'sp_mode': sp_mode,
+        'dynamic_res': dyn_res,
+        'pixel_budget': pixel_budget,
+        'max_side': max_side,
     }
     return net, meta
 
 
-def extract_page_curved_systems(staff_unet, page_img, device='cpu', meta=None):
+def extract_page_curved_systems(staff_unet, page_img, device='cpu', meta=None,
+                                force_dynamic=False):
     """Run ``StaffUNet2D`` -> ``extract_curved_systems`` on a full-page image."""
     import torch
     if not isinstance(page_img, Image.Image):
         page_img = Image.open(page_img).convert('RGB')
     orig_w, orig_h = page_img.size
     m = meta or {}
+    sp_mode = str(m.get('sp_mode', 'rel_h'))
+    out_stride = int(m.get('out_stride', getattr(staff_unet, 'out_stride', 2)))
+    in_ch = int(m.get('in_channels', getattr(staff_unet, 'in_channels', 3)))
+    if bool(m.get('dynamic_res', False)) or bool(force_dynamic):
+        pixel_budget = int(m.get('pixel_budget', 1536 * 1152))
+        max_side = int(m.get('max_side', 2048))
+        x_ten, dyn_meta = dynamic_res.preprocess_page_dynamic(
+            page_img, pixel_budget=pixel_budget, max_side=max_side,
+            stride=32, in_channels=in_ch)
+        x = x_ten.unsqueeze(0).to(device)
+        with torch.no_grad():
+            probs = staff_unet.predict_probs(x, sp_mode=sp_mode)
+        probs = dynamic_res.unpad_probs_dynamic(
+            probs, dyn_meta, out_stride=out_stride)
+        return staff_unet2d.extract_curved_systems(
+            probs, orig_w=orig_w, orig_h=orig_h,
+            sp_mode=sp_mode, iso_scale=dyn_meta['scale'],
+            out_stride=out_stride)
     target_h = int(m.get('target_h', 1024))
     target_w = int(m.get('target_w', 768))
-    in_ch = int(m.get('in_channels', getattr(staff_unet, 'in_channels', 3)))
     x = staff_unet2d.preprocess_page_image(
         page_img, target_h=target_h, target_w=target_w,
         in_channels=in_ch).unsqueeze(0).to(device)
     with torch.no_grad():
-        probs = staff_unet.predict_probs(x)
+        probs = staff_unet.predict_probs(x, sp_mode=sp_mode)
     return staff_unet2d.extract_curved_systems(
-        probs, orig_w=orig_w, orig_h=orig_h)
+        probs, orig_w=orig_w, orig_h=orig_h,
+        sp_mode=sp_mode, out_stride=out_stride)
 
 
 def decode_curved_system(net, page_img, curved_sys, heat_net, device, height,
@@ -1451,10 +1486,13 @@ def run_suite31(args, net, heat_net, workdir, device, extra_chans=None,
                 }
                 clean_pil = Image.open(clean).convert('RGB')
                 photo_pil = Image.open(photo).convert('RGB')
+                extract_kw = {'device': device, 'meta': staff_unet_meta}
+                if getattr(args, 'dynamic_staff_unet', False):
+                    extract_kw['force_dynamic'] = True
                 clean_sys = extract_page_curved_systems(
-                    staff_unet, clean_pil, device=device, meta=staff_unet_meta)
+                    staff_unet, clean_pil, **extract_kw)
                 photo_sys = extract_page_curved_systems(
-                    staff_unet, photo_pil, device=device, meta=staff_unet_meta)
+                    staff_unet, photo_pil, **extract_kw)
                 deg_src = 'staff-unet2d' if photo_sys else 'staff-unet-miss'
                 domain_specs = (
                     ('clean', clean_pil, clean_sys if clean_sys else None),
