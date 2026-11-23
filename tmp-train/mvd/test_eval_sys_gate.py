@@ -881,5 +881,150 @@ class TestExtraChans4chAnd3ch(unittest.TestCase):
             self.assertFalse(dec['loop_trimmed'])
 
 
+class TestStaffUNet2DWiring(unittest.TestCase):
+    """Exp 1: --staff-unet-ckpt direct curved-system extraction + Bezier ribbon."""
+
+    def _make_curved_system(self, n_staves=2, page_w=400, page_h=600):
+        import numpy as np
+        import staff_unet2d as su
+        staves = []
+        for s in range(n_staves):
+            yc = 80.0 + s * 70.0
+            x_ctrl = np.linspace(20.0, page_w - 20.0, 4, dtype=np.float64)
+            y_ctrl = np.array([yc, yc - 4.0, yc + 4.0, yc], dtype=np.float64)
+            ctrl = np.stack([x_ctrl, y_ctrl], axis=-1)
+            sp_ctrl = np.full(4, 10.0, dtype=np.float64)
+            staves.append(su.CurvedStaff(
+                ctrl_pts=ctrl, sp_ctrl=sp_ctrl,
+                x_start=20.0, x_end=float(page_w - 20.0),
+                sp_median=10.0, confidence=0.95))
+        return su.CurvedSystem(
+            staves=staves, x_start=20.0, x_end=float(page_w - 20.0),
+            polygon=np.zeros((8, 2), dtype=np.float64), confidence=0.95)
+
+    def test_load_staff_unet_roundtrip_cpu(self):
+        import staff_unet2d as su
+        m = su.StaffUNet2D(in_channels=3, base_channels=16, out_stride=2)
+        with tempfile.TemporaryDirectory(prefix='t_sunet_ckpt_') as tmp:
+            p = Path(tmp) / 'staff_unet2d.pt'
+            torch.save({
+                'state_dict': m.state_dict(),
+                'in_channels': 3,
+                'base_channels': 16,
+                'out_stride': 2,
+                'target_h': 256,
+                'target_w': 192,
+            }, p)
+            loaded, meta = esg.load_staff_unet(p, device='cpu')
+            self.assertEqual(meta['target_h'], 256)
+            self.assertEqual(meta['target_w'], 192)
+            self.assertEqual(meta['base_channels'], 16)
+            self.assertFalse(loaded.training)
+
+    def test_decode_curved_system_handles_gt4_staves_chunked(self):
+        page_img = Image.new('RGB', (400, 600), (255, 255, 255))
+        csys6 = self._make_curved_system(n_staves=6)
+        chunk_shapes = []
+        c1_toks = ['clef-G-2', 'key+0', 'time-4-4', 'voice-1', 'quarter', 'C', '4', 'bar']
+        c2_toks = ['clef-F-4', 'key+0', 'time-4-4', 'voice-1', 'quarter', 'G', '2', 'bar']
+        responses = [c1_toks, c2_toks]
+
+        def fake_fallback(net, ten, beam=3, mem_mask=None, **kw):
+            chunk_shapes.append(tuple(ten.shape))
+            return responses.pop(0)
+
+        with tempfile.TemporaryDirectory(prefix='t_csys6_') as tmp:
+            tmpd = Path(tmp)
+            with mock.patch.object(
+                    esg.mdec, 'decode_system_with_measure_fallback',
+                    side_effect=fake_fallback):
+                dec = esg.decode_curved_system(
+                    None, page_img, csys6, heat_net=None, device='cpu',
+                    height=256, beam=3, max_len=576, workdir=tmpd,
+                    stem='s6-hyp', extra_chans=1)
+        self.assertEqual(dec['geom'], 'staff-unet2d+chunked')
+        self.assertEqual(dec['n_staves'], 6)
+        self.assertEqual(dec['n_chunks'], 2)
+        self.assertEqual(len(chunk_shapes), 2)
+        # 4ch RGB+staff canonical 256px height on both chunks
+        self.assertEqual(chunk_shapes[0][1:3], (4, 256))
+        self.assertEqual(chunk_shapes[1][1:3], (4, 256))
+        # Voices merged across chunks: voice-1 from chunk 1, voice-2 from chunk 2
+        self.assertIn('voice-1', dec['tokens'])
+        self.assertIn('voice-2', dec['tokens'])
+
+    def test_run_suite31_with_staff_unet_bypasses_page_prep_rownet_and_scaled(self):
+        with tempfile.TemporaryDirectory(prefix='t_sunet_s31_') as tmp:
+            tmpd = Path(tmp)
+            suite = _make_suite31_fixture(tmpd / 'suite', slugs=('hit', 'miss'))
+            workdir = tmpd / 'work'
+            workdir.mkdir()
+            ref_toks = ['clef-G-2', 'key+0', 'time-4-4', 'quarter', 'C', '4', 'bar']
+            ref_notes = workdir / 'ref_notes.json'
+            ref_notes.write_text('{}', encoding='utf-8')
+            csys = self._make_curved_system(n_staves=2, page_w=200, page_h=300)
+
+            call_idx = {'n': 0}
+
+            def fake_extract(sunet, pil_img, device='cpu', meta=None):
+                idx = call_idx['n']
+                call_idx['n'] += 1
+                # Order: hit clean (0), hit photo (1), miss clean (2), miss photo (3)
+                if idx == 3:
+                    return []  # miss photo -> 0.0, NEVER scaled fallback
+                return [csys]
+
+            def fake_decode_curved(net, page_img, curved_sys, heat_net, device,
+                                   height, beam, max_len, wd, stem, **kw):
+                esg.write_hyp_bekern(wd, stem, ref_toks)
+                return {'tokens': ref_toks, 'ntokens': len(ref_toks),
+                        'eos_miss': False, 'vocab_valid': True,
+                        'decode_secs': 0.01, 'loop_trimmed': False,
+                        'geom': 'staff-unet2d', 'n_staves': 2, 'n_chunks': 1}
+
+            def fake_run_cli(cmd, **kw):
+                out_path = Path(cmd[cmd.index('--out') + 1])
+                out_path.write_text('{}', encoding='utf-8')
+                return mock.Mock(returncode=0, stderr='')
+
+            with mock.patch.object(esg.page_prep, 'prep_page',
+                                   side_effect=AssertionError('page_prep must not run')), \
+                 mock.patch.object(esg, 'suite31_page_boxes',
+                                   side_effect=AssertionError('RowNet boxes must not run')), \
+                 mock.patch.object(esg.bhc, '_sysdev_one',
+                                   side_effect=AssertionError('bhc must not run')), \
+                 mock.patch.object(esg, 'suite31_page_refs',
+                                   return_value=(ref_toks, ref_notes)), \
+                 mock.patch.object(esg, 'extract_page_curved_systems',
+                                   side_effect=fake_extract), \
+                 mock.patch.object(esg, 'decode_curved_system',
+                                   side_effect=fake_decode_curved), \
+                 mock.patch.object(esg, 'run_cli', side_effect=fake_run_cli), \
+                 mock.patch.object(esg, 'score_notes_pair',
+                                   return_value={'f1': 0.9, 'ser': 0.1,
+                                                 'proxy_fixes': 1,
+                                                 'zeroed': False,
+                                                 'zero_reason': None}), \
+                 mock.patch.object(esg, 'score_notation_bekerns',
+                                   return_value={'notation_f1': 0.9,
+                                                 'notation_drift': 0.9,
+                                                 'notation_zeroed': False,
+                                                 'notation_zero_reason': None}):
+                rows, summary = esg.run_suite31(
+                    _suite31_args(suite, blind_photo=True, no_notation=False),
+                    None, None, workdir, 'cpu', extra_chans=1,
+                    staff_unet=object(), staff_unet_meta={'target_h': 256, 'target_w': 192})
+
+            by_slug = {r['piece']: r for r in rows}
+            self.assertEqual(by_slug['hit']['deg_box_source'], 'staff-unet2d')
+            self.assertEqual(by_slug['hit']['photo_prep_meta']['bypassed_by'], 'staff_unet2d')
+            self.assertEqual(by_slug['hit']['photo_f1'], 0.9)
+            self.assertEqual(by_slug['miss']['deg_box_source'], 'staff-unet-miss')
+            self.assertEqual(by_slug['miss']['photo_f1'], 0.0)
+            self.assertEqual(by_slug['miss']['photo_notation_f1'], 0.0)
+            self.assertAlmostEqual(summary['blind_photo_detected_rate'], 0.5)
+            self.assertAlmostEqual(summary['suite31_photo_f1_mean'], 0.45)
+
+
 if __name__ == '__main__':
     unittest.main()

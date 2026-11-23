@@ -42,6 +42,8 @@ import build_hybrid_cache as bhc  # noqa: E402
 import build_gate20_sys_dev as bgate  # noqa: E402
 import measure_decode as mdec  # noqa: E402
 import page_prep  # noqa: E402
+import bezier_ribbon  # noqa: E402
+import staff_unet2d  # noqa: E402
 import numpy as np  # noqa: E402
 from PIL import Image  # noqa: E402
 
@@ -442,6 +444,11 @@ def main():
     ap.add_argument('--rectify', action='store_true',
                     help='T2.4: rectify strips via cache tables (implied '
                     'by --hybrid) with RowNet/blind fallback')
+    ap.add_argument('--staff-unet-ckpt', default=None,
+                    help='Exp 1: StaffUNet2D .pt checkpoint for direct '
+                         'curved-system extraction + Bezier ribbon unwarping '
+                         'on full pages (replaces RowNet + page_prep + scaled '
+                         'fallback under --blind-photo)')
     ap.add_argument('--suite31', action='store_true',
                     help='T2.4: also evaluate suite31 clean+photo pages')
     ap.add_argument('--no-notation', action='store_true',
@@ -530,8 +537,10 @@ def main():
         args.rectify = True
     use_heatnet = (extra == heat_features.EXTRA_CHANS) and not args.no_heatnet
 
+    has_foveal = any(k.startswith('foveal_proj.') for k in state)
     net = model.MvdNet(vocab=len(data.VOCAB) + 3, anisotropic=True,
-                       stride=args.stride, extra_chans=extra)
+                       stride=args.stride, extra_chans=extra,
+                       foveal_tap=has_foveal)
     try:
         # Compat loader (train.load_weights_compat): strict when shapes
         # match, aux-fresh for pre-S13b ckpts, stem/vocab transplants
@@ -545,9 +554,18 @@ def main():
             % (args.ckpt, extra, str(e)[:200]))
     net.to(device).eval()
     heat_net = None
+    staff_unet = None
+    staff_unet_meta = None
     geom_index = {}
-    if args.rectify:
+    if args.rectify and not (args.suite31_only and args.staff_unet_ckpt):
         bgate.ensure_weights_readable()
+    if args.staff_unet_ckpt:
+        staff_unet, staff_unet_meta = load_staff_unet(
+            args.staff_unet_ckpt, device=device)
+        print('StaffUNet2D: %s on %s (%dx%d, stride=%d)'
+              % (args.staff_unet_ckpt, device,
+                 staff_unet_meta['target_h'], staff_unet_meta['target_w'],
+                 staff_unet_meta['out_stride']), flush=True)
     if args.rectify and args.hybrid_cache:
         geom_index = load_geometry_index(args.hybrid_cache)
         print('geometry index: %d validated strips in %s'
@@ -802,7 +820,10 @@ def main():
         'mscz_100': summary['degraded_mscz_valid_rate'] == 1.0,
     }
 
-    if args.rectify:
+    if args.staff_unet_ckpt:
+        preproc = ('StaffUNet2D curved-system extraction + '
+                   'bezier_ribbon canonical-256 unwarping')
+    elif args.rectify:
         preproc = ('rectify_system_strip canonical-256 (cache tables, '
                    'RowNet fallback, legacy on skip)')
     else:
@@ -813,12 +834,13 @@ def main():
     elif extra == 1:
         preproc += ' + staff-grid (4ch input, no HeatNet)'
         preproc += '; measure-fallback beam (T2.3)'
-    elif args.rectify:
+    elif args.rectify or args.staff_unet_ckpt:
         preproc += '; measure-fallback beam (T2.3)'
     suite31_rows, suite31_summary = [], {}
     if args.suite31:
         suite31_rows, suite31_summary = run_suite31(
-            args, net, heat_net, workdir, device, extra_chans=extra)
+            args, net, heat_net, workdir, device, extra_chans=extra,
+            staff_unet=staff_unet, staff_unet_meta=staff_unet_meta)
         summary.update(suite31_summary)
     report = {
         'gate': 'gate20-sys-v2',
@@ -833,6 +855,7 @@ def main():
                    'blind_photo': bool(args.blind_photo),
                    'hybrid_cache': args.hybrid_cache,
                    'heat_pt': args.heat_pt if use_heatnet else None,
+                   'staff_unet_ckpt': args.staff_unet_ckpt,
                    'rectify': args.rectify,
                    'suite31': args.suite31,
                    'suite31_dir': args.suite31_dir if args.suite31 else None},
@@ -1232,6 +1255,137 @@ def suite31_page_boxes(clean_path, photo_path, gt_path, s_ref=None,
     return clean_boxes, deg_boxes, 'scaled'
 
 
+def load_staff_unet(ckpt_path, device='cpu'):
+    """Load a ``StaffUNet2D`` checkpoint saved by ``staff_unet2d.train_staff_unet2d``.
+
+    Returns ``(model, meta)`` where ``meta`` holds ``in_channels``,
+    ``base_channels``, ``out_stride``, ``target_h``, and ``target_w``.
+    """
+    import torch
+    state = torch.load(str(ckpt_path), map_location='cpu', weights_only=True)
+    if isinstance(state, dict) and ('state_dict' in state or 'model' in state):
+        sd = state.get('state_dict', state.get('model'))
+        in_ch = int(state.get('in_channels', 3))
+        base_ch = int(state.get('base_channels', 40))
+        out_stride = int(state.get('out_stride', 2))
+        target_h = int(state.get('target_h', 1024))
+        target_w = int(state.get('target_w', 768))
+    else:
+        sd = state
+        in_ch, base_ch, out_stride, target_h, target_w = 3, 40, 2, 1024, 768
+    net = staff_unet2d.StaffUNet2D(
+        in_channels=in_ch, base_channels=base_ch, out_stride=out_stride)
+    net.load_state_dict(sd)
+    net.to(device).eval()
+    meta = {
+        'in_channels': in_ch,
+        'base_channels': base_ch,
+        'out_stride': out_stride,
+        'target_h': target_h,
+        'target_w': target_w,
+    }
+    return net, meta
+
+
+def extract_page_curved_systems(staff_unet, page_img, device='cpu', meta=None):
+    """Run ``StaffUNet2D`` -> ``extract_curved_systems`` on a full-page image."""
+    import torch
+    if not isinstance(page_img, Image.Image):
+        page_img = Image.open(page_img).convert('RGB')
+    orig_w, orig_h = page_img.size
+    m = meta or {}
+    target_h = int(m.get('target_h', 1024))
+    target_w = int(m.get('target_w', 768))
+    in_ch = int(m.get('in_channels', getattr(staff_unet, 'in_channels', 3)))
+    x = staff_unet2d.preprocess_page_image(
+        page_img, target_h=target_h, target_w=target_w,
+        in_channels=in_ch).unsqueeze(0).to(device)
+    with torch.no_grad():
+        probs = staff_unet.predict_probs(x)
+    return staff_unet2d.extract_curved_systems(
+        probs, orig_w=orig_w, orig_h=orig_h)
+
+
+def decode_curved_system(net, page_img, curved_sys, heat_net, device, height,
+                         beam, max_len, workdir, stem, ink_eos_veto=False,
+                         ilme_lambda=0.0, lattice_repair=False,
+                         adapt_steps=0, adapt_lr=0.1, stride='8x16',
+                         extra_chans=0):
+    """Unwarp a ``CurvedSystem`` via ``bezier_ribbon`` and measure-fallback decode.
+
+    Directly extracts canonical ``height``-px (default 256 px) strips +
+    ``ref_channel`` from the full page without rectangular cropping or
+    RowNet. Systems with ``> 4`` staves are automatically chunked via
+    ``bezier_ribbon.sample_curved_system_chunks`` (``chunk_staves_for_ribbon``)
+    and merged at the measure/voice level identically to
+    ``measure_decode.decode_multi_staff_system``.
+    """
+    import torch
+    t0 = time.time()
+    if not isinstance(page_img, Image.Image):
+        page_img = Image.open(page_img).convert('RGB')
+    chunks = bezier_ribbon.sample_curved_system_chunks(
+        page_img, curved_sys,
+        max_staves=bezier_ribbon.MAX_STAVES,
+        target_sp=bezier_ribbon.REF_TARGET_SP,
+        height=height,
+    )
+    chunk_streams = []
+    with torch.no_grad():
+        for rect_img, ref, staff_indices in chunks:
+            ten = rectified_input_tensor_from_rect(
+                rect_img, ref, heat_net, device, extra_chans=extra_chans)
+            mem_mask = mdec.mask_for_strip(
+                ten, len(staff_indices), stride=stride)
+            ctoks = mdec.decode_system_with_measure_fallback(
+                net, ten, beam=beam, mem_mask=mem_mask,
+                ink_eos_veto=ink_eos_veto, ilme_lambda=ilme_lambda,
+                lattice_repair=lattice_repair, adapt_steps=adapt_steps,
+                adapt_lr=adapt_lr)
+            chunk_streams.append(ctoks)
+    if len(chunk_streams) == 1:
+        toks = chunk_streams[0]
+        geom = 'staff-unet2d'
+    else:
+        merged_header = []
+        merged = []
+        for ci, ctoks in enumerate(chunk_streams):
+            header, measures, _tb = mdec.split_measures(ctoks)
+            merged_header.extend(header)
+            while len(merged) < len(measures):
+                merged.append([])
+            for j, meas in enumerate(measures):
+                meas = mdec._explicit_voice(meas)
+                if ci == 0:
+                    merged[j].extend(meas)
+                else:
+                    merged[j].extend(
+                        mdec._shift_voices(meas, mdec._measure_voices(merged[j])))
+        toks = mdec.join_measures(merged_header, merged, True)
+        geom = 'staff-unet2d+chunked'
+    secs = time.time() - t0
+    valid = hyp_tokens_valid(toks)
+    loop_trimmed = False
+    if valid:
+        trimmed = trim_max_len_repeat_loop(toks, max_len=max_len)
+        loop_trimmed = len(trimmed) < len(toks)
+        toks = canonicalize_bekern_tail_order(trimmed)
+    write_hyp_bekern(workdir, stem, toks if valid else [])
+    n_staves = (len(curved_sys.staves) if hasattr(curved_sys, 'staves')
+                else len(curved_sys))
+    return {
+        'tokens': toks if valid else [],
+        'ntokens': len(toks) if valid else 0,
+        'eos_miss': False,
+        'vocab_valid': valid,
+        'decode_secs': secs,
+        'loop_trimmed': loop_trimmed,
+        'geom': geom,
+        'n_staves': n_staves,
+        'n_chunks': len(chunks),
+    }
+
+
 def decode_row_system(net, img_file, row, heat_net, device, height, beam,
                       max_len, hybrid, workdir, stem, ink_eos_veto=False,
                       ilme_lambda=0.0, lattice_repair=False,
@@ -1248,11 +1402,15 @@ def decode_row_system(net, img_file, row, heat_net, device, height, beam,
                             extra_chans=extra_chans)
 
 
-def run_suite31(args, net, heat_net, workdir, device, extra_chans=None):
-    """Suite31 photo+clean page eval (T2.4): boxes, rectify, decode, stitch.
+def run_suite31(args, net, heat_net, workdir, device, extra_chans=None,
+                staff_unet=None, staff_unet_meta=None):
+    """Suite31 photo+clean page eval (T2.4 / Exp 1): boxes or StaffUNet2D, decode, stitch.
 
     Pages land in ``workdir`` crops only; ``suite31/`` is read-only.
-    Multi-staff systems (5-7 staves) decode via T2.3 chunked merging.
+    Multi-staff systems (5-7 staves) decode via T2.3 / Bezier ribbon chunked
+    merging. When ``staff_unet`` is provided, replaces RowNet + page_prep +
+    scaled fallback with direct ``StaffUNet2D`` -> ``extract_curved_systems``
+    -> ``bezier_ribbon.sample_curved_system_chunks`` extraction.
     Returns ``(piece_rows, summary_dict)``.
     """
     blind_photo = bool(getattr(args, 'blind_photo', False))
@@ -1276,109 +1434,158 @@ def run_suite31(args, net, heat_net, workdir, device, extra_chans=None):
             gt = suite / piece['gt']['file']
             clean = suite / piece['clean']['file']
             photo = suite / piece['photo']['file']
-            prepped_photo_img, prep_meta = page_prep.prep_page(photo)
-            photo_eval = workdir / ('s31-%s-photo-prepped.png' % slug)
-            prepped_photo_img.save(photo_eval)
-            prow['photo_prep_meta'] = {
-                'skew_deg': prep_meta['skew_deg'],
-                'border_crop_box': prep_meta['border_crop_box'],
-                'applied': prep_meta['applied'],
-            }
             ref_page_toks, page_ref_notes = suite31_page_refs(
                 gt, 's31-' + slug, workdir)
-            ref_head, _ref_body = split_head_body(ref_page_toks)
-            s_ref = sum(1 for _t in ref_head
-                        if _t.startswith('clef-')) or None
-            got = suite31_page_boxes(str(clean), str(photo_eval), str(gt),
-                                     s_ref=s_ref, blind_photo=blind_photo)
-            if (got is None and getattr(args, 'use_manifest_boxes', False)
-                    and piece.get('system_boxes')):
-                cboxes = piece['system_boxes']
-                if blind_photo:
-                    got = (cboxes, None, 'blind-miss')
-                else:
-                    with Image.open(clean) as im:
-                        cw, ch = im.size
-                    with Image.open(photo_eval) as im:
-                        dw, dh = im.size
-                    sx, sy = dw / cw, dh / ch
-                    dboxes = [
-                        [max(0, min(int(round(b[0] * sx)), dw - 1)),
-                         max(0, min(int(round(b[1] * sy)), dh - 1)),
-                         max(1, min(int(round(b[2] * sx)), dw)),
-                         max(1, min(int(round(b[3] * sy)), dh))]
-                        for b in cboxes
-                    ]
-                    got = (cboxes, dboxes, 'manifest-boxes')
-            if got is None:
-                prow.update({'skipped': True,
-                             'reason': 'system-grouping-ambiguous'})
-                piece_rows.append(prow)
-                print('%s SKIP system-grouping-ambiguous' % slug, flush=True)
-                continue
-            clean_boxes, deg_boxes, deg_src = got
-            for domain, page_img, boxes in (
+            if staff_unet is not None:
+                # Exp 1: StaffUNet2D + Bezier ribbon directly on raw full pages
+                # (bypasses page_prep, RowNet, and scaled-clean fallback).
+                prow['photo_prep_meta'] = {
+                    'skew_deg': 0.0,
+                    'border_crop_box': None,
+                    'applied': False,
+                    'bypassed_by': 'staff_unet2d',
+                }
+                clean_pil = Image.open(clean).convert('RGB')
+                photo_pil = Image.open(photo).convert('RGB')
+                clean_sys = extract_page_curved_systems(
+                    staff_unet, clean_pil, device=device, meta=staff_unet_meta)
+                photo_sys = extract_page_curved_systems(
+                    staff_unet, photo_pil, device=device, meta=staff_unet_meta)
+                deg_src = 'staff-unet2d' if photo_sys else 'staff-unet-miss'
+                domain_specs = (
+                    ('clean', clean_pil, clean_sys if clean_sys else None),
+                    ('photo', photo_pil, photo_sys if photo_sys else None),
+                )
+                n_clean_systems = len(clean_sys)
+                prow['photo_n_systems'] = len(photo_sys)
+            else:
+                prepped_photo_img, prep_meta = page_prep.prep_page(photo)
+                photo_eval = workdir / ('s31-%s-photo-prepped.png' % slug)
+                prepped_photo_img.save(photo_eval)
+                prow['photo_prep_meta'] = {
+                    'skew_deg': prep_meta['skew_deg'],
+                    'border_crop_box': prep_meta['border_crop_box'],
+                    'applied': prep_meta['applied'],
+                }
+                ref_head, _ref_body = split_head_body(ref_page_toks)
+                s_ref = sum(1 for _t in ref_head
+                            if _t.startswith('clef-')) or None
+                got = suite31_page_boxes(str(clean), str(photo_eval), str(gt),
+                                         s_ref=s_ref, blind_photo=blind_photo)
+                if (got is None and getattr(args, 'use_manifest_boxes', False)
+                        and piece.get('system_boxes')):
+                    cboxes = piece['system_boxes']
+                    if blind_photo:
+                        got = (cboxes, None, 'blind-miss')
+                    else:
+                        with Image.open(clean) as im:
+                            cw, ch = im.size
+                        with Image.open(photo_eval) as im:
+                            dw, dh = im.size
+                        sx, sy = dw / cw, dh / ch
+                        dboxes = [
+                            [max(0, min(int(round(b[0] * sx)), dw - 1)),
+                             max(0, min(int(round(b[1] * sy)), dh - 1)),
+                             max(1, min(int(round(b[2] * sx)), dw)),
+                             max(1, min(int(round(b[3] * sy)), dh))]
+                            for b in cboxes
+                        ]
+                        got = (cboxes, dboxes, 'manifest-boxes')
+                if got is None:
+                    prow.update({'skipped': True,
+                                 'reason': 'system-grouping-ambiguous'})
+                    piece_rows.append(prow)
+                    print('%s SKIP system-grouping-ambiguous' % slug, flush=True)
+                    continue
+                clean_boxes, deg_boxes, deg_src = got
+                domain_specs = (
                     ('clean', clean, clean_boxes),
-                    ('photo', photo_eval, deg_boxes)):
+                    ('photo', photo_eval, deg_boxes),
+                )
+                n_clean_systems = len(clean_boxes)
+            for domain, page_img, items in domain_specs:
                 dskey = domain
-                if boxes is None:
+                if items is None:
+                    miss_reason = ('staff-unet-miss'
+                                   if staff_unet is not None else deg_src)
                     prow[dskey + '_f1'] = 0.0
                     prow[dskey + '_ser'] = 1.0
-                    prow[dskey + '_zero_reason'] = deg_src
+                    prow[dskey + '_zero_reason'] = miss_reason
                     prow[dskey + '_mod_f1'] = modifier_f1(ref_page_toks, [])
                     prow[dskey + '_loop_trimmed'] = 0
                     if not args.no_notation:
                         prow[dskey + '_notation_f1'] = 0.0
                         prow[dskey + '_notation_drift'] = 0.0
                         prow[dskey + '_notation_zeroed'] = True
-                        prow[dskey + '_notation_zero_reason'] = deg_src
+                        prow[dskey + '_notation_zero_reason'] = miss_reason
                     print('%s [%s] f1=0.0000 ser=1.0000 (%s)' % (
-                        slug, domain, deg_src), flush=True)
+                        slug, domain, miss_reason), flush=True)
                     continue
                 hyps_toks = []
                 domain_trimmed = 0
-                for i, box in enumerate(boxes):
-                    crop = workdir / ('s31-%s-s%d-%s.png' % (slug, i, domain))
-                    bgate.crop_box(str(page_img), str(crop), box)
-                    clean_name = 's31-%s-s%d-clean.png' % (slug, i)
-                    if (domain == 'photo' and not blind_photo
-                            and (workdir / clean_name).exists()):
-                        # Photo strips pair against the clean crop
-                        # (written by the clean pass above) so
-                        # mapped-refine transfers clean truth onto the
-                        # photo geometry; the degraded row is selected.
-                        s = {'id': slug, 'page': 1, 'sys_idx': i,
-                             'clean': clean_name, 'degraded': crop.name}
-                        use_degraded = True
-                    else:
-                        s = {'id': slug, 'page': 1, 'sys_idx': i,
-                             'clean': crop.name, 'degraded': crop.name}
-                        use_degraded = False
-                    try:
-                        c_row, d_row = bhc._sysdev_one((str(workdir), s))
-                        want = d_row if use_degraded else c_row
-                        row = want if not want.get('skip') else None
-                        if row is not None and not row.get('table'):
-                            row = None
-                    except ValueError:
-                        row = None
+                for i, item in enumerate(items):
                     stem = 's31-%s-s%d-%s-hyp' % (slug, i, domain)
-                    try:
-                        dec = decode_row_system(
-                            net, str(crop), row, heat_net, device,
-                            args.height, args.beam, args.max_len,
-                            args.hybrid, workdir, stem,
-                            ink_eos_veto=args.ink_veto,
-                            ilme_lambda=args.ilme_lambda,
-                            lattice_repair=args.lattice_repair,
-                            adapt_steps=args.adapt_steps,
-                            adapt_lr=args.adapt_lr, stride=args.stride,
-                            extra_chans=extra_chans)
-                    except Exception as e:  # noqa: BLE001 - record, continue
-                        prow['%s_s%d_error' % (domain, i)] = (
-                            'decode-crash: %s' % e)
-                        hyps_toks.append([])
-                        continue
+                    if staff_unet is not None:
+                        try:
+                            dec = decode_curved_system(
+                                net, page_img, item, heat_net, device,
+                                args.height, args.beam, args.max_len,
+                                workdir, stem,
+                                ink_eos_veto=args.ink_veto,
+                                ilme_lambda=args.ilme_lambda,
+                                lattice_repair=args.lattice_repair,
+                                adapt_steps=args.adapt_steps,
+                                adapt_lr=args.adapt_lr, stride=args.stride,
+                                extra_chans=(extra_chans if extra_chans is not None
+                                             else (heat_features.EXTRA_CHANS
+                                                   if args.hybrid else 0)))
+                        except Exception as e:  # noqa: BLE001 - record, continue
+                            prow['%s_s%d_error' % (domain, i)] = (
+                                'decode-crash: %s' % e)
+                            hyps_toks.append([])
+                            continue
+                    else:
+                        box = item
+                        crop = workdir / ('s31-%s-s%d-%s.png' % (slug, i, domain))
+                        bgate.crop_box(str(page_img), str(crop), box)
+                        clean_name = 's31-%s-s%d-clean.png' % (slug, i)
+                        if (domain == 'photo' and not blind_photo
+                                and (workdir / clean_name).exists()):
+                            # Photo strips pair against the clean crop
+                            # (written by the clean pass above) so
+                            # mapped-refine transfers clean truth onto the
+                            # photo geometry; the degraded row is selected.
+                            s = {'id': slug, 'page': 1, 'sys_idx': i,
+                                 'clean': clean_name, 'degraded': crop.name}
+                            use_degraded = True
+                        else:
+                            s = {'id': slug, 'page': 1, 'sys_idx': i,
+                                 'clean': crop.name, 'degraded': crop.name}
+                            use_degraded = False
+                        try:
+                            c_row, d_row = bhc._sysdev_one((str(workdir), s))
+                            want = d_row if use_degraded else c_row
+                            row = want if not want.get('skip') else None
+                            if row is not None and not row.get('table'):
+                                row = None
+                        except ValueError:
+                            row = None
+                        try:
+                            dec = decode_row_system(
+                                net, str(crop), row, heat_net, device,
+                                args.height, args.beam, args.max_len,
+                                args.hybrid, workdir, stem,
+                                ink_eos_veto=args.ink_veto,
+                                ilme_lambda=args.ilme_lambda,
+                                lattice_repair=args.lattice_repair,
+                                adapt_steps=args.adapt_steps,
+                                adapt_lr=args.adapt_lr, stride=args.stride,
+                                extra_chans=extra_chans)
+                        except Exception as e:  # noqa: BLE001 - record, continue
+                            prow['%s_s%d_error' % (domain, i)] = (
+                                'decode-crash: %s' % e)
+                            hyps_toks.append([])
+                            continue
                     ht = (workdir / (stem + '-bekern.txt')).read_text(
                         encoding='utf-8').split()
                     hyps_toks.append(ht)
@@ -1448,7 +1655,7 @@ def run_suite31(args, net, heat_net, workdir, device, extra_chans=None):
                 print('%s [%s] f1=%.4f ser=%.4f' % (
                     slug, domain, prow.get(dskey + '_f1'),
                     prow.get(dskey + '_ser')), flush=True)
-            prow['n_systems'] = len(clean_boxes)
+            prow['n_systems'] = n_clean_systems
             prow['deg_box_source'] = deg_src
             prow['ref_tokens'] = len(ref_page_toks)
         except Exception as e:  # noqa: BLE001 - record, never crash gate
@@ -1468,7 +1675,8 @@ def run_suite31(args, net, heat_net, workdir, device, extra_chans=None):
         'blind_photo': blind_photo,
         'blind_photo_detected_rate': (
             sum(1 for r in scored_rows
-                if r.get('deg_box_source') == 'detected') / len(scored_rows)
+                if r.get('deg_box_source') in ('detected', 'staff-unet2d'))
+            / len(scored_rows)
             if scored_rows else None),
         'clean_loop_trimmed': clean_loop_trimmed,
         'photo_loop_trimmed': photo_loop_trimmed,
