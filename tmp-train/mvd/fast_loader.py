@@ -43,24 +43,25 @@ def measure_pair_widths(
     Uses ``hybrid_index`` metadata when available (zero disk opens), else reads
     only the image header via ``PIL.Image.open(p).size`` (no pixel decode).
     """
-    widths: list[int] = []
-    for img_path, _bek, _stem in pairs:
-        w_est = None
+    def _one_width(pair):
+        img_path = pair[0]
         if hybrid_index is not None:
             row = hybrid_index.get(Path(img_path).name)
             if isinstance(row, dict):
                 rw = row.get('rect_w') or row.get('width')
                 if isinstance(rw, (int, float)) and rw > 0:
-                    w_est = int(round(rw))
-        if w_est is None:
-            try:
-                with Image.open(img_path) as im:
-                    iw, ih = im.size
-                w_est = max(1, int(round(iw * height / max(ih, 1))))
-            except Exception:
-                w_est = height * 4
-        widths.append(w_est)
-    return widths
+                    return int(round(rw))
+        try:
+            with Image.open(img_path) as im:
+                iw, ih = im.size
+            return max(1, int(round(iw * height / max(ih, 1))))
+        except Exception:
+            return height * 4
+
+    if len(pairs) >= 64:
+        with ThreadPoolExecutor(max_workers=16) as pool:
+            return list(pool.map(_one_width, pairs, chunksize=64))
+    return [_one_width(p) for p in pairs]
 
 
 def epoch_bucketed_batches(

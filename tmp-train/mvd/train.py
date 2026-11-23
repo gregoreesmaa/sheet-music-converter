@@ -138,7 +138,7 @@ META_KEYS = ('vocab', 'pages', 'height', 'lr', 'seed', 'exclude',
              'extra_chans', 'hybrid_cache', 'heat_pt', 'stride',
              'aux_weight', 'aux_every', 'heat_dropout',
              'coord_weight', 'coord_every', 'simshots',
-             'epoch_aug_p', 'epoch_aug_clean_p', 'epoch_redraw_dir',
+             'epoch_aug_p', 'epoch_aug_clean_p', 'epoch_aug_geom', 'epoch_redraw_dir',
              'bf16', 'channels_last', 'width_bucket', 'prefetch')
 
 # Values new flags had implicitly before they existed. An old
@@ -153,6 +153,7 @@ LEGACY_DEFAULTS = {
     'grad_checkpoint': False,
     'epoch_aug_p': 0.0,
     'epoch_aug_clean_p': 0.0,
+    'epoch_aug_geom': 0.0,
     'epoch_redraw_dir': None,
     'bf16': False,
     'channels_last': False,
@@ -174,7 +175,7 @@ RESUME_KEYS = ('vocab', 'pages', 'height', 'lr', 'seed', 'exclude',
                'mwer_weight', 'mwer_beams', 'mwer_every',
                'mwer_maxlen', 'action_weight', 'action_every',
                'specaug_p', 'specaug_slope', 'handink', 'simshots',
-               'epoch_aug_p', 'epoch_aug_clean_p', 'epoch_redraw_dir',
+               'epoch_aug_p', 'epoch_aug_clean_p', 'epoch_aug_geom', 'epoch_redraw_dir',
                'bf16', 'channels_last', 'width_bucket', 'prefetch')
 
 _LOCK_HELD = []
@@ -308,11 +309,13 @@ MAINTENANCE_EVERY = 500
 
 # S13 4x8 VRAM wall: rectification can stretch an ordinary strip to
 # ~5760 px (observed pole, train step 3860 — 5 kills). Typical
-# rectified strips are ~1200-2300 px; beyond this cap the aux+coord
-# triple forward cannot fit 16 GB. Skips are deterministic (same
-# pairs -> same skips), so the fixed step->batch map stays
-# resume-exact (same precedent as the old 8000 sidecar-cap guard).
-BATCH_WIDTH_CAP = 4096
+# rectified strips are ~1200-2600 px; at B=4 with width-bucketing,
+# a W=3664 batch (step 1313) spills 16 GB VRAM into Windows WDDM and
+# triggers a TDR driver reset ("CUDA driver error: device not ready").
+# Cap at 3072 (skips only ~0.16% outlier strips). Skips are
+# deterministic (same pairs -> same skips), so the fixed step->batch
+# map stays resume-exact.
+BATCH_WIDTH_CAP = 3072
 
 
 def batch_too_wide(width):
@@ -400,6 +403,7 @@ def build_meta(args, pairs):
         'simshots': getattr(args, 'simshots', False),
         'epoch_aug_p': getattr(args, 'epoch_aug_p', 0.0),
         'epoch_aug_clean_p': getattr(args, 'epoch_aug_clean_p', 0.0),
+        'epoch_aug_geom': getattr(args, 'epoch_aug_geom', 0.0),
         'epoch_redraw_dir': getattr(args, 'epoch_redraw_dir', None),
         'bf16': getattr(args, 'bf16', False),
         'channels_last': getattr(args, 'channels_last', False),
@@ -838,8 +842,14 @@ def filter_hybrid_pairs(pairs, hybrid_index=None, allow_on_the_fly=False):
     dc = dd = 0
     for p in pairs:
         has_file = compact_sidecar.resolve_sidecar_path(p[0]) is not None
-        has_otf = (allow_on_the_fly and hybrid_index is not None
-                   and Path(p[0]).name in hybrid_index)
+        has_otf = False
+        if allow_on_the_fly and hybrid_index is not None:
+            row = hybrid_index.get(Path(p[0]).name)
+            if isinstance(row, dict):
+                tbl = row.get('table')
+                staves = tbl.get('staves') if isinstance(tbl, dict) else None
+                n_s = len(staves) if isinstance(staves, list) else int(row.get('S', 0) or 0)
+                has_otf = (1 <= n_s <= 4)
         if has_file or has_otf:
             kept.append(p)
         elif '_d' in Path(p[0]).stem.rsplit('-', 1)[-1]:
@@ -966,9 +976,11 @@ def collate_hybrid(batch, height, stride='8x16', hybrid_index=None):
     return rgb, encode_targets(batch), key_mask, gray, staff
 
 
-def hybrid_model_input(heat_net, pair, height, device, stride='8x16'):
+def hybrid_model_input(heat_net, pair, height, device, stride='8x16',
+                       hybrid_index=None):
     """Single-pair ``[1, 11, H, W]`` model input for eval/probes (T2.4)."""
-    rgb, _, _, gray, staff = collate_hybrid([pair], height, stride)
+    rgb, _, _, gray, staff = collate_hybrid([pair], height, stride,
+                                            hybrid_index=hybrid_index)
     return assemble_hybrid_batch(heat_net, rgb.to(device),
                                  gray.to(device), staff.to(device))
 
@@ -1537,17 +1549,18 @@ def main():
                     help='HeatNet .pt checkpoint for --hybrid-cache '
                          '(CUDA when available; loaded once, eval mode). '
                          'Recorded in meta.json and enforced on --resume.')
-    ap.add_argument('--epoch-aug-p', type=float, default=0.8,
-                    help='per-epoch deterministic physical+3D-geom aug '
-                         'probability on degraded strips (default 0.8; pass '
-                         '0.0 to disable). Fresh draw each epoch; preserves '
-                         'clean anchors. Recorded in meta.json and enforced '
-                         'on --resume.')
-    ap.add_argument('--epoch-aug-clean-p', type=float, default=0.0,
-                    help='per-epoch photometric/optics aug probability on '
-                         'clean .png strips (default 0.0 preserves the '
-                         '20-30%% clean anchor floor). Recorded in meta.json '
-                         'and enforced on --resume.')
+    ap.add_argument('--epoch-aug-p', type=float, default=0.0,
+                    help='per-epoch deterministic physical aug probability on '
+                         'already-degraded _d* strips (default 0.0 to avoid '
+                         'double-degrading _d* JPEGs).')
+    ap.add_argument('--epoch-aug-clean-p', type=float, default=0.75,
+                    help='per-epoch physical+geom aug probability on clean '
+                         '.png strips (default 0.75: keeps 25%% clean anchor '
+                         'floor, turns 75%% into fresh photo draws each epoch).')
+    ap.add_argument('--epoch-aug-geom', type=float, default=0.15,
+                    help='3D geometric warp strength in epoch_aug (default '
+                         '0.15 = gentle +/-1-2 px spline-jitter preserving '
+                         'canonical staff alignment; 0.0 = photometric only).')
     ap.add_argument('--epoch-redraw-dir', default=None,
                     help='optional root holding ep<E>/ fresh photo-degrade '
                          'redraws; substitutes degraded strips per epoch '
@@ -1589,11 +1602,12 @@ def main():
         hybrid_index = load_hybrid_index(args.hybrid_cache)
         print('hybrid index: %d validated strips in %s'
               % (len(hybrid_index), args.hybrid_cache))
-        pairs, drop_clean, drop_deg = filter_hybrid_pairs(pairs)
+        pairs, drop_clean, drop_deg = filter_hybrid_pairs(
+            pairs, hybrid_index=hybrid_index, allow_on_the_fly=True)
         print('hybrid filter: kept %d pairs (dropped clean=%d '
-              'degraded=%d without sidecars)'
+              'degraded=%d without sidecars/tables)'
               % (len(pairs), drop_clean, drop_deg))
-        assert pairs, 'no training pairs with sidecars selected'
+        assert pairs, 'no training pairs with sidecars or tables selected'
     if args.aux_weight > 0 and not args.hybrid_cache:
         sys.exit('refusing: --aux-weight needs --hybrid-cache (aux '
                  'targets are the hybrid-extra channels)')
@@ -1762,7 +1776,8 @@ def main():
     def _collate_step(_st, _ep, batch):
         if heat_net is None:
             return collate(batch, args.height, args.stride)
-        return collate_hybrid(batch, args.height, args.stride)
+        return collate_hybrid(batch, args.height, args.stride,
+                              hybrid_index=hybrid_index)
 
     non_block = (device == 'cuda' and args.prefetch > 0)
     if args.prefetch > 0:
@@ -1789,7 +1804,8 @@ def main():
             if args.epoch_aug_p > 0 or args.epoch_aug_clean_p > 0:
                 imgs, _ = epoch_aug.augment_standardized_batch(
                     imgs, batch, args.seed, epoch,
-                    aug_p=args.epoch_aug_p, clean_p=args.epoch_aug_clean_p)
+                    aug_p=args.epoch_aug_p, clean_p=args.epoch_aug_clean_p,
+                    geom_strength=args.epoch_aug_geom)
         else:
             # Hybrid: rectified RGB + staff from sidecars, heat from one
             # batched fp32 HeatNet forward OUTSIDE autocast (probs() is
@@ -1813,7 +1829,8 @@ def main():
                 rgb_d, gray_d, staff_d = epoch_aug.augment_standardized_batch(
                     rgb_d, batch, args.seed, epoch,
                     aug_p=args.epoch_aug_p, clean_p=args.epoch_aug_clean_p,
-                    grayb=gray_d, staffb=staff_d)
+                    grayb=gray_d, staffb=staff_d,
+                    geom_strength=args.epoch_aug_geom)
             imgs = assemble_hybrid_batch(
                 heat_net, rgb_d, gray_d, staff_d)
             # S13b: aux targets are the UNDROPPED extras (denoising:
@@ -1835,113 +1852,168 @@ def main():
                 args.specaug_p, args.specaug_slope)
         need_aux = (args.aux_weight > 0 and step % max(1, args.aux_every) == 0)
         need_coord = (args.coord_weight > 0 and step % max(1, args.coord_every) == 0)
-        with torch.amp.autocast('cuda', enabled=amp, dtype=amp_dtype):
-            ce_loss, apred_shared, xc_shared = net.loss_shared(
-                imgs, tgt, sample_p=args.sample_p,
-                mem_mask=key_mask, tok_weight=args.tok_weight,
-                weight_ids=STRUCT_WEIGHT_IDS,
-                tok_dropout=args.tok_dropout,
-                content_ids=CONTENT_IDS,
-                need_aux=need_aux, need_coord=need_coord,
-                augment=aug)
-            loss = ce_loss / K
-            mterm = None
-            if args.margin_weight > 0 and step % max(
-                    1, args.margin_every) == 0:
-                # Spike S3: sibling margin on one stream-picked sample
-                # ('seed:step' string seed — deterministic across runs,
-                # no run-history input). One extra encode +
-                # (1 + siblings) decoder passes; the batch CE above is
-                # untouched.
-                mrng = random.Random('%d:%d' % (args.seed, step))
-                mi = mrng.randrange(tgt.shape[0])
-                ref_ids = [t for t in tgt[mi].tolist()
-                           if t != data.PAD_ID]
-                sibs = mutate_modifier_siblings(
-                    ref_ids, args.margin_siblings, mrng,
-                    model.MODIFIER_IDS, len(data.VOCAB))
-                mimg = imgs[mi:mi + 1]
-                mmask = (key_mask[mi:mi + 1]
-                         if key_mask is not None else None)
-                mem1 = net.encode(mimg, mmask)
-                ref_lp = sequence_logprob(net, mem1, ref_ids, mmask)
-                sib_lps = torch.stack(
-                    [sequence_logprob(net, mem1, s, mmask)
-                     for s in sibs])
-                mterm = sibling_margin_loss(ref_lp, sib_lps, args.margin)
-                loss = loss + args.margin_weight * mterm / K
-            wterm = None
-            if args.mwer_weight > 0 and step % max(
-                    1, args.mwer_every) == 0:
-                # Spike S4: MWER on one stream-picked sample
-                # ('seed:step:mwer' string seed — deterministic across
-                # runs, no run-history input). B=4 grammar beams decode
-                # no-grad; their risks vs the reference weight the
-                # grad-carrying teacher-forced beam log-probs.
-                wrng = random.Random('%d:%d:mwer' % (args.seed, step))
-                wi = wrng.randrange(tgt.shape[0])
-                wref = [t for t in tgt[wi].tolist()
-                        if t != data.PAD_ID]
-                wimg = imgs[wi:wi + 1]
-                wmask = (key_mask[wi:wi + 1]
-                         if key_mask is not None else None)
-                with torch.no_grad():
-                    wbeams = net.beam_search(
-                        wimg, beam=args.mwer_beams, strict=True,
-                        max_len=args.mwer_maxlen, mem_mask=wmask,
-                        return_all=True)
-                whyps = [beam_hyp(b, net.eos_id, len(data.VOCAB))
-                         for b in wbeams[0].tolist()]
-                wmem = net.encode(wimg, wmask)
-                wbeam_lps = torch.stack(
-                    [sequence_logprob(net, wmem, h, wmask)
-                     for h in whyps])
-                wrisks = torch.tensor(
-                    [weighted_risk(wref, h, data.TOKEN_TO_ID['bar'],
-                                   net.eos_id, model.MODIFIER_IDS)
-                     for h in whyps],
-                    device=wbeam_lps.device, dtype=torch.float32)
-                wterm = mwer_loss(wbeam_lps, wrisks)
-                loss = loss + args.mwer_weight * wterm / K
-            aterm = None
-            if args.action_weight > 0 and step % max(
-                    1, args.action_every) == 0:
-                # Spike S7: token-level expected keystroke risk on the
-                # batch (one extra forward, no beams). Cost matrix is
-                # a pure function of ids; build once per run.
-                if acost is None:
-                    acost = keystroke_cost_matrix(
-                        net.vocab, model.MODIFIER_IDS).to(imgs.device)
-                abos = torch.full_like(tgt[:, :1], net.bos_id)
-                alogits = net(imgs, torch.cat([abos, tgt[:, :-1]],
-                                              dim=1), key_mask)
-                aterm = expected_keystroke_risk(alogits, tgt, acost)
-                loss = loss + args.action_weight * aterm / K
-            auxterm = None
-            if need_aux:
-                # S13b: dense ink/keypoint distillation from the shared trunk
-                # forward (zero redundant ConvNeXt pass).
-                apred = apred_shared
-                agres = torch.nn.functional.interpolate(
-                    aux_tgt, size=apred.shape[-2:], mode='area')
-                abce = torch.nn.functional.binary_cross_entropy_with_logits(
-                    apred, agres, reduction='none').mean(dim=1)
-                if key_mask is not None:
-                    avalid = (~key_mask).to(abce.dtype).reshape(abce.shape)
-                    auxterm = ((abce * avalid).sum()
-                               / avalid.sum().clamp_min(1.0))
-                else:
-                    auxterm = abce.mean()
-                loss = loss + args.aux_weight * auxterm / K
-            cterm = None
-            if need_coord:
-                # S13c: monotonic-reading supervision from the shared decoder
-                # pass (zero redundant encoder/decoder pass).
-                xc = xc_shared
-                cterm = model.coord_monotonic_penalty(
-                    xc, tgt, model.VOICE_IDS, net.pad_id)
-                loss = loss + args.coord_weight * cterm / K
-        scaler.scale(loss).backward()
+        # Width-aware micro-chunking: at H=256 and B=4, batches wider than
+        # 2176 px exceed 16 GB VRAM and spill into Windows WDDM (triggering
+        # slow paging or TDR driver resets). Splitting wide batches into
+        # B=2 sub-chunks keeps peak VRAM <= 11 GB with mathematically
+        # identical gradients and zero skipped strips up to BATCH_WIDTH_CAP.
+        _b_cur = imgs.shape[0]
+        _no_extra_terms = (
+            args.margin_weight <= 0 and args.mwer_weight <= 0
+            and args.action_weight <= 0)
+        if (_b_cur > 2 and imgs.shape[-1] > 2176 and _no_extra_terms):
+            _mb = 2
+            _loss_acc = 0.0
+            _aux_acc = 0.0 if need_aux else None
+            _coord_acc = 0.0 if need_coord else None
+            mterm = wterm = aterm = None
+            for _s in range(0, _b_cur, _mb):
+                _e = min(_b_cur, _s + _mb)
+                _wf = (_e - _s) / float(_b_cur)
+                _im = imgs[_s:_e]
+                _tg = tgt[_s:_e]
+                _km = key_mask[_s:_e] if key_mask is not None else None
+                with torch.amp.autocast('cuda', enabled=amp, dtype=amp_dtype):
+                    _ce, _ap, _xc = net.loss_shared(
+                        _im, _tg, sample_p=args.sample_p,
+                        mem_mask=_km, tok_weight=args.tok_weight,
+                        weight_ids=STRUCT_WEIGHT_IDS,
+                        tok_dropout=args.tok_dropout,
+                        content_ids=CONTENT_IDS,
+                        need_aux=need_aux, need_coord=need_coord,
+                        augment=aug)
+                    _sub = _ce * (_wf / K)
+                    if need_aux:
+                        _at = aux_tgt[_s:_e]
+                        _ag = torch.nn.functional.interpolate(
+                            _at, size=_ap.shape[-2:], mode='area')
+                        _ab = torch.nn.functional.binary_cross_entropy_with_logits(
+                            _ap, _ag, reduction='none').mean(dim=1)
+                        if _km is not None:
+                            _av = (~_km).to(_ab.dtype).reshape(_ab.shape)
+                            _ax = (_ab * _av).sum() / _av.sum().clamp_min(1.0)
+                        else:
+                            _ax = _ab.mean()
+                        _sub = _sub + args.aux_weight * _ax * (_wf / K)
+                        _aux_acc += float(_ax.detach().item()) * _wf
+                    if need_coord:
+                        _ct = model.coord_monotonic_penalty(
+                            _xc, _tg, model.VOICE_IDS, net.pad_id)
+                        _sub = _sub + args.coord_weight * _ct * (_wf / K)
+                        _coord_acc += float(_ct.detach().item()) * _wf
+                scaler.scale(_sub).backward()
+                _loss_acc += float(_sub.detach().item())
+            loss = torch.tensor(_loss_acc)
+            auxterm = torch.tensor(_aux_acc) if _aux_acc is not None else None
+            cterm = torch.tensor(_coord_acc) if _coord_acc is not None else None
+        else:
+            with torch.amp.autocast('cuda', enabled=amp, dtype=amp_dtype):
+                ce_loss, apred_shared, xc_shared = net.loss_shared(
+                    imgs, tgt, sample_p=args.sample_p,
+                    mem_mask=key_mask, tok_weight=args.tok_weight,
+                    weight_ids=STRUCT_WEIGHT_IDS,
+                    tok_dropout=args.tok_dropout,
+                    content_ids=CONTENT_IDS,
+                    need_aux=need_aux, need_coord=need_coord,
+                    augment=aug)
+                loss = ce_loss / K
+                mterm = None
+                if args.margin_weight > 0 and step % max(
+                        1, args.margin_every) == 0:
+                    # Spike S3: sibling margin on one stream-picked sample
+                    # ('seed:step' string seed — deterministic across runs,
+                    # no run-history input). One extra encode +
+                    # (1 + siblings) decoder passes; the batch CE above is
+                    # untouched.
+                    mrng = random.Random('%d:%d' % (args.seed, step))
+                    mi = mrng.randrange(tgt.shape[0])
+                    ref_ids = [t for t in tgt[mi].tolist()
+                               if t != data.PAD_ID]
+                    sibs = mutate_modifier_siblings(
+                        ref_ids, args.margin_siblings, mrng,
+                        model.MODIFIER_IDS, len(data.VOCAB))
+                    mimg = imgs[mi:mi + 1]
+                    mmask = (key_mask[mi:mi + 1]
+                             if key_mask is not None else None)
+                    mem1 = net.encode(mimg, mmask)
+                    ref_lp = sequence_logprob(net, mem1, ref_ids, mmask)
+                    sib_lps = torch.stack(
+                        [sequence_logprob(net, mem1, s, mmask)
+                         for s in sibs])
+                    mterm = sibling_margin_loss(ref_lp, sib_lps, args.margin)
+                    loss = loss + args.margin_weight * mterm / K
+                wterm = None
+                if args.mwer_weight > 0 and step % max(
+                        1, args.mwer_every) == 0:
+                    # Spike S4: MWER on one stream-picked sample
+                    # ('seed:step:mwer' string seed — deterministic across
+                    # runs, no run-history input). B=4 grammar beams decode
+                    # no-grad; their risks vs the reference weight the
+                    # grad-carrying teacher-forced beam log-probs.
+                    wrng = random.Random('%d:%d:mwer' % (args.seed, step))
+                    wi = wrng.randrange(tgt.shape[0])
+                    wref = [t for t in tgt[wi].tolist()
+                            if t != data.PAD_ID]
+                    wimg = imgs[wi:wi + 1]
+                    wmask = (key_mask[wi:wi + 1]
+                             if key_mask is not None else None)
+                    with torch.no_grad():
+                        wbeams = net.beam_search(
+                            wimg, beam=args.mwer_beams, strict=True,
+                            max_len=args.mwer_maxlen, mem_mask=wmask,
+                            return_all=True)
+                    whyps = [beam_hyp(b, net.eos_id, len(data.VOCAB))
+                             for b in wbeams[0].tolist()]
+                    wmem = net.encode(wimg, wmask)
+                    wbeam_lps = torch.stack(
+                        [sequence_logprob(net, wmem, h, wmask)
+                         for h in whyps])
+                    wrisks = torch.tensor(
+                        [weighted_risk(wref, h, data.TOKEN_TO_ID['bar'],
+                                       net.eos_id, model.MODIFIER_IDS)
+                         for h in whyps],
+                        device=wbeam_lps.device, dtype=torch.float32)
+                    wterm = mwer_loss(wbeam_lps, wrisks)
+                    loss = loss + args.mwer_weight * wterm / K
+                aterm = None
+                if args.action_weight > 0 and step % max(
+                        1, args.action_every) == 0:
+                    # Spike S7: token-level expected keystroke risk on the
+                    # batch (one extra forward, no beams). Cost matrix is
+                    # a pure function of ids; build once per run.
+                    if acost is None:
+                        acost = keystroke_cost_matrix(
+                            net.vocab, model.MODIFIER_IDS).to(imgs.device)
+                    abos = torch.full_like(tgt[:, :1], net.bos_id)
+                    alogits = net(imgs, torch.cat([abos, tgt[:, :-1]],
+                                                  dim=1), key_mask)
+                    aterm = expected_keystroke_risk(alogits, tgt, acost)
+                    loss = loss + args.action_weight * aterm / K
+                auxterm = None
+                if need_aux:
+                    # S13b: dense ink/keypoint distillation from the shared trunk
+                    # forward (zero redundant ConvNeXt pass).
+                    apred = apred_shared
+                    agres = torch.nn.functional.interpolate(
+                        aux_tgt, size=apred.shape[-2:], mode='area')
+                    abce = torch.nn.functional.binary_cross_entropy_with_logits(
+                        apred, agres, reduction='none').mean(dim=1)
+                    if key_mask is not None:
+                        avalid = (~key_mask).to(abce.dtype).reshape(abce.shape)
+                        auxterm = ((abce * avalid).sum()
+                                   / avalid.sum().clamp_min(1.0))
+                    else:
+                        auxterm = abce.mean()
+                    loss = loss + args.aux_weight * auxterm / K
+                cterm = None
+                if need_coord:
+                    # S13c: monotonic-reading supervision from the shared decoder
+                    # pass (zero redundant encoder/decoder pass).
+                    xc = xc_shared
+                    cterm = model.coord_monotonic_penalty(
+                        xc, tgt, model.VOICE_IDS, net.pad_id)
+                    loss = loss + args.coord_weight * cterm / K
+            scaler.scale(loss).backward()
         pending += 1
         if pending >= K:
             flush()
@@ -2002,14 +2074,15 @@ def main():
                         args.height).unsqueeze(0).to(device))
                 else:
                     ergb, etgt, _, egray, erstaff = collate_hybrid(
-                        [pairs[0]], args.height, args.stride)
+                        [pairs[0]], args.height, args.stride,
+                        hybrid_index=hybrid_index)
                     eimgs = assemble_hybrid_batch(
                         heat_net, ergb.to(device), egray.to(device),
                         erstaff.to(device))
                     m0 = net.encode(eimgs)
                     m1 = net.encode(hybrid_model_input(
                         heat_net, pairs[1 % len(pairs)], args.height,
-                        device, args.stride))
+                        device, args.stride, hybrid_index=hybrid_index))
                 memd = (m0.mean(dim=1).reshape(-1)
                         - m1.mean(dim=1).reshape(-1)).norm().item()
                 hyp = net.greedy(eimgs, max_len=etgt.shape[1] + 16)

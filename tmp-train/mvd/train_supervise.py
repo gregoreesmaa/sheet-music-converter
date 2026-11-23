@@ -46,10 +46,23 @@ def cooldown_for(consec_early, base=120):
 
 
 def ensure_resume(train_args):
-    """Return a copy of ``train_args`` containing exactly one --resume."""
-    args = [a for a in train_args if a != '--resume']
+    """Return a copy of ``train_args`` containing exactly one --resume (no --init-from)."""
+    args = []
+    i = 0
+    while i < len(train_args):
+        if train_args[i] == '--resume':
+            i += 1
+        elif train_args[i] == '--init-from':
+            i += 2  # drop --init-from <ckpt> once resuming
+        else:
+            args.append(train_args[i])
+            i += 1
     args.append('--resume')
     return args
+
+
+def _has_init_from(train_args):
+    return '--init-from' in train_args
 
 
 def main(argv):
@@ -79,18 +92,20 @@ def main(argv):
     if not train_args:
         print('no train.py args after --', flush=True)
         return 3
-    train_args = ensure_resume(train_args)
+    first_args = [a for a in train_args if a != '--resume'] if _has_init_from(train_args) else ensure_resume(train_args)
+    resume_args = ensure_resume(train_args)
     here = Path(__file__).resolve().parent
     attempt = 0
     consec_early = 0
     while True:
         attempt += 1
+        cur_args = first_args if attempt == 1 else resume_args
         print('supervisor: attempt %d/%d: python %s'
               % (attempt, tries,
-                 ' '.join(['train.py'] + train_args)), flush=True)
+                 ' '.join(['train.py'] + cur_args)), flush=True)
         born = time.time()
         proc = subprocess.run(
-            [sys.executable, str(here / 'train.py')] + train_args)
+            [sys.executable, str(here / 'train.py')] + cur_args)
         lived = time.time() - born
         # An attempt that survives 10+ min died of something else
         # than startup sickness; only chain-escalate fast repeats.

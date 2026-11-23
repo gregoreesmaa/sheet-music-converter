@@ -300,20 +300,36 @@ def rectify_on_the_fly(
 
     img = Image.open(img_path).convert('RGB')
     table = row.get('table') or {}
-    if int(table.get('w_in', -1)) != img.size[0]:
-        raise ValueError(
-            f'w_in {table.get("w_in")} != img width {img.size[0]} for {img_path}')
-    curves = sst.table_to_curves(table)
-    rect_img, ref = R.rectify_system_strip(
-        img, curves, target_sp=target_sp, height=height)
-    if rect_img.size[0] > int(max_width):
-        raise ValueError(
-            f'rectified width {rect_img.size[0]} > cap {max_width} for {img_path}')
+    curves = None
+    if int(table.get('w_in', -1)) == img.size[0]:
+        try:
+            raw_curves = sst.table_to_curves(table)
+            # Ensure every staff's 5 lines are ordered top-to-bottom (fixes
+            # rare inverted table rows that yield negative median staff space).
+            curves = [np.sort(np.asarray(c, dtype=np.float64), axis=0)
+                      for c in raw_curves]
+            rect_img, ref = R.rectify_system_strip(
+                img, curves, target_sp=target_sp, height=height)
+            if rect_img.size[0] > int(max_width):
+                rect_img = rect_img.resize((int(max_width), int(height)), Image.LANCZOS)
+                ref = reconstruct_staff_grid(
+                    len(curves), height=height, width=int(max_width),
+                    target_sp=target_sp).squeeze(0)
+        except ValueError:
+            curves = None
+    if curves is None:
+        # Degenerate table row fallback: aspect-preserving resize + canonical grid.
+        iw, ih = img.size
+        nw = max(1, min(int(max_width), round(iw * height / max(ih, 1))))
+        rect_img = img.resize((nw, int(height)), Image.LANCZOS)
+        nslot_fb = max(1, min(4, _parse_nslot(row.get('S', 1))))
+        ref = reconstruct_staff_grid(
+            nslot_fb, height=height, width=nw, target_sp=target_sp).squeeze(0)
     rgb, gray = _decode_pil_to_rgb_gray(rect_img, standardize_fn=standardize_fn)
     staff = (ref > 0.5).float()
     if staff.dim() == 2:
         staff = staff.unsqueeze(0)
-    nslot = _parse_nslot(row.get('S', len(curves)))
+    nslot = _parse_nslot(row.get('S', len(curves) if curves is not None else 1))
     return rgb, gray, staff, nslot
 
 
