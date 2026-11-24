@@ -36,6 +36,10 @@ QUARTER_REST_ARCHETYPES: Tuple[str, ...] = (
     "hurried_slash_zig",
     "baroque_c_hook",
     "calligraphic_s_curl",
+    "sharp_v_tick",
+    "baroque_flag_loop",
+    "modern_tall_z",
+    "scribble_s",
 )
 
 EIGHTH_REST_ARCHETYPES: Tuple[str, ...] = (
@@ -49,6 +53,8 @@ NOTEHEAD_ARCHETYPES: Tuple[str, ...] = (
     "slash",
     "teardrop",
     "compact",
+    "heavy_wedge",
+    "hollow_diamond",
 )
 
 CLEF_ARCHETYPES: Tuple[str, ...] = (
@@ -252,7 +258,7 @@ def _draw_quarter_rest_archetype(
         draw_calligraphic_polyline(canvas, upper, color_rgb, base_w * 1.25, style, kind="rest")
         draw_calligraphic_polyline(canvas, lower, color_rgb, base_w * 1.0, style, kind="rest")
 
-    else:  # "calligraphic_s_curl"
+    elif archetype == "calligraphic_s_curl":
         # Sweeping calligraphic S-curve with top serif flick and graceful bottom curl.
         ctrl = np.array([
             [-0.10, -1.52],
@@ -265,6 +271,61 @@ def _draw_quarter_rest_archetype(
         pts = _transform_local(ctrl, cx, cy, sp, rng, style, jitter_sp=0.10, scale_x_range=(0.84, 1.20), scale_y_range=(0.86, 1.18))
         curve = _eval_catmull_rom(pts, samples_per_seg=9)
         draw_calligraphic_polyline(canvas, curve, color_rgb, base_w * 1.12, style, kind="rest")
+
+    elif archetype == "sharp_v_tick":
+        # Rapid contemporary / student angular V-tick check mark with brisk lower flick.
+        ctrl = np.array([
+            [-0.34, -1.28],
+            [0.38, -0.42],
+            [-0.28, 0.34],
+            [0.14, 1.34],
+        ], dtype=np.float64)
+        pts = _transform_local(ctrl, cx, cy, sp, rng, style, jitter_sp=0.10, scale_x_range=(0.82, 1.22), scale_y_range=(0.86, 1.16))
+        draw_calligraphic_polyline(canvas, pts, color_rgb, base_w * 1.18, style, kind="rest")
+
+    elif archetype == "baroque_flag_loop":
+        # 18th-century reverse-flag / closed upper loop descending into a sweeping C-tail.
+        loop_ctrl = np.array([
+            [0.26, -1.18],
+            [-0.22, -1.36],
+            [-0.36, -0.78],
+            [0.24, -0.58],
+            [0.10, 0.12],
+            [-0.34, 0.76],
+            [0.18, 1.38],
+        ], dtype=np.float64)
+        pts = _transform_local(loop_ctrl, cx, cy, sp, rng, style, jitter_sp=0.09, scale_x_range=(0.84, 1.18), scale_y_range=(0.88, 1.16))
+        curve = _eval_catmull_rom(pts, samples_per_seg=8)
+        draw_calligraphic_polyline(canvas, curve, color_rgb, base_w * 1.14, style, kind="rest")
+
+    elif archetype == "modern_tall_z":
+        # Elongated jazz / conductor tall narrow Z with horizontal top bar & tight lower bracket.
+        ctrl = np.array([
+            [-0.36, -1.48],
+            [0.36, -1.44],
+            [-0.32, 0.52],
+            [0.34, 0.56],
+            [-0.12, 1.46],
+        ], dtype=np.float64)
+        pts = _transform_local(ctrl, cx, cy, sp, rng, style, jitter_sp=0.09, scale_x_range=(0.82, 1.18), scale_y_range=(0.90, 1.18))
+        upper = pts[:4]
+        tail = _eval_quad(pts[3], pts[3] + np.array([-0.26 * sp, 0.36 * sp]), pts[4], n=9)
+        draw_calligraphic_polyline(canvas, np.vstack((upper, tail[1:])), color_rgb, base_w * 1.16, style, kind="rest")
+
+    else:  # "scribble_s"
+        # Loose continuous cursive S-squiggly loop with double-inflection and trailing whip.
+        ctrl = np.array([
+            [0.30, -1.42],
+            [-0.30, -1.04],
+            [0.34, -0.44],
+            [-0.34, 0.16],
+            [0.32, 0.74],
+            [-0.18, 1.18],
+            [0.24, 1.48],
+        ], dtype=np.float64)
+        pts = _transform_local(ctrl, cx, cy, sp, rng, style, jitter_sp=0.11, scale_x_range=(0.80, 1.24), scale_y_range=(0.85, 1.18))
+        curve = _eval_catmull_rom(pts, samples_per_seg=8)
+        draw_calligraphic_polyline(canvas, curve, color_rgb, base_w * 1.04, style, kind="rest")
 
 
 def _draw_flagged_rest(
@@ -450,7 +511,7 @@ def draw_notehead(
             NOTEHEAD_ARCHETYPES,
             style.get("notehead_archetype_weights"),
             rng,
-            default_weights=(0.48, 0.18, 0.20, 0.14),
+            default_weights=(0.38, 0.16, 0.16, 0.12, 0.10, 0.08),
         )
 
     size_j = float(rng.uniform(0.90, 1.12)) * float(style.get("notehead_scale", 1.0))
@@ -460,6 +521,16 @@ def draw_notehead(
     nx, ny = cx + ox, cy + oy
 
     if dk == "whole":
+        if arch == "hollow_diamond":
+            rx = sp * 0.72 * size_j * float(rng.uniform(0.94, 1.08))
+            ry = sp * 0.50 * size_j * float(rng.uniform(0.92, 1.06))
+            rad = math.radians(float(rng.normal(base_angle * 0.3, 5.0)))
+            cos_a, sin_a = math.cos(rad), math.sin(rad)
+            verts = np.array([[rx, 0.0], [0.0, -ry], [-rx, 0.0], [0.0, ry], [rx, 0.0]], dtype=np.float64)
+            verts += rng.normal(0.0, 0.04 * sp, size=verts.shape)
+            pts = np.column_stack((nx + verts[:, 0] * cos_a - verts[:, 1] * sin_a, ny + verts[:, 0] * sin_a + verts[:, 1] * cos_a))
+            draw_calligraphic_polyline(canvas, pts, color_rgb, max(1.1, sp * 0.22 * size_j), style, kind="hollow_notehead")
+            return
         rx = sp * 0.72 * size_j * float(rng.uniform(0.94, 1.08))
         ry = sp * 0.48 * size_j * float(rng.uniform(0.92, 1.06))
         angle = float(rng.normal(base_angle * 0.4, 6.0))
@@ -469,6 +540,26 @@ def draw_notehead(
         return
 
     if dk == "half":
+        if arch == "hollow_diamond":
+            rx = sp * 0.66 * size_j
+            ry = sp * 0.46 * size_j
+            rad = math.radians(float(rng.normal(base_angle * 0.4, 6.0)))
+            cos_a, sin_a = math.cos(rad), math.sin(rad)
+            verts = np.array([[rx, 0.0], [0.0, -ry], [-rx, 0.0], [0.0, ry], [rx * 0.92, -ry * 0.08]], dtype=np.float64)
+            verts += rng.normal(0.0, 0.04 * sp, size=verts.shape)
+            pts = np.column_stack((nx + verts[:, 0] * cos_a - verts[:, 1] * sin_a, ny + verts[:, 0] * sin_a + verts[:, 1] * cos_a))
+            draw_calligraphic_polyline(canvas, pts, color_rgb, max(1.0, sp * 0.20 * size_j), style, kind="hollow_notehead")
+            return
+        if arch == "heavy_wedge":
+            rx = sp * 0.68 * size_j
+            ry = sp * 0.44 * size_j
+            angle = float(rng.normal(base_angle - 6.0, 5.5))
+            local_style = dict(style)
+            local_style["hollow_stroke_ratio"] = float(style.get("hollow_stroke_ratio", 0.44)) * 1.28
+            open_prob = float(style.get("hollow_open_prob", 0.32))
+            gap = float(rng.uniform(0.05, 0.15)) if rng.random() < open_prob else 0.0
+            draw_filled_blob(canvas, nx, ny, rx, ry, angle, color_rgb, local_style, hollow=True, open_gap=gap)
+            return
         if arch == "slash":
             # Brisk open diamond/slash loop.
             rx = sp * 0.66 * size_j
@@ -488,6 +579,39 @@ def draw_notehead(
         return
 
     # Filled notehead ("filled")
+    if arch == "heavy_wedge":
+        # Bold broad-nib wedge / heavy calligraphic parallelogram notehead.
+        angle = math.radians(float(rng.normal(base_angle - 5.0, 6.0)))
+        half_len = sp * 0.64 * size_j
+        dx = half_len * math.cos(angle)
+        dy = half_len * math.sin(angle)
+        px = -0.14 * sp * math.sin(angle)
+        py = 0.14 * sp * math.cos(angle)
+        pts1 = np.array([[nx - dx, ny - dy], [nx + dx, ny + dy]], dtype=np.float64)
+        pts2 = np.array([[nx - dx * 0.78 + px, ny - dy * 0.78 + py], [nx + dx * 0.85 - px, ny + dy * 0.85 - py]], dtype=np.float64)
+        local_style = dict(style)
+        local_style["taper_start"] = 0.04
+        local_style["taper_end"] = 0.06
+        local_style["nib_min_ratio"] = max(_get_style_min_ratio(style), 0.72)
+        draw_calligraphic_polyline(canvas, pts1, color_rgb, sp * 0.72 * size_j, local_style, kind="notehead_wedge")
+        draw_calligraphic_polyline(canvas, pts2, color_rgb, sp * 0.58 * size_j, local_style, kind="notehead_wedge")
+        return
+
+    if arch == "hollow_diamond":
+        # Faceted handwritten diamond / lozenge head (crisp diamond outline + quick interior dash).
+        rx = sp * 0.62 * size_j * float(rng.uniform(0.92, 1.08))
+        ry = sp * 0.45 * size_j * float(rng.uniform(0.92, 1.08))
+        rad = math.radians(float(rng.normal(base_angle * 0.5, 6.5)))
+        cos_a, sin_a = math.cos(rad), math.sin(rad)
+        verts = np.array([[rx, 0.0], [0.0, -ry], [-rx, 0.0], [0.0, ry], [rx, 0.0]], dtype=np.float64)
+        verts += rng.normal(0.0, 0.04 * sp, size=verts.shape)
+        pts = np.column_stack((nx + verts[:, 0] * cos_a - verts[:, 1] * sin_a, ny + verts[:, 0] * sin_a + verts[:, 1] * cos_a))
+        draw_calligraphic_polyline(canvas, pts, color_rgb, max(1.1, sp * 0.24 * size_j), style, kind="notehead_diamond")
+        # Quick interior fill slash so filled diamond reads heavier than half/whole diamond.
+        slash = np.array([[-rx * 0.55, ry * 0.12], [rx * 0.55, -ry * 0.12]], dtype=np.float64)
+        s_pts = np.column_stack((nx + slash[:, 0] * cos_a - slash[:, 1] * sin_a, ny + slash[:, 0] * sin_a + slash[:, 1] * cos_a))
+        draw_calligraphic_polyline(canvas, s_pts, color_rgb, max(1.2, sp * 0.38 * size_j), style, kind="notehead_diamond")
+        return
     if arch == "slash":
         # Beethoven / hurried jazz dash-slash notehead!
         angle = math.radians(float(rng.normal(base_angle - 8.0, 8.0)))
@@ -1109,3 +1233,268 @@ def draw_brace(
     )
     draw_calligraphic_polyline(canvas, upper, color_rgb, base_w * 1.15, style, kind="brace")
     draw_calligraphic_polyline(canvas, lower, color_rgb, base_w * 1.15, style, kind="brace")
+
+
+# ---------------------------------------------------------------------------
+# Expressive Primitives: Slurs/Ties, Fermatas, Dynamics, Hairpins, Corrections
+# ---------------------------------------------------------------------------
+
+
+def draw_slur_or_tie(
+    canvas: StrokeCanvas,
+    x0: float,
+    y0: float,
+    x1: float,
+    y1: float,
+    sp: float,
+    above: bool,
+    color_rgb: RGBLike,
+    style: dict,
+    rng: np.random.Generator,
+) -> None:
+    """Draw a tapered organic handwritten slur or tie between (x0, y0) and (x1, y1)."""
+    dx = x1 - x0
+    dy = y1 - y0
+    span = math.hypot(dx, dy)
+    if span < 1.0:
+        return
+
+    sign = -1.0 if above else 1.0
+    # Natural arch height scales sublinearly with span.
+    arch_h = sign * max(0.55 * sp, min(2.4 * sp, 0.18 * span + 0.42 * sp)) * float(rng.uniform(0.85, 1.18))
+    asym = float(rng.uniform(-0.08, 0.08))
+
+    p0 = np.array([x0 + rng.normal(0.0, 0.04 * sp), y0 + rng.normal(0.0, 0.04 * sp)])
+    p3 = np.array([x1 + rng.normal(0.0, 0.04 * sp), y1 + rng.normal(0.0, 0.04 * sp)])
+    p1 = p0 + np.array([dx * (0.28 + asym), dy * 0.28 + arch_h])
+    p2 = p0 + np.array([dx * (0.72 + asym), dy * 0.72 + arch_h])
+
+    n_pts = max(16, int(span / 4.5))
+    curve = _eval_cubic(p0, p1, p2, p3, n=n_pts)
+
+    thin_w = max(0.85, sp * float(style.get("slur_stroke_ratio", 0.13)))
+    local_style = dict(style)
+    local_style["taper_start"] = 0.24
+    local_style["taper_end"] = 0.24
+    draw_calligraphic_polyline(canvas, curve, color_rgb, thin_w, local_style, kind="slur")
+
+    # Subtle calligraphic thickening at the apex of the arch.
+    mid_p1 = p1 + np.array([0.0, sign * 0.12 * sp])
+    mid_p2 = p2 + np.array([0.0, sign * 0.12 * sp])
+    inner = _eval_cubic(p0, mid_p1, mid_p2, p3, n=n_pts)
+    s0 = max(1, n_pts // 6)
+    s1 = min(n_pts - 1, n_pts - n_pts // 6)
+    if s1 > s0 + 1:
+        draw_calligraphic_polyline(canvas, inner[s0:s1], color_rgb, thin_w * 1.15, local_style, kind="slur")
+
+
+def draw_fermata(
+    canvas: StrokeCanvas,
+    cx: float,
+    cy: float,
+    sp: float,
+    above: bool,
+    color_rgb: RGBLike,
+    style: dict,
+    rng: np.random.Generator,
+) -> None:
+    """Draw a hand-drawn fermata (semicircular arch + center ink dot)."""
+    sign = -1.0 if above else 1.0
+    rx = sp * float(rng.uniform(0.95, 1.22))
+    ry = sp * float(rng.uniform(0.68, 0.92))
+    phis = np.linspace(math.pi * 0.08, math.pi * 0.92, 18)
+    arch = np.column_stack((
+        cx + rx * np.cos(phis) + rng.normal(0.0, 0.03 * sp, size=len(phis)),
+        cy + sign * ry * np.sin(phis) + rng.normal(0.0, 0.03 * sp, size=len(phis)),
+    ))
+    base_w = max(1.0, sp * float(style.get("glyph_stroke_ratio", 0.18)))
+    local_style = dict(style)
+    local_style["taper_start"] = 0.22
+    local_style["taper_end"] = 0.22
+    draw_calligraphic_polyline(canvas, arch, color_rgb, base_w * 1.12, local_style, kind="fermata")
+
+    dot_r = max(1.1, sp * float(rng.uniform(0.16, 0.24)))
+    dot_y = cy + sign * ry * float(rng.uniform(0.22, 0.36))
+    draw_filled_blob(
+        canvas,
+        cx + float(rng.normal(0.0, 0.04 * sp)),
+        dot_y,
+        dot_r,
+        dot_r * float(rng.uniform(0.88, 1.12)),
+        float(rng.uniform(-25.0, 25.0)),
+        color_rgb,
+        style,
+        hollow=False,
+    )
+
+
+def _draw_dynamic_letter(
+    canvas: StrokeCanvas,
+    ch: str,
+    cx: float,
+    cy: float,
+    sp: float,
+    color_rgb: RGBLike,
+    style: dict,
+    rng: np.random.Generator,
+) -> None:
+    """Draw a single cursive handwritten dynamic letter ('p', 'f', 'm', 's', 'z', 'r')."""
+    w = max(1.0, sp * float(style.get("dynamic_stroke_ratio", 0.19)))
+
+    def _stroke(ctrl: np.ndarray, smooth: bool = True, width_mult: float = 1.0) -> None:
+        pts = _transform_local(
+            ctrl,
+            cx,
+            cy,
+            sp,
+            rng,
+            style,
+            jitter_sp=0.06,
+            scale_x_range=(0.88, 1.14),
+            scale_y_range=(0.88, 1.14),
+            extra_slant_deg=10.0,
+        )
+        path = _eval_catmull_rom(pts, 7) if (smooth and len(pts) >= 3) else pts
+        draw_calligraphic_polyline(canvas, path, color_rgb, w * width_mult, style, kind="dynamic")
+
+    c = ch.lower()
+    if c == "p":
+        # Descending stem + cursive open belly loop.
+        _stroke(np.array([[-0.22, -0.52], [-0.38, 1.05]]), smooth=False, width_mult=1.12)
+        _stroke(np.array([[-0.24, -0.28], [0.22, -0.56], [0.46, -0.10], [0.16, 0.38], [-0.28, 0.24]]), smooth=True)
+    elif c == "f":
+        # Sweeping cursive forte S-stem + angled crossbar.
+        _stroke(np.array([[0.48, -1.05], [0.12, -1.16], [-0.04, -0.20], [-0.22, 0.92], [-0.56, 1.08]]), smooth=True, width_mult=1.18)
+        _stroke(np.array([[-0.38, -0.18], [0.36, -0.24]]), smooth=False, width_mult=0.92)
+    elif c == "m":
+        # Three-arch cursive mezzo 'm'.
+        _stroke(np.array([
+            [-0.64, 0.34], [-0.50, -0.34], [-0.22, -0.30], [-0.20, 0.34],
+            [-0.08, -0.34], [0.18, -0.30], [0.20, 0.34],
+            [0.34, -0.34], [0.58, -0.26], [0.64, 0.36],
+        ]), smooth=True, width_mult=0.95)
+    elif c == "s":
+        _stroke(np.array([[0.32, -0.44], [-0.14, -0.52], [-0.26, -0.10], [0.26, 0.10], [0.16, 0.48], [-0.34, 0.42]]), smooth=True)
+    elif c == "z":
+        _stroke(np.array([[-0.34, -0.42], [0.36, -0.44], [-0.36, 0.42], [0.38, 0.40]]), smooth=False)
+    elif c == "r":
+        _stroke(np.array([[-0.26, 0.38], [-0.20, -0.38], [0.10, -0.42], [0.34, -0.18]]), smooth=True)
+    else:
+        # Generic small cursive stroke fallback.
+        _stroke(np.array([[-0.24, -0.32], [0.24, 0.32]]), smooth=False)
+
+
+def draw_dynamic_text(
+    canvas: StrokeCanvas,
+    text: str,
+    cx: float,
+    cy: float,
+    sp: float,
+    color_rgb: RGBLike,
+    style: dict,
+    rng: np.random.Generator,
+) -> None:
+    """Draw handwritten cursive dynamic markings (e.g. 'p', 'mf', 'ff', 'sfz', 'fp')."""
+    chars = [ch for ch in str(text).strip() if not ch.isspace()]
+    if not chars:
+        return
+    step = sp * float(rng.uniform(0.84, 1.02))
+    start_x = cx - 0.5 * step * (len(chars) - 1)
+    for i, ch in enumerate(chars):
+        lx = start_x + i * step + float(rng.normal(0.0, 0.04 * sp))
+        ly = cy + float(rng.normal(0.0, 0.04 * sp))
+        _draw_dynamic_letter(canvas, ch, lx, ly, sp, color_rgb, style, rng)
+
+
+def draw_hairpin(
+    canvas: StrokeCanvas,
+    x0: float,
+    x1: float,
+    cy: float,
+    sp: float,
+    kind: str,
+    color_rgb: RGBLike,
+    style: dict,
+    rng: np.random.Generator,
+) -> None:
+    """Draw a handwritten crescendo ('cresc'/'<') or diminuendo ('dim'/'decresc'/'>') hairpin."""
+    if x1 < x0:
+        x0, x1 = x1, x0
+    span = x1 - x0
+    if span < 1.0:
+        return
+
+    k = str(kind).strip().lower()
+    is_cresc = k in ("cresc", "crescendo", "<", "open_right")
+    half_open = sp * float(rng.uniform(0.45, 0.72))
+    base_w = max(0.9, sp * float(style.get("hairpin_stroke_ratio", 0.135)))
+
+    if is_cresc:
+        vx, ox = x0, x1
+    else:
+        vx, ox = x1, x0
+
+    # Slight organic hand-drawn bow on each arm.
+    for sign in (-1.0, 1.0):
+        vy = cy + float(rng.normal(0.0, 0.04 * sp))
+        oy = cy + sign * half_open + float(rng.normal(0.0, 0.05 * sp))
+        mid_x = 0.5 * (vx + ox)
+        mid_y = 0.5 * (vy + oy) + float(rng.normal(0.0, 0.07 * sp))
+        pts = _eval_quad(np.array([vx, vy]), np.array([mid_x, mid_y]), np.array([ox, oy]), n=max(10, int(span / 8.0)))
+        draw_calligraphic_polyline(canvas, pts, color_rgb, base_w, style, kind="hairpin")
+
+
+def draw_correction_scratch(
+    canvas: StrokeCanvas,
+    x0: float,
+    y0: float,
+    x1: float,
+    y1: float,
+    sp: float,
+    color_rgb: RGBLike,
+    style: dict,
+    rng: np.random.Generator,
+    kind: str = "auto",
+) -> None:
+    """Draw a composer/student cross-out scratch over a mistaken note or bar region."""
+    lx0, lx1 = (min(x0, x1), max(x0, x1))
+    ly0, ly1 = (min(y0, y1), max(y0, y1))
+    w = max(sp * 0.8, lx1 - lx0)
+    h = max(sp * 0.8, ly1 - ly0)
+
+    k = str(kind).strip().lower()
+    if k == "auto":
+        k = str(rng.choice(["scribble", "cross_x", "hatch"]))
+
+    stroke_w = max(1.0, sp * float(style.get("glyph_stroke_ratio", 0.18)) * float(rng.uniform(0.95, 1.35)))
+
+    if k == "cross_x":
+        # Bold X plus optional extra horizontal slash.
+        p1 = np.array([[lx0, ly0], [lx1, ly1]], dtype=np.float64) + rng.normal(0.0, 0.08 * sp, size=(2, 2))
+        p2 = np.array([[lx0, ly1], [lx1, ly0]], dtype=np.float64) + rng.normal(0.0, 0.08 * sp, size=(2, 2))
+        draw_calligraphic_polyline(canvas, p1, color_rgb, stroke_w * 1.15, style, kind="correction")
+        draw_calligraphic_polyline(canvas, p2, color_rgb, stroke_w * 1.15, style, kind="correction")
+        if rng.random() < 0.5:
+            ym = 0.5 * (ly0 + ly1)
+            p3 = np.array([[lx0 - 0.15 * sp, ym], [lx1 + 0.15 * sp, ym + rng.normal(0.0, 0.15 * sp)]], dtype=np.float64)
+            draw_calligraphic_polyline(canvas, p3, color_rgb, stroke_w * 0.95, style, kind="correction")
+    elif k == "hatch":
+        # Multiple rapid parallel diagonal cross-out strokes.
+        n_lines = int(rng.integers(3, 7))
+        for i in range(n_lines):
+            frac = (i + 0.5) / n_lines
+            cx = lx0 + frac * w
+            dx = 0.25 * h * float(rng.uniform(0.6, 1.4))
+            pts = np.array([
+                [cx - dx + rng.normal(0.0, 0.06 * sp), ly1 + rng.normal(0.0, 0.08 * sp)],
+                [cx + dx + rng.normal(0.0, 0.06 * sp), ly0 + rng.normal(0.0, 0.08 * sp)],
+            ], dtype=np.float64)
+            draw_calligraphic_polyline(canvas, pts, color_rgb, stroke_w * 0.95, style, kind="correction")
+    else:  # "scribble"
+        # Dense back-and-forth zigzag scribble crossing out the mistake.
+        n_zigs = int(rng.integers(5, 11))
+        xs = np.linspace(lx0, lx1, n_zigs)
+        ys = np.array([ly0 if i % 2 == 0 else ly1 for i in range(n_zigs)], dtype=np.float64)
+        ctrl = np.column_stack((xs, ys)) + rng.normal(0.0, 0.12 * sp, size=(n_zigs, 2))
+        curve = _eval_catmull_rom(ctrl, samples_per_seg=6)
+        draw_calligraphic_polyline(canvas, curve, color_rgb, stroke_w * 1.08, style, kind="correction")

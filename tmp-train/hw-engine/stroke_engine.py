@@ -183,6 +183,50 @@ def _perturb_ink_color(
     return ink_rgb, opacity
 
 
+def _soft_blur_2d(arr: np.ndarray, radius: int) -> np.ndarray:
+    """Fast pure-NumPy 2D separable box blur (2 passes for smooth feather halo)."""
+    r = int(radius)
+    if r <= 0 or arr.size == 0:
+        return arr.copy()
+    out = arr.astype(np.float32, copy=True)
+    k = 2 * r + 1
+    inv_k = np.float32(1.0 / k)
+    for _ in range(2):
+        # Horizontal pass
+        padded = np.pad(out, ((0, 0), (r, r)), mode="edge")
+        cs = np.cumsum(padded, axis=1, dtype=np.float32)
+        cs = np.pad(cs, ((0, 0), (1, 0)), mode="constant", constant_values=0.0)
+        out = (cs[:, k:] - cs[:, :-k]) * inv_k
+        # Vertical pass
+        padded = np.pad(out, ((r, r), (0, 0)), mode="edge")
+        cs = np.cumsum(padded, axis=0, dtype=np.float32)
+        cs = np.pad(cs, ((1, 0), (0, 0)), mode="constant", constant_values=0.0)
+        out = (cs[k:, :] - cs[:-k, :]) * inv_k
+    return out
+
+
+def _apply_ink_feather(
+    patch: np.ndarray,
+    canvas: StrokeCanvas,
+    x0: int,
+    y0: int,
+    x1: int,
+    y1: int,
+    ink_feather: float,
+) -> np.ndarray:
+    """Add an organic porous-paper wet-ink feathering/bleed halo around a stroke patch."""
+    f = float(np.clip(ink_feather, 0.0, 1.0))
+    if f <= 1e-4 or patch.size == 0:
+        return patch
+    radius = max(1, int(round(1.0 + 2.5 * f)))
+    halo = _soft_blur_2d(patch, radius)
+    tooth = canvas.get_tooth_patch(x0, y0, x1, y1)
+    # Porous fibers wick ink unevenly outward.
+    fiber_mod = np.float32(0.50) + np.float32(0.85) * tooth
+    feathered = np.clip(halo * fiber_mod * np.float32(0.55 * f), 0.0, 0.85)
+    return np.maximum(patch, feathered)
+
+
 def _stamp_discs_to_canvas(
     canvas: StrokeCanvas,
     xs: np.ndarray,
@@ -192,12 +236,16 @@ def _stamp_discs_to_canvas(
     ink_rgb: np.ndarray,
     stroke_opacity: float,
     grain_strength: float,
+    ink_feather: float = 0.0,
+    pool_strengths: Optional[np.ndarray] = None,
 ) -> None:
     """Rasterize variable-radius anti-aliased discs into a local bbox and blend."""
     if len(xs) == 0:
         return
     max_r = float(np.max(radii))
-    pad = int(math.ceil(max_r + 1.5))
+    feather_f = float(np.clip(ink_feather, 0.0, 1.0))
+    feather_pad = int(math.ceil(feather_f * 4.0)) + 1 if feather_f > 1e-4 else 0
+    pad = int(math.ceil(max_r + 1.5)) + feather_pad
     x0 = max(0, int(math.floor(float(np.min(xs)))) - pad)
     y0 = max(0, int(math.floor(float(np.min(ys)))) - pad)
     x1 = min(canvas.width, int(math.ceil(float(np.max(xs)))) + pad + 1)
@@ -206,10 +254,17 @@ def _stamp_discs_to_canvas(
         return
 
     patch = np.zeros((y1 - y0, x1 - x0), dtype=np.float32)
+    use_pool = pool_strengths is not None and float(np.max(pool_strengths)) > 1e-4
+    pool_patch = np.zeros((y1 - y0, x1 - x0), dtype=np.float32) if use_pool else None
     pw = x1 - x0
     ph = y1 - y0
 
-    for px, py, r, a in zip(xs, ys, radii, alphas):
+    if use_pool and pool_strengths is not None:
+        p_iter = pool_strengths
+    else:
+        p_iter = np.zeros(len(xs), dtype=np.float32)
+
+    for px, py, r, a, ps in zip(xs, ys, radii, alphas, p_iter):
         if a <= 1e-4 or r <= 1e-3:
             continue
         lx = px - x0
@@ -228,6 +283,12 @@ def _stamp_discs_to_canvas(
         cov = np.clip(np.float32(r + 0.5) - dist, 0.0, 1.0) * np.float32(a)
         sub = patch[iy0:iy1, ix0:ix1]
         np.maximum(sub, cov, out=sub)
+        if pool_patch is not None and ps > 1e-4:
+            p_sub = pool_patch[iy0:iy1, ix0:ix1]
+            np.maximum(p_sub, cov * np.float32(ps), out=p_sub)
+
+    if feather_f > 1e-4:
+        patch = _apply_ink_feather(patch, canvas, x0, y0, x1, y1, feather_f)
 
     if grain_strength > 0.0:
         tooth = canvas.get_tooth_patch(x0, y0, x1, y1)
@@ -235,8 +296,17 @@ def _stamp_discs_to_canvas(
         grain_mod = np.clip(1.0 - grain_strength * (1.0 - tooth) * 1.25, 0.08, 1.0)
         patch *= grain_mod
 
-    patch *= np.float32(stroke_opacity)
-    canvas.composite_patch(x0, y0, x1, y1, patch, ink_rgb)
+    if pool_patch is not None:
+        # Speed-dependent pooling darkens ink slightly and boosts local opacity at sharp turns.
+        eff_alpha = np.clip(patch * np.float32(stroke_opacity) + pool_patch * np.float32(0.18), 0.0, 1.0)
+        darken = np.clip(1.0 - np.float32(0.32) * pool_patch, 0.55, 1.0)[..., None]
+        local_ink = np.clip(ink_rgb[None, None, :] * darken, 0.0, 1.0)
+        a3 = eff_alpha[..., None]
+        dst = canvas.buf[y0:y1, x0:x1]
+        canvas.buf[y0:y1, x0:x1] = dst * (1.0 - a3) + local_ink * a3
+    else:
+        patch *= np.float32(stroke_opacity)
+        canvas.composite_patch(x0, y0, x1, y1, patch, ink_rgb)
 
 
 def draw_calligraphic_polyline(
@@ -362,7 +432,22 @@ def draw_calligraphic_polyline(
             widths += bw * pool_e * g_end
             alphas = np.minimum(1.0, alphas + 0.15 * g_end)
 
-    # 4. Dry-brush / ink-skip dropout along stroke.
+    # 4. Speed-dependent ink pooling at sharp curvature / turns.
+    pool_strengths: Optional[np.ndarray] = None
+    if ink_pool > 0.0 and len(res_pts) >= 4:
+        unwrapped = np.unwrap(theta)
+        dtheta = np.abs(np.diff(unwrapped))
+        curv_raw = np.zeros(len(res_pts), dtype=np.float64)
+        curv_raw[:-1] += 0.5 * dtheta
+        curv_raw[1:] += 0.5 * dtheta
+        # Ignore tiny numeric jitter; respond strongly to real corners/turns.
+        curv = np.clip((curv_raw - 0.04) / 0.30, 0.0, 1.0)
+        if float(np.max(curv)) > 1e-4:
+            widths += bw * (0.20 * ink_pool) * curv
+            alphas = np.minimum(1.0, alphas + 0.25 * ink_pool * curv)
+            pool_strengths = np.clip(curv * min(1.0, ink_pool * 1.4), 0.0, 1.0).astype(np.float32)
+
+    # 5. Dry-brush / ink-skip dropout along stroke.
     ink_dropout = float(np.clip(style.get("ink_dropout", 0.05), 0.0, 0.95))
     if ink_dropout > 1e-4:
         n_drop_knots = max(4, int(total_len / 5.5) + 2)
@@ -373,9 +458,54 @@ def draw_calligraphic_polyline(
         drop_scale = np.clip((u_noise - ink_dropout * 0.65) / max(0.12, ink_dropout * 0.55 + 0.15), 0.0, 1.0)
         alphas *= (1.0 - ink_dropout * 0.85) + (ink_dropout * 0.85) * drop_scale
 
+    ink_feather = float(np.clip(style.get("ink_feather", 0.0), 0.0, 1.0))
     radii = np.maximum(0.28, 0.5 * widths)
+
+    # 6. Optional split-nib double-edge (parted quill/fountain-pen tines).
+    split_nib_prob = float(np.clip(style.get("split_nib_prob", 0.0), 0.0, 1.0))
+    if split_nib_prob > 0.0 and bw >= 1.2 and total_len > 4.0 and float(rng.random()) < split_nib_prob:
+        g2norm = np.hypot(grad2[:, 0], grad2[:, 1])
+        g2norm = np.where(g2norm > 1e-7, g2norm, 1.0)
+        nx2 = -grad2[:, 1] / g2norm
+        ny2 = grad2[:, 0] / g2norm
+        sep = np.maximum(0.45, radii * (0.45 + 0.25 * env))
+        _stamp_discs_to_canvas(
+            canvas,
+            res_pts[:, 0] + nx2 * sep,
+            res_pts[:, 1] + ny2 * sep,
+            np.maximum(0.25, radii * 0.56),
+            alphas * 0.92,
+            ink_rgb,
+            stroke_opacity,
+            grain_strength,
+            ink_feather=ink_feather,
+            pool_strengths=pool_strengths,
+        )
+        _stamp_discs_to_canvas(
+            canvas,
+            res_pts[:, 0] - nx2 * sep,
+            res_pts[:, 1] - ny2 * sep,
+            np.maximum(0.25, radii * 0.48),
+            alphas * 0.78,
+            ink_rgb,
+            stroke_opacity,
+            grain_strength,
+            ink_feather=ink_feather,
+            pool_strengths=pool_strengths,
+        )
+        return
+
     _stamp_discs_to_canvas(
-        canvas, res_pts[:, 0], res_pts[:, 1], radii, alphas, ink_rgb, stroke_opacity, grain_strength
+        canvas,
+        res_pts[:, 0],
+        res_pts[:, 1],
+        radii,
+        alphas,
+        ink_rgb,
+        stroke_opacity,
+        grain_strength,
+        ink_feather=ink_feather,
+        pool_strengths=pool_strengths,
     )
 
 
@@ -387,6 +517,7 @@ def draw_staff_line(
     color_rgb: RGBLike,
     base_width: float,
     style: dict,
+    shared_wave: Optional[np.ndarray] = None,
 ) -> None:
     """Draw a hand-drawn or pre-ruled staff line with subtle waviness & nib variation."""
     if x1 < x0:
@@ -414,6 +545,18 @@ def draw_staff_line(
     tremor_px = float(style.get("staff_tremor_px", style.get("tremor_px", 0.25) * (0.2 if pre_ruled else 0.7)))
 
     t = np.linspace(0.0, 1.0, n)
+    if shared_wave is not None:
+        sw = np.asarray(shared_wave, dtype=np.float64)
+        if len(sw) == n:
+            ys = ys + sw
+        elif len(sw) >= 2:
+            ys = ys + np.interp(t, np.linspace(0.0, 1.0, len(sw)), sw)
+    else:
+        rastrum_wobble = float(style.get("rastrum_wobble", 0.0))
+        if rastrum_wobble > 0.0:
+            n_rknots = max(4, int(n / 90.0) + 3)
+            ys = ys + _smooth_1d_noise(rng, n, n_rknots) * rastrum_wobble
+
     if wobble_px > 0.0:
         b1 = float(rng.normal(0.0, wobble_px * 0.5))
         b2 = float(rng.normal(0.0, wobble_px * 0.35))
@@ -444,7 +587,9 @@ def draw_staff_line(
         drop_scale = np.clip((u_noise - ink_dropout * 0.65) / max(0.15, ink_dropout * 0.55 + 0.15), 0.0, 1.0)
         col_alpha = ((1.0 - ink_dropout * 0.75) + (ink_dropout * 0.75) * drop_scale).astype(np.float32)
 
-    pad = int(math.ceil(float(np.max(radii)) + 1.5))
+    ink_feather = float(np.clip(style.get("ink_feather", 0.0) * (0.4 if pre_ruled else 0.8), 0.0, 1.0))
+    feather_pad = int(math.ceil(ink_feather * 3.0)) + 1 if ink_feather > 1e-4 else 0
+    pad = int(math.ceil(float(np.max(radii)) + 1.5)) + feather_pad
     iy0 = max(0, int(math.floor(float(np.min(ys)))) - pad)
     iy1 = min(canvas.height, int(math.ceil(float(np.max(ys)))) + pad + 1)
     if iy1 <= iy0:
@@ -455,6 +600,9 @@ def draw_staff_line(
     patch = np.clip(radii.astype(np.float32)[None, :] + np.float32(0.5) - dist, 0.0, 1.0)
     patch *= col_alpha[None, :]
 
+    if ink_feather > 1e-4:
+        patch = _apply_ink_feather(patch, canvas, ix0, iy0, ix1, iy1, ink_feather)
+
     grain_strength = float(np.clip(style.get("grain_strength", 0.10) * (0.5 if pre_ruled else 1.0), 0.0, 1.0))
     if grain_strength > 0.0:
         tooth = canvas.get_tooth_patch(ix0, iy0, ix1, iy1)
@@ -464,6 +612,56 @@ def draw_staff_line(
     staff_opacity = float(style.get("staff_opacity", stroke_opacity * (0.82 if pre_ruled else 0.94)))
     patch *= np.float32(np.clip(staff_opacity, 0.15, 1.0))
     canvas.composite_patch(ix0, iy0, ix1, iy1, patch, ink_rgb)
+
+
+def draw_rastrum_staff(
+    canvas: StrokeCanvas,
+    x0: float,
+    x1: float,
+    y_fn: Callable[[Union[float, np.ndarray], int], Union[float, np.ndarray]],
+    color_rgb: RGBLike,
+    base_width: float,
+    style: dict,
+    line_indices: Sequence[int] = (-2, -1, 0, 1, 2),
+) -> np.ndarray:
+    """Draw a 5-line staff with coherent rastrum parallel hand-drawn wobble.
+
+    All staff lines share a single smooth hand-drawn wave of amplitude
+    ``style.get("rastrum_wobble", 0.0)`` (plus each line's own subtle nib/tremor
+    micro-variation), mimicking a traditional 5-nibbed rastrum pen.
+
+    Returns the shared 1D wave array (in pixels) applied across the staff lines.
+    """
+    if x1 < x0:
+        x0, x1 = x1, x0
+    ix0 = max(0, int(math.floor(x0)))
+    ix1 = min(canvas.width, int(math.ceil(x1)) + 1)
+    n = max(0, ix1 - ix0)
+    if n == 0:
+        return np.zeros(0, dtype=np.float64)
+
+    rastrum_amp = float(style.get("rastrum_wobble", 0.0))
+    if rastrum_amp > 0.0:
+        n_knots = max(4, int(n / 85.0) + 3)
+        shared_wave = _smooth_1d_noise(canvas.rng, n, n_knots) * rastrum_amp
+    else:
+        shared_wave = np.zeros(n, dtype=np.float64)
+
+    # Slight independent line micro-wobble on top of the shared rastrum motion.
+    local_style = dict(style)
+    local_style["rastrum_wobble"] = 0.0
+    for idx in line_indices:
+        draw_staff_line(
+            canvas,
+            x0,
+            x1,
+            lambda x, li=idx: y_fn(x, li),
+            color_rgb,
+            base_width,
+            local_style,
+            shared_wave=shared_wave,
+        )
+    return shared_wave
 
 
 def draw_filled_blob(
@@ -542,7 +740,9 @@ def draw_filled_blob(
     c3 = float(rng.normal(0.0, irreg * 0.50))
     p3 = float(rng.uniform(0.0, 2.0 * math.pi))
 
-    max_r = max(rx, ry) * (1.0 + abs(c1) + abs(c2) + abs(c3)) + 2.0
+    ink_feather = float(np.clip(style.get("ink_feather", 0.0), 0.0, 1.0))
+    feather_pad = int(math.ceil(ink_feather * 4.0)) + 1 if ink_feather > 1e-4 else 0
+    max_r = max(rx, ry) * (1.0 + abs(c1) + abs(c2) + abs(c3)) + 2.0 + feather_pad
     x0 = max(0, int(math.floor(cx - max_r)))
     y0 = max(0, int(math.floor(cy - max_r)))
     x1 = min(canvas.width, int(math.ceil(cx + max_r)) + 1)
@@ -573,6 +773,9 @@ def draw_filled_blob(
     scale_px = np.float32(max(1.0, 2.0 * rx * ry / (rx + ry)))
     signed_px = (boundary - norm_r) * scale_px
     patch = np.clip(signed_px + np.float32(0.5), 0.0, 1.0)
+
+    if ink_feather > 1e-4:
+        patch = _apply_ink_feather(patch, canvas, x0, y0, x1, y1, ink_feather)
 
     # Subtle internal dry-brush / pencil shading streak when grain or dropout is high.
     grain_strength = float(np.clip(style.get("grain_strength", 0.10), 0.0, 1.0))

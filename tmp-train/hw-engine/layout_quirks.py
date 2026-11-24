@@ -6,9 +6,27 @@ Pure NumPy implementation driven exclusively by a caller-provided
 
 from __future__ import annotations
 
-from typing import Any, Callable, Sequence
+from typing import Any, Callable, Optional, Sequence
 
 import numpy as np
+
+PAPER_TYPES: tuple[str, ...] = (
+    "aged_rag",
+    "bright_white",
+    "cream_manuscript",
+    "spiral_notebook",
+    "ozalid_blue",
+    "soviet_green_tint",
+)
+
+_PAPER_TYPE_TINTS: dict[str, tuple[float, float, float]] = {
+    "aged_rag": (0.88, 0.82, 0.70),
+    "bright_white": (0.98, 0.98, 0.98),
+    "cream_manuscript": (0.95, 0.92, 0.84),
+    "spiral_notebook": (0.97, 0.98, 0.99),
+    "ozalid_blue": (0.86, 0.90, 0.96),
+    "soviet_green_tint": (0.86, 0.93, 0.86),
+}
 
 
 def _bilinear_upsample(grid: np.ndarray, out_h: int, out_w: int) -> np.ndarray:
@@ -54,6 +72,18 @@ def make_manuscript_paper(
     paper_mottle = float(style.get("paper_mottle", 0.08))
     bleed_through = float(style.get("bleed_through", 0.06))
     eraser_smudge_prob = float(style.get("eraser_smudge_prob", 0.05))
+    paper_type = style.get("paper_type")
+    stain_prob = float(style.get("stain_prob", 0.0))
+
+    if paper_type in _PAPER_TYPE_TINTS:
+        tint = np.asarray(_PAPER_TYPE_TINTS[str(paper_type)], dtype=np.float32)
+        # Blend strongly toward the paper_type base tint while respecting subtle style hue.
+        base_rgb = np.clip(0.80 * tint + 0.20 * base_rgb, 0.05, 0.99)
+        if paper_type == "aged_rag":
+            paper_grain = max(paper_grain, 0.10)
+            paper_mottle = max(paper_mottle, 0.18)
+        elif paper_type == "bright_white":
+            paper_mottle = min(paper_mottle, 0.03)
 
     # Subtle per-page paper tone drift
     tone_shift = rng.normal(0.0, 0.012, size=3).astype(np.float32)
@@ -177,7 +207,147 @@ def make_manuscript_paper(
             img[y0:y1, x0:x1, :] += core[:, :, None]
             img[y0:y1, x0:x1, :] -= halo[:, :, None] * (1.0 - ink_rgb[None, None, :]) * 0.55
 
+    # 6. Optional spiral-notebook ruled lines & left margin line
+    if paper_type == "spiral_notebook":
+        rule_spacing = max(14, int(round(height / 32.0)))
+        rule_rgb = np.array([0.62, 0.78, 0.94], dtype=np.float32)
+        for yr in range(rule_spacing, height - rule_spacing // 2, rule_spacing):
+            img[yr : min(height, yr + 1), :, :] = (
+                img[yr : min(height, yr + 1), :, :] * 0.72 + rule_rgb[None, None, :] * 0.28
+            )
+        margin_x = max(8, int(round(width * 0.095)))
+        if margin_x + 1 < width:
+            margin_rgb = np.array([0.92, 0.56, 0.58], dtype=np.float32)
+            img[:, margin_x : margin_x + 2, :] = (
+                img[:, margin_x : margin_x + 2, :] * 0.68 + margin_rgb[None, None, :] * 0.32
+            )
+        # Subtle spiral-binding punch holes along far-left edge
+        hole_x = max(4, int(round(width * 0.025)))
+        hole_r = max(2.5, min(width, height) * 0.012)
+        hole_step = max(18, int(round(height / 18.0)))
+        yy_h, xx_h = np.ogrid[:height, :width]
+        for yh in range(hole_step // 2, height - hole_step // 2, hole_step):
+            y0 = max(0, int(yh - hole_r - 2))
+            y1 = min(height, int(yh + hole_r + 3))
+            x0 = max(0, int(hole_x - hole_r - 2))
+            x1 = min(width, int(hole_x + hole_r + 3))
+            if y1 > y0 and x1 > x0:
+                d = np.hypot((yy_h[y0:y1, :] - yh).astype(np.float32), (xx_h[:, x0:x1] - hole_x).astype(np.float32))
+                mask = np.clip(hole_r + 0.5 - d, 0.0, 1.0)[..., None]
+                img[y0:y1, x0:x1, :] = img[y0:y1, x0:x1, :] * (1.0 - 0.72 * mask) + np.float32(0.22) * (0.72 * mask)
+
+    # 7. Optional coffee / water ring stain (capillary darker rim + faint tinted interior)
+    if stain_prob > 0.0 and float(rng.random()) < stain_prob:
+        n_stains = int(rng.integers(1, 3))
+        yy_s, xx_s = np.ogrid[:height, :width]
+        for _ in range(n_stains):
+            cy = float(rng.uniform(height * 0.08, height * 0.92))
+            cx = float(rng.uniform(width * 0.08, width * 0.92))
+            rad = float(rng.uniform(max(14.0, min(height, width) * 0.045), max(28.0, min(height, width) * 0.14)))
+            ring_w = max(2.0, rad * float(rng.uniform(0.08, 0.16)))
+            y0 = max(0, int(cy - rad * 1.45))
+            y1 = min(height, int(cy + rad * 1.45) + 1)
+            x0 = max(0, int(cx - rad * 1.45))
+            x1 = min(width, int(cx + rad * 1.45) + 1)
+            if y1 <= y0 or x1 <= x0:
+                continue
+            dy = (yy_s[y0:y1, :] - cy).astype(np.float32)
+            dx = (xx_s[:, x0:x1] - cx).astype(np.float32)
+            r_px = np.hypot(dx, dy)
+            phi = np.arctan2(dy, dx)
+            # Organic uneven coffee-cup perimeter
+            p1, p2 = float(rng.uniform(0, 2 * np.pi)), float(rng.uniform(0, 2 * np.pi))
+            r_eff = rad * (1.0 + 0.06 * np.cos(2.0 * phi + p1) + 0.04 * np.cos(3.0 * phi + p2))
+            # Capillary rim peak + soft interior wash
+            rim = np.exp(-0.5 * ((r_px - r_eff) / (ring_w + 1e-6)) ** 2)
+            interior = np.clip((r_eff - r_px) / max(ring_w * 1.5, 1.0), 0.0, 1.0) * 0.25
+            strength = float(rng.uniform(0.14, 0.34))
+            alpha = np.clip((rim + interior) * strength, 0.0, 0.55)[..., None]
+            # Coffee brown vs fainter water-ring sepia
+            is_coffee = float(rng.random()) < 0.70
+            stain_rgb = np.array([0.46, 0.30, 0.15] if is_coffee else [0.68, 0.62, 0.50], dtype=np.float32)
+            img[y0:y1, x0:x1, :] = img[y0:y1, x0:x1, :] * (1.0 - alpha) + stain_rgb[None, None, :] * alpha
+
     return np.clip(img, 0.0, 1.0).astype(np.float32, copy=False)
+
+
+def draw_margin_annotations(
+    canvas: Any,
+    style: dict[str, Any],
+    rng: np.random.Generator,
+    staff_ys: Optional[Sequence[float]] = None,
+    sp: float = 12.0,
+) -> list[dict[str, Any]]:
+    """Draw optional handwritten rehearsal marks (boxed letters) and margin scratches.
+
+    Returns a list of annotation metadata dicts describing what was drawn.
+    """
+    try:
+        from .stroke_engine import draw_calligraphic_polyline
+    except ImportError:
+        from stroke_engine import draw_calligraphic_polyline
+
+    w = int(canvas.width)
+    h = int(canvas.height)
+    ink_rgb = style.get("ink_rgb", (0.15, 0.13, 0.11))
+    stroke_w = max(0.95, float(sp) * 0.14)
+    drawn: list[dict[str, Any]] = []
+
+    if staff_ys is not None and len(staff_ys) > 0:
+        anchor_ys = [float(y) for y in staff_ys]
+    else:
+        anchor_ys = [float(h * frac) for frac in (0.16, 0.42, 0.68)]
+
+    # 1. Boxed rehearsal letter mark (e.g. [A], [B], [C]) above a staff or in upper margin.
+    y_ref = anchor_ys[0]
+    rx = float(rng.uniform(max(18.0, w * 0.06), max(28.0, min(w - 28.0, w * 0.24))))
+    ry = float(np.clip(y_ref - 2.6 * sp, 16.0, max(18.0, h - 20.0)))
+    box_r = max(6.0, sp * 0.95)
+    box = np.array([
+        [rx - box_r, ry - box_r],
+        [rx + box_r, ry - box_r],
+        [rx + box_r, ry + box_r],
+        [rx - box_r, ry + box_r],
+        [rx - box_r, ry - box_r],
+    ], dtype=np.float64) + rng.normal(0.0, 0.06 * sp, size=(5, 2))
+    draw_calligraphic_polyline(canvas, box, ink_rgb, stroke_w * 0.95, style, kind="annotation")
+    # Stylized 'A' or 'B' rehearsal glyph inside the box
+    letter = str(rng.choice(["A", "B", "C"]))
+    s = box_r * 0.58
+    if letter == "A":
+        draw_calligraphic_polyline(canvas, np.array([[rx - s, ry + s], [rx, ry - s], [rx + s, ry + s]]), ink_rgb, stroke_w, style, kind="annotation")
+        draw_calligraphic_polyline(canvas, np.array([[rx - 0.55 * s, ry + 0.15 * s], [rx + 0.55 * s, ry + 0.10 * s]]), ink_rgb, stroke_w * 0.85, style, kind="annotation")
+    elif letter == "B":
+        draw_calligraphic_polyline(canvas, np.array([[rx - 0.5 * s, ry - s], [rx - 0.5 * s, ry + s]]), ink_rgb, stroke_w, style, kind="annotation")
+        draw_calligraphic_polyline(canvas, np.array([[rx - 0.5 * s, ry - s], [rx + 0.5 * s, ry - 0.55 * s], [rx - 0.45 * s, ry], [rx + 0.6 * s, ry + 0.55 * s], [rx - 0.5 * s, ry + s]]), ink_rgb, stroke_w * 0.95, style, kind="annotation")
+    else:
+        draw_calligraphic_polyline(canvas, np.array([[rx + 0.6 * s, ry - 0.7 * s], [rx - 0.1 * s, ry - s], [rx - 0.6 * s, ry], [rx - 0.1 * s, ry + s], [rx + 0.6 * s, ry + 0.7 * s]]), ink_rgb, stroke_w, style, kind="annotation")
+    drawn.append({"kind": "rehearsal_box", "label": letter, "x": rx, "y": ry})
+
+    # 2. Quick conductor/copyist margin cue (check mark, asterisk, or marginal slash) in left/right margin.
+    y_cue = anchor_ys[min(1, len(anchor_ys) - 1)]
+    on_left = bool(rng.random() < 0.6)
+    cx = float(rng.uniform(8.0, max(12.0, w * 0.07))) if on_left else float(rng.uniform(min(w - 12.0, w * 0.93), max(14.0, w - 8.0)))
+    cy = float(np.clip(y_cue + rng.normal(0.0, sp), 12.0, max(14.0, h - 12.0)))
+    cue_kind = str(rng.choice(["check", "asterisk", "slashes"]))
+    if cue_kind == "check":
+        pts = np.array([[cx - 0.5 * sp, cy], [cx - 0.1 * sp, cy + 0.45 * sp], [cx + 0.7 * sp, cy - 0.6 * sp]], dtype=np.float64)
+        draw_calligraphic_polyline(canvas, pts, ink_rgb, stroke_w * 1.1, style, kind="annotation")
+    elif cue_kind == "asterisk":
+        r_a = 0.55 * sp
+        for ang_deg in (0.0, 60.0, 120.0):
+            rad = np.deg2rad(ang_deg)
+            p0 = np.array([cx - r_a * np.cos(rad), cy - r_a * np.sin(rad)])
+            p1 = np.array([cx + r_a * np.cos(rad), cy + r_a * np.sin(rad)])
+            draw_calligraphic_polyline(canvas, np.vstack((p0, p1)), ink_rgb, stroke_w * 0.9, style, kind="annotation")
+    else:
+        for k_s in range(2):
+            off = (k_s - 0.5) * 0.35 * sp
+            pts = np.array([[cx + off - 0.3 * sp, cy + 0.5 * sp], [cx + off + 0.3 * sp, cy - 0.5 * sp]], dtype=np.float64)
+            draw_calligraphic_polyline(canvas, pts, ink_rgb, stroke_w * 1.05, style, kind="annotation")
+    drawn.append({"kind": f"margin_{cue_kind}", "x": cx, "y": cy})
+
+    return drawn
 
 
 def compute_quirky_note_positions(

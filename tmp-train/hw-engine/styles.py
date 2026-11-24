@@ -8,7 +8,13 @@ glyph variant generator, and page renderer.
 from __future__ import annotations
 
 import copy
-from typing import Any
+import json
+from pathlib import Path
+from typing import Any, Optional, Union
+
+import numpy as np
+
+STYLE_PACKS_DIR: Path = Path(__file__).resolve().parent / "style_packs"
 
 REST_ARCHETYPES: tuple[str, ...] = (
     "lightning_z",
@@ -17,6 +23,10 @@ REST_ARCHETYPES: tuple[str, ...] = (
     "hurried_slash_zig",
     "baroque_c_hook",
     "calligraphic_s_curl",
+    "sharp_v_tick",
+    "baroque_flag_loop",
+    "modern_tall_z",
+    "scribble_s",
 )
 
 NOTEHEAD_ARCHETYPES: tuple[str, ...] = (
@@ -24,6 +34,17 @@ NOTEHEAD_ARCHETYPES: tuple[str, ...] = (
     "slash",
     "teardrop",
     "compact",
+    "heavy_wedge",
+    "hollow_diamond",
+)
+
+PAPER_TYPES: tuple[str, ...] = (
+    "aged_rag",
+    "bright_white",
+    "cream_manuscript",
+    "spiral_notebook",
+    "ozalid_blue",
+    "soviet_green_tint",
 )
 
 REQUIRED_STYLE_KEYS: tuple[str, ...] = (
@@ -77,6 +98,10 @@ def _weights(
     hurried_slash_zig: float,
     baroque_c_hook: float,
     calligraphic_s_curl: float,
+    sharp_v_tick: float = 0.0,
+    baroque_flag_loop: float = 0.0,
+    modern_tall_z: float = 0.0,
+    scribble_s: float = 0.0,
 ) -> dict[str, float]:
     raw = {
         "lightning_z": float(lightning_z),
@@ -85,6 +110,10 @@ def _weights(
         "hurried_slash_zig": float(hurried_slash_zig),
         "baroque_c_hook": float(baroque_c_hook),
         "calligraphic_s_curl": float(calligraphic_s_curl),
+        "sharp_v_tick": float(sharp_v_tick),
+        "baroque_flag_loop": float(baroque_flag_loop),
+        "modern_tall_z": float(modern_tall_z),
+        "scribble_s": float(scribble_s),
     }
     total = sum(raw.values())
     if total <= 0.0:
@@ -331,11 +360,11 @@ SCRIBE_STYLES: dict[str, dict[str, Any]] = {
         "ink_var": 0.22,
         "ink_pooling": 0.44,
         "slant_deg": 5.0,
-        "notehead_archetype": "teardrop",
+        "notehead_archetype": "heavy_wedge",
         "notehead_scale": 1.15,
         "notehead_angle_deg": -36.0,
         "hollow_open_prob": 0.10,
-        "rest_archetype_weights": _weights(0.02, 0.14, 0.08, 0.04, 0.62, 0.10),
+        "rest_archetype_weights": _weights(0.02, 0.10, 0.06, 0.04, 0.44, 0.08, 0.01, 0.23, 0.01, 0.01),
         "clef_ornate": 0.88,
         "barline_overshoot_sp": 0.35,
         "spacing_jitter": 0.16,
@@ -664,11 +693,11 @@ SCRIBE_STYLES: dict[str, dict[str, Any]] = {
         "ink_var": 0.15,
         "ink_pooling": 0.14,
         "slant_deg": -13.5,
-        "notehead_archetype": "oval",
+        "notehead_archetype": "hollow_diamond",
         "notehead_scale": 1.00,
         "notehead_angle_deg": -12.0,
         "hollow_open_prob": 0.26,
-        "rest_archetype_weights": _weights(0.28, 0.36, 0.16, 0.12, 0.04, 0.04),
+        "rest_archetype_weights": _weights(0.22, 0.30, 0.12, 0.10, 0.03, 0.03, 0.10, 0.02, 0.04, 0.04),
         "clef_ornate": 0.34,
         "barline_overshoot_sp": 0.28,
         "spacing_jitter": 0.24,
@@ -836,9 +865,297 @@ SCRIBE_STYLES: dict[str, dict[str, Any]] = {
 }
 
 
-def list_styles() -> list[str]:
-    """Return the ordered list of all registered scribe style names."""
-    return list(SCRIBE_STYLES.keys())
+# Snapshot of built-in styles for clean reloads.
+_BUILTIN_STYLES: dict[str, dict[str, Any]] = copy.deepcopy(SCRIBE_STYLES)
+
+# Numeric parameter bounds used for validation and safe random scribe sampling.
+_NUMERIC_CLAMP_BOUNDS: dict[str, tuple[float, float]] = {
+    "nib_angle_deg": (-65.0, 65.0),
+    "nib_min_ratio": (0.15, 0.95),
+    "stroke_scale": (0.45, 2.20),
+    "wobble_px": (0.0, 4.0),
+    "tremor_px": (0.0, 3.5),
+    "ink_dropout": (0.0, 0.55),
+    "grain_strength": (0.0, 0.75),
+    "ink_var": (0.0, 0.55),
+    "ink_pooling": (0.0, 0.75),
+    "slant_deg": (-14.0, 18.0),
+    "notehead_scale": (0.65, 1.45),
+    "notehead_angle_deg": (-50.0, 10.0),
+    "hollow_open_prob": (0.0, 1.0),
+    "clef_ornate": (0.0, 1.0),
+    "barline_overshoot_sp": (0.0, 1.0),
+    "spacing_jitter": (0.08, 0.45),
+    "bar_width_var": (0.10, 0.35),
+    "end_bar_cram": (0.0, 0.40),
+    "staff_curve_px": (0.0, 16.0),
+    "staff_slope_deg": (-2.5, 2.5),
+    "sp_jitter_frac": (0.0, 0.10),
+    "blank_prerule_prob": (0.0, 0.60),
+    "paper_grain": (0.0, 0.28),
+    "paper_mottle": (0.0, 0.38),
+    "bleed_through": (0.0, 0.25),
+    "eraser_smudge_prob": (0.0, 1.0),
+    "margin_annotations_prob": (0.0, 1.0),
+    # Optional extended physics & paper parameters
+    "ink_feather": (0.0, 1.0),
+    "split_nib_prob": (0.0, 1.0),
+    "rastrum_wobble": (0.0, 6.0),
+    "stain_prob": (0.0, 1.0),
+}
+
+_OPTIONAL_NUMERIC_DEFAULTS: dict[str, float] = {
+    "ink_feather": 0.0,
+    "split_nib_prob": 0.0,
+    "rastrum_wobble": 0.0,
+    "stain_prob": 0.0,
+}
+
+_INTERPOLATABLE_NUMERIC_KEYS: tuple[str, ...] = tuple(_NUMERIC_CLAMP_BOUNDS.keys())
+_RGB_KEYS: tuple[str, ...] = ("ink_rgb", "staff_ink_rgb", "paper_rgb")
+
+
+def _normalize_rest_weights(raw_weights: dict[str, Any]) -> dict[str, float]:
+    """Validate and normalize a rest_archetype_weights dict across all REST_ARCHETYPES."""
+    if not isinstance(raw_weights, dict):
+        raise ValueError("rest_archetype_weights must be a dict")
+    unknown = set(raw_weights.keys()) - set(REST_ARCHETYPES)
+    if unknown:
+        raise ValueError(f"Unknown rest_archetype_weights keys: {sorted(unknown)}")
+    merged: dict[str, float] = {}
+    for key in REST_ARCHETYPES:
+        val = float(raw_weights.get(key, 0.0))
+        if val < 0.0:
+            raise ValueError(f"rest_archetype_weights[{key!r}] must be >= 0, got {val}")
+        merged[key] = val
+    total = sum(merged.values())
+    if total <= 0.0:
+        raise ValueError("rest_archetype_weights must sum to a positive value")
+    return {k: round(v / total, 6) for k, v in merged.items()}
+
+
+def _merge_style_dicts(parent: dict[str, Any], child: dict[str, Any]) -> dict[str, Any]:
+    """Deep-merge child style overrides onto a copy of parent."""
+    merged = copy.deepcopy(parent)
+    for key, val in child.items():
+        if key == "extends":
+            continue
+        if key == "rest_archetype_weights" and isinstance(val, dict) and isinstance(merged.get(key), dict):
+            # Allow child to override a subset of rest weights or all of them.
+            combined = dict(merged[key])
+            combined.update(val)
+            merged[key] = combined
+        else:
+            merged[key] = copy.deepcopy(val)
+    return merged
+
+
+def _validate_and_normalize_style(name: str, spec: dict[str, Any]) -> dict[str, Any]:
+    """Validate a resolved style dict against REQUIRED_STYLE_KEYS and normalize types."""
+    if not isinstance(name, str) or not name.strip():
+        raise ValueError("Style name must be a non-empty string")
+    if not isinstance(spec, dict):
+        raise ValueError(f"Style spec for {name!r} must be a dict")
+
+    out = copy.deepcopy(spec)
+    out.pop("extends", None)
+    out["name"] = name
+
+    missing = [k for k in REQUIRED_STYLE_KEYS if k not in out]
+    if missing:
+        raise ValueError(f"Style {name!r} is missing required keys: {missing}")
+
+    # Normalize RGB channels to 3-tuples of floats in [0, 1].
+    for rgb_key in _RGB_KEYS:
+        rgb = out[rgb_key]
+        if not isinstance(rgb, (list, tuple, np.ndarray)) or len(rgb) != 3:
+            raise ValueError(f"Style {name!r}.{rgb_key} must be a 3-element RGB sequence")
+        rgb_t = tuple(float(ch) for ch in rgb)
+        for ch in rgb_t:
+            if not (0.0 <= ch <= 1.0):
+                raise ValueError(f"Style {name!r}.{rgb_key} channel {ch} out of [0, 1]")
+        out[rgb_key] = rgb_t
+
+    if out["notehead_archetype"] not in NOTEHEAD_ARCHETYPES:
+        raise ValueError(
+            f"Style {name!r} has invalid notehead_archetype {out['notehead_archetype']!r}; "
+            f"expected one of {NOTEHEAD_ARCHETYPES}"
+        )
+
+    out["rest_archetype_weights"] = _normalize_rest_weights(out["rest_archetype_weights"])
+
+    if "paper_type" in out and out["paper_type"] is not None:
+        if out["paper_type"] not in PAPER_TYPES:
+            raise ValueError(
+                f"Style {name!r} has invalid paper_type {out['paper_type']!r}; "
+                f"expected one of {PAPER_TYPES}"
+            )
+
+    if "tags" in out and out["tags"] is not None:
+        if isinstance(out["tags"], str):
+            out["tags"] = [out["tags"]]
+        elif isinstance(out["tags"], (list, tuple, set)):
+            out["tags"] = [str(t) for t in out["tags"]]
+        else:
+            raise ValueError(f"Style {name!r}.tags must be a list of strings")
+
+    # Sanity-check numeric types and clamp to safe rendering bounds.
+    for key in _INTERPOLATABLE_NUMERIC_KEYS:
+        if key in out and out[key] is not None:
+            out[key] = float(out[key])
+
+    if out["stroke_scale"] <= 0.0:
+        raise ValueError(f"Style {name!r}.stroke_scale must be > 0")
+    if not (0.0 < out["nib_min_ratio"] <= 1.0):
+        raise ValueError(f"Style {name!r}.nib_min_ratio must be in (0, 1]")
+
+    for key, (lo, hi) in _NUMERIC_CLAMP_BOUNDS.items():
+        if key in out and out[key] is not None:
+            out[key] = float(np.clip(out[key], lo, hi))
+
+    return out
+
+
+def register_style(
+    name: str,
+    spec: dict[str, Any],
+    *,
+    overwrite: bool = True,
+) -> dict[str, Any]:
+    """Validate, resolve optional ``extends`` inheritance, and register a scribe style."""
+    if not overwrite and name in SCRIBE_STYLES:
+        raise ValueError(f"Style {name!r} is already registered")
+    if not isinstance(spec, dict):
+        raise ValueError(f"Style spec for {name!r} must be a dict")
+
+    resolved = copy.deepcopy(spec)
+    parent_name = resolved.get("extends")
+    if parent_name is not None:
+        if parent_name == name:
+            raise ValueError(f"Style {name!r} cannot extend itself")
+        if parent_name not in SCRIBE_STYLES:
+            raise ValueError(f"Style {name!r} extends unknown parent style {parent_name!r}")
+        resolved = _merge_style_dicts(SCRIBE_STYLES[parent_name], resolved)
+
+    validated = _validate_and_normalize_style(name, resolved)
+    SCRIBE_STYLES[name] = validated
+    return copy.deepcopy(validated)
+
+
+def _extract_pack_entries(payload: Any, source_path: Path) -> dict[str, dict[str, Any]]:
+    """Parse flexible JSON style-pack schemas into a {name: spec} mapping."""
+    entries: dict[str, dict[str, Any]] = {}
+    if isinstance(payload, list):
+        for item in payload:
+            if not isinstance(item, dict) or "name" not in item:
+                raise ValueError(f"List entry in {source_path} must be a dict with a 'name' key")
+            entries[str(item["name"])] = item
+        return entries
+
+    if not isinstance(payload, dict):
+        raise ValueError(f"Style pack {source_path} must contain a JSON object or list")
+
+    # Wrapper format: {"styles": {...}} or {"styles": [...]}
+    if "styles" in payload and isinstance(payload["styles"], (dict, list)):
+        return _extract_pack_entries(payload["styles"], source_path)
+
+    # Single style dict format: {"name": "...", "extends": "...", ...}
+    if "name" in payload and isinstance(payload["name"], str):
+        entries[payload["name"]] = payload
+        return entries
+
+    # Mapping format: {"style_a": {...}, "style_b": {...}}
+    for key, val in payload.items():
+        if str(key).startswith("_") or str(key) in ("schema_version", "pack_name", "description"):
+            continue
+        if not isinstance(val, dict):
+            raise ValueError(f"Entry {key!r} in {source_path} must be a dict")
+        entries[str(key)] = val
+    return entries
+
+
+def reload_style_packs(
+    packs_dir: Optional[Union[str, Path]] = None,
+    *,
+    reset_to_builtins: bool = False,
+) -> list[str]:
+    """Discover and load all ``*.json`` style packs from ``packs_dir`` (default: ``style_packs/``).
+
+    Supports multi-level ``"extends"`` inheritance across built-ins and pack files,
+    with circular-inheritance detection and full ``REQUIRED_STYLE_KEYS`` validation.
+    Returns the list of style names loaded from disk.
+    """
+    if reset_to_builtins:
+        SCRIBE_STYLES.clear()
+        SCRIBE_STYLES.update(copy.deepcopy(_BUILTIN_STYLES))
+
+    target_dir = Path(packs_dir) if packs_dir is not None else STYLE_PACKS_DIR
+    if not target_dir.exists() or not target_dir.is_dir():
+        return []
+
+    pending: dict[str, dict[str, Any]] = {}
+    for json_path in sorted(target_dir.glob("*.json")):
+        with json_path.open("r", encoding="utf-8") as fh:
+            payload = json.load(fh)
+        entries = _extract_pack_entries(payload, json_path)
+        for style_name, spec in entries.items():
+            pending[style_name] = copy.deepcopy(spec)
+
+    if not pending:
+        return []
+
+    # Resolve in dependency order so styles can extend other styles in the same or other packs.
+    loaded: list[str] = []
+    visiting: set[str] = set()
+
+    def _resolve_and_register(style_name: str) -> None:
+        if style_name not in pending:
+            return
+        if style_name in visiting:
+            raise ValueError(f"Circular style inheritance detected involving {style_name!r}")
+        visiting.add(style_name)
+        spec = pending[style_name]
+        parent_name = spec.get("extends")
+        if parent_name is not None:
+            if parent_name == style_name:
+                raise ValueError(f"Style {style_name!r} cannot extend itself")
+            if parent_name in pending:
+                _resolve_and_register(parent_name)
+            elif parent_name not in SCRIBE_STYLES:
+                raise ValueError(
+                    f"Style {style_name!r} extends unknown parent style {parent_name!r}"
+                )
+        register_style(style_name, spec, overwrite=True)
+        pending.pop(style_name, None)
+        visiting.discard(style_name)
+        loaded.append(style_name)
+
+    for style_name in list(pending.keys()):
+        _resolve_and_register(style_name)
+
+    return loaded
+
+
+def list_styles(tag: Optional[str] = None) -> list[str]:
+    """Return the ordered list of registered scribe style names, optionally filtered by ``tag``.
+
+    When ``tag`` is provided, matches against explicit ``style["tags"]``, ``style["era"]``,
+    ``style["paper_type"]``, or ``style["notehead_archetype"]`` (case-insensitive).
+    """
+    if tag is None:
+        return list(SCRIBE_STYLES.keys())
+    needle = str(tag).strip().lower()
+    matched: list[str] = []
+    for name, s in SCRIBE_STYLES.items():
+        tags_lower = {str(t).strip().lower() for t in s.get("tags", ())}
+        if (
+            needle in tags_lower
+            or str(s.get("era", "")).strip().lower() == needle
+            or str(s.get("paper_type", "")).strip().lower() == needle
+            or str(s.get("notehead_archetype", "")).strip().lower() == needle
+        ):
+            matched.append(name)
+    return matched
 
 
 def get_style(name: str) -> dict[str, Any]:
@@ -847,3 +1164,146 @@ def get_style(name: str) -> dict[str, Any]:
         valid = ", ".join(SCRIBE_STYLES.keys())
         raise KeyError(f"Unknown scribe style {name!r}. Valid styles: {valid}")
     return copy.deepcopy(SCRIBE_STYLES[name])
+
+
+def interpolate_styles(
+    name_a: Union[str, dict[str, Any]],
+    name_b: Union[str, dict[str, Any]],
+    alpha: float,
+    rng: Optional[np.random.Generator] = None,
+) -> dict[str, Any]:
+    """Continuously interpolate between two scribe styles at blend factor ``alpha`` in ``[0, 1]``.
+
+    ``alpha == 0.0`` yields style A; ``alpha == 1.0`` yields style B.
+    Discrete attributes (``notehead_archetype``, ``era``, ``paper_type``) are chosen
+    probabilistically using ``rng`` if provided, otherwise by thresholding ``alpha >= 0.5``.
+    """
+    t = float(alpha)
+    if not (0.0 <= t <= 1.0):
+        raise ValueError(f"alpha must be in [0.0, 1.0], got {alpha}")
+
+    sa = get_style(name_a) if isinstance(name_a, str) else copy.deepcopy(name_a)
+    sb = get_style(name_b) if isinstance(name_b, str) else copy.deepcopy(name_b)
+    label_a = str(sa.get("name", "style_a"))
+    label_b = str(sb.get("name", "style_b"))
+
+    def _pick_b() -> bool:
+        if rng is not None:
+            return bool(rng.random() < t)
+        return t >= 0.5
+
+    out = copy.deepcopy(sa if t < 0.5 else sb)
+    out["name"] = f"{label_a}__x{t:.2f}__{label_b}"
+    out["description"] = f"Interpolated scribe ({1.0 - t:.2f} {label_a} + {t:.2f} {label_b})."
+    out["era"] = sb["era"] if _pick_b() else sa["era"]
+    out["notehead_archetype"] = sb["notehead_archetype"] if _pick_b() else sa["notehead_archetype"]
+
+    # Optional paper_type
+    pa = sa.get("paper_type")
+    pb = sb.get("paper_type")
+    if pa is not None or pb is not None:
+        chosen_p = pb if _pick_b() else pa
+        if chosen_p is not None:
+            out["paper_type"] = chosen_p
+        else:
+            out.pop("paper_type", None)
+
+    # Interpolate RGB tuples
+    for rgb_key in _RGB_KEYS:
+        ra = np.asarray(sa[rgb_key], dtype=np.float64)
+        rb = np.asarray(sb[rgb_key], dtype=np.float64)
+        blended = np.clip((1.0 - t) * ra + t * rb, 0.0, 1.0)
+        out[rgb_key] = tuple(round(float(c), 6) for c in blended)
+
+    # Interpolate numeric parameters (required + optional)
+    for key in _INTERPOLATABLE_NUMERIC_KEYS:
+        if key in sa or key in sb:
+            default_v = _OPTIONAL_NUMERIC_DEFAULTS.get(key, 0.0)
+            va = float(sa.get(key, default_v))
+            vb = float(sb.get(key, default_v))
+            out[key] = (1.0 - t) * va + t * vb
+
+    # Interpolate and renormalize rest_archetype_weights
+    rwa = sa["rest_archetype_weights"]
+    rwb = sb["rest_archetype_weights"]
+    raw_rw = {
+        k: (1.0 - t) * float(rwa.get(k, 0.0)) + t * float(rwb.get(k, 0.0))
+        for k in REST_ARCHETYPES
+    }
+    out["rest_archetype_weights"] = _normalize_rest_weights(raw_rw)
+
+    return out
+
+
+def sample_random_scribe(
+    rng: np.random.Generator,
+    base_style: Optional[Union[str, dict[str, Any]]] = None,
+    jitter: float = 0.20,
+) -> dict[str, Any]:
+    """Sample a continuous unseen handwritten scribe profile for high-variance training.
+
+    If ``base_style`` is ``None``, randomly selects two registered styles and interpolates
+    between them before applying controlled parameter jitter scaled by ``jitter``.
+    """
+    j = max(0.0, float(jitter))
+    if base_style is None:
+        names = list_styles()
+        idx_a = int(rng.integers(0, len(names)))
+        idx_b = int(rng.integers(0, len(names)))
+        alpha = float(rng.uniform(0.0, 1.0))
+        scribe = interpolate_styles(names[idx_a], names[idx_b], alpha, rng=rng)
+    elif isinstance(base_style, str):
+        scribe = get_style(base_style)
+    else:
+        scribe = copy.deepcopy(base_style)
+
+    # Jitter RGB channels gently within [0, 1].
+    if j > 0.0:
+        for rgb_key in _RGB_KEYS:
+            rgb = np.asarray(scribe[rgb_key], dtype=np.float64)
+            scale = 0.12 if rgb_key == "paper_rgb" else 0.18
+            delta = rng.normal(0.0, scale * j, size=3)
+            # Keep paper reasonably bright unless explicitly dark.
+            lo = 0.65 if rgb_key == "paper_rgb" else 0.02
+            hi = 0.99 if rgb_key == "paper_rgb" else 0.85
+            rgb_j = np.clip(rgb + delta, lo, hi)
+            scribe[rgb_key] = tuple(round(float(c), 6) for c in rgb_j)
+
+        # Jitter all required numeric keys within safe bounds.
+        for key, (lo, hi) in _NUMERIC_CLAMP_BOUNDS.items():
+            if key in _OPTIONAL_NUMERIC_DEFAULTS and key not in scribe:
+                continue
+            val = float(scribe[key])
+            span = hi - lo
+            # Mix multiplicative + additive jitter so zero-valued params can also explore.
+            noise = float(rng.normal(0.0, j)) * (0.5 * abs(val) + 0.12 * span)
+            scribe[key] = float(np.clip(val + noise, lo, hi))
+
+        # Perturb rest archetype weights smoothly and renormalize.
+        rw = scribe["rest_archetype_weights"]
+        raw_rw: dict[str, float] = {}
+        for k in REST_ARCHETYPES:
+            w = float(rw.get(k, 0.0))
+            w_new = max(0.0, w * float(np.exp(rng.normal(0.0, j * 1.4))) + max(0.0, float(rng.normal(0.0, 0.04 * j))))
+            raw_rw[k] = w_new
+        if sum(raw_rw.values()) <= 1e-9:
+            raw_rw = {k: 1.0 for k in REST_ARCHETYPES}
+        scribe["rest_archetype_weights"] = _normalize_rest_weights(raw_rw)
+
+    # Populate extended stroke/paper physics parameters if not already set.
+    if "ink_feather" not in scribe:
+        scribe["ink_feather"] = float(np.clip(rng.uniform(0.0, 0.45) * (0.5 + j), 0.0, 1.0))
+    if "split_nib_prob" not in scribe:
+        scribe["split_nib_prob"] = float(np.clip(rng.uniform(0.0, 0.35) if rng.random() < 0.35 else 0.0, 0.0, 1.0))
+    if "rastrum_wobble" not in scribe:
+        scribe["rastrum_wobble"] = float(np.clip(rng.uniform(0.0, 2.5), 0.0, 6.0))
+    if "stain_prob" not in scribe:
+        scribe["stain_prob"] = float(np.clip(rng.uniform(0.0, 0.30) if rng.random() < 0.35 else 0.0, 0.0, 1.0))
+
+    token = int(rng.integers(0, 16**6))
+    scribe["name"] = f"sampled_scribe_{token:06x}"
+    return scribe
+
+
+# Auto-discover any JSON style packs present in style_packs/ on module import.
+reload_style_packs()
