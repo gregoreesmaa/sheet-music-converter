@@ -682,6 +682,8 @@ class TestNewFlagsLegacyResume(unittest.TestCase):
         'gdcm_weight': 0.0,
         'extra_data_dir': None,
         'max_tokens': 768,
+        'rope_2d': False,
+        'mtp_weight': 0.0,
     }
 
     def test_old_meta_without_new_keys_resumes_at_defaults_and_refuses_nondefault(self):
@@ -709,7 +711,9 @@ class TestNewFlagsLegacyResume(unittest.TestCase):
                                ('comer', True),
                                ('gdcm_weight', 0.1),
                                ('extra_data_dir', ['D:/tmp/extra']),
-                               ('max_tokens', 512)):
+                               ('max_tokens', 512),
+                               ('rope_2d', True),
+                               ('mtp_weight', 0.10)):
                 with self.subTest(key=k):
                     mut = dict(base)
                     mut[k] = bad_val
@@ -777,6 +781,72 @@ class TestExp2BWarmStartAndOptimizer(unittest.TestCase):
         # At step 0 of warmup (u=0): mult * 1/10 -> 2.5x group is 2.5x decoder group.
         sched_lrs = sorted({round(lr_v, 10) for lr_v in sched.get_last_lr()})
         self.assertAlmostEqual(sched_lrs[-1] / sched_lrs[1], 2.5, places=5)
+
+
+class TestRoPE2DAndMTPWarmStart(unittest.TestCase):
+    """Warm-start, inference auto-detect, and optimizer groups for RoPE2D + MTP."""
+
+    def test_warm_start_from_legacy_and_inference_drop_mtp(self):
+        import torch
+        import data
+        import model
+        v = len(data.VOCAB) + 3
+        torch.manual_seed(7)
+        legacy = model.MvdNet(
+            vocab=v, d_model=64, layers=2, heads=4, dim_ff=128,
+            extra_chans=1, foveal_tap=True)
+        upgraded = model.MvdNet(
+            vocab=v, d_model=64, layers=2, heads=4, dim_ff=128,
+            extra_chans=1, foveal_tap=True, rope_2d=True, use_mtp=True)
+
+        how = train.load_weights_compat(upgraded, legacy.state_dict())
+        self.assertIn('rope2d-fresh', how)
+        self.assertIn('mtp-fresh', how)
+
+        legacy.eval()
+        upgraded.eval()
+        imgs = torch.randn(2, 4, 64, 128)
+        tgt_in = torch.tensor([
+            [legacy.bos_id, data.TOKEN_TO_ID['clef-G-2'], data.TOKEN_TO_ID['quarter'],
+             data.TOKEN_TO_ID['C'], data.TOKEN_TO_ID['4'], data.TOKEN_TO_ID['bar']],
+            [legacy.bos_id, data.TOKEN_TO_ID['clef-F-4'], data.TOKEN_TO_ID['half'],
+             data.TOKEN_TO_ID['G'], data.TOKEN_TO_ID['3'], data.TOKEN_TO_ID['bar']],
+        ], dtype=torch.long)
+        with torch.no_grad():
+            self.assertTrue(torch.allclose(
+                legacy.encode(imgs), upgraded.encode(imgs), atol=1e-6))
+            self.assertTrue(torch.allclose(
+                legacy(imgs, tgt_in), upgraded(imgs, tgt_in), atol=1e-5))
+            self.assertTrue(torch.equal(
+                legacy.greedy_kv(imgs[:1], max_len=6, constrain=False),
+                upgraded.greedy_kv(imgs[:1], max_len=6, constrain=False)))
+
+        # Simulate non-zero trained rope2d gate, then load into inference net
+        # (use_mtp=False, rope_2d auto-detected from state_dict keys).
+        with torch.no_grad():
+            upgraded.rope2d.gate.fill_(0.5)
+        ckpt_sd = upgraded.state_dict()
+        has_rope2d = any(k.startswith('rope2d.') for k in ckpt_sd)
+        self.assertTrue(has_rope2d)
+        infer_net = model.MvdNet(
+            vocab=v, d_model=64, layers=2, heads=4, dim_ff=128,
+            extra_chans=1, foveal_tap=True, rope_2d=has_rope2d, use_mtp=False)
+        how_infer = train.load_weights_compat(infer_net, ckpt_sd)
+        self.assertEqual(how_infer, 'strict+mtp-dropped')
+        self.assertFalse(hasattr(infer_net, 'mtp_head'))
+        infer_net.eval()
+        with torch.no_grad():
+            self.assertTrue(torch.allclose(
+                upgraded.encode(imgs), infer_net.encode(imgs), atol=1e-6))
+            self.assertTrue(torch.equal(
+                upgraded.greedy_kv(imgs[:1], max_len=6, constrain=False),
+                infer_net.greedy_kv(imgs[:1], max_len=6, constrain=False)))
+
+        # Fresh-head 2.5x LR param group includes rope2d and mtp_head.
+        opt, _ = train.build_optimizer(
+            upgraded, lr=1e-4, trunk_mult=0.5, warmup=0, cosine=False)
+        lrs = sorted({round(g['lr'], 10) for g in opt.param_groups})
+        self.assertEqual(lrs, sorted([0.5e-4, 1.0e-4, 2.5e-4]))
 
 
 class TestExtraDataDirAndMaxTokens(unittest.TestCase):

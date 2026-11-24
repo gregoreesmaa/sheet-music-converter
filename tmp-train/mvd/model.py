@@ -21,7 +21,10 @@ from torchvision.models import convnext_tiny
 import comer_gdcm
 import data
 import grammar
+import pos_forest_head
 import s18_factored
+
+extract_voice1_ctc_targets = pos_forest_head.extract_voice1_ctc_targets
 
 
 def _sinusoidal_1d(n, dim, device):
@@ -297,6 +300,117 @@ def _sinusoidal_2d(h, w, dim, device, y_scale=1.0, x_scale=1.0):
     return ey + ex
 
 
+def apply_2d_rope(x, h, w, base_y=100.0, base_x=10000.0,
+                  y_scale=1.0, x_scale=1.0,
+                  inv_freq_y=None, inv_freq_x=None):
+    """Apply anisotropic 2D Rotary Position Embeddings (2D-RoPE-STR 2024).
+
+    Rotates the first half of channels by vertical staff-line coordinate
+    ``y`` (with higher-frequency ``base_y=100.0``) and the second half by
+    horizontal time coordinate ``x`` (with long-range ``base_x=10000.0``).
+    Accepts ``[B, H * W, D]`` or ``[B, H, W, D]`` (``D % 4 == 0``) and
+    preserves shape, dtype, and L2 norm. Angles are computed in float32
+    for AMP (bf16/fp16) numerical safety on wide musical strips.
+    """
+    is_3d = (x.ndim == 3)
+    if is_3d:
+        b, s, d = x.shape
+        assert s == h * w, f'seq len {s} != h*w ({h}*{w})'
+        x4 = x.reshape(b, h, w, d)
+    elif x.ndim == 4:
+        b, hx, wx, d = x.shape
+        assert hx == h and wx == w, f'spatial {(hx, wx)} != {(h, w)}'
+        x4 = x
+    else:
+        raise ValueError(f'expected 3D or 4D tensor, got shape {tuple(x.shape)}')
+    assert d % 4 == 0, f'dim must be divisible by 4, got {d}'
+    half = d // 2
+    q = d // 4
+    dev = x.device
+    dt = x.dtype
+
+    ys = torch.arange(h, device=dev, dtype=torch.float32) * float(y_scale)
+    xs = torch.arange(w, device=dev, dtype=torch.float32) * float(x_scale)
+    if inv_freq_y is None:
+        inv_freq_y = torch.exp(
+            torch.arange(q, device=dev, dtype=torch.float32)
+            * -(math.log(float(base_y)) / q))
+    else:
+        inv_freq_y = inv_freq_y.to(device=dev, dtype=torch.float32)
+    if inv_freq_x is None:
+        inv_freq_x = torch.exp(
+            torch.arange(q, device=dev, dtype=torch.float32)
+            * -(math.log(float(base_x)) / q))
+    else:
+        inv_freq_x = inv_freq_x.to(device=dev, dtype=torch.float32)
+
+    ang_y = ys[:, None] * inv_freq_y[None, :]  # [H, q]
+    ang_x = xs[:, None] * inv_freq_x[None, :]  # [W, q]
+    cos_y = ang_y.cos().to(dt)[None, :, None, :]  # [1, H, 1, q]
+    sin_y = ang_y.sin().to(dt)[None, :, None, :]
+    cos_x = ang_x.cos().to(dt)[None, None, :, :]  # [1, 1, W, q]
+    sin_x = ang_x.sin().to(dt)[None, None, :, :]
+
+    xy = x4[..., :half]
+    xy_e, xy_o = xy[..., 0::2], xy[..., 1::2]
+    ry = torch.stack(
+        [xy_e * cos_y - xy_o * sin_y, xy_e * sin_y + xy_o * cos_y], dim=-1
+    ).flatten(-2)
+
+    xx = x4[..., half:]
+    xx_e, xx_o = xx[..., 0::2], xx[..., 1::2]
+    rx = torch.stack(
+        [xx_e * cos_x - xx_o * sin_x, xx_e * sin_x + xx_o * cos_x], dim=-1
+    ).flatten(-2)
+
+    out = torch.cat([ry, rx], dim=-1)
+    return out.reshape(b, h * w, d) if is_3d else out
+
+
+class RoPE2D(nn.Module):
+    """Anisotropic 2D Rotary Position Embedding module with zero-init gate.
+
+    Computes ``x + tanh(gate) * (apply_2d_rope(x, h, w) - x)`` so that
+    warm-starting from a legacy ``rope_2d=False`` checkpoint is an exact
+    step-0 identity while allowing per-channel gradients to smoothly turn
+    on 2D-RoPE from step 1.
+    """
+
+    def __init__(self, dim: int, base_y: float = 100.0,
+                 base_x: float = 10000.0, zero_init_gate: bool = True):
+        super().__init__()
+        if dim % 4 != 0:
+            raise ValueError(f'RoPE2D dim must be divisible by 4, got {dim}')
+        self.dim = int(dim)
+        self.base_y = float(base_y)
+        self.base_x = float(base_x)
+        q = self.dim // 4
+        self.register_buffer(
+            'inv_freq_y',
+            torch.exp(torch.arange(q, dtype=torch.float32)
+                      * -(math.log(self.base_y) / q)),
+        )
+        self.register_buffer(
+            'inv_freq_x',
+            torch.exp(torch.arange(q, dtype=torch.float32)
+                      * -(math.log(self.base_x) / q)),
+        )
+        init_g = torch.zeros(self.dim) if zero_init_gate else torch.ones(self.dim)
+        self.gate = nn.Parameter(init_g)
+
+    def forward(self, x, h, w, y_scale=1.0, x_scale=1.0):
+        rot = apply_2d_rope(
+            x, h, w, base_y=self.base_y, base_x=self.base_x,
+            y_scale=y_scale, x_scale=x_scale,
+            inv_freq_y=self.inv_freq_y, inv_freq_x=self.inv_freq_x)
+        g = torch.tanh(self.gate).to(x.dtype)
+        if x.ndim == 3:
+            g = g.view(1, 1, -1)
+        else:
+            g = g.view(1, 1, 1, -1)
+        return x + g * (rot - x)
+
+
 class _PadConv(nn.Module):
     """Zero-pad the input, then apply the wrapped conv.
 
@@ -530,7 +644,9 @@ class MvdNet(nn.Module):
                  pretrained=False, extra_chans: int = 0,
                  stride: str = '8x16', foveal_tap: bool = False,
                  use_comer: bool = False, use_gdcm: bool = False,
-                 use_s18: bool = False):
+                 use_s18: bool = False, rope_2d: bool = False,
+                 use_mtp: bool = False, use_pos_head: bool = False,
+                 use_ctc: bool = False):
         # NOTE: no max_tgt — target positions are runtime sinusoids
         # (corpus pages reach 4414 tokens; a fixed table crashes).
         # anisotropic=True (v2): 8x vertical / 16x horizontal encoder
@@ -566,6 +682,10 @@ class MvdNet(nn.Module):
         self.use_comer = bool(use_comer)
         self.use_gdcm = bool(use_gdcm)
         self.use_s18 = bool(use_s18)
+        self.rope_2d = bool(rope_2d)
+        self.use_mtp = bool(use_mtp)
+        self.use_pos_head = bool(use_pos_head)
+        self.use_ctc = bool(use_ctc)
         self._last_hw_mem = None
         self._tensor_cache = {}
 
@@ -621,6 +741,20 @@ class MvdNet(nn.Module):
             self.s18_head = s18_factored.S18FactoredHead(
                 d_model=d_model, vocab_size=vocab,
                 consistency_weight=0.0, eos_id=self.eos_id)
+        if self.rope_2d:
+            self.rope2d = RoPE2D(d_model)
+        if self.use_mtp:
+            self.mtp_head = nn.Sequential(
+                nn.LayerNorm(d_model),
+                nn.Linear(d_model, d_model),
+                nn.GELU(),
+                nn.Linear(d_model, vocab),
+            )
+        if self.use_pos_head:
+            self.pos_head = pos_forest_head.MusicalPosHead(d_model=d_model)
+        if self.use_ctc:
+            self.ctc_vpool = nn.Linear(d_model, 1)
+            self.ctc_head = nn.Linear(d_model, vocab + 1)
 
     def _expand_stem(self, extra):
         """Widen the stem conv to ``3 + extra`` input channels.
@@ -728,6 +862,8 @@ class MvdNet(nn.Module):
         y_scale, x_scale = stride_grid_scale(self.stride)
         pos = _sinusoidal_2d(h, w, d, proj.device, y_scale, x_scale)
         seq = self.mem_norm(proj.permute(0, 2, 3, 1).reshape(b, h * w, d)) + pos.reshape(1, h * w, d)
+        if self.rope_2d:
+            seq = self.rope2d(seq, h, w, y_scale=y_scale, x_scale=x_scale)
         pred_counts = None
         if self.use_gdcm:
             pred_counts = self.gdcm_head(seq, mem_mask=mem_mask)
@@ -888,6 +1024,112 @@ class MvdNet(nn.Module):
         """
         return self.out(self.decode_hidden(mem, tgt_in, mem_mask, hw_mem=hw_mem))
 
+    def mtp_loss(self, h, tgt):
+        """Multi-Token Prediction auxiliary CE loss (DeepSeek-V3 / Meta 2024).
+
+        Predicts token ``t+2`` (``tgt[:, 1:]``) from decoder hidden state
+        ``h[:, :-1]`` at step ``t``, ignoring ``self.pad_id``. Training-only;
+        never invoked during greedy/beam inference.
+        """
+        if not self.use_mtp:
+            raise RuntimeError('mtp_loss called on MvdNet with use_mtp=False')
+        if tgt.shape[1] < 2 or not bool((tgt[:, 1:] != self.pad_id).any()):
+            return self.mtp_head(h[:, :1]).sum() * 0.0
+        mtp_logits = self.mtp_head(h[:, :-1])
+        return F.cross_entropy(
+            mtp_logits.reshape(-1, self.vocab),
+            tgt[:, 1:].reshape(-1),
+            ignore_index=self.pad_id,
+        )
+
+    def pos_loss(self, h, tgt, id2tok=None):
+        """PosFormer-style musical position-forest auxiliary loss (ECCV 2024).
+
+        Supervises per-token measure beat phase (16-bin CE), active voice ID
+        (8-class CE), and ``[in_chord, in_tuplet, is_bar_close]`` flags (BCE)
+        from shared decoder hidden states ``h``. Training-only; never invoked
+        during greedy/beam inference.
+        """
+        if not self.use_pos_head:
+            raise RuntimeError('pos_loss called on MvdNet with use_pos_head=False')
+        return self.pos_head.loss_from_tokens(
+            h, tgt, id2tok=(data.VOCAB if id2tok is None else id2tok),
+            pad_id=self.pad_id,
+        )
+
+    def ctc_loss(self, mem, tgt, hw_mem=None, mem_mask=None, id2tok=None):
+        """Column-pooled Voice-1 auxiliary CTC loss (InterCTC / Focal-CTC).
+
+        Applies attention-weighted vertical collapse ``[B, h_mem, w_mem, d]``
+        -> ``[B, w_mem, d]`` via ``self.ctc_vpool`` and computes CTC loss
+        against the strictly monotonic Voice-1 skeleton (headers + Voice-1
+        tokens up to any ``voice-2``+ reset). Computed in float32 for AMP
+        safety; training-only, never invoked during greedy/beam inference.
+        """
+        if not self.use_ctc:
+            raise RuntimeError('ctc_loss called on MvdNet with use_ctc=False')
+        b, s, d = mem.shape
+        if hw_mem is None:
+            if (self._last_hw_mem is not None
+                    and self._last_hw_mem[0] * self._last_hw_mem[1] == s):
+                hw_mem = self._last_hw_mem
+            else:
+                hw_mem = (1, s)
+        h_mem, w_mem = hw_mem
+        mem_4d = mem.reshape(b, h_mem, w_mem, d)
+        attn_logits = self.ctc_vpool(mem_4d).squeeze(-1)  # [B, h_mem, w_mem]
+        if mem_mask is not None:
+            mask_3d = mem_mask.reshape(b, h_mem, w_mem)
+            col_active = (~mask_3d).any(dim=1)  # [B, w_mem]
+            safe_logits = attn_logits.float().masked_fill(mask_3d, float('-inf'))
+            # Prevent softmax NaN on completely masked padding columns.
+            safe_logits = torch.where(
+                col_active[:, None, :], safe_logits,
+                torch.zeros_like(safe_logits))
+            attn_w = F.softmax(safe_logits, dim=1)
+            attn_w = torch.where(
+                col_active[:, None, :], attn_w, torch.zeros_like(attn_w)
+            ).to(mem_4d.dtype)
+            input_lengths = col_active.sum(dim=1).clamp_min(1).to(torch.long)
+        else:
+            attn_w = F.softmax(attn_logits.float(), dim=1).to(mem_4d.dtype)
+            input_lengths = torch.full(
+                (b,), w_mem, device=mem.device, dtype=torch.long)
+
+        col_feats = (mem_4d * attn_w.unsqueeze(-1)).sum(dim=1)  # [B, w_mem, d]
+        ctc_logits = self.ctc_head(col_feats)  # [B, w_mem, vocab + 1]
+        log_probs = F.log_softmax(ctc_logits.float(), dim=-1).transpose(0, 1)
+
+        targets_1d, target_lengths = extract_voice1_ctc_targets(
+            tgt, id2tok=(data.VOCAB if id2tok is None else id2tok),
+            pad_id=self.pad_id, bos_id=self.bos_id, eos_id=self.eos_id,
+        )
+        # Filter out empty or impossible-length rows (target_len > input_len).
+        valid_rows = (target_lengths > 0) & (target_lengths <= input_lengths)
+        if not bool(valid_rows.any()):
+            return ctc_logits.sum() * 0.0
+        if bool(valid_rows.all()):
+            return F.ctc_loss(
+                log_probs, targets_1d, input_lengths, target_lengths,
+                blank=self.vocab, zero_infinity=True,
+            )
+        # Slice only valid batch rows so F.ctc_loss never sees 0-length targets.
+        sel_idx = valid_rows.nonzero(as_tuple=False).squeeze(-1)
+        offsets = torch.cumsum(target_lengths, dim=0) - target_lengths
+        chunks = [
+            targets_1d[int(offsets[i]):int(offsets[i] + target_lengths[i])]
+            for i in sel_idx.tolist()
+        ]
+        sel_targets = torch.cat(chunks, dim=0)
+        return F.ctc_loss(
+            log_probs[:, sel_idx, :],
+            sel_targets,
+            input_lengths[sel_idx],
+            target_lengths[sel_idx],
+            blank=self.vocab,
+            zero_infinity=True,
+        )
+
     def loss(self, images, tgt, sample_p=0.0, mem_mask=None,
                tok_weight=1.0, weight_ids=(), tok_dropout=0.0,
                content_ids=(), augment=None):
@@ -953,7 +1195,7 @@ class MvdNet(nn.Module):
                     content_ids=(), need_aux=False, need_coord=False,
                     coord_layer=-1, augment=None,
                     return_hidden=False, return_logits=False,
-                    need_gdcm=False):
+                    need_gdcm=False, need_ctc=False):
         """Single-pass ``(ce_loss, aux_pred, x_centroids[, h][, logits][, gdcm_loss])`` sharing 1 encoder + 1 decoder.
 
         Eliminates the 3x ConvNeXt-Tiny encoder + 2x Transformer decoder
@@ -1036,6 +1278,11 @@ class MvdNet(nn.Module):
                 tgt, pad_id=self.pad_id).to(mem.device)
             gdcm_loss = self.gdcm_head.compute_loss(pred_counts, tgt_counts)
 
+        ctc_loss = None
+        if need_ctc and self.use_ctc:
+            ctc_loss = self.ctc_loss(
+                mem, tgt, hw_mem=(h_mem, w_mem), mem_mask=mem_mask)
+
         out = (ce, apred, xc)
         if return_hidden:
             out = out + (h,)
@@ -1043,6 +1290,8 @@ class MvdNet(nn.Module):
             out = out + (logits,)
         if need_gdcm:
             out = out + (gdcm_loss,)
+        if need_ctc:
+            out = out + (ctc_loss,)
         return out
 
     @torch.no_grad()

@@ -498,6 +498,77 @@ class TestStage2Speedups(unittest.TestCase):
                 self.assertTrue(torch.equal(got[k][row_idx], state[k][g2_id]))
 
 
+class TestRoPE2DAndMTP(unittest.TestCase):
+    """Unit tests for anisotropic 2D-RoPE and Multi-Token Prediction head."""
+
+    def test_apply_2d_rope_anisotropic_norm_preserving(self):
+        torch.manual_seed(0)
+        b, h, w, d = 2, 6, 10, 64
+        x = torch.randn(b, h * w, d)
+        rot = model.apply_2d_rope(x, h, w)
+        self.assertEqual(rot.shape, x.shape)
+        self.assertEqual(rot.dtype, x.dtype)
+        # Exact L2 norm preservation at every spatial position.
+        self.assertTrue(torch.allclose(
+            rot.norm(dim=-1), x.norm(dim=-1), atol=1e-5))
+        # 4D input matches 3D input.
+        rot4 = model.apply_2d_rope(x.reshape(b, h, w, d), h, w)
+        self.assertTrue(torch.allclose(rot4.reshape(b, h * w, d), rot, atol=1e-6))
+        # Axis separation: constant vector rotated by (y, x) has y-half
+        # invariant across x and x-half invariant across y.
+        ones = torch.ones(1, h, w, d)
+        r1 = model.apply_2d_rope(ones, h, w)
+        half = d // 2
+        self.assertTrue(torch.allclose(
+            r1[:, :, 0:1, :half].expand_as(r1[..., :half]),
+            r1[..., :half], atol=1e-6))
+        self.assertTrue(torch.allclose(
+            r1[:, 0:1, :, half:].expand_as(r1[..., half:]),
+            r1[..., half:], atol=1e-6))
+        # Anisotropic bases produce distinct rotations along y vs x.
+        self.assertFalse(torch.allclose(
+            r1[0, 1, 0, :half], r1[0, 0, 1, half:], atol=1e-4))
+
+    def test_rope2d_and_mtp_forward_backward_and_zero_inference_overhead(self):
+        torch.manual_seed(1)
+        net = model.MvdNet(vocab=VOCAB_SIZE, d_model=64, layers=2, heads=4,
+                           dim_ff=128, rope_2d=True, use_mtp=True)
+        net.train()
+        img = torch.randn(2, 3, 64, 128)
+        tgt = torch.randint(0, len(VOCAB), (2, 12))
+        ce, _, _, h = net.loss_shared(img, tgt, return_hidden=True)
+        mtp = net.mtp_loss(h, tgt)
+        total = ce + 0.10 * mtp
+        total.backward()
+        self.assertTrue(bool(torch.isfinite(total)))
+        self.assertIsNotNone(net.rope2d.gate.grad)
+        self.assertGreater(net.rope2d.gate.grad.abs().sum().item(), 0.0)
+        for p in net.mtp_head.parameters():
+            self.assertIsNotNone(p.grad)
+            self.assertGreater(p.grad.abs().sum().item(), 0.0)
+
+        # Edge cases: T=1 and all-PAD tgt[:, 1:] must produce finite 0.0.
+        self.assertEqual(float(net.mtp_loss(h[:, :1], tgt[:, :1]).item()), 0.0)
+        all_pad = torch.full_like(tgt, net.pad_id)
+        all_pad[:, 0] = 1
+        self.assertEqual(float(net.mtp_loss(h, all_pad).item()), 0.0)
+
+        # Zero inference overhead: mtp_head is never called in forward/greedy/beam.
+        calls = [0]
+        handle = net.mtp_head.register_forward_hook(
+            lambda _m, _i, _o: calls.__setitem__(0, calls[0] + 1))
+        try:
+            net.eval()
+            with torch.no_grad():
+                _ = net(img[:1], tgt[:1, :4])
+                _ = net.greedy(img[:1], max_len=4, constrain=False)
+                _ = net.greedy_kv(img[:1], max_len=4, constrain=False)
+                _ = net.beam_search(img[:1], max_len=4, beam=2, constrain=False)
+        finally:
+            handle.remove()
+        self.assertEqual(calls[0], 0, 'mtp_head must never run during inference')
+
+
 if __name__ == '__main__':
     test_forward_shapes()
     test_long_sequence_no_position_cap()

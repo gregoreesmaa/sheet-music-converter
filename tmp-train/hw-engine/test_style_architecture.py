@@ -208,6 +208,10 @@ class TestPluggableStyleArchitecture(unittest.TestCase):
             self.assertTrue(0.0 <= s["split_nib_prob"] <= 1.0)
             self.assertTrue(0.0 <= s["rastrum_wobble"] <= 6.0)
             self.assertTrue(0.0 <= s["stain_prob"] <= 1.0)
+            self.assertIn("notehead_aspect", s)
+            self.assertIn("notehead_fill_density", s)
+            self.assertTrue(0.25 <= s["notehead_aspect"] <= 2.20)
+            self.assertTrue(0.25 <= s["notehead_fill_density"] <= 1.50)
         self.assertGreaterEqual(len(names), 10)
 
         # Sampling anchored to a specific base style works
@@ -249,17 +253,78 @@ class TestExpandedGlyphsAndStrokePhysics(unittest.TestCase):
     def test_expanded_notehead_archetypes_heavy_wedge_and_hollow_diamond(self) -> None:
         self.assertIn("heavy_wedge", NOTEHEAD_ARCHETYPES)
         self.assertIn("hollow_diamond", NOTEHEAD_ARCHETYPES)
+        self.assertEqual(len(NOTEHEAD_ARCHETYPES), 18)
         base_style = get_style("bach_thick_iron_gall")
         bg = np.broadcast_to(BG_CREAM, (64, 64, 3))
-        for arch in ("heavy_wedge", "hollow_diamond"):
+        filled_renders = []
+        for idx, arch in enumerate(NOTEHEAD_ARCHETYPES):
             for dur in ("filled", "half", "whole"):
                 style = dict(base_style, notehead_archetype=arch)
-                c1 = StrokeCanvas(64, 64, BG_CREAM, np.random.default_rng(31))
-                c2 = StrokeCanvas(64, 64, BG_CREAM, np.random.default_rng(32))
-                draw_notehead(c1, dur, 32.0, 32.0, 14.0, INK_DARK, style, np.random.default_rng(41))
-                draw_notehead(c2, dur, 32.0, 32.0, 14.0, INK_DARK, style, np.random.default_rng(42))
+                c1 = StrokeCanvas(64, 64, BG_CREAM, np.random.default_rng(31 + idx * 7))
+                c2 = StrokeCanvas(64, 64, BG_CREAM, np.random.default_rng(32 + idx * 7))
+                draw_notehead(c1, dur, 32.0, 32.0, 14.0, INK_DARK, style, np.random.default_rng(41 + idx * 7))
+                draw_notehead(c2, dur, 32.0, 32.0, 14.0, INK_DARK, style, np.random.default_rng(42 + idx * 7))
                 self.assertGreater(_mean_abs_diff(c1.buf, bg), 1e-4, f"{arch}/{dur} drew nothing")
                 self.assertGreater(_mean_abs_diff(c1.buf, c2.buf), 1e-4, f"{arch}/{dur} did not vary")
+                if dur == "filled":
+                    filled_renders.append((arch, c1.buf))
+
+        # Every pair of the 18 filled notehead archetypes should render distinctly
+        for i in range(len(filled_renders)):
+            for j in range(i + 1, len(filled_renders)):
+                diff = _mean_abs_diff(filled_renders[i][1], filled_renders[j][1])
+                self.assertGreater(
+                    diff,
+                    1e-4,
+                    f"Notehead archetypes {filled_renders[i][0]} and {filled_renders[j][0]} rendered identically",
+                )
+
+    def test_slim_noteheads_aspect_and_fill_density_morphological_effect(self) -> None:
+        base_style = get_style("romantic_copyist_oblong")
+
+        def _ink_mass(arch: str, dur: str = "filled", aspect: float = 1.0, fill_density: float = 1.0, seed: int = 100) -> float:
+            st = dict(
+                base_style,
+                notehead_archetype=arch,
+                notehead_aspect=aspect,
+                notehead_fill_density=fill_density,
+                wobble_px=0.3,
+                tremor_px=0.05,
+            )
+            c = StrokeCanvas(80, 80, BG_CREAM, np.random.default_rng(seed))
+            draw_notehead(c, dur, 40.0, 40.0, 16.0, INK_DARK, st, np.random.default_rng(seed + 1))
+            return float(np.sum(np.mean(np.clip(BG_CREAM - c.buf, 0.0, 1.0), axis=2)))
+
+        # Slim/needle/hairline/pinprick archetypes deposit substantially less ink than heavy_wedge/ink_blot
+        mass_oval = _ink_mass("oval")
+        mass_blot = _ink_mass("ink_blot")
+        for slim_arch in ("slim_oval", "needle_slash", "hairline_dash", "vertical_tick", "pinprick_dot", "slim_diamond"):
+            with self.subTest(slim_arch=slim_arch):
+                m = _ink_mass(slim_arch)
+                self.assertGreater(m, 3.0, f"{slim_arch} rendered too faintly")
+                self.assertLess(m, mass_oval * 0.78, f"{slim_arch} was not noticeably slimmer than oval")
+                self.assertLess(m, mass_blot * 0.65, f"{slim_arch} was not much slimmer than ink_blot")
+
+        # notehead_aspect < 0.55 vs > 1.35 visibly alters morphology across archetypes
+        for arch in ("oval", "slim_oval", "needle_slash", "hollow_diamond", "chevron_wedge"):
+            with self.subTest(aspect_arch=arch):
+                st_slim = dict(base_style, notehead_archetype=arch, notehead_aspect=0.32)
+                st_wide = dict(base_style, notehead_archetype=arch, notehead_aspect=1.85)
+                c_slim = StrokeCanvas(80, 80, BG_CREAM, np.random.default_rng(701))
+                c_wide = StrokeCanvas(80, 80, BG_CREAM, np.random.default_rng(701))
+                draw_notehead(c_slim, "filled", 40.0, 40.0, 16.0, INK_DARK, st_slim, np.random.default_rng(702))
+                draw_notehead(c_wide, "filled", 40.0, 40.0, 16.0, INK_DARK, st_wide, np.random.default_rng(702))
+                self.assertGreater(_mean_abs_diff(c_slim.buf, c_wide.buf), 1e-3)
+                m_slim = float(np.sum(np.mean(np.clip(BG_CREAM - c_slim.buf, 0.0, 1.0), axis=2)))
+                m_wide = float(np.sum(np.mean(np.clip(BG_CREAM - c_wide.buf, 0.0, 1.0), axis=2)))
+                self.assertLess(m_slim, m_wide)
+
+        # notehead_fill_density 0.30 vs 1.40 increases filled ink coverage
+        for arch in ("oval", "zigzag_fill", "broad_nib_lozenge", "open_loop", "chevron_wedge", "heavy_wedge"):
+            with self.subTest(density_arch=arch):
+                m_sparse = _ink_mass(arch, fill_density=0.30, seed=800)
+                m_dense = _ink_mass(arch, fill_density=1.40, seed=800)
+                self.assertLess(m_sparse, m_dense, f"{arch} did not increase fill mass with notehead_fill_density")
 
     def test_new_handwritten_primitives_render_cleanly(self) -> None:
         style = get_style("mozart_flowing_cursive")

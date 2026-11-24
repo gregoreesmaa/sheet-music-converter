@@ -563,9 +563,9 @@ def run_stage2_unsup_round(
 ):
     """Run one scheduled Stage-2 unsupervised round via lazy-imported modules.
 
-    Supports ``mode`` in ``('ema_enc', 'bar_math', 'both')``. Gracefully skips
-    if the target optional module (``unsup_stage2`` / ``unsup_bar_math``) is
-    not present.
+    Supports ``mode`` in ``('ema_enc', 'bar_math', 'both', 'grpo_bar_math')``.
+    Gracefully skips if the target optional module (``unsup_stage2`` /
+    ``unsup_bar_math``) is not present.
     """
     summary = {
         'step': int(step),
@@ -619,6 +619,16 @@ def run_stage2_unsup_round(
             summary['ran'].append('bar_math')
             summary['metrics']['bar_math'] = res
 
+    if mode == 'grpo_bar_math':
+        mb = (unsup_bar_math_mod if unsup_bar_math_mod is not None
+              else _lazy_import_mvd_module('unsup_bar_math'))
+        res = _invoke(mb, 'unsup_bar_math',
+                      ('run_grpo_bar_math_round',),
+                      common_kw)
+        if res is not None:
+            summary['ran'].append('grpo_bar_math')
+            summary['metrics']['grpo_bar_math'] = res
+
     return summary
 
 
@@ -660,7 +670,8 @@ META_KEYS = ('vocab', 'pages', 'height', 'lr', 'seed', 'exclude',
              'max_tokens', 'real_hw_corpus', 'hw_mix_ratio', 'hw_pure_frac',
              'rism_incipit_dir', 'rism_mix_ratio', 'unsup_strips_dir',
              'unsup_every_steps', 'unsup_round_steps', 'unsup_mode',
-             'unsup_weight', 'unsup_kl_beta')
+             'unsup_weight', 'unsup_kl_beta', 'rope_2d', 'mtp_weight',
+             'pos_weight', 'ctc_weight')
 
 # Values new flags had implicitly before they existed. An old
 # meta.json missing one of these keys resumes iff the current run uses
@@ -703,6 +714,10 @@ LEGACY_DEFAULTS = {
     'unsup_mode': 'both',
     'unsup_weight': 0.25,
     'unsup_kl_beta': 0.10,
+    'rope_2d': False,
+    'mtp_weight': 0.0,
+    'pos_weight': 0.0,
+    'ctc_weight': 0.0,
 }
 
 # Exact fingerprint enforced on --resume (T0.2): every key here must
@@ -727,7 +742,8 @@ RESUME_KEYS = ('vocab', 'pages', 'height', 'lr', 'seed', 'exclude',
                'max_tokens', 'real_hw_corpus', 'hw_mix_ratio', 'hw_pure_frac',
                'rism_incipit_dir', 'rism_mix_ratio', 'unsup_strips_dir',
                'unsup_every_steps', 'unsup_round_steps', 'unsup_mode',
-               'unsup_weight', 'unsup_kl_beta')
+               'unsup_weight', 'unsup_kl_beta', 'rope_2d', 'mtp_weight',
+               'pos_weight', 'ctc_weight')
 
 _LOCK_HELD = []
 
@@ -987,6 +1003,10 @@ def build_meta(args, pairs):
         'unsup_mode': getattr(args, 'unsup_mode', 'both'),
         'unsup_weight': getattr(args, 'unsup_weight', 0.25),
         'unsup_kl_beta': getattr(args, 'unsup_kl_beta', 0.10),
+        'rope_2d': getattr(args, 'rope_2d', False),
+        'mtp_weight': getattr(args, 'mtp_weight', 0.0),
+        'pos_weight': getattr(args, 'pos_weight', 0.0),
+        'ctc_weight': getattr(args, 'ctc_weight', 0.0),
     }
 
 
@@ -1708,7 +1728,9 @@ def build_optimizer(net, lr, trunk_mult=1.0, warmup=0, cosine=False,
     for _n, _p in net.named_parameters():
         if not _p.requires_grad:
             continue
-        if _n.startswith(('s18_head.', 'comer_bias.', 'gdcm_head.')):
+        if _n.startswith(('s18_head.', 'comer_bias.', 'gdcm_head.',
+                          'rope2d.', 'mtp_head.', 'pos_head.',
+                          'ctc_vpool.', 'ctc_head.')):
             _key = 'fresh_'
         elif _n.startswith(('encoder.', 'proj.')):
             _key = 'trunk_'
@@ -1945,10 +1967,53 @@ def load_weights_compat(net, state):
     state_gdcm = {k for k in state if k.startswith('gdcm_head.')}
     gdcm_fresh = bool(own_gdcm and not state_gdcm)
 
+    own_rope2d = {k for k in own if k.startswith('rope2d.')}
+    state_rope2d = {k for k in state if k.startswith('rope2d.')}
+    rope2d_fresh = bool(own_rope2d and not state_rope2d)
+
+    own_mtp = {k for k in own if k.startswith('mtp_head.')}
+    state_mtp = {k for k in state if k.startswith('mtp_head.')}
+    mtp_fresh = bool(own_mtp and not state_mtp)
+    mtp_dropped = bool(not own_mtp and state_mtp)
+    skip_own_mtp = {
+        k for k in own_mtp
+        if k not in state or tuple(state[k].shape) != tuple(own[k].shape)
+    }
+    skip_state_mtp = {
+        k for k in state_mtp
+        if k not in own or tuple(state[k].shape) != tuple(own[k].shape)
+    }
+    mtp_resized = bool(not mtp_fresh and not mtp_dropped
+                       and (skip_own_mtp or skip_state_mtp))
+
+    own_pos = {k for k in own if k.startswith('pos_head.')}
+    state_pos = {k for k in state if k.startswith('pos_head.')}
+    pos_fresh = bool(own_pos and not state_pos)
+    pos_dropped = bool(not own_pos and state_pos)
+
+    own_ctc = {k for k in own if k.startswith(('ctc_vpool.', 'ctc_head.'))}
+    state_ctc = {k for k in state if k.startswith(('ctc_vpool.', 'ctc_head.'))}
+    ctc_fresh = bool(own_ctc and not state_ctc)
+    ctc_dropped = bool(not own_ctc and state_ctc)
+    skip_own_ctc = {
+        k for k in own_ctc
+        if k not in state or tuple(state[k].shape) != tuple(own[k].shape)
+    }
+    skip_state_ctc = {
+        k for k in state_ctc
+        if k not in own or tuple(state[k].shape) != tuple(own[k].shape)
+    }
+    ctc_resized = bool(not ctc_fresh and not ctc_dropped
+                       and (skip_own_ctc or skip_state_ctc))
+
     # Legacy strict+aux-fresh fast path (preserves exact return string).
     if (not stem_mismatch and not vocab_mismatch and not foveal_fresh
             and not s18_fresh and not s18_resized
             and not comer_fresh and not gdcm_fresh
+            and not rope2d_fresh and not mtp_fresh
+            and not mtp_dropped and not mtp_resized
+            and not pos_fresh and not pos_dropped
+            and not ctc_fresh and not ctc_dropped and not ctc_resized
             and own_aux and not state_aux
             and all(k in state and tuple(state[k].shape) == tuple(own[k].shape)
                     for k in own if k not in own_aux)
@@ -1961,11 +2026,16 @@ def load_weights_compat(net, state):
 
     if not (padconv or stem_mismatch or vocab_mismatch or aux_skipped
             or foveal_fresh or s18_fresh or s18_resized
-            or comer_fresh or gdcm_fresh):
+            or comer_fresh or gdcm_fresh or rope2d_fresh
+            or mtp_fresh or mtp_dropped or mtp_resized
+            or pos_fresh or pos_dropped
+            or ctc_fresh or ctc_dropped or ctc_resized):
         net.load_state_dict(state)  # re-raise the original error
 
-    skip_own = set(skip_own_aux) | set(skip_own_s18)
-    skip_state = set(skip_state_aux) | set(skip_state_s18)
+    skip_own = (set(skip_own_aux) | set(skip_own_s18)
+                | set(skip_own_mtp) | set(skip_own_ctc))
+    skip_state = (set(skip_state_aux) | set(skip_state_s18)
+                  | set(skip_state_mtp) | set(skip_state_ctc))
     if foveal_fresh:
         skip_own |= own_foveal
     if s18_fresh:
@@ -1974,6 +2044,20 @@ def load_weights_compat(net, state):
         skip_own |= own_comer
     if gdcm_fresh:
         skip_own |= own_gdcm
+    if rope2d_fresh:
+        skip_own |= own_rope2d
+    if mtp_fresh:
+        skip_own |= own_mtp
+    if mtp_dropped:
+        skip_state |= state_mtp
+    if pos_fresh:
+        skip_own |= own_pos
+    if pos_dropped:
+        skip_state |= state_pos
+    if ctc_fresh:
+        skip_own |= own_ctc
+    if ctc_dropped:
+        skip_state |= state_ctc
     if stem_mismatch:
         skip_own |= {stem_w, stem_b}
         skip_state |= {stem_w, stem_b}
@@ -2060,6 +2144,24 @@ def load_weights_compat(net, state):
                         and state[k].shape[0] < own_params[k].shape[0]):
                     n_s = state[k].shape[0]
                     own_params[k][:n_s].copy_(state[k])
+        if mtp_resized:
+            own_params = dict(net.named_parameters())
+            for k in skip_own_mtp:
+                if (k in state and k in own_params
+                        and state[k].ndim == own_params[k].ndim
+                        and state[k].shape[1:] == own_params[k].shape[1:]
+                        and state[k].shape[0] < own_params[k].shape[0]):
+                    n_m = state[k].shape[0]
+                    own_params[k][:n_m].copy_(state[k])
+        if ctc_resized:
+            own_params = dict(net.named_parameters())
+            for k in skip_own_ctc:
+                if (k in state and k in own_params
+                        and state[k].ndim == own_params[k].ndim
+                        and state[k].shape[1:] == own_params[k].shape[1:]
+                        and state[k].shape[0] < own_params[k].shape[0]):
+                    n_c = state[k].shape[0]
+                    own_params[k][:n_c].copy_(state[k])
     rest = {k: v for k, v in state.items() if k not in skip_state}
     missing, unexpected = net.load_state_dict(rest, strict=False)
     assert not unexpected, unexpected
@@ -2083,6 +2185,20 @@ def load_weights_compat(net, state):
         parts.append('comer-fresh')
     if gdcm_fresh:
         parts.append('gdcm-fresh')
+    if rope2d_fresh:
+        parts.append('rope2d-fresh')
+    if mtp_fresh:
+        parts.append('mtp-fresh')
+    if mtp_dropped:
+        parts.append('mtp-dropped')
+    if pos_fresh:
+        parts.append('pos-fresh')
+    if pos_dropped:
+        parts.append('pos-dropped')
+    if ctc_fresh:
+        parts.append('ctc-fresh')
+    if ctc_dropped:
+        parts.append('ctc-dropped')
     if padconv:
         parts.append('padconv')
     return '+'.join(parts)
@@ -2413,10 +2529,10 @@ def main():
                     help='steps per scheduled unsupervised round (default 100). '
                          'Recorded in meta.json and enforced on --resume.')
     ap.add_argument('--unsup-mode', default='both',
-                    choices=('ema_enc', 'bar_math', 'both'),
-                    help='unsupervised round mode: ema_enc, bar_math, or both '
-                         '(default both). Recorded in meta.json and enforced '
-                         'on --resume.')
+                    choices=('ema_enc', 'bar_math', 'both', 'grpo_bar_math'),
+                    help='unsupervised round mode: ema_enc, bar_math, both, '
+                         'or grpo_bar_math (default both). Recorded in '
+                         'meta.json and enforced on --resume.')
     ap.add_argument('--unsup-weight', type=float, default=0.25,
                     help='unsupervised round loss weight (default 0.25). '
                          'Recorded in meta.json and enforced on --resume.')
@@ -2424,6 +2540,31 @@ def main():
                     help='unsupervised round KL regularization beta '
                          '(default 0.10). Recorded in meta.json and enforced '
                          'on --resume.')
+    ap.add_argument('--rope-2d', action='store_true',
+                    help='enable anisotropic 2D Rotary Position Embeddings '
+                         '(2D-RoPE-STR 2024) on encoder memory (zero-init '
+                         'residual gate for lossless warm-start). Recorded '
+                         'in meta.json and enforced on --resume.')
+    ap.add_argument('--mtp-weight', type=float, default=0.0,
+                    help='Multi-Token Prediction auxiliary head loss weight '
+                         '(DeepSeek-V3 / Meta 2024) predicting token t+2 '
+                         'from decoder hidden state at step t (0.0 = off, '
+                         'legacy; e.g. 0.10; zero inference overhead). '
+                         'Recorded in meta.json and enforced on --resume.')
+    ap.add_argument('--pos-weight', type=float, default=0.0,
+                    help='PosFormer-style musical position-forest auxiliary '
+                         'head loss weight (ECCV 2024) predicting 16-bin beat '
+                         'phase + 8-class voice ID + [in_chord, in_tuplet, '
+                         'is_bar_close] flags from h_shared (0.0 = off, '
+                         'legacy; zero inference overhead). Recorded in '
+                         'meta.json and enforced on --resume.')
+    ap.add_argument('--ctc-weight', type=float, default=0.0,
+                    help='Column-pooled Voice-1 auxiliary CTC head loss '
+                         'weight (InterCTC / Focal-CTC) on attention-pooled '
+                         'encoder columns against the monotonic Voice-1 '
+                         'skeleton (0.0 = off, legacy; zero inference '
+                         'overhead). Recorded in meta.json and enforced on '
+                         '--resume.')
     args = ap.parse_args()
 
     torch.manual_seed(args.seed)
@@ -2541,6 +2682,9 @@ def main():
 
     use_gdcm = args.gdcm_weight > 0
     use_s18 = args.s18_weight > 0
+    use_mtp = args.mtp_weight > 0
+    use_pos_head = args.pos_weight > 0
+    use_ctc = args.ctc_weight > 0
     if args.pretrained:
         net = model.MvdNet(vocab=len(data.VOCAB) + 3, anisotropic=True,
                            pretrained=True, stride=args.stride,
@@ -2548,7 +2692,11 @@ def main():
                            foveal_tap=args.foveal_tap,
                            use_comer=args.comer,
                            use_gdcm=use_gdcm,
-                           use_s18=use_s18).to(device)
+                           use_s18=use_s18,
+                           rope_2d=args.rope_2d,
+                           use_mtp=use_mtp,
+                           use_pos_head=use_pos_head,
+                           use_ctc=use_ctc).to(device)
         print('MvdNet v2: anisotropic %s encoder + timm pretrained trunk'
               % args.stride
               + (' + %d hybrid extra chans' % args.extra_chans
@@ -2556,7 +2704,11 @@ def main():
               + (' + foveal_tap' if args.foveal_tap else '')
               + (' + CoMER' if args.comer else '')
               + (' + GDCM' if use_gdcm else '')
-              + (' + S18' if use_s18 else ''))
+              + (' + S18' if use_s18 else '')
+              + (' + RoPE2D' if args.rope_2d else '')
+              + (' + MTP' if use_mtp else '')
+              + (' + PosHead' if use_pos_head else '')
+              + (' + CTC' if use_ctc else ''))
     else:
         net = model.MvdNet(vocab=len(data.VOCAB) + 3,
                            stride=args.stride,
@@ -2564,7 +2716,11 @@ def main():
                            foveal_tap=args.foveal_tap,
                            use_comer=args.comer,
                            use_gdcm=use_gdcm,
-                           use_s18=use_s18).to(device)
+                           use_s18=use_s18,
+                           rope_2d=args.rope_2d,
+                           use_mtp=use_mtp,
+                           use_pos_head=use_pos_head,
+                           use_ctc=use_ctc).to(device)
     K0 = max(1, args.accum)
     total_updates = (args.steps // K0 + 2 * (args.steps //
                      max(1, args.eval_every) + 1) + 2)
@@ -2872,6 +3028,10 @@ def main():
         need_coord = (args.coord_weight > 0 and step % max(1, args.coord_every) == 0)
         need_s18 = (args.s18_weight > 0)
         need_gdcm = (args.gdcm_weight > 0)
+        need_mtp = (args.mtp_weight > 0)
+        need_pos = (args.pos_weight > 0)
+        need_ctc = (args.ctc_weight > 0)
+        need_hidden = (need_s18 or need_mtp or need_pos)
         # Width-aware micro-chunking: at H=256 and B=4, batches wider than
         # 2176 px exceed 16 GB VRAM and spill into Windows WDDM (triggering
         # slow paging or TDR driver resets). Splitting wide batches into
@@ -2897,6 +3057,12 @@ def main():
                         if need_s18 else None)
             _gdcm_acc = (torch.zeros((), device=device, dtype=torch.float32)
                          if need_gdcm else None)
+            _mtp_acc = (torch.zeros((), device=device, dtype=torch.float32)
+                        if need_mtp else None)
+            _pos_acc = (torch.zeros((), device=device, dtype=torch.float32)
+                        if need_pos else None)
+            _ctc_acc = (torch.zeros((), device=device, dtype=torch.float32)
+                        if need_ctc else None)
             mterm = wterm = aterm = jterm = None
             for _s in range(0, _b_cur, _mb):
                 _e = min(_b_cur, _s + _mb)
@@ -2912,14 +3078,17 @@ def main():
                         tok_dropout=args.tok_dropout,
                         content_ids=CONTENT_IDS,
                         need_aux=need_aux, need_coord=need_coord,
-                        augment=aug, return_hidden=need_s18,
-                        need_gdcm=need_gdcm)
+                        augment=aug, return_hidden=need_hidden,
+                        need_gdcm=need_gdcm, need_ctc=need_ctc)
                     _ce, _ap, _xc = _sh[0], _sh[1], _sh[2]
                     _si = 3
-                    _h = _sh[_si] if need_s18 else None
-                    if need_s18:
+                    _h = _sh[_si] if need_hidden else None
+                    if need_hidden:
                         _si += 1
                     _gd = _sh[_si] if need_gdcm else None
+                    if need_gdcm:
+                        _si += 1
+                    _ctcl = _sh[_si] if need_ctc else None
                     _sub = _ce * (_wf / K)
                     if need_aux:
                         _at = aux_tgt[_s:_e]
@@ -2947,6 +3116,17 @@ def main():
                     if need_gdcm and _gd is not None:
                         _sub = _sub + args.gdcm_weight * _gd * (_wf / K)
                         _gdcm_acc = _gdcm_acc + _gd.detach().float() * _wf
+                    if need_mtp:
+                        _mtpl = net.mtp_loss(_h, _tg)
+                        _sub = _sub + args.mtp_weight * _mtpl * (_wf / K)
+                        _mtp_acc = _mtp_acc + _mtpl.detach().float() * _wf
+                    if need_pos:
+                        _posl = net.pos_loss(_h, _tg)
+                        _sub = _sub + args.pos_weight * _posl * (_wf / K)
+                        _pos_acc = _pos_acc + _posl.detach().float() * _wf
+                    if need_ctc and _ctcl is not None:
+                        _sub = _sub + args.ctc_weight * _ctcl * (_wf / K)
+                        _ctc_acc = _ctc_acc + _ctcl.detach().float() * _wf
                 scaler.scale(_sub).backward()
                 _loss_acc = _loss_acc + _sub.detach().float()
             loss = _loss_acc
@@ -2954,6 +3134,9 @@ def main():
             cterm = _coord_acc
             s18term = _s18_acc
             gterm = _gdcm_acc
+            mtpterm = _mtp_acc
+            posterm = _pos_acc
+            ctcterm = _ctc_acc
         else:
             with torch.amp.autocast('cuda', enabled=amp, dtype=amp_dtype):
                 shared_out = net.loss_shared(
@@ -2963,18 +3146,22 @@ def main():
                     tok_dropout=args.tok_dropout,
                     content_ids=CONTENT_IDS,
                     need_aux=need_aux, need_coord=need_coord,
-                    augment=aug, return_hidden=need_s18,
-                    return_logits=need_jsd, need_gdcm=need_gdcm)
+                    augment=aug, return_hidden=need_hidden,
+                    return_logits=need_jsd, need_gdcm=need_gdcm,
+                    need_ctc=need_ctc)
                 ce_loss, apred_shared, xc_shared = (
                     shared_out[0], shared_out[1], shared_out[2])
                 _si = 3
-                h_shared = shared_out[_si] if need_s18 else None
-                if need_s18:
+                h_shared = shared_out[_si] if need_hidden else None
+                if need_hidden:
                     _si += 1
                 logits_shared = shared_out[_si] if need_jsd else None
                 if need_jsd:
                     _si += 1
                 gdcm_shared = shared_out[_si] if need_gdcm else None
+                if need_gdcm:
+                    _si += 1
+                ctc_shared = shared_out[_si] if need_ctc else None
                 loss = ce_loss / K
                 s18term = None
                 if need_s18:
@@ -2985,6 +3172,18 @@ def main():
                 if need_gdcm and gdcm_shared is not None:
                     gterm = gdcm_shared
                     loss = loss + args.gdcm_weight * gterm / K
+                mtpterm = None
+                if need_mtp:
+                    mtpterm = net.mtp_loss(h_shared, tgt)
+                    loss = loss + args.mtp_weight * mtpterm / K
+                posterm = None
+                if need_pos:
+                    posterm = net.pos_loss(h_shared, tgt)
+                    loss = loss + args.pos_weight * posterm / K
+                ctcterm = None
+                if need_ctc and ctc_shared is not None:
+                    ctcterm = ctc_shared
+                    loss = loss + args.ctc_weight * ctcterm / K
                 jterm = None
                 if need_jsd and clean_imgs_jsd is not None:
                     b_jsd = clean_imgs_jsd.shape[0]
@@ -3118,6 +3317,12 @@ def main():
                 msg += ' s18 %.4f' % float(s18term.item())
             if gterm is not None:
                 msg += ' gdcm %.4f' % float(gterm.item())
+            if mtpterm is not None:
+                msg += ' mtp %.4f' % float(mtpterm.item())
+            if posterm is not None:
+                msg += ' pos %.4f' % float(posterm.item())
+            if ctcterm is not None:
+                msg += ' ctc %.4f' % float(ctcterm.item())
             if aug is not None:
                 msg += ' aug'
             _res, _alc = cuda_mem_stats(device)

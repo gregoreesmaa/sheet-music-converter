@@ -110,6 +110,219 @@ class TestStaffUNet2DModel(unittest.TestCase):
         self.assertEqual(fast_metrics, {})
         self.assertAlmostEqual(float(fast_loss.item()), float(loss.item()), places=6)
 
+    def test_strip_conv_forward_backward_and_warmstart_identity(self):
+        torch.manual_seed(0)
+        base = su.StaffUNet2D(in_channels=3, base_channels=16, out_stride=2, strip_conv=False).eval()
+        strip = su.StaffUNet2D(in_channels=3, base_channels=16, out_stride=2, strip_conv=True).eval()
+
+        # Warm-start strip_conv=True from a strip_conv=False state_dict.
+        incompat = strip.load_state_dict(base.state_dict(), strict=False)
+        self.assertEqual(incompat.unexpected_keys, [])
+        self.assertGreater(len(incompat.missing_keys), 0)
+        for k in incompat.missing_keys:
+            self.assertTrue(
+                k.startswith("strip_dec2.") or k.startswith("strip_dec1."),
+                f"unexpected missing key: {k}",
+            )
+
+        x = torch.randn(2, 3, 128, 96)
+        with torch.no_grad():
+            y_base = base(x)
+            y_strip = strip(x)
+        self.assertEqual(tuple(y_strip.shape), (2, 4, 64, 48))
+        # Exact zero-init residual gate identity at step 0.
+        self.assertTrue(
+            torch.equal(y_base, y_strip),
+            f"step-0 warm-start max diff={(y_base - y_strip).abs().max().item()}",
+        )
+
+        # Forward + backward shapes & finite gradients (including strip gate gamma).
+        strip.train()
+        out = strip(x)
+        tgt = torch.zeros(2, 4, 64, 48)
+        tgt[:, 0, 20:30, 4:44] = 1.0
+        tgt[:, 1, 25, 4:44] = 1.0
+        loss, _ = su.StaffUNetLoss()(out, tgt)
+        self.assertTrue(torch.isfinite(loss))
+        loss.backward()
+        self.assertIsNotNone(strip.strip_dec2.gamma.grad)
+        self.assertIsNotNone(strip.strip_dec1.gamma.grad)
+        self.assertTrue(torch.isfinite(strip.strip_dec2.gamma.grad).all())
+        self.assertTrue(torch.isfinite(strip.strip_dec1.gamma.grad).all())
+        self.assertGreater(float(strip.strip_dec2.gamma.grad.abs().sum()), 0.0)
+        self.assertGreater(float(strip.strip_dec1.gamma.grad.abs().sum()), 0.0)
+
+        # Checkpoint metadata roundtrip via load_staff_unet2d and warm-start via train_staff_unet2d.
+        with tempfile.TemporaryDirectory() as td:
+            td_path = Path(td)
+            Image.new("RGB", (256, 320), color=(250, 248, 242)).save(td_path / "p0.png")
+            manifest = td_path / "manifest.jsonl"
+            manifest.write_text(
+                json.dumps(
+                    {
+                        "image": "p0.png",
+                        "staves": [{"y_center": 120.0, "sp": 8.0, "x0": 20.0, "x1": 236.0, "system_id": 0}],
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            base_ckpt = su.train_staff_unet2d(
+                manifest=manifest,
+                out_dir=td_path / "base",
+                epochs=1,
+                batch_size=1,
+                target_h=128,
+                target_w=96,
+                base_channels=16,
+                device="cpu",
+                strip_conv=False,
+            )
+            ws_ckpt = su.train_staff_unet2d(
+                manifest=manifest,
+                out_dir=td_path / "ws_strip",
+                epochs=1,
+                batch_size=1,
+                target_h=128,
+                target_w=96,
+                base_channels=16,
+                device="cpu",
+                init_from=base_ckpt,
+                strip_conv=True,
+                cldice_weight=0.2,
+            )
+            loaded, meta = su.load_staff_unet2d(ws_ckpt, device="cpu")
+            self.assertTrue(meta["strip_conv"])
+            self.assertTrue(loaded.use_strip_conv)
+            self.assertIsNotNone(loaded.strip_dec2)
+            self.assertIsNotNone(loaded.strip_dec1)
+
+    def test_soft_staff_cldice_loss_continuity_and_gradients(self):
+        # 5-line horizontal staff target (1-px thick lines at rows 10, 14, 18, 22, 26).
+        target = torch.zeros(1, 40, 80, dtype=torch.float32)
+        for y in (10, 14, 18, 22, 26):
+            target[0, y, 6:74] = 1.0
+
+        # Continuous prediction vs broken prediction (20-px horizontal gap in the middle).
+        pred_cont = torch.full_like(target, 0.02)
+        for y in (10, 14, 18, 22, 26):
+            pred_cont[0, y, 6:74] = 0.95
+
+        pred_broken = pred_cont.clone()
+        pred_broken[0, :, 30:50] = 0.02
+
+        pred_cont.requires_grad_(True)
+        pred_broken.requires_grad_(True)
+
+        loss_cont = su.soft_staff_cldice_loss(pred_cont, target)
+        loss_broken = su.soft_staff_cldice_loss(pred_broken, target)
+
+        self.assertTrue(torch.isfinite(loss_cont))
+        self.assertTrue(torch.isfinite(loss_broken))
+        self.assertLess(
+            float(loss_cont.item()),
+            float(loss_broken.item()),
+            f"continuous ({loss_cont.item():.4f}) should have lower clDice loss than broken ({loss_broken.item():.4f})",
+        )
+
+        loss_broken.backward()
+        self.assertIsNotNone(pred_broken.grad)
+        self.assertTrue(torch.isfinite(pred_broken.grad).all())
+        # Gap pixels on the staff lines must receive a direct negative gradient (pushing probs up).
+        gap_grad = pred_broken.grad[0, [10, 14, 18, 22, 26], 30:50]
+        self.assertLess(float(gap_grad.mean().item()), 0.0)
+
+        # Empty target + empty pred stays finite (no 0/0 NaN).
+        empty_loss = su.soft_staff_cldice_loss(torch.zeros_like(target), torch.zeros_like(target))
+        self.assertTrue(torch.isfinite(empty_loss))
+
+        # StaffUNetLoss wiring: default cldice_weight=0.0 omits loss_cldice; >0.0 adds it cleanly.
+        logits = torch.randn(2, 4, 32, 48, requires_grad=True)
+        tgt4 = torch.zeros(2, 4, 32, 48)
+        tgt4[:, 0, 10, 4:44] = 1.0
+        tgt4[:, 1, 10, 4:44] = 1.0
+        l0, m0 = su.StaffUNetLoss(cldice_weight=0.0)(logits, tgt4)
+        l1, m1 = su.StaffUNetLoss(cldice_weight=0.25)(logits, tgt4)
+        self.assertNotIn("loss_cldice", m0)
+        self.assertIn("loss_cldice", m1)
+        self.assertTrue(torch.isfinite(l1))
+        self.assertGreater(float(l1.item()), float(l0.item()))
+        l1.backward()
+        self.assertTrue(torch.isfinite(logits.grad).all())
+
+    def test_academic_losses_wiring_finite_loss_and_gradients(self):
+        torch.manual_seed(0)
+        preds = torch.randn(2, 4, 64, 48, requires_grad=True)
+        tgt = torch.zeros(2, 4, 64, 48)
+        tgt[:, 0, [14, 18, 22, 26, 30], 4:44] = 1.0
+        tgt[:, 1, 22, 4:44] = 1.0
+        tgt[:, 2, 12:33, 4:44] = 1.0
+        tgt[:, 3, 12:33, 4:44] = 1.5
+
+        crit_base = su.StaffUNetLoss(sp_mode="log_hm")
+        crit_acad = su.StaffUNetLoss(
+            sp_mode="log_hm",
+            srl_weight=0.25,
+            silog_weight=0.20,
+            bdou_weight=0.15,
+        )
+        l_base, m_base = crit_base(preds, tgt)
+        self.assertNotIn("loss_srl", m_base)
+        self.assertNotIn("loss_silog", m_base)
+        self.assertNotIn("loss_bdou", m_base)
+
+        l_acad, m_acad = crit_acad(preds, tgt)
+        self.assertTrue(torch.isfinite(l_acad))
+        for k in ("loss_srl", "loss_silog", "loss_bdou"):
+            self.assertIn(k, m_acad)
+            self.assertTrue(math.isfinite(m_acad[k]), f"non-finite {k}={m_acad[k]}")
+        self.assertGreater(float(l_acad.item()), float(l_base.item()))
+
+        l_acad.backward()
+        self.assertIsNotNone(preds.grad)
+        self.assertTrue(torch.isfinite(preds.grad).all())
+        self.assertGreater(float(preds.grad.abs().sum()), 0.0)
+
+        # Empty target batch must still yield finite loss (no 0/0 NaN).
+        empty_loss, _ = crit_acad(preds.detach(), torch.zeros_like(tgt))
+        self.assertTrue(torch.isfinite(empty_loss))
+
+    def test_efdmix_eval_identity_legacy_strict_load_and_train_backward(self):
+        torch.manual_seed(0)
+        legacy = su.StaffUNet2D(in_channels=3, base_channels=16, out_stride=2, efdm_prob=0.0).eval()
+        efdm = su.StaffUNet2D(in_channels=3, base_channels=16, out_stride=2, efdm_prob=0.5).eval()
+
+        # Zero extra parameters: legacy state_dict loads with strict=True.
+        self.assertEqual(legacy.num_parameters(), efdm.num_parameters())
+        efdm.load_state_dict(legacy.state_dict(), strict=True)
+
+        x = torch.randn(2, 3, 128, 96)
+        with torch.no_grad():
+            y_legacy = legacy(x)
+            y_efdm = efdm(x)
+        self.assertTrue(
+            torch.equal(y_legacy, y_efdm),
+            f"EFDMix eval() should be strict identity, max diff={(y_legacy - y_efdm).abs().max().item()}",
+        )
+
+        # In train() mode, forward + backward stay finite and produce non-zero gradients.
+        efdm.train()
+        out = efdm(x)
+        self.assertEqual(tuple(out.shape), (2, 4, 64, 48))
+        tgt = torch.zeros(2, 4, 64, 48)
+        tgt[:, 0, 20:30, 4:44] = 1.0
+        tgt[:, 1, 25, 4:44] = 1.0
+        tgt[:, 2, 18:32, 4:44] = 1.0
+        tgt[:, 3, 18:32, 4:44] = 0.08
+        loss, _ = su.StaffUNetLoss(srl_weight=0.2, silog_weight=0.1, bdou_weight=0.1)(out, tgt)
+        self.assertTrue(torch.isfinite(loss))
+        loss.backward()
+        grad_norm = sum(float(p.grad.norm()) for p in efdm.parameters() if p.grad is not None)
+        self.assertGreater(grad_norm, 0.0)
+        for p in efdm.parameters():
+            if p.grad is not None:
+                self.assertTrue(torch.isfinite(p.grad).all())
+
     def test_onnx_export(self):
         import onnx
 
@@ -605,6 +818,50 @@ class TestTrainingSmoke(unittest.TestCase):
                 if not torch.equal(xa, x_ref):
                     diffs += 1
             self.assertGreater(diffs, 0, "clean_frac=0.0 should apply photo/geometric augmentations")
+
+    def test_train_smoke_with_academic_losses_efdm_and_fourier_hw(self):
+        with tempfile.TemporaryDirectory() as td:
+            td_path = Path(td)
+            Image.new("RGB", (256, 320), color=(250, 248, 242)).save(td_path / "p0.png")
+            Image.new("RGB", (256, 320), color=(244, 240, 230)).save(td_path / "p1.png")
+            unlab_dir = td_path / "unlabeled_hw"
+            unlab_dir.mkdir()
+            Image.new("RGB", (256, 320), color=(215, 200, 175)).save(unlab_dir / "hw0.png")
+            manifest = td_path / "manifest.jsonl"
+            rows = [
+                {
+                    "image": "p0.png",
+                    "staves": [{"y_center": 120.0, "sp": 8.0, "x0": 20.0, "x1": 236.0, "system_id": 0}],
+                },
+                {
+                    "image": "p1.png",
+                    "staves": [{"y_center": 140.0, "sp": 8.0, "x0": 20.0, "x1": 236.0, "system_id": 0}],
+                },
+            ]
+            manifest.write_text("\n".join(json.dumps(r) for r in rows) + "\n", encoding="utf-8")
+
+            ckpt = su.train_staff_unet2d(
+                manifest=manifest,
+                out_dir=td_path / "ckpt_acad",
+                epochs=1,
+                batch_size=2,
+                target_h=128,
+                target_w=96,
+                base_channels=16,
+                device="cpu",
+                sp_mode="log_hm",
+                clean_frac=0.0,
+                srl_weight=0.2,
+                silog_weight=0.1,
+                bdou_weight=0.1,
+                efdm_prob=0.5,
+                fourier_hw_prob=1.0,
+                unlabeled_dirs=str(unlab_dir),
+            )
+            self.assertTrue(ckpt.exists())
+            loaded, _meta = su.load_staff_unet2d(ckpt, device="cpu")
+            self.assertIsNone(loaded.efdm1)
+            self.assertIsNone(loaded.efdm2)
 
 
 if __name__ == "__main__":

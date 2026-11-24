@@ -50,6 +50,7 @@ def main() -> None:
     ap.add_argument("--page-w", type=int, default=1320)
     ap.add_argument("--page-h", type=int, default=1760)
     ap.add_argument("--seed", type=int, default=2026)
+    ap.add_argument("--prefix", type=str, default="", help="Optional style-name prefix filter (e.g. 'wild_')")
     args = ap.parse_args()
 
     import styles as st
@@ -64,6 +65,8 @@ def main() -> None:
         score_candidates.append(str(p))
 
     all_styles = st.list_styles()
+    if args.prefix:
+        all_styles = [s for s in all_styles if s.startswith(args.prefix)]
     rng = random.Random(args.seed)
 
     jobs = []

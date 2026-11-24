@@ -29,8 +29,10 @@ tests hermetic and is pinned by ``test_grammar.py``.
 
 from __future__ import annotations
 
+from dataclasses import dataclass, field
 import sys
 from pathlib import Path
+from typing import Sequence
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import data  # noqa: E402
@@ -44,6 +46,9 @@ from PIL import Image  # noqa: E402
 
 __all__ = [
     'MAX_VOICE',
+    'ScoreContext',
+    'propagate_across_systems',
+    'stitch_multipage_work',
     'split_measures',
     'join_measures',
     'fallback_repair',
@@ -604,3 +609,601 @@ def decode_multi_staff_system(net, page_img, system_staves_lines,
     return merge_chunk_streams(
         chunk_streams, chunk_staff_counts=chunk_staff_counts,
         max_voice=MAX_VOICE)
+
+
+# ---------------------------------------------------------------------------
+# Multi-system & multi-page musical state carryforward (ScoreContext).
+# ---------------------------------------------------------------------------
+
+_ALTER_SUFFIX = {
+    'a-2': 'bb',
+    'a-1': 'b',
+    'a1': '#',
+    'a2': 'x',
+}
+
+_NOTE_TAIL_NON_MOD = (
+    grammar.DURATIONS | grammar.STEPS | grammar.OCTAVES
+    | grammar.CLEFS | grammar.KEYS | grammar.TIMES | grammar.VOICES
+    | grammar.DYNS | grammar.HAIRS | grammar.BAR_LEFT | grammar.BAR_LIKES
+    | grammar.TUPLET_STARTS
+    | frozenset((grammar.REST, grammar.BAR_REST, grammar.CHORD,
+                 grammar.GRACE, grammar.TUPLET_STOP))
+)
+
+
+def _is_header_tok(tok: str) -> bool:
+    return (tok.startswith('clef-')
+            or tok.startswith('key')
+            or tok.startswith('time-'))
+
+
+def _split_head_body_toks(toks: Sequence[str]) -> tuple[list[str], list[str]]:
+    toks_list = list(toks)
+    i = 0
+    while i < len(toks_list) and _is_header_tok(toks_list[i]):
+        i += 1
+    return toks_list[:i], toks_list[i:]
+
+
+def _as_tokens(stream: str | Sequence[str]) -> list[str]:
+    if isinstance(stream, str):
+        return stream.split()
+    return list(stream)
+
+
+def _parse_header_slots(head_toks: Sequence[str]) -> tuple[list[str], list[str], list[str]]:
+    clefs: list[str] = []
+    keys: list[str] = []
+    times: list[str] = []
+    for t in head_toks:
+        if t.startswith('clef-'):
+            clefs.append(t)
+        elif t.startswith('key'):
+            keys.append(t)
+        elif t.startswith('time-'):
+            times.append(t)
+    return clefs, keys, times
+
+
+@dataclass
+class ScoreContext:
+    """Running musical state carried across systems and page boundaries.
+
+    Tracks per-staff headers (0-based staff index -> bekern token) and
+    cross-boundary musical spans so multi-system pages and multi-page
+    works preserve clefs, key/time signatures, measure numbering, voice
+    counts, pickups, ties, slurs, hairpins, and repeat/volta state.
+
+    ``open_ties`` is keyed by ``(staff, voice, pitch)`` where ``staff``
+    is 0-based, ``voice`` is 1-based, and ``pitch`` is canonical (e.g.
+    ``'C4'``, ``'F#4'``, ``'Bb3'``).
+    """
+
+    clef: dict[int, str] = field(default_factory=dict)
+    key_sig: dict[int, str] = field(default_factory=dict)
+    time_sig: dict[int, str] = field(default_factory=dict)
+    active_voices: int = 0
+    measure_index: int = 0
+    in_pickup: bool = False
+    open_ties: dict[tuple[int, int, str], int] = field(default_factory=dict)
+    open_slurs: dict[tuple[int, int], int] = field(default_factory=dict)
+    open_hairpins: dict[int, str] = field(default_factory=dict)
+    open_volta: str | None = None
+    emitted_header: bool = False
+
+    def clone(self) -> ScoreContext:
+        """Return an independent deep copy of this context."""
+        return ScoreContext(
+            clef=dict(self.clef),
+            key_sig=dict(self.key_sig),
+            time_sig=dict(self.time_sig),
+            active_voices=self.active_voices,
+            measure_index=self.measure_index,
+            in_pickup=self.in_pickup,
+            open_ties=dict(self.open_ties),
+            open_slurs=dict(self.open_slurs),
+            open_hairpins=dict(self.open_hairpins),
+            open_volta=self.open_volta,
+            emitted_header=self.emitted_header,
+        )
+
+    @property
+    def staff_count(self) -> int:
+        """Number of staves currently tracked by header slots."""
+        best = 0
+        for d in (self.clef, self.key_sig, self.time_sig):
+            if d:
+                best = max(best, max(d.keys()) + 1)
+        return best
+
+    def staff_for_voice(self, voice: int) -> int:
+        """Map a 1-based voice index to a 0-based staff index."""
+        n = self.staff_count
+        if n <= 1:
+            return 0
+        return min(max(0, voice - 1), n - 1)
+
+    def header_tokens(self) -> list[str]:
+        """Emit canonical per-staff leading header tokens from current state."""
+        n = self.staff_count
+        if n == 0:
+            return []
+        out: list[str] = []
+        for s in range(n):
+            if s in self.clef:
+                out.append(self.clef[s])
+            if s in self.key_sig:
+                out.append(self.key_sig[s])
+            if s in self.time_sig:
+                out.append(self.time_sig[s])
+        return out
+
+
+def _active_barlen(ctx: ScoreContext) -> float | None:
+    ts = ctx.time_sig.get(0)
+    if ts is None and ctx.time_sig:
+        ts = ctx.time_sig[min(ctx.time_sig.keys())]
+    if ts is None:
+        return None
+    return grammar._beats_of(ts)
+
+
+def _init_slots_from_header(
+    ctx: ScoreContext,
+    clefs: list[str],
+    keys: list[str],
+    times: list[str],
+) -> None:
+    """Populate initial per-staff header maps (incoming overrides defaults)."""
+    for idx, tok in enumerate(clefs):
+        ctx.clef[idx] = tok
+    if len(keys) == 1 and len(ctx.key_sig) > 1:
+        for s in list(ctx.key_sig.keys()):
+            ctx.key_sig[s] = keys[0]
+    else:
+        for idx, tok in enumerate(keys):
+            ctx.key_sig[idx] = tok
+    if len(times) == 1 and len(ctx.time_sig) > 1:
+        for s in list(ctx.time_sig.keys()):
+            ctx.time_sig[s] = times[0]
+    else:
+        for idx, tok in enumerate(times):
+            ctx.time_sig[idx] = tok
+
+
+def _diff_staff_map(
+    active: dict[int, str],
+    incoming: list[str],
+    *,
+    broadcast_single: bool = False,
+) -> list[str]:
+    """Diff incoming per-staff header tokens against ``active``, updating in place.
+
+    Omitted courtesy headers (``incoming == []``) preserve ``active``
+    untouched and emit ``[]``. Genuine changes update ``active`` and
+    return deduplicated changed tokens in order. When
+    ``broadcast_single=True`` (used for shared key/time signatures) and
+    a single incoming token arrives on a multi-staff score where all
+    staves previously shared one value, all tracked staff slots update
+    together so subsequent full-staff courtesy headers stay silent.
+    """
+    if not incoming:
+        return []
+    changed: list[str] = []
+    if (broadcast_single and len(incoming) == 1 and len(active) > 1
+            and len(set(active.values())) == 1):
+        tok = incoming[0]
+        prev = next(iter(active.values()))
+        if tok != prev:
+            for s in list(active.keys()):
+                active[s] = tok
+            changed.append(tok)
+        return changed
+    for idx, tok in enumerate(incoming):
+        if idx in active:
+            if active[idx] != tok:
+                active[idx] = tok
+                if tok not in changed:
+                    changed.append(tok)
+        else:
+            prev_vals = [active[k] for k in sorted(active.keys())]
+            prev = prev_vals[-1] if prev_vals else None
+            active[idx] = tok
+            if prev is None:
+                if tok not in changed:
+                    changed.append(tok)
+            elif tok != prev and tok not in changed:
+                changed.append(tok)
+    return changed
+
+
+def _match_open_tie(
+    open_ties: dict[tuple[int, int, str], int],
+    staff: int,
+    voice: int,
+    pitch: str,
+) -> tuple[int, int, str] | None:
+    exact = (staff, voice, pitch)
+    if open_ties.get(exact, 0) > 0:
+        return exact
+    for k, cnt in open_ties.items():
+        if cnt > 0 and k[1] == voice and k[2] == pitch:
+            return k
+    pitch_matches = [k for k, cnt in open_ties.items() if cnt > 0 and k[2] == pitch]
+    if len(pitch_matches) == 1:
+        return pitch_matches[0]
+    return None
+
+
+def _pop_open_tie(
+    open_ties: dict[tuple[int, int, str], int],
+    key: tuple[int, int, str],
+) -> None:
+    cnt = open_ties.get(key, 0)
+    if cnt <= 1:
+        open_ties.pop(key, None)
+    else:
+        open_ties[key] = cnt - 1
+
+
+def _is_tail_mod_tok(tok: str) -> bool:
+    if tok in _NOTE_TAIL_NON_MOD:
+        return False
+    return not (
+        tok.startswith('clef-')
+        or tok.startswith('key')
+        or tok.startswith('time-')
+        or tok.startswith('voice-')
+        or tok.startswith('dyn-')
+        or tok.startswith('hairpin-')
+        or tok.startswith('tuplet-')
+        or tok.startswith('bar')
+        or tok.startswith('volta-')
+    )
+
+
+def _process_system_body(
+    body: list[str],
+    ctx: ScoreContext,
+) -> list[str]:
+    """Walk one system body, updating ``ctx`` and resolving cross-system ties."""
+    out: list[str] = []
+    carried_ties = bool(ctx.open_ties)
+    cur_voice = 1
+    cur_measure_in_sys = 0
+    voice_cursor: dict[int, float] = {1: 0.0}
+    voice_last_onset: dict[int, float] = {}
+    measure_has_content = False
+    pending_chord = False
+    pending_grace = False
+
+    i = 0
+    n = len(body)
+    while i < n:
+        t = body[i]
+
+        # Closing barlines advance measure_index and reset per-measure cursors.
+        if t == grammar.BAR or t in grammar.BAR_RIGHT:
+            out.append(t)
+            if t == 'bar-repeat-right':
+                ctx.open_volta = None
+            ctx.measure_index += 1
+            ctx.in_pickup = False
+            cur_measure_in_sys += 1
+            cur_voice = 1
+            voice_cursor = {1: 0.0}
+            voice_last_onset = {}
+            measure_has_content = False
+            pending_chord = False
+            pending_grace = False
+            i += 1
+            continue
+
+        if t == 'bar-repeat-left':
+            ctx.open_volta = 'repeat-left'
+            out.append(t)
+            i += 1
+            continue
+
+        if t.startswith('volta-'):
+            ctx.open_volta = None if t.endswith('-stop') else t
+            out.append(t)
+            i += 1
+            continue
+
+        if t.startswith('voice-'):
+            try:
+                v = int(t.split('-')[1])
+            except (IndexError, ValueError):
+                v = cur_voice
+            if v > 0:
+                cur_voice = v
+                ctx.active_voices = max(ctx.active_voices, v)
+                voice_cursor.setdefault(v, 0.0)
+            out.append(t)
+            i += 1
+            continue
+
+        if t.startswith('clef-'):
+            s_idx = ctx.staff_for_voice(cur_voice)
+            ctx.clef[s_idx] = t
+            out.append(t)
+            i += 1
+            continue
+
+        if t.startswith('key'):
+            if ctx.key_sig:
+                for s in list(ctx.key_sig.keys()):
+                    ctx.key_sig[s] = t
+            else:
+                ctx.key_sig[0] = t
+            out.append(t)
+            i += 1
+            continue
+
+        if t.startswith('time-'):
+            if ctx.time_sig:
+                for s in list(ctx.time_sig.keys()):
+                    ctx.time_sig[s] = t
+            else:
+                ctx.time_sig[0] = t
+            out.append(t)
+            i += 1
+            continue
+
+        if t.startswith('hairpin-'):
+            if t == 'hairpin-cresc-start':
+                ctx.open_hairpins[cur_voice] = 'cresc'
+            elif t == 'hairpin-dim-start':
+                ctx.open_hairpins[cur_voice] = 'dim'
+            elif t == 'hairpin-stop':
+                ctx.open_hairpins.pop(cur_voice, None)
+            out.append(t)
+            i += 1
+            continue
+
+        if t == grammar.CHORD:
+            pending_chord = True
+            out.append(t)
+            i += 1
+            continue
+
+        if t == grammar.GRACE:
+            pending_grace = True
+            out.append(t)
+            i += 1
+            continue
+
+        if t == grammar.BAR_REST:
+            measure_has_content = True
+            ctx.active_voices = max(ctx.active_voices, cur_voice)
+            barlen = _active_barlen(ctx)
+            if barlen is not None:
+                voice_cursor[cur_voice] = max(
+                    voice_cursor.get(cur_voice, 0.0), barlen)
+            pending_chord = False
+            pending_grace = False
+            out.append(t)
+            i += 1
+            continue
+
+        # Plain rest: rest <dur> [dot*] [mods*]
+        if t == grammar.REST and i + 1 < n and body[i + 1] in grammar.DURATIONS:
+            measure_has_content = True
+            ctx.active_voices = max(ctx.active_voices, cur_voice)
+            staff = ctx.staff_for_voice(cur_voice)
+            dur_tok = body[i + 1]
+            out.append(t)
+            out.append(dur_tok)
+            i += 2
+            dots = 0
+            while i < n and _is_tail_mod_tok(body[i]):
+                tt = body[i]
+                if tt == grammar.DOT:
+                    dots += 1
+                elif tt == 'slur-start':
+                    ctx.open_slurs[(staff, cur_voice)] = (
+                        ctx.open_slurs.get((staff, cur_voice), 0) + 1)
+                elif tt == 'slur-stop':
+                    d = ctx.open_slurs.get((staff, cur_voice), 0)
+                    if d <= 1:
+                        ctx.open_slurs.pop((staff, cur_voice), None)
+                    else:
+                        ctx.open_slurs[(staff, cur_voice)] = d - 1
+                out.append(tt)
+                i += 1
+            if not pending_grace:
+                base = grammar._WRITTEN.get(dur_tok, 0.0)
+                val = base * (2.0 - 2.0 ** (-dots))
+                voice_cursor[cur_voice] = voice_cursor.get(cur_voice, 0.0) + val
+            pending_chord = False
+            pending_grace = False
+            continue
+
+        # Pitched note: <dur> <step> <octave> [tail...]
+        if (t in grammar.DURATIONS and i + 2 < n
+                and body[i + 1] in grammar.STEPS
+                and body[i + 2] in grammar.OCTAVES):
+            measure_has_content = True
+            ctx.active_voices = max(ctx.active_voices, cur_voice)
+            staff = ctx.staff_for_voice(cur_voice)
+            dur_tok, step_tok, oct_tok = t, body[i + 1], body[i + 2]
+            i += 3
+            tail: list[str] = []
+            alter_tok = None
+            dots = 0
+            has_tie_start = False
+            has_tie_stop = False
+            while i < n and _is_tail_mod_tok(body[i]):
+                tt = body[i]
+                tail.append(tt)
+                if tt in _ALTER_SUFFIX and alter_tok is None:
+                    alter_tok = tt
+                elif tt == grammar.DOT:
+                    dots += 1
+                elif tt == grammar.TIE_START:
+                    has_tie_start = True
+                elif tt == grammar.TIE_STOP:
+                    has_tie_stop = True
+                elif tt == 'slur-start':
+                    ctx.open_slurs[(staff, cur_voice)] = (
+                        ctx.open_slurs.get((staff, cur_voice), 0) + 1)
+                elif tt == 'slur-stop':
+                    d = ctx.open_slurs.get((staff, cur_voice), 0)
+                    if d <= 1:
+                        ctx.open_slurs.pop((staff, cur_voice), None)
+                    else:
+                        ctx.open_slurs[(staff, cur_voice)] = d - 1
+                i += 1
+
+            pitch = '%s%s%s' % (
+                step_tok,
+                _ALTER_SUFFIX.get(alter_tok, '') if alter_tok else '',
+                oct_tok,
+            )
+            note_onset = (
+                voice_last_onset.get(cur_voice, 0.0)
+                if pending_chord
+                else voice_cursor.get(cur_voice, 0.0)
+            )
+            at_sys_start_onset = (
+                cur_measure_in_sys == 0 and note_onset == 0.0
+            )
+            matched_tie = _match_open_tie(ctx.open_ties, staff, cur_voice, pitch)
+            if has_tie_stop:
+                if matched_tie is not None:
+                    _pop_open_tie(ctx.open_ties, matched_tie)
+            elif carried_ties and at_sys_start_onset and matched_tie is not None:
+                # Cross-system / cross-page tie continuation where the new
+                # system omitted tie-stop: inject tie-stop so the carried
+                # tie closes cleanly rather than stranding an unclosed tie.
+                tail.append(grammar.TIE_STOP)
+                _pop_open_tie(ctx.open_ties, matched_tie)
+
+            if has_tie_start:
+                tkey = (staff, cur_voice, pitch)
+                ctx.open_ties[tkey] = ctx.open_ties.get(tkey, 0) + 1
+
+            out.append(dur_tok)
+            out.append(step_tok)
+            out.append(oct_tok)
+            out.extend(tail)
+
+            if not pending_chord:
+                voice_last_onset[cur_voice] = note_onset
+                if not pending_grace:
+                    base = grammar._WRITTEN.get(dur_tok, 0.0)
+                    val = base * (2.0 - 2.0 ** (-dots))
+                    voice_cursor[cur_voice] = note_onset + val
+            pending_chord = False
+            pending_grace = False
+            continue
+
+        out.append(t)
+        i += 1
+
+    if measure_has_content:
+        ctx.measure_index += 1
+        barlen = _active_barlen(ctx)
+        max_dur = max(voice_cursor.values(), default=0.0)
+        ctx.in_pickup = bool(
+            barlen is not None and 0.0 < max_dur < barlen - grammar._BAR_EPS)
+
+    return out
+
+
+def propagate_across_systems(
+    system_bekerns: Sequence[str | Sequence[str]],
+    init_ctx: ScoreContext | None = None,
+    *,
+    emit_header: bool | None = None,
+) -> tuple[str, ScoreContext]:
+    """Stitch system bekern streams while carrying musical state forward.
+
+    Parameters
+    ----------
+    system_bekerns:
+        Ordered sequence of system bekern streams (each a whitespace-separated
+        ``str`` or a sequence of token strings).
+    init_ctx:
+        Optional :class:`ScoreContext` carried from a preceding page or
+        section. Never mutated in place; a fresh updated copy is returned.
+    emit_header:
+        If ``None`` (default), emits the opening header on the first
+        non-empty system only when ``init_ctx`` has not already emitted one
+        (``not ctx.emitted_header``). Pass ``True`` to force emitting the
+        resolved leading header even when continuing from a prior page.
+
+    Returns
+    -------
+    ``(stitched_bekern, updated_ctx)``
+        Space-joined bekern string and updated :class:`ScoreContext`.
+    """
+    ctx = init_ctx.clone() if init_ctx is not None else ScoreContext()
+    should_emit_initial = (
+        (not ctx.emitted_header) if emit_header is None else bool(emit_header)
+    )
+    out_heads: list[str] = []
+    out_body: list[str] = []
+    had_nonempty_body = False
+
+    for raw in system_bekerns:
+        toks = _as_tokens(raw)
+        h, b = _split_head_body_toks(toks)
+        if not b:
+            continue
+        clefs, keys, times = _parse_header_slots(h)
+        if not had_nonempty_body and should_emit_initial:
+            had_nonempty_body = True
+            if ctx.staff_count == 0:
+                # Fresh start: preserve the exact token ordering of the
+                # first non-empty system's leading header.
+                _init_slots_from_header(ctx, clefs, keys, times)
+                out_heads = list(h)
+            else:
+                # Seeded init_ctx before page 1 (or forced standalone header):
+                # merge incoming header overrides onto carried defaults.
+                _init_slots_from_header(ctx, clefs, keys, times)
+                out_heads = ctx.header_tokens()
+            ctx.emitted_header = True
+        else:
+            had_nonempty_body = True
+            changed: list[str] = []
+            changed.extend(_diff_staff_map(ctx.clef, clefs, broadcast_single=False))
+            changed.extend(_diff_staff_map(ctx.key_sig, keys, broadcast_single=True))
+            changed.extend(_diff_staff_map(ctx.time_sig, times, broadcast_single=True))
+            out_body.extend(changed)
+        processed_b = _process_system_body(b, ctx)
+        out_body.extend(processed_b)
+
+    if not had_nonempty_body and system_bekerns:
+        first_h, _ = _split_head_body_toks(_as_tokens(system_bekerns[0]))
+        if first_h and should_emit_initial:
+            clefs, keys, times = _parse_header_slots(first_h)
+            _init_slots_from_header(ctx, clefs, keys, times)
+            out_heads = list(first_h)
+            ctx.emitted_header = True
+
+    stitched = out_heads + out_body
+    return ' '.join(stitched), ctx
+
+
+def stitch_multipage_work(
+    page_system_lists: Sequence[Sequence[str | Sequence[str]]],
+    init_ctx: ScoreContext | None = None,
+) -> tuple[str, ScoreContext]:
+    """Stitch a multi-page score (pages 1..K) sequentially with ``ScoreContext``.
+
+    Each element of ``page_system_lists`` is the ordered list of system
+    bekern streams for one page. Musical state (per-staff clefs, key/time
+    signatures, open ties/slurs/hairpins/voltas, measure index, active
+    voices) flows from page ``p`` into page ``p + 1``.
+    """
+    ctx = init_ctx.clone() if init_ctx is not None else ScoreContext()
+    page_chunks: list[str] = []
+    for page_systems in page_system_lists:
+        chunk, ctx = propagate_across_systems(page_systems, init_ctx=ctx)
+        if chunk:
+            page_chunks.append(chunk)
+    return ' '.join(page_chunks), ctx

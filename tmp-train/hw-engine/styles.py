@@ -36,6 +36,18 @@ NOTEHEAD_ARCHETYPES: tuple[str, ...] = (
     "compact",
     "heavy_wedge",
     "hollow_diamond",
+    "slim_oval",
+    "needle_slash",
+    "hairline_dash",
+    "vertical_tick",
+    "pinprick_dot",
+    "slim_diamond",
+    "boomerang_hook",
+    "open_loop",
+    "zigzag_fill",
+    "broad_nib_lozenge",
+    "ink_blot",
+    "chevron_wedge",
 )
 
 PAPER_TYPES: tuple[str, ...] = (
@@ -880,7 +892,7 @@ _NUMERIC_CLAMP_BOUNDS: dict[str, tuple[float, float]] = {
     "ink_var": (0.0, 0.55),
     "ink_pooling": (0.0, 0.75),
     "slant_deg": (-14.0, 18.0),
-    "notehead_scale": (0.65, 1.45),
+    "notehead_scale": (0.50, 1.45),
     "notehead_angle_deg": (-50.0, 10.0),
     "hollow_open_prob": (0.0, 1.0),
     "clef_ornate": (0.0, 1.0),
@@ -902,6 +914,8 @@ _NUMERIC_CLAMP_BOUNDS: dict[str, tuple[float, float]] = {
     "split_nib_prob": (0.0, 1.0),
     "rastrum_wobble": (0.0, 6.0),
     "stain_prob": (0.0, 1.0),
+    "notehead_aspect": (0.25, 2.20),
+    "notehead_fill_density": (0.25, 1.50),
 }
 
 _OPTIONAL_NUMERIC_DEFAULTS: dict[str, float] = {
@@ -909,6 +923,8 @@ _OPTIONAL_NUMERIC_DEFAULTS: dict[str, float] = {
     "split_nib_prob": 0.0,
     "rastrum_wobble": 0.0,
     "stain_prob": 0.0,
+    "notehead_aspect": 1.0,
+    "notehead_fill_density": 1.0,
 }
 
 _INTERPOLATABLE_NUMERIC_KEYS: tuple[str, ...] = tuple(_NUMERIC_CLAMP_BOUNDS.keys())
@@ -1008,12 +1024,32 @@ def _validate_and_normalize_style(name: str, spec: dict[str, Any]) -> dict[str, 
         raise ValueError(f"Style {name!r}.stroke_scale must be > 0")
     if not (0.0 < out["nib_min_ratio"] <= 1.0):
         raise ValueError(f"Style {name!r}.nib_min_ratio must be in (0, 1]")
+    if not (0.50 <= out["notehead_scale"] <= 1.45):
+        raise ValueError(
+            f"Style {name!r}.notehead_scale must be in [0.50, 1.45], got {out['notehead_scale']}"
+        )
+    if "notehead_aspect" in out and out["notehead_aspect"] is not None:
+        if not (0.25 <= out["notehead_aspect"] <= 2.20):
+            raise ValueError(
+                f"Style {name!r}.notehead_aspect must be in [0.25, 2.20], got {out['notehead_aspect']}"
+            )
+    if "notehead_fill_density" in out and out["notehead_fill_density"] is not None:
+        if not (0.25 <= out["notehead_fill_density"] <= 1.50):
+            raise ValueError(
+                f"Style {name!r}.notehead_fill_density must be in [0.25, 1.50], got {out['notehead_fill_density']}"
+            )
 
     for key, (lo, hi) in _NUMERIC_CLAMP_BOUNDS.items():
         if key in out and out[key] is not None:
             out[key] = float(np.clip(out[key], lo, hi))
 
     return out
+
+
+def validate_style(spec: dict[str, Any], name: Optional[str] = None) -> dict[str, Any]:
+    """Validate and normalize a style dict against required keys and parameter bounds."""
+    resolved_name = name if name is not None else str(spec.get("name", ""))
+    return _validate_and_normalize_style(resolved_name, spec)
 
 
 def register_style(
@@ -1299,6 +1335,21 @@ def sample_random_scribe(
         scribe["rastrum_wobble"] = float(np.clip(rng.uniform(0.0, 2.5), 0.0, 6.0))
     if "stain_prob" not in scribe:
         scribe["stain_prob"] = float(np.clip(rng.uniform(0.0, 0.30) if rng.random() < 0.35 else 0.0, 0.0, 1.0))
+
+    # Sample morphological notehead parameters & explore all 18 archetypes.
+    if base_style is None and j > 0.0 and rng.random() < 0.45:
+        scribe["notehead_archetype"] = str(NOTEHEAD_ARCHETYPES[int(rng.integers(0, len(NOTEHEAD_ARCHETYPES)))])
+    if "notehead_aspect" not in scribe:
+        u = float(rng.random())
+        if u < 0.28:
+            aspect = float(rng.uniform(0.28, 0.55))
+        elif u < 0.80:
+            aspect = float(rng.uniform(0.60, 1.30))
+        else:
+            aspect = float(rng.uniform(1.35, 2.05))
+        scribe["notehead_aspect"] = float(np.clip(aspect, 0.25, 2.20))
+    if "notehead_fill_density" not in scribe:
+        scribe["notehead_fill_density"] = float(np.clip(rng.uniform(0.30, 1.45), 0.25, 1.50))
 
     token = int(rng.integers(0, 16**6))
     scribe["name"] = f"sampled_scribe_{token:06x}"

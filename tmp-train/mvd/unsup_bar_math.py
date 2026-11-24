@@ -978,3 +978,418 @@ def run_bar_math_round(
     mean_loss = total_loss / max(1, ran)
     print(f"  [unsup-bar-math step {step}] ran_steps={ran}/{steps} accepted={mean_acc:.2%} mean_loss={mean_loss:.4f}", flush=True)
     return {"ran_steps": ran, "accepted_frac": mean_acc, "mean_loss": mean_loss}
+
+
+def _ids_to_tokens_flex(
+    seq_ids: Sequence[int],
+    id2tok: Union[Sequence[str], Dict[int, str]],
+    pad_id: int,
+    bos_id: int,
+    eos_id: int,
+) -> Tuple[List[str], List[int]]:
+    """Convert raw decoded IDs to ``(token_strings, trimmed_ids)`` for list or dict vocab."""
+    if isinstance(id2tok, dict):
+        toks: List[str] = []
+        trimmed_ids: List[int] = []
+        for raw_i in seq_ids:
+            i = int(raw_i)
+            if i == pad_id or i == bos_id:
+                continue
+            if i == eos_id:
+                trimmed_ids.append(eos_id)
+                break
+            tok = id2tok.get(i)
+            if tok is not None:
+                toks.append(str(tok))
+                trimmed_ids.append(i)
+        return toks, trimmed_ids
+    return _ids_to_tokens(seq_ids, id2tok, pad_id, bos_id, eos_id)
+
+
+def _score_visual(visual_scorer, strip: torch.Tensor, toks: Sequence[str]) -> float:
+    """Call optional ``visual_scorer`` with ``(strip, toks)`` (fallback ``(toks,)``)."""
+    if visual_scorer is None:
+        return 0.0
+    try:
+        return float(visual_scorer(strip, toks))
+    except TypeError:
+        return float(visual_scorer(toks))
+
+
+def grpo_bar_math_step(
+    model,
+    ref_model,
+    strips: torch.Tensor,
+    *,
+    mem_mask: Optional[torch.Tensor] = None,
+    id2tok: Optional[Union[Sequence[str], Dict[int, str]]] = None,
+    num_beams: int = 4,
+    kl_beta: float = 0.08,
+    max_len: int = 192,
+    visual_scorer=None,
+    w_bm: float = 0.75,
+    w_vis: float = 0.25,
+    w_deg: float = 0.50,
+) -> Tuple[torch.Tensor, Dict[str, Any]]:
+    """Verifier-guided Group Relative Policy Optimization (GRPO) step.
+
+    1. Samples ``K = num_beams`` candidate sequences per strip via
+       ``model.beam_search(..., beam=K, return_all=True)`` (falling back to
+       ``model.greedy_kv`` if ``beam_search`` is unavailable).
+    2. Scores each candidate ``i`` with::
+
+           r_i = w_bm * bar_math_ratio + w_vis * visual_score - w_deg * float(is_degenerate)
+
+    3. Computes group-relative advantages per strip::
+
+           A_i = (r_i - mean(r)) / (std(r) + 1e-6)
+
+       Strips with ``std(r) < 1e-4`` (flat reward groups) are skipped so they
+       do not inject gradient noise.
+    4. Computes length-normalized sequence log-probabilities under ``model``
+       (with grad) and frozen ``ref_model`` (no grad), returning::
+
+           loss = -(A_i.detach() * seq_logp_i).mean() + kl_beta * kl_token_mean
+
+    Returns:
+        ``(loss, stats)`` scalar loss tensor and monitoring dict.
+    """
+    device = strips.device
+    batch_size = int(strips.shape[0])
+    if batch_size == 0:
+        zero = torch.zeros((), device=device, dtype=torch.float32)
+        return zero, {
+            "batch_size": 0,
+            "num_beams": int(num_beams),
+            "active_strips": 0,
+            "active_frac": 0.0,
+            "active_indices": [],
+            "pg_loss": 0.0,
+            "kl_loss": 0.0,
+            "mean_reward": 0.0,
+            "mean_valid_bar_ratio": 0.0,
+            "degenerate_frac": 0.0,
+            "rewards": [],
+            "advantages": [],
+        }
+
+    if id2tok is None:
+        if _mvd_data is None:
+            raise ValueError("id2tok must be provided when data.VOCAB is unavailable")
+        vocab: Union[Sequence[str], Dict[int, str]] = _mvd_data.VOCAB
+    else:
+        vocab = id2tok
+
+    can_constrain = bool(
+        _mvd_data is not None
+        and not isinstance(vocab, dict)
+        and len(vocab) == len(_mvd_data.VOCAB)
+    )
+
+    k_req = max(1, int(num_beams))
+    was_training = model.training
+    with torch.no_grad():
+        model.eval()
+        beam_fn = getattr(model, "beam_search", None)
+        if k_req > 1 and callable(beam_fn):
+            cand_ids = beam_fn(
+                strips,
+                max_len=max_len,
+                constrain=can_constrain,
+                strict=False,
+                beam=k_req,
+                mem_mask=mem_mask,
+                return_all=True,
+            )  # [B, K, L]
+        else:
+            dec = model.greedy_kv(
+                strips,
+                max_len=max_len,
+                constrain=can_constrain,
+                mem_mask=mem_mask,
+            )  # [B, L]
+            cand_ids = dec.unsqueeze(1)  # [B, 1, L]
+        if cand_ids.ndim == 2:
+            cand_ids = cand_ids.unsqueeze(1)
+    model.train(was_training)
+
+    k_cands = int(cand_ids.shape[1])
+    active_indices: List[int] = []
+    flat_targets: List[List[int]] = []
+    flat_advantages: List[float] = []
+
+    all_rewards: List[List[float]] = []
+    all_advantages: List[Optional[List[float]]] = []
+    all_bm_ratios: List[float] = []
+    n_deg_total = 0
+    n_cands_total = batch_size * k_cands
+
+    for b in range(batch_size):
+        strip_rewards: List[float] = []
+        strip_targets: List[List[int]] = []
+
+        for k in range(k_cands):
+            toks, trimmed_ids = _ids_to_tokens_flex(
+                cand_ids[b, k].tolist(),
+                vocab,
+                model.pad_id,
+                model.bos_id,
+                model.eos_id,
+            )
+            res = score_bekern_bar_math(toks)
+            bm_ratio = float(res.valid_bar_ratio)
+            is_deg = bool(res.is_degenerate)
+            vis_score = _score_visual(visual_scorer, strips[b], toks)
+
+            r_i = (
+                float(w_bm) * bm_ratio
+                + float(w_vis) * vis_score
+                - float(w_deg) * float(is_deg)
+            )
+            strip_rewards.append(r_i)
+            strip_targets.append(trimmed_ids if trimmed_ids else [model.eos_id])
+            all_bm_ratios.append(bm_ratio)
+            if is_deg:
+                n_deg_total += 1
+
+        all_rewards.append(strip_rewards)
+        r_t = torch.tensor(strip_rewards, dtype=torch.float32)
+        r_mean = r_t.mean()
+        r_std = r_t.std(unbiased=False)
+
+        if float(r_std.item()) < 1e-4:
+            all_advantages.append(None)
+            continue
+
+        adv_t = (r_t - r_mean) / (r_std + 1e-6)
+        adv_list = [float(x) for x in adv_t.tolist()]
+        all_advantages.append(adv_list)
+        active_indices.append(b)
+        flat_targets.extend(strip_targets)
+        flat_advantages.extend(adv_list)
+
+    mean_reward = (
+        sum(sum(rs) for rs in all_rewards) / float(max(1, n_cands_total))
+    )
+    mean_bm_ratio = (
+        sum(all_bm_ratios) / float(max(1, len(all_bm_ratios)))
+    )
+    deg_frac = float(n_deg_total) / float(max(1, n_cands_total))
+
+    if not active_indices:
+        zero_loss = torch.zeros((), device=device, dtype=torch.float32)
+        return zero_loss, {
+            "batch_size": batch_size,
+            "num_beams": k_cands,
+            "active_strips": 0,
+            "active_frac": 0.0,
+            "active_indices": [],
+            "pg_loss": 0.0,
+            "kl_loss": 0.0,
+            "mean_reward": mean_reward,
+            "mean_valid_bar_ratio": mean_bm_ratio,
+            "degenerate_frac": deg_frac,
+            "rewards": all_rewards,
+            "advantages": all_advantages,
+        }
+
+    n_total = len(flat_targets)
+    max_t = max(len(t) for t in flat_targets)
+    tgt = torch.full((n_total, max_t), model.pad_id, dtype=torch.long, device=device)
+    for row_i, t_ids in enumerate(flat_targets):
+        tgt[row_i, : len(t_ids)] = torch.tensor(t_ids, dtype=torch.long, device=device)
+
+    idx_t = torch.tensor(active_indices, dtype=torch.long, device=device)
+    act_imgs = strips.index_select(0, idx_t).repeat_interleave(k_cands, dim=0)
+    act_mem_mask = (
+        mem_mask.index_select(0, idx_t).repeat_interleave(k_cands, dim=0)
+        if mem_mask is not None
+        else None
+    )
+
+    bos = torch.full((n_total, 1), model.bos_id, dtype=torch.long, device=device)
+    inp = torch.cat([bos, tgt[:, :-1]], dim=1)
+
+    # Differentiable student forward pass.
+    student_logits = model(act_imgs, inp, mem_mask=act_mem_mask)  # [N_total, T, V]
+
+    # Frozen reference model forward pass (no grad).
+    ref_was_training = ref_model.training
+    with torch.no_grad():
+        ref_model.eval()
+        ref_logits = ref_model(act_imgs, inp, mem_mask=act_mem_mask)
+    ref_model.train(ref_was_training)
+
+    log_p = F.log_softmax(student_logits.float(), dim=-1)
+    log_q = F.log_softmax(ref_logits.float(), dim=-1)
+
+    valid_mask = tgt != model.pad_id  # [N_total, T]
+    valid_f = valid_mask.to(log_p.dtype)
+    tok_counts = valid_f.sum(dim=1).clamp_min(1.0)  # [N_total]
+
+    safe_tgt = tgt.clamp(min=0, max=log_p.shape[-1] - 1)
+    tok_logp = log_p.gather(-1, safe_tgt.unsqueeze(-1)).squeeze(-1)  # [N_total, T]
+    seq_logp = (tok_logp * valid_f).sum(dim=1) / tok_counts  # [N_total]
+
+    adv_vec = torch.tensor(flat_advantages, device=device, dtype=seq_logp.dtype)
+    pg_loss = -(adv_vec.detach() * seq_logp).mean()
+
+    # Token-level KL(student || ref) over non-PAD target positions.
+    p = log_p.exp()
+    kl_tok = (p * (log_p - log_q)).sum(dim=-1).clamp_min(0.0)  # [N_total, T]
+    kl_token_mean = (kl_tok * valid_f).sum() / valid_f.sum().clamp_min(1.0)
+
+    total_loss = pg_loss + float(kl_beta) * kl_token_mean
+
+    stats = {
+        "batch_size": batch_size,
+        "num_beams": k_cands,
+        "active_strips": len(active_indices),
+        "active_frac": float(len(active_indices)) / float(batch_size),
+        "active_indices": active_indices,
+        "pg_loss": float(pg_loss.detach().item()),
+        "kl_loss": float(kl_token_mean.detach().item()),
+        "mean_reward": mean_reward,
+        "mean_valid_bar_ratio": mean_bm_ratio,
+        "degenerate_frac": deg_frac,
+        "rewards": all_rewards,
+        "advantages": all_advantages,
+    }
+    return total_loss, stats
+
+
+def run_grpo_bar_math_round(
+    net: nn.Module,
+    opt: torch.optim.Optimizer,
+    scaler,
+    strip_paths: list,
+    step: int = 0,
+    steps: int = 50,
+    weight: float = 0.25,
+    kl_beta: float = 0.08,
+    height: int = 256,
+    device: torch.device | str = "cpu",
+    amp: bool = False,
+    amp_dtype=torch.bfloat16,
+    seed: int = 0,
+    batch_size: int = 2,
+    num_beams: int = 4,
+    max_len: int = 192,
+    visual_scorer=None,
+    w_bm: float = 0.75,
+    w_vis: float = 0.25,
+    w_deg: float = 0.50,
+    **_extra,
+) -> dict:
+    """Execute one verifier-guided GRPO bar-math unsupervised round on unlabeled strips."""
+    import copy
+    import numpy as np
+    from PIL import Image
+    import data as _mvd_data
+
+    if not strip_paths or int(steps) <= 0:
+        return {
+            "ran_steps": 0,
+            "active_frac": 0.0,
+            "mean_loss": 0.0,
+            "mean_reward": 0.0,
+            "mean_kl": 0.0,
+        }
+
+    dev = torch.device(device)
+    ref_model = copy.deepcopy(net).to(dev).eval()
+    for p in ref_model.parameters():
+        p.requires_grad_(False)
+
+    rng = np.random.default_rng(int(seed))
+    n_imgs = len(strip_paths)
+    in_ch = int(getattr(net, "in_chans", 4))
+    was_train = net.training
+    net.train()
+    use_amp = bool(amp and dev.type == "cuda")
+    total_loss = 0.0
+    total_active = 0.0
+    total_reward = 0.0
+    total_kl = 0.0
+    ran = 0
+    bs = max(1, int(batch_size))
+
+    for _ in range(int(steps)):
+        idxs = rng.integers(0, n_imgs, size=bs)
+        imgs = []
+        max_w = 0
+        for idx in idxs:
+            try:
+                im = Image.open(strip_paths[int(idx)]).convert("RGB")
+                ow, oh = im.size
+                nw = max(32, min(1536, int(round(ow * (height / max(1, oh))))))
+                im = im.resize((nw, int(height)), Image.BOX)
+                arr = np.asarray(im, dtype=np.float32) / 255.0
+                t = (torch.from_numpy(arr).permute(2, 0, 1) - 0.85) / 0.25
+                if in_ch > 3:
+                    pad_c = torch.zeros((in_ch - 3, int(height), nw), dtype=torch.float32)
+                    t = torch.cat([t, pad_c], dim=0)
+                imgs.append(t)
+                max_w = max(max_w, nw)
+            except Exception:
+                continue
+        if not imgs:
+            continue
+        padded = []
+        for t in imgs:
+            pw = max_w - t.shape[2]
+            if pw > 0:
+                t = F.pad(t, (0, pw, 0, 0), value=0.6)
+            padded.append(t)
+        x = torch.stack(padded, dim=0).to(dev, non_blocking=True)
+
+        opt.zero_grad(set_to_none=True)
+        with torch.amp.autocast("cuda", dtype=amp_dtype, enabled=use_amp):
+            step_loss, stats = grpo_bar_math_step(
+                net,
+                ref_model,
+                x,
+                id2tok=_mvd_data.VOCAB,
+                num_beams=int(num_beams),
+                kl_beta=float(kl_beta),
+                max_len=int(max_len),
+                visual_scorer=visual_scorer,
+                w_bm=float(w_bm),
+                w_vis=float(w_vis),
+                w_deg=float(w_deg),
+            )
+            loss = step_loss * float(weight)
+        active = float(stats.get("active_frac", 0.0))
+        total_active += active
+        total_reward += float(stats.get("mean_reward", 0.0))
+        total_kl += float(stats.get("kl_loss", 0.0))
+        if active > 0.0 and torch.isfinite(loss) and loss.requires_grad:
+            if scaler is not None and use_amp and amp_dtype == torch.float16:
+                scaler.scale(loss).backward()
+                scaler.step(opt)
+                scaler.update()
+            else:
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(net.parameters(), 1.0)
+                opt.step()
+            total_loss += float(loss.detach().item())
+        ran += 1
+
+    net.train(was_train)
+    mean_active = total_active / max(1, ran)
+    mean_loss = total_loss / max(1, ran)
+    mean_reward = total_reward / max(1, ran)
+    mean_kl = total_kl / max(1, ran)
+    print(
+        f"  [unsup-grpo-bar-math step {step}] ran_steps={ran}/{steps} "
+        f"active={mean_active:.2%} mean_loss={mean_loss:.4f} "
+        f"mean_reward={mean_reward:.4f} mean_kl={mean_kl:.4f}",
+        flush=True,
+    )
+    return {
+        "ran_steps": ran,
+        "active_frac": mean_active,
+        "mean_loss": mean_loss,
+        "mean_reward": mean_reward,
+        "mean_kl": mean_kl,
+    }

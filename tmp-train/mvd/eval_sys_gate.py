@@ -45,6 +45,7 @@ import page_prep  # noqa: E402
 import bezier_ribbon  # noqa: E402
 import dynamic_res  # noqa: E402
 import staff_unet2d  # noqa: E402
+import verifier_3tier  # noqa: E402
 import numpy as np  # noqa: E402
 from PIL import Image  # noqa: E402
 
@@ -243,43 +244,45 @@ def _update_active_from_body(body_toks, active_clefs, active_keys, active_times)
                 active_clefs.append(t)
 
 
-def stitch_page_toks(sys_toks_list):
+def stitch_page_toks_with_context(sys_toks_list, init_ctx=None):
+    """Stitch per-system token lists with ``ScoreContext`` carryforward.
+
+    Returns ``(canonical_tokens, updated_ctx)`` using
+    :func:`measure_decode.propagate_across_systems` followed by
+    :func:`canonicalize_bekern_tail_order`.
+    """
+    stitched_str, ctx = mdec.propagate_across_systems(
+        sys_toks_list, init_ctx=init_ctx)
+    toks = stitched_str.split() if stitched_str else []
+    return canonicalize_bekern_tail_order(toks), ctx
+
+
+def stitch_multipage_toks(page_sys_toks_lists, init_ctx=None):
+    """Stitch a multi-page score (list of per-page system token lists).
+
+    Returns ``(canonical_tokens, final_ctx)`` using
+    :func:`measure_decode.stitch_multipage_work`.
+    """
+    stitched_str, ctx = mdec.stitch_multipage_work(
+        page_sys_toks_lists, init_ctx=init_ctx)
+    toks = stitched_str.split() if stitched_str else []
+    return canonicalize_bekern_tail_order(toks), ctx
+
+
+def stitch_page_toks(sys_toks_list, init_ctx=None):
     """Page token stream from per-system token lists.
 
-    Leading headers (``clef-`` / ``key`` / ``time-``) are adopted from
-    the first system with a non-empty body. For every subsequent
-    non-empty system, unchanged courtesy headers are stripped while any
-    changed ``clef-``, ``key``, or ``time-`` tokens are emitted before
-    that system's body (and update the active page header state),
-    preserving mid-page clef/key/meter changes. An empty first system
-    (decode crash) does not lock in empty headers. All-empty input
-    stitches to ``[]``.
+    Delegates to :func:`measure_decode.propagate_across_systems` via
+    :func:`stitch_page_toks_with_context`: leading headers (``clef-`` /
+    ``key`` / ``time-``) are adopted from the first system with a
+    non-empty body, unchanged courtesy headers on subsequent systems are
+    stripped while genuine mid-page clef/key/meter changes are emitted,
+    and cross-system ties/slurs/hairpins are carried cleanly. An empty
+    first system (decode crash) does not lock in empty headers. All-empty
+    input stitches to ``[]``.
     """
-    heads = []
-    out_body = []
-    active_clefs, active_keys, active_times = [], [], []
-    initialized = False
-    for toks in sys_toks_list:
-        h, b = split_head_body(toks)
-        if not b:
-            continue
-        if not initialized:
-            heads = list(h)
-            c, k, tm = _header_slots(h)
-            active_clefs, active_keys, active_times = list(c), list(k), list(tm)
-            initialized = True
-        else:
-            c, k, tm = _header_slots(h)
-            changed = []
-            changed.extend(_diff_header_slots(active_clefs, c))
-            changed.extend(_diff_header_slots(active_keys, k))
-            changed.extend(_diff_header_slots(active_times, tm))
-            out_body.extend(changed)
-        out_body.extend(b)
-        _update_active_from_body(b, active_clefs, active_keys, active_times)
-    if not initialized and sys_toks_list:
-        heads, _b = split_head_body(sys_toks_list[0])
-    return canonicalize_bekern_tail_order(list(heads) + out_body)
+    toks, _ctx = stitch_page_toks_with_context(sys_toks_list, init_ctx=init_ctx)
+    return toks
 
 
 def run_cli(args, timeout=600):
@@ -487,7 +490,7 @@ def detect_ckpt_extra_chans(state):
     return max(0, int(w.shape[1]) - 3)
 
 
-def main():
+def build_arg_parser():
     ap = argparse.ArgumentParser(description='T1.6 sys-dev gate eval')
     ap.add_argument('--ckpt', required=True)
     ap.add_argument('--out', required=True)
@@ -562,6 +565,17 @@ def main():
     ap.add_argument('--verify-alpha', type=float, default=2.0,
                     help='T4.1: visual IoU weight for --verify-beam '
                     '(combined_score = logprob + alpha * visual_iou)')
+    ap.add_argument('--verifier-3tier', action='store_true',
+                    help='Enable 3-Tier Closed-Loop Verifier (Tier 1 bar-math/'
+                    'spanner gate, conditional Tier 2 visual rerank, selective '
+                    'Tier 3 geometric/TTA repair & review flagging)')
+    ap.add_argument('--verifier-pref-out', default=None,
+                    help='Optional JSONL path to emit preference pairs whenever '
+                    '--verifier-3tier overrules greedy beam-0')
+    ap.add_argument('--page-tta', default='none',
+                    choices=('none', 'em', 'come', 'come_sar'),
+                    help='Optional episodic LayerNorm TTA mode for Tier 3 '
+                    'repair / page adaptation (default: none)')
     ap.add_argument('--suite31-dir', default=str(SUITE31_DEFAULT))
     ap.add_argument('--suite31-manifest', default=None,
                     help='optional path to an alternate Suite31 manifest JSON '
@@ -580,6 +594,11 @@ def main():
     ap.add_argument('--pieces', default=None,
                     help='smoke-test: comma-separated suite31 piece slugs '
                          'to evaluate (preserves manifest order)')
+    return ap
+
+
+def main():
+    ap = build_arg_parser()
     args = ap.parse_args()
     if args.suite31_only:
         args.suite31 = True
@@ -627,10 +646,12 @@ def main():
     has_comer = any(k.startswith('comer_bias.') for k in state)
     has_gdcm = any(k.startswith('gdcm_head.') for k in state)
     has_s18 = any(k.startswith('s18_head.') for k in state)
+    has_rope2d = any(k.startswith('rope2d.') for k in state)
     net = model.MvdNet(vocab=len(data.VOCAB) + 3, anisotropic=True,
                        stride=args.stride, extra_chans=extra,
                        foveal_tap=has_foveal, use_comer=has_comer,
-                       use_gdcm=has_gdcm, use_s18=has_s18)
+                       use_gdcm=has_gdcm, use_s18=has_s18,
+                       rope_2d=has_rope2d)
     try:
         # Compat loader (train.load_weights_compat): strict when shapes
         # match, aux-fresh for pre-S13b ckpts, stem/vocab transplants
@@ -670,6 +691,13 @@ def main():
 
     workdir = Path(tempfile.mkdtemp(prefix='t16_gate_'))
     gate_sha = sha256_file(GATE20 / 'gate_manifest.json')
+    verifier = None
+    if args.verifier_3tier:
+        tta_mode = args.page_tta if args.page_tta != 'none' else 'come'
+        verifier = verifier_3tier.ClosedLoopVerifier(
+            tta_mode=tta_mode,
+            pref_out_path=args.verifier_pref_out,
+        )
 
     sys_rows, page_groups = [], {}
     if args.suite31_only:
@@ -694,7 +722,9 @@ def main():
                         adapt_lr=args.adapt_lr, stride=args.stride,
                         extra_chans=extra,
                         verify_beam=args.verify_beam,
-                        verify_alpha=args.verify_alpha)
+                        verify_alpha=args.verify_alpha,
+                        verifier=verifier,
+                        page_tta=args.page_tta)
                 else:
                     dec = decode_system(net, img, args.height, args.max_len,
                                         args.beam, device, workdir,
@@ -932,8 +962,12 @@ def main():
     if args.suite31:
         suite31_rows, suite31_summary = run_suite31(
             args, net, heat_net, workdir, device, extra_chans=extra,
-            staff_unet=staff_unet, staff_unet_meta=staff_unet_meta)
+            staff_unet=staff_unet, staff_unet_meta=staff_unet_meta,
+            verifier=verifier)
         summary.update(suite31_summary)
+    if verifier is not None:
+        summary['verifier_3tier'] = verifier.telemetry_dict()
+        summary['low_confidence_measures'] = verifier.low_confidence_measures_total
     report = {
         'gate': 'gate20-sys-v2',
         'gate_manifest_sha256': gate_sha,
@@ -964,6 +998,9 @@ def main():
                      'adapt_lr': args.adapt_lr,
                      'verify_beam': bool(args.verify_beam),
                      'verify_alpha': float(args.verify_alpha),
+                     'verifier_3tier': bool(args.verifier_3tier),
+                     'verifier_pref_out': args.verifier_pref_out,
+                     'page_tta': args.page_tta,
                      'max_len': args.max_len, 'image_height': args.height,
                      'preprocessing': preproc,
                      'device': device, 'torch': torch.__version__},
@@ -1142,12 +1179,46 @@ def hyp_tokens_valid(toks):
         return False
 
 
+def _decode_strip_with_verifier_3tier(net, ten, beam, max_len, mem_mask,
+                                      adapt_steps, adapt_lr, verifier,
+                                      strip_id, page_tta='none'):
+    """Run top-K beam decode + 3-Tier Closed-Loop Verifier on one strip tensor."""
+    import torch
+    bs_kwargs = {}
+    if mem_mask is not None:
+        bs_kwargs['mem_mask'] = mem_mask
+    if adapt_steps:
+        bs_kwargs['adapt_steps'] = adapt_steps
+        bs_kwargs['adapt_lr'] = adapt_lr
+    beam_k = max(2, int(beam))
+
+    def _run_beams(t_in):
+        with torch.no_grad():
+            all_beams, all_scores = net.beam_search(
+                t_in, beam=beam_k, strict=True, max_len=int(max_len),
+                return_beams=True, **bs_kwargs)
+        cands = []
+        for b_ids, lp in zip(all_beams[0], all_scores[0]):
+            toks_i = mdec._ids_to_tokens([b_ids])
+            fixed_i, _, _ = mdec.fallback_repair(toks_i)
+            cands.append((fixed_i, float(lp)))
+        return cands
+
+    candidates = _run_beams(ten)
+    if not candidates:
+        return [], None
+    tta_model = net if (page_tta and page_tta != 'none') else None
+    v_out = verifier.verify_strip(
+        strip_id, ten, candidates, decode_fn=_run_beams, tta_model=tta_model)
+    return list(v_out.tokens), v_out
+
+
 def decode_system_v2(net, img_path, row, heat_net, device, height, beam,
                      max_len, hybrid, workdir, stem, ink_eos_veto=False,
                      ilme_lambda=0.0, lattice_repair=False,
                      adapt_steps=0, adapt_lr=0.1, stride='8x16',
                      extra_chans=None, verify_beam=False,
-                     verify_alpha=2.0):
+                     verify_alpha=2.0, verifier=None, page_tta='none'):
     """T2.4 decode: rectified (+hybrid/4ch) input, measure-fallback beam search.
 
     Geometry from the cache row (fallback: RowNet detect, then legacy
@@ -1178,6 +1249,7 @@ def decode_system_v2(net, img_path, row, heat_net, device, height, beam,
         dec['geom'] = 'legacy'
         return dec
     img = Image.open(img_path).convert('RGB')
+    v_out = None
     with torch.no_grad():
         if len(staves) > rect_mod.MAX_STAVES:
             extra = hybrid_extra_fn(heat_net, device,
@@ -1201,15 +1273,21 @@ def decode_system_v2(net, img_path, row, heat_net, device, height, beam,
                                              device, height, hybrid,
                                              extra_chans=extra_chans)
                 obs_gray = None
-            toks = mdec.decode_system_with_measure_fallback(
-                net, ten, beam=beam,
-                mem_mask=mdec.mask_for_strip(
-                    ten, len(staves), stride=stride),
-                ink_eos_veto=ink_eos_veto, ilme_lambda=ilme_lambda,
-                lattice_repair=lattice_repair, adapt_steps=adapt_steps,
-                adapt_lr=adapt_lr, verify_beam=verify_beam,
-                verify_alpha=verify_alpha, obs_gray=obs_gray,
-                max_len=max_len)
+            mem_mask = mdec.mask_for_strip(ten, len(staves), stride=stride)
+            if verifier is not None:
+                toks, v_out = _decode_strip_with_verifier_3tier(
+                    net, ten, beam=beam, max_len=max_len, mem_mask=mem_mask,
+                    adapt_steps=adapt_steps, adapt_lr=adapt_lr,
+                    verifier=verifier, strip_id=stem, page_tta=page_tta)
+            else:
+                toks = mdec.decode_system_with_measure_fallback(
+                    net, ten, beam=beam,
+                    mem_mask=mem_mask,
+                    ink_eos_veto=ink_eos_veto, ilme_lambda=ilme_lambda,
+                    lattice_repair=lattice_repair, adapt_steps=adapt_steps,
+                    adapt_lr=adapt_lr, verify_beam=verify_beam,
+                    verify_alpha=verify_alpha, obs_gray=obs_gray,
+                    max_len=max_len)
     secs = time.time() - t0
     valid = hyp_tokens_valid(toks)
     loop_trimmed = False
@@ -1218,11 +1296,15 @@ def decode_system_v2(net, img_path, row, heat_net, device, height, beam,
         loop_trimmed = len(trimmed) < len(toks)
         toks = canonicalize_bekern_tail_order(trimmed)
     write_hyp_bekern(workdir, stem, toks if valid else [])
-    return {'tokens': toks if valid else [], 'ntokens': len(toks) if valid else 0,
-            'eos_miss': False, 'vocab_valid': valid, 'decode_secs': secs,
-            'loop_trimmed': loop_trimmed,
-            'geom': geom if len(staves) <= rect_mod.MAX_STAVES
-            else geom + '+chunked'}
+    res_dict = {'tokens': toks if valid else [], 'ntokens': len(toks) if valid else 0,
+                'eos_miss': False, 'vocab_valid': valid, 'decode_secs': secs,
+                'loop_trimmed': loop_trimmed,
+                'geom': geom if len(staves) <= rect_mod.MAX_STAVES
+                else geom + '+chunked'}
+    if v_out is not None:
+        res_dict['verifier_needs_review'] = v_out.needs_review
+        res_dict['low_confidence_measures'] = v_out.low_confidence_measures
+    return res_dict
 
 
 def suite31_page_refs(gt_path, sys_stem, workdir):
@@ -1397,10 +1479,15 @@ def load_staff_unet(ckpt_path, device='cpu'):
         in_ch, base_ch, out_stride, target_h, target_w = 3, 40, 2, 1024, 768
         sp_mode, dyn_res = 'rel_h', False
         pixel_budget, max_side = 1536 * 1152, 2048
-    has_row_ctx = any(k.startswith('row_ctx.') for k in sd)
+    has_row_ctx = (
+        bool(state.get('row_ctx', False)) if isinstance(state, dict) else False
+    ) or any(k.startswith('row_ctx.') for k in sd)
+    has_strip_conv = (
+        bool(state.get('strip_conv', False)) if isinstance(state, dict) else False
+    ) or any(k.startswith('strip_dec2.') or k.startswith('strip_dec1.') for k in sd)
     net = staff_unet2d.StaffUNet2D(
         in_channels=in_ch, base_channels=base_ch, out_stride=out_stride,
-        row_ctx=has_row_ctx)
+        row_ctx=has_row_ctx, strip_conv=has_strip_conv)
     net.load_state_dict(sd)
     net.to(device).eval()
     meta = {
@@ -1413,6 +1500,8 @@ def load_staff_unet(ckpt_path, device='cpu'):
         'dynamic_res': dyn_res,
         'pixel_budget': pixel_budget,
         'max_side': max_side,
+        'row_ctx': has_row_ctx,
+        'strip_conv': has_strip_conv,
     }
     return net, meta
 
@@ -1460,7 +1549,7 @@ def decode_curved_system(net, page_img, curved_sys, heat_net, device, height,
                          ilme_lambda=0.0, lattice_repair=False,
                          adapt_steps=0, adapt_lr=0.1, stride='8x16',
                          extra_chans=0, verify_beam=False,
-                         verify_alpha=2.0):
+                         verify_alpha=2.0, verifier=None, page_tta='none'):
     """Unwarp a ``CurvedSystem`` via ``bezier_ribbon`` and measure-fallback decode.
 
     Directly extracts canonical ``height``-px (default 256 px) strips +
@@ -1483,22 +1572,34 @@ def decode_curved_system(net, page_img, curved_sys, heat_net, device, height,
     chunk_streams = []
     chunk_staff_counts = []
     prev_staves_cum = 0
+    needs_review_any = False
+    low_conf_all = []
     with torch.no_grad():
-        for rect_img, ref, staff_indices in chunks:
+        for c_idx, (rect_img, ref, staff_indices) in enumerate(chunks):
             if prev_staves_cum >= mdec.MAX_VOICE:
                 break
             ten = rectified_input_tensor_from_rect(
                 rect_img, ref, heat_net, device, extra_chans=extra_chans)
             mem_mask = mdec.mask_for_strip(
                 ten, len(staff_indices), stride=stride)
-            ctoks = mdec.decode_system_with_measure_fallback(
-                net, ten, beam=beam, mem_mask=mem_mask,
-                ink_eos_veto=ink_eos_veto, ilme_lambda=ilme_lambda,
-                lattice_repair=lattice_repair, adapt_steps=adapt_steps,
-                adapt_lr=adapt_lr, verify_beam=verify_beam,
-                verify_alpha=verify_alpha,
-                obs_gray=(rect_img if verify_beam else None),
-                max_len=max_len)
+            if verifier is not None:
+                ctoks, v_out = _decode_strip_with_verifier_3tier(
+                    net, ten, beam=beam, max_len=max_len, mem_mask=mem_mask,
+                    adapt_steps=adapt_steps, adapt_lr=adapt_lr,
+                    verifier=verifier, strip_id='%s-c%d' % (stem, c_idx),
+                    page_tta=page_tta)
+                if v_out is not None and v_out.needs_review:
+                    needs_review_any = True
+                    low_conf_all.extend(v_out.low_confidence_measures)
+            else:
+                ctoks = mdec.decode_system_with_measure_fallback(
+                    net, ten, beam=beam, mem_mask=mem_mask,
+                    ink_eos_veto=ink_eos_veto, ilme_lambda=ilme_lambda,
+                    lattice_repair=lattice_repair, adapt_steps=adapt_steps,
+                    adapt_lr=adapt_lr, verify_beam=verify_beam,
+                    verify_alpha=verify_alpha,
+                    obs_gray=(rect_img if verify_beam else None),
+                    max_len=max_len)
             chunk_streams.append(ctoks)
             chunk_staff_counts.append(len(staff_indices))
             prev_staves_cum += len(staff_indices)
@@ -1520,7 +1621,7 @@ def decode_curved_system(net, page_img, curved_sys, heat_net, device, height,
     write_hyp_bekern(workdir, stem, toks if valid else [])
     n_staves = (len(curved_sys.staves) if hasattr(curved_sys, 'staves')
                 else len(curved_sys))
-    return {
+    res = {
         'tokens': toks if valid else [],
         'ntokens': len(toks) if valid else 0,
         'eos_miss': False,
@@ -1531,6 +1632,10 @@ def decode_curved_system(net, page_img, curved_sys, heat_net, device, height,
         'n_staves': n_staves,
         'n_chunks': len(chunks),
     }
+    if verifier is not None:
+        res['verifier_needs_review'] = needs_review_any
+        res['low_confidence_measures'] = sorted(set(low_conf_all))
+    return res
 
 
 def decode_row_system(net, img_file, row, heat_net, device, height, beam,
@@ -1538,7 +1643,7 @@ def decode_row_system(net, img_file, row, heat_net, device, height, beam,
                       ilme_lambda=0.0, lattice_repair=False,
                       adapt_steps=0, adapt_lr=0.1, stride='8x16',
                       extra_chans=None, verify_beam=False,
-                      verify_alpha=2.0):
+                      verify_alpha=2.0, verifier=None, page_tta='none'):
     """Decode one eval strip file with its geometry row (T2.4 shared tail)."""
     return decode_system_v2(net, img_file, row, heat_net, device, height,
                             beam, max_len, hybrid, workdir, stem,
@@ -1549,7 +1654,9 @@ def decode_row_system(net, img_file, row, heat_net, device, height, beam,
                             adapt_lr=adapt_lr, stride=stride,
                             extra_chans=extra_chans,
                             verify_beam=verify_beam,
-                            verify_alpha=verify_alpha)
+                            verify_alpha=verify_alpha,
+                            verifier=verifier,
+                            page_tta=page_tta)
 
 
 def classify_suite31_stratum(piece):
@@ -1607,7 +1714,7 @@ def _summarize_suite31_slice(rows):
 
 
 def run_suite31(args, net, heat_net, workdir, device, extra_chans=None,
-                staff_unet=None, staff_unet_meta=None):
+                staff_unet=None, staff_unet_meta=None, verifier=None):
     """Suite31 photo+clean page eval (T2.4 / Exp 1): boxes or StaffUNet2D, decode, stitch.
 
     Pages land in ``workdir`` crops only; ``suite31/`` is read-only.
@@ -1752,7 +1859,9 @@ def run_suite31(args, net, heat_net, workdir, device, extra_chans=None,
                                              else (heat_features.EXTRA_CHANS
                                                    if args.hybrid else 0)),
                                 verify_beam=bool(getattr(args, 'verify_beam', False)),
-                                verify_alpha=float(getattr(args, 'verify_alpha', 2.0)))
+                                verify_alpha=float(getattr(args, 'verify_alpha', 2.0)),
+                                verifier=verifier,
+                                page_tta=str(getattr(args, 'page_tta', 'none')))
                         except Exception as e:  # noqa: BLE001 - record, continue
                             prow['%s_s%d_error' % (domain, i)] = (
                                 'decode-crash: %s' % e)
@@ -1796,7 +1905,9 @@ def run_suite31(args, net, heat_net, workdir, device, extra_chans=None,
                                 adapt_lr=args.adapt_lr, stride=args.stride,
                                 extra_chans=extra_chans,
                                 verify_beam=bool(getattr(args, 'verify_beam', False)),
-                                verify_alpha=float(getattr(args, 'verify_alpha', 2.0)))
+                                verify_alpha=float(getattr(args, 'verify_alpha', 2.0)),
+                                verifier=verifier,
+                                page_tta=str(getattr(args, 'page_tta', 'none')))
                         except Exception as e:  # noqa: BLE001 - record, continue
                             prow['%s_s%d_error' % (domain, i)] = (
                                 'decode-crash: %s' % e)
@@ -1810,6 +1921,10 @@ def run_suite31(args, net, heat_net, workdir, device, extra_chans=None,
                     if dec.get('loop_trimmed'):
                         prow['%s_s%d_loop_trimmed' % (domain, i)] = True
                         domain_trimmed += 1
+                    if dec.get('verifier_needs_review'):
+                        prow['%s_s%d_needs_review' % (domain, i)] = True
+                        prow['%s_s%d_low_conf_measures' % (domain, i)] = (
+                            dec.get('low_confidence_measures', []))
                 prow[dskey + '_loop_trimmed'] = domain_trimmed
                 if domain == 'clean':
                     clean_loop_trimmed += domain_trimmed

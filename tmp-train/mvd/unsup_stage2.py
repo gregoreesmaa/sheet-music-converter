@@ -167,6 +167,25 @@ def _normalize_page_strips(
     return items
 
 
+def come_opinion_entropy(logits: torch.Tensor, temp: float = 1.0, clamp_val: float = 20.0) -> torch.Tensor:
+    """ICLR 2025 COME Dirichlet Opinion Entropy (prevents singleton collapse on OOD inputs).
+
+    For logits z over V classes:
+      e_k = exp(clamp(z_k / T, -clamp_val, clamp_val))
+      alpha_k = e_k + 1,  S = sum(alpha_k)
+      b_k = e_k / S,      u = V / S
+      H_COME = -sum(b_k * log(b_k)) - u * log(u)
+    """
+    z = (logits.float() / max(float(temp), 1e-4)).clamp(-float(clamp_val), float(clamp_val))
+    evidence = torch.exp(z)
+    alpha = evidence + 1.0
+    S = alpha.sum(dim=-1, keepdim=True)
+    b = evidence / S
+    u = float(logits.shape[-1]) / S.squeeze(-1)
+    eps = 1e-8
+    return -(b * torch.log(b.clamp_min(eps))).sum(dim=-1) - u * torch.log(u.clamp_min(eps))
+
+
 @contextmanager
 def episodic_page_ln_tta(
     model: nn.Module,
@@ -176,14 +195,18 @@ def episodic_page_ln_tta(
     min_conf: float = 0.80,
     mem_mask: torch.Tensor | Sequence[torch.Tensor | None] | None = None,
     max_len: int = 32,
+    mode: str = "come",
+    sam_rho: float = 0.05,
 ) -> Iterator[nn.Module]:
     """Episodic per-page LayerNorm Test-Time Adaptation context manager.
 
     Clones ONLY ``nn.LayerNorm`` affine ``(weight, bias)`` parameters (including
     ``torchvision.models.convnext.LayerNorm2d``, which subclasses ``nn.LayerNorm``),
-    runs ``steps`` of confidence-gated entropy minimization on ``page_strips``,
-    yields the adapted ``model``, and restores exact original weights,
-    ``requires_grad`` flags, and ``training`` mode on exit.
+    runs ``steps`` of confidence-gated entropy minimization on ``page_strips``
+    (supporting ``"em"``, ``"come"`` [ICLR 2025 Dirichlet Opinion Entropy], and
+    ``"come_sar"`` [COME + 1-step SAM flatness]), yields the adapted ``model``,
+    and restores exact original weights, ``requires_grad`` flags, and
+    ``training`` mode on exit.
     """
     was_training = model.training
     orig_req_grad = {p: p.requires_grad for p in model.parameters()}
@@ -199,6 +222,37 @@ def episodic_page_ln_tta(
                     seen_ids.add(id(p))
                     ln_params.append(p)
                     saved_ln.append((p, p.detach().clone()))
+
+    def _compute_loss(batches_in, rollouts_in):
+        total_ent = None
+        total_count = 0
+        for (strips, mm), tgt_in in zip(batches_in, rollouts_in):
+            if tgt_in is not None:
+                logits = model(strips, tgt_in, mem_mask=mm)
+                valid_pos = (tgt_in != pad_id) if pad_id >= 0 else torch.ones_like(
+                    tgt_in, dtype=torch.bool
+                )
+            else:
+                logits = model(strips)
+                valid_pos = torch.ones(logits.shape[:-1], dtype=torch.bool, device=logits.device)
+
+            probs = F.softmax(logits.float(), dim=-1)
+            max_p = probs.max(dim=-1).values
+            if mode in ("come", "come_sar"):
+                ent = come_opinion_entropy(logits)
+            else:
+                log_probs = F.log_softmax(logits.float(), dim=-1)
+                ent = -(probs * log_probs).sum(dim=-1)
+
+            conf_mask = (max_p >= float(min_conf)) & valid_pos
+            n_sel = int(conf_mask.sum().item())
+            if n_sel > 0:
+                ent_sum = ent[conf_mask].sum()
+                total_ent = ent_sum if total_ent is None else (total_ent + ent_sum)
+                total_count += n_sel
+        if total_ent is None or total_count == 0:
+            return None
+        return total_ent / float(total_count)
 
     try:
         model.eval()
@@ -216,57 +270,58 @@ def episodic_page_ln_tta(
 
             for _ in range(int(steps)):
                 opt.zero_grad(set_to_none=True)
-                total_ent = None
-                total_count = 0
-
+                rollouts: list[torch.Tensor | None] = []
                 for strips, mm in batches:
-                    # Obtain short unlabeled prefix via no-grad greedy rollout.
                     with torch.no_grad():
-                        if hasattr(model, "greedy") and bos_id is not None:
-                            gen = model.greedy(
-                                strips,
-                                max_len=max(1, int(max_len)),
-                                constrain=False,
-                                mem_mask=mm,
-                            )
+                        if bos_id is not None and (hasattr(model, "greedy_kv") or hasattr(model, "greedy")):
+                            if hasattr(model, "greedy_kv"):
+                                gen = model.greedy_kv(
+                                    strips,
+                                    max_len=max(1, int(max_len)),
+                                    constrain=True,
+                                    mem_mask=mm,
+                                )
+                            else:
+                                gen = model.greedy(
+                                    strips,
+                                    max_len=max(1, int(max_len)),
+                                    constrain=False,
+                                    mem_mask=mm,
+                                )
                             bos = torch.full(
                                 (strips.shape[0], 1),
                                 int(bos_id),
                                 dtype=torch.long,
                                 device=strips.device,
                             )
-                            if gen.shape[1] > 1:
-                                tgt_in = torch.cat([bos, gen[:, :-1]], dim=1)
-                            else:
-                                tgt_in = bos
+                            tgt_in = torch.cat([bos, gen[:, :-1]], dim=1) if gen.shape[1] > 1 else bos
                         else:
                             tgt_in = None
+                    rollouts.append(tgt_in)
 
-                    # Differentiable forward pass (gradients flow ONLY to LN params).
-                    if tgt_in is not None:
-                        logits = model(strips, tgt_in, mem_mask=mm)
-                        valid_pos = (tgt_in != pad_id) if pad_id >= 0 else torch.ones_like(
-                            tgt_in, dtype=torch.bool
-                        )
-                    else:
-                        logits = model(strips)
-                        valid_pos = torch.ones(logits.shape[:-1], dtype=torch.bool, device=logits.device)
-
-                    probs = F.softmax(logits.float(), dim=-1)
-                    log_probs = F.log_softmax(logits.float(), dim=-1)
-                    max_p = probs.max(dim=-1).values
-                    ent = -(probs * log_probs).sum(dim=-1)
-
-                    conf_mask = (max_p >= float(min_conf)) & valid_pos
-                    n_sel = int(conf_mask.sum().item())
-                    if n_sel > 0:
-                        ent_sum = ent[conf_mask].sum()
-                        total_ent = ent_sum if total_ent is None else (total_ent + ent_sum)
-                        total_count += n_sel
-
-                if total_ent is not None and total_count > 0:
-                    loss = total_ent / float(total_count)
+                loss = _compute_loss(batches, rollouts)
+                if loss is not None:
                     loss.backward()
+                    if mode == "come_sar" and float(sam_rho) > 0.0:
+                        # 1-step SAM ascent on LayerNorm params for flat minima (SAR, ICLR 2023)
+                        grad_norm = torch.sqrt(
+                            sum((p.grad.detach().float().pow(2).sum() for p in ln_params if p.grad is not None), torch.tensor(0.0, device=ln_params[0].device))
+                        ).clamp_min(1e-12)
+                        e_ws: list[tuple[nn.Parameter, torch.Tensor]] = []
+                        with torch.no_grad():
+                            scale = float(sam_rho) / grad_norm
+                            for p in ln_params:
+                                if p.grad is not None:
+                                    e_w = p.grad.detach() * scale.to(p.dtype)
+                                    p.add_(e_w)
+                                    e_ws.append((p, e_w))
+                        opt.zero_grad(set_to_none=True)
+                        loss2 = _compute_loss(batches, rollouts)
+                        if loss2 is not None:
+                            loss2.backward()
+                        with torch.no_grad():
+                            for p, e_w in e_ws:
+                                p.sub_(e_w)
                     opt.step()
 
         # Disable grads during inference inside the context block.

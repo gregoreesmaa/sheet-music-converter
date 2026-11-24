@@ -46,8 +46,11 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader, Dataset
 
 __all__ = [
+    "HorizontalStripBlock",
     "StaffUNet2D",
+    "soft_staff_cldice_loss",
     "StaffUNetLoss",
+    "load_staff_unet2d",
     "CurvedStaff",
     "CurvedSystem",
     "fit_cubic_bezier_1d",
@@ -132,6 +135,75 @@ class _ConvBlock(nn.Module):
         return self.net(x)
 
 
+class HorizontalStripBlock(nn.Module):
+    """Lightweight horizontal strip-convolution block (AAAI 2025 Strip-RCNN / Strip Pooling).
+
+    Captures long-range horizontal staff-line continuity via depthwise ``1 x k``
+    and wide ``1 x (2k+1)`` strip convolutions, ``1x1`` pointwise mixing,
+    GroupNorm, and SiLU, gated by a zero-initialized residual parameter so
+    warm-starting from a pretrained checkpoint without strip-conv blocks
+    preserves exact pretrained predictions at step 0.
+    """
+
+    def __init__(self, channels: int, kernel_w: int = 15):
+        super().__init__()
+        if kernel_w < 3 or kernel_w % 2 == 0:
+            raise ValueError(f"kernel_w must be an odd integer >= 3, got {kernel_w}")
+        self.channels = int(channels)
+        self.kernel_w = int(kernel_w)
+        num_groups = 8
+        while num_groups > 1 and (self.channels % num_groups) != 0:
+            num_groups //= 2
+
+        self.dw_strip = nn.Conv2d(
+            self.channels,
+            self.channels,
+            kernel_size=(1, self.kernel_w),
+            padding=(0, self.kernel_w // 2),
+            groups=self.channels,
+            bias=False,
+        )
+        wide_k = 2 * self.kernel_w + 1
+        self.dw_strip_wide = nn.Conv2d(
+            self.channels,
+            self.channels,
+            kernel_size=(1, wide_k),
+            padding=(0, self.kernel_w),
+            groups=self.channels,
+            bias=False,
+        )
+        self.pw = nn.Conv2d(self.channels, self.channels, kernel_size=1, bias=False)
+        self.norm = nn.GroupNorm(num_groups, self.channels)
+        self.act = nn.SiLU(inplace=True)
+        self.gamma = nn.Parameter(torch.zeros(1))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        h = self.dw_strip(x)
+        h = self.dw_strip_wide(h)
+        h = self.pw(h)
+        h = self.act(self.norm(h))
+        return x + self.gamma * h
+
+
+_ACAD_LOSSES_MOD: Any = None
+
+
+def _get_academic_losses():
+    """Lazy-import sibling ``stage1_academic_losses`` module (safe for spawned workers)."""
+    global _ACAD_LOSSES_MOD
+    if _ACAD_LOSSES_MOD is not None:
+        return _ACAD_LOSSES_MOD
+    import sys as _sys
+
+    mvd_dir = str(Path(__file__).resolve().parent)
+    if mvd_dir not in _sys.path:
+        _sys.path.insert(0, mvd_dir)
+    import stage1_academic_losses as _acad
+
+    _ACAD_LOSSES_MOD = _acad
+    return _acad
+
+
 class StaffUNet2D(nn.Module):
     """Compact 2D UNet predicting 4 dense staff/system maps at 1/2 (or 1/4) resolution.
 
@@ -140,6 +212,12 @@ class StaffUNet2D(nn.Module):
         base_channels: Channel width at 1/4 resolution (default 40 -> ~1.35M params).
         out_stride: Output spatial stride (2 for 1/2-res skip-up head [default,
             512x384 out for 1024x768 in], or 4 for 1/4-res output).
+        row_ctx: Enable global horizontal row-context + (2, 4) bottleneck dilation.
+        strip_conv: Enable zero-init residual :class:`HorizontalStripBlock` in
+            decoder stages ``dec2`` and ``dec1``.
+        efdm_prob: Probability of early-encoder EFDMix style mixing after
+            ``enc1`` and ``enc2`` during training (0.0 = off; strict identity in
+            ``eval()`` with zero extra parameters).
     """
 
     def __init__(
@@ -148,6 +226,8 @@ class StaffUNet2D(nn.Module):
         base_channels: int = 40,
         out_stride: int = 2,
         row_ctx: bool = False,
+        strip_conv: bool = False,
+        efdm_prob: float = 0.0,
     ):
         super().__init__()
         if out_stride not in (2, 4):
@@ -156,6 +236,8 @@ class StaffUNet2D(nn.Module):
         self.base_channels = int(base_channels)
         self.out_stride = int(out_stride)
         self.use_row_ctx = bool(row_ctx)
+        self.use_strip_conv = bool(strip_conv)
+        self.efdm_prob = float(efdm_prob)
 
         c1 = base_channels             # 40  @ 1/4
         c2 = int(base_channels * 1.8)  # 72  @ 1/8
@@ -182,6 +264,14 @@ class StaffUNet2D(nn.Module):
         self.enc3 = _ConvBlock(c2, c3)
         self.pool3 = nn.MaxPool2d(2)
 
+        if self.efdm_prob > 0.0:
+            acad = _get_academic_losses()
+            self.efdm1: nn.Module | None = acad.EFDMix(p=self.efdm_prob, alpha=0.1)
+            self.efdm2: nn.Module | None = acad.EFDMix(p=self.efdm_prob, alpha=0.1)
+        else:
+            self.efdm1 = None
+            self.efdm2 = None
+
         # Horizontal dilation in bottleneck widens receptive field along staves.
         self.bottleneck = _ConvBlock(c3, c4, dilation=(2, 4) if self.use_row_ctx else (1, 2))
         if self.use_row_ctx:
@@ -205,6 +295,12 @@ class StaffUNet2D(nn.Module):
         self.dec3 = _ConvBlock(c4 + c3, c3)
         self.dec2 = _ConvBlock(c3 + c2, c2)
         self.dec1 = _ConvBlock(c2 + c1, c1)
+        if self.use_strip_conv:
+            self.strip_dec2 = HorizontalStripBlock(c2, kernel_w=15)
+            self.strip_dec1 = HorizontalStripBlock(c1, kernel_w=15)
+        else:
+            self.strip_dec2 = None
+            self.strip_dec1 = None
 
         if self.out_stride == 2:
             # Lightweight 1/2-res skip-up fusion: preserves fine 5-line separation on 6-staff pages.
@@ -231,7 +327,11 @@ class StaffUNet2D(nn.Module):
         """
         s2 = self.stem1(x)
         s4 = self.enc1(self.stem2(s2))
+        if self.efdm1 is not None:
+            s4 = self.efdm1(s4)
         s8 = self.enc2(self.pool1(s4))
+        if self.efdm2 is not None:
+            s8 = self.efdm2(s8)
         s16 = self.enc3(self.pool2(s8))
         b32 = self.bottleneck(self.pool3(s16))
         if self.row_ctx is not None:
@@ -242,9 +342,13 @@ class StaffUNet2D(nn.Module):
 
         u8 = F.interpolate(d16, size=s8.shape[-2:], mode="bilinear", align_corners=False)
         d8 = self.dec2(torch.cat([u8, s8], dim=1))
+        if self.strip_dec2 is not None:
+            d8 = self.strip_dec2(d8)
 
         u4 = F.interpolate(d8, size=s4.shape[-2:], mode="bilinear", align_corners=False)
         d4 = self.dec1(torch.cat([u4, s4], dim=1))
+        if self.strip_dec1 is not None:
+            d4 = self.strip_dec1(d4)
 
         if self.dec0 is not None:
             u2 = F.interpolate(d4, size=s2.shape[-2:], mode="bilinear", align_corners=False)
@@ -281,10 +385,71 @@ def _soft_dice_loss(logits: torch.Tensor, targets: torch.Tensor, eps: float = 1e
     return (1.0 - dice).mean()
 
 
+def _soft_erode_vertical(img: torch.Tensor) -> torch.Tensor:
+    return -F.max_pool2d(-img, kernel_size=(3, 1), stride=1, padding=(1, 0))
+
+
+def _soft_dilate_vertical(img: torch.Tensor) -> torch.Tensor:
+    return F.max_pool2d(img, kernel_size=(3, 1), stride=1, padding=(1, 0))
+
+
+def _soft_open_vertical(img: torch.Tensor) -> torch.Tensor:
+    return _soft_dilate_vertical(_soft_erode_vertical(img))
+
+
+def _soft_skel_horizontal(img: torch.Tensor, iters: int = 3) -> torch.Tensor:
+    """Differentiable vertical thinning to 1-px horizontal staff-line skeletons."""
+    img1 = _soft_open_vertical(img)
+    skel = F.relu(img - img1)
+    for _ in range(max(0, int(iters) - 1)):
+        img = _soft_erode_vertical(img)
+        img1 = _soft_open_vertical(img)
+        delta = F.relu(img - img1)
+        skel = skel + F.relu(delta - skel * delta)
+    return skel
+
+
+def soft_staff_cldice_loss(
+    pred_ch0_prob: torch.Tensor,
+    target_ch0: torch.Tensor,
+    iters: int = 3,
+    eps: float = 1e-5,
+) -> torch.Tensor:
+    """Horizontal soft-skeleton continuity loss (CVPR 2021 clDice for staff lines).
+
+    Uses pure-PyTorch GPU-differentiable vertical morphological erosion/opening
+    (``-max_pool2d(-x, (3, 1))``) so broken or faint horizontal staff lines
+    receive a direct topological continuity gradient.
+
+    Args:
+        pred_ch0_prob: Predicted staff-line probabilities in ``[0, 1]``,
+            shape ``[B, H, W]`` or ``[B, 1, H, W]``.
+        target_ch0: Ground-truth staff-line mask in ``[0, 1]``, same shape.
+        iters: Morphological thinning iterations (default 3, handles 1..5 px lines).
+        eps: Smoothing constant preventing 0/0 on empty pages.
+    """
+    vp = pred_ch0_prob.float()
+    vt = target_ch0.float()
+    if vp.ndim == 3:
+        vp = vp.unsqueeze(1)
+    if vt.ndim == 3:
+        vt = vt.unsqueeze(1)
+    if vp.ndim != 4 or vt.ndim != 4:
+        raise ValueError(f"expected [B, H, W] or [B, 1, H, W], got {tuple(vp.shape)} and {tuple(vt.shape)}")
+
+    skel_p = _soft_skel_horizontal(vp, iters=iters)
+    skel_t = _soft_skel_horizontal(vt, iters=iters)
+
+    tprec = ((skel_p * vt).sum(dim=(1, 2, 3)) + eps) / (skel_p.sum(dim=(1, 2, 3)) + eps)
+    tsens = ((skel_t * vp).sum(dim=(1, 2, 3)) + eps) / (skel_t.sum(dim=(1, 2, 3)) + eps)
+    cl_dice = (2.0 * tprec * tsens + eps) / (tprec + tsens + eps)
+    return (1.0 - cl_dice).mean()
+
+
 class StaffUNetLoss(nn.Module):
     """Multi-task loss for ``StaffUNet2D``.
 
-    - ``ch0`` (staff lines): BCE + Dice
+    - ``ch0`` (staff lines): BCE + Dice (+ optional horizontal clDice)
     - ``ch1`` (staff center): BCE + Dice
     - ``ch2`` (system body): BCE + Dice
     - ``ch3`` (``sp_px / H``): SmoothL1 masked on staff pixels
@@ -298,6 +463,10 @@ class StaffUNetLoss(nn.Module):
         w_sp: float = 10.0,
         smooth_l1_beta: float = 0.005,
         sp_mode: str = "rel_h",
+        cldice_weight: float = 0.0,
+        srl_weight: float = 0.0,
+        silog_weight: float = 0.0,
+        bdou_weight: float = 0.0,
     ):
         super().__init__()
         if sp_mode not in ("rel_h", "log_hm"):
@@ -308,6 +477,10 @@ class StaffUNetLoss(nn.Module):
         self.w_sp = float(w_sp)
         self.smooth_l1_beta = float(smooth_l1_beta)
         self.sp_mode = str(sp_mode)
+        self.cldice_weight = float(cldice_weight)
+        self.srl_weight = float(srl_weight)
+        self.silog_weight = float(silog_weight)
+        self.bdou_weight = float(bdou_weight)
 
     def forward(
         self,
@@ -358,6 +531,28 @@ class StaffUNetLoss(nn.Module):
             + self.w_system * l_system
             + self.w_sp * l_sp
         )
+        l_cldice: torch.Tensor | None = None
+        if self.cldice_weight > 0.0:
+            l_cldice = soft_staff_cldice_loss(torch.sigmoid(preds[:, 0]), targets[:, 0])
+            total = total + self.cldice_weight * l_cldice
+        l_srl: torch.Tensor | None = None
+        if self.srl_weight > 0.0:
+            acad = _get_academic_losses()
+            l_srl = 0.5 * (
+                acad.skeleton_recall_loss(preds[:, 0], targets[:, 0])
+                + acad.skeleton_recall_loss(preds[:, 1], targets[:, 1])
+            )
+            total = total + self.srl_weight * l_srl
+        l_silog: torch.Tensor | None = None
+        if self.silog_weight > 0.0:
+            acad = _get_academic_losses()
+            l_silog = acad.silog_loss(sp_pred, sp_tgt, (targets[:, 0] > 0.5).float())
+            total = total + self.silog_weight * l_silog
+        l_bdou: torch.Tensor | None = None
+        if self.bdou_weight > 0.0:
+            acad = _get_academic_losses()
+            l_bdou = acad.boundary_dou_loss(preds[:, 2], targets[:, 2])
+            total = total + self.bdou_weight * l_bdou
         if not return_metrics:
             return total, {}
         metrics = {
@@ -367,7 +562,71 @@ class StaffUNetLoss(nn.Module):
             "loss_system": float(l_system.detach().item()),
             "loss_sp": float(l_sp.detach().item()),
         }
+        if l_cldice is not None:
+            metrics["loss_cldice"] = float(l_cldice.detach().item())
+        if l_srl is not None:
+            metrics["loss_srl"] = float(l_srl.detach().item())
+        if l_silog is not None:
+            metrics["loss_silog"] = float(l_silog.detach().item())
+        if l_bdou is not None:
+            metrics["loss_bdou"] = float(l_bdou.detach().item())
         return total, metrics
+
+
+def load_staff_unet2d(
+    ckpt_path: str | Path,
+    device: str | torch.device = "cpu",
+) -> tuple[StaffUNet2D, dict[str, Any]]:
+    """Load a ``StaffUNet2D`` checkpoint with automatic architecture metadata reconstruction."""
+    state = torch.load(str(ckpt_path), map_location="cpu", weights_only=True)
+    if isinstance(state, dict) and ("state_dict" in state or "model" in state):
+        sd = state.get("state_dict", state.get("model"))
+        in_ch = int(state.get("in_channels", 3))
+        base_ch = int(state.get("base_channels", 40))
+        out_stride = int(state.get("out_stride", 2))
+        target_h = int(state.get("target_h", 1024))
+        target_w = int(state.get("target_w", 768))
+        sp_mode = str(state.get("sp_mode", "rel_h"))
+        dyn_res = bool(state.get("dynamic_res", False))
+        pixel_budget = int(state.get("pixel_budget", 1536 * 1152))
+        max_side = int(state.get("max_side", 2048))
+        has_row_ctx = bool(state.get("row_ctx", False)) or any(k.startswith("row_ctx.") for k in sd)
+        has_strip_conv = bool(state.get("strip_conv", False)) or any(
+            k.startswith("strip_dec2.") or k.startswith("strip_dec1.") for k in sd
+        )
+    else:
+        sd = state
+        in_ch, base_ch, out_stride, target_h, target_w = 3, 40, 2, 1024, 768
+        sp_mode, dyn_res = "rel_h", False
+        pixel_budget, max_side = 1536 * 1152, 2048
+        has_row_ctx = any(k.startswith("row_ctx.") for k in sd)
+        has_strip_conv = any(
+            k.startswith("strip_dec2.") or k.startswith("strip_dec1.") for k in sd
+        )
+
+    net = StaffUNet2D(
+        in_channels=in_ch,
+        base_channels=base_ch,
+        out_stride=out_stride,
+        row_ctx=has_row_ctx,
+        strip_conv=has_strip_conv,
+    )
+    net.load_state_dict(sd, strict=True)
+    net.to(device).eval()
+    meta = {
+        "in_channels": in_ch,
+        "base_channels": base_ch,
+        "out_stride": out_stride,
+        "target_h": target_h,
+        "target_w": target_w,
+        "sp_mode": sp_mode,
+        "dynamic_res": dyn_res,
+        "pixel_budget": pixel_budget,
+        "max_side": max_side,
+        "row_ctx": has_row_ctx,
+        "strip_conv": has_strip_conv,
+    }
+    return net, meta
 
 
 # ---------------------------------------------------------------------------
@@ -2003,6 +2262,44 @@ class StaffUNetDataset(Dataset):
         return x, target
 
 
+def _sample_unlabeled_hw_batch(
+    pool: Sequence[Path],
+    batch_size: int,
+    in_channels: int,
+    rng: np.random.Generator,
+    cache: dict[str, torch.Tensor],
+    max_cache: int = 64,
+    cache_h: int = 256,
+    cache_w: int = 192,
+) -> torch.Tensor | None:
+    """Sample a small cached tensor batch ``[N, C, cache_h, cache_w]`` from unlabeled pages."""
+    if not pool or batch_size <= 0:
+        return None
+    n = min(int(batch_size), len(pool))
+    tensors: list[torch.Tensor] = []
+    for _ in range(max(n, n * 2)):
+        if len(tensors) >= n:
+            break
+        p = pool[int(rng.integers(0, len(pool)))]
+        key = str(p)
+        t = cache.get(key)
+        if t is None:
+            try:
+                with Image.open(p) as im:
+                    t = preprocess_page_image(
+                        im, target_h=cache_h, target_w=cache_w, in_channels=in_channels
+                    )
+            except Exception:
+                continue
+            if len(cache) >= max_cache:
+                cache.pop(next(iter(cache)))
+            cache[key] = t
+        tensors.append(t)
+    if not tensors:
+        return None
+    return torch.stack(tensors, dim=0)
+
+
 def train_staff_unet2d(
     manifest: str | Path,
     out_dir: str | Path,
@@ -2026,6 +2323,13 @@ def train_staff_unet2d(
     init_from: str | Path | None = None,
     buckets: Sequence[tuple[int, int]] | None = None,
     row_ctx: bool = False,
+    strip_conv: bool = False,
+    cldice_weight: float = 0.0,
+    srl_weight: float = 0.0,
+    silog_weight: float = 0.0,
+    bdou_weight: float = 0.0,
+    efdm_prob: float = 0.0,
+    fourier_hw_prob: float = 0.0,
     unlabeled_dirs: str | Sequence[str] | None = None,
     unsup_round_every: int = 0,
     unsup_round_steps: int = 200,
@@ -2096,7 +2400,8 @@ def train_staff_unet2d(
 
     model = StaffUNet2D(
         in_channels=in_channels, base_channels=base_channels,
-        out_stride=out_stride, row_ctx=row_ctx,
+        out_stride=out_stride, row_ctx=row_ctx, strip_conv=strip_conv,
+        efdm_prob=efdm_prob,
     ).to(dev)
     if init_from is not None:
         init_state = torch.load(str(init_from), map_location="cpu", weights_only=True)
@@ -2106,7 +2411,25 @@ def train_staff_unet2d(
         else:
             init_sd = init_state
             init_sp_mode = "rel_h"
-        model.load_state_dict(init_sd, strict=True)
+        if strip_conv:
+            incompatible = model.load_state_dict(init_sd, strict=False)
+            bad_missing = [
+                k for k in incompatible.missing_keys
+                if not (k.startswith("strip_dec2.") or k.startswith("strip_dec1."))
+            ]
+            if bad_missing or incompatible.unexpected_keys:
+                raise RuntimeError(
+                    f"Unexpected key mismatch loading --init-from={init_from}: "
+                    f"missing={bad_missing}, unexpected={incompatible.unexpected_keys}"
+                )
+            if incompatible.missing_keys:
+                print(
+                    f"[init-from] warm-started with {len(incompatible.missing_keys)} newly added "
+                    f"strip-conv keys (zero-init residual gate): {incompatible.missing_keys}",
+                    flush=True,
+                )
+        else:
+            model.load_state_dict(init_sd, strict=True)
         if init_sp_mode != sp_mode:
             with torch.no_grad():
                 nn.init.normal_(model.head.weight[3], mean=0.0, std=0.01)
@@ -2118,6 +2441,10 @@ def train_staff_unet2d(
     criterion = StaffUNetLoss(
         w_sp=(1.0 if sp_mode == "log_hm" else 10.0),
         sp_mode=sp_mode,
+        cldice_weight=cldice_weight,
+        srl_weight=srl_weight,
+        silog_weight=silog_weight,
+        bdou_weight=bdou_weight,
     )
     if use_cuda:
         try:
@@ -2130,6 +2457,12 @@ def train_staff_unet2d(
     use_amp = use_cuda
     amp_dtype = torch.bfloat16 if (use_amp and bf16) else torch.float16
     scaler = torch.amp.GradScaler("cuda", enabled=(use_amp and not bf16))
+
+    fourier_hw_prob = float(fourier_hw_prob)
+    use_fourier_hw = (fourier_hw_prob > 0.0) and bool(unlabeled_images) and bool(augment) and (clean_frac < 1.0)
+    fourier_rng = np.random.default_rng(int(seed) + 7919) if use_fourier_hw else None
+    fourier_gen = torch.Generator().manual_seed(int(seed) + 7919) if use_fourier_hw else None
+    fourier_hw_cache: dict[str, torch.Tensor] = {}
 
     ckpt_path = out_path / "staff_unet2d.pt"
     n_batches = len(loader)
@@ -2147,6 +2480,30 @@ def train_staff_unet2d(
             else:
                 x = x.to(dev, non_blocking=use_pin)
             y = y.to(dev, non_blocking=use_pin)
+            if (
+                fourier_rng is not None
+                and float(fourier_rng.random()) >= clean_frac
+                and float(fourier_rng.random()) < fourier_hw_prob
+            ):
+                x_hw = _sample_unlabeled_hw_batch(
+                    unlabeled_images,
+                    batch_size=int(x.shape[0]),
+                    in_channels=in_channels,
+                    rng=fourier_rng,
+                    cache=fourier_hw_cache,
+                )
+                if x_hw is not None:
+                    acad = _get_academic_losses()
+                    x = acad.fourier_hw_amplitude_mix(
+                        x,
+                        x_hw,
+                        p=1.0,
+                        beta=0.15,
+                        alpha=0.5,
+                        generator=fourier_gen,
+                    )
+                    if use_cuda:
+                        x = x.to(memory_format=torch.channels_last)
             opt.zero_grad(set_to_none=True)
             with torch.amp.autocast(dev.type, dtype=amp_dtype, enabled=use_amp):
                 preds = model(x)
@@ -2213,6 +2570,13 @@ def train_staff_unet2d(
             "max_side": int(max_side),
             "sp_mode": str(sp_mode),
             "row_ctx": bool(row_ctx),
+            "strip_conv": bool(strip_conv),
+            "cldice_weight": float(cldice_weight),
+            "srl_weight": float(srl_weight),
+            "silog_weight": float(silog_weight),
+            "bdou_weight": float(bdou_weight),
+            "efdm_prob": float(efdm_prob),
+            "fourier_hw_prob": float(fourier_hw_prob),
             "epoch": ep,
             "loss": avg,
         }
@@ -2246,6 +2610,47 @@ def _main() -> None:
     p.add_argument("--sp-mode", default="rel_h", choices=["rel_h", "log_hm"], help="ch3 staff-space parameterization")
     p.add_argument("--init-from", default=None, help="Optional checkpoint path to warm-start from")
     p.add_argument("--row-ctx", action="store_true", help="Enable global horizontal row-context + (2,4) bottleneck dilation")
+    p.add_argument(
+        "--strip-conv",
+        action="store_true",
+        help="Enable zero-init residual HorizontalStripBlock in decoder stages d2/d1",
+    )
+    p.add_argument(
+        "--cldice-weight",
+        type=float,
+        default=0.0,
+        help="Weight for horizontal soft-skeleton clDice continuity loss on ch0 (0.0 = off)",
+    )
+    p.add_argument(
+        "--srl-weight",
+        type=float,
+        default=0.0,
+        help="Weight for ECCV 2024 Skeleton Recall Loss on ch0 & ch1 (0.0 = off)",
+    )
+    p.add_argument(
+        "--silog-weight",
+        type=float,
+        default=0.0,
+        help="Weight for UniDepth Scale-Invariant Log Loss on ch3 masked by ch0 > 0.5 (0.0 = off)",
+    )
+    p.add_argument(
+        "--bdou-weight",
+        type=float,
+        default=0.0,
+        help="Weight for MICCAI Boundary DoU loss on ch2 system boundaries (0.0 = off)",
+    )
+    p.add_argument(
+        "--efdm-prob",
+        type=float,
+        default=0.0,
+        help="Probability of early-encoder EFDMix style mixing after enc1/enc2 during training (0.0 = off)",
+    )
+    p.add_argument(
+        "--fourier-hw-prob",
+        type=float,
+        default=0.0,
+        help="Probability of unlabeled-HW Fourier low-frequency amplitude mix on non-clean batches (0.0 = off)",
+    )
     p.add_argument(
         "--unlabeled-dirs",
         default=None,
@@ -2304,6 +2709,13 @@ def _main() -> None:
         sp_mode=args.sp_mode,
         init_from=args.init_from,
         row_ctx=args.row_ctx,
+        strip_conv=args.strip_conv,
+        cldice_weight=args.cldice_weight,
+        srl_weight=args.srl_weight,
+        silog_weight=args.silog_weight,
+        bdou_weight=args.bdou_weight,
+        efdm_prob=args.efdm_prob,
+        fourier_hw_prob=args.fourier_hw_prob,
         unlabeled_dirs=args.unlabeled_dirs,
         unsup_round_every=args.unsup_round_every,
         unsup_round_steps=args.unsup_round_steps,

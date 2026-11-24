@@ -55,6 +55,18 @@ NOTEHEAD_ARCHETYPES: Tuple[str, ...] = (
     "compact",
     "heavy_wedge",
     "hollow_diamond",
+    "slim_oval",
+    "needle_slash",
+    "hairline_dash",
+    "vertical_tick",
+    "pinprick_dot",
+    "slim_diamond",
+    "boomerang_hook",
+    "open_loop",
+    "zigzag_fill",
+    "broad_nib_lozenge",
+    "ink_blot",
+    "chevron_wedge",
 )
 
 CLEF_ARCHETYPES: Tuple[str, ...] = (
@@ -479,6 +491,115 @@ def _get_style_min_ratio(style: dict) -> float:
 # Noteheads
 # ---------------------------------------------------------------------------
 
+_DEFAULT_NOTEHEAD_WEIGHTS: Tuple[float, ...] = (
+    0.20,  # oval
+    0.09,  # slash
+    0.09,  # teardrop
+    0.08,  # compact
+    0.06,  # heavy_wedge
+    0.06,  # hollow_diamond
+    0.05,  # slim_oval
+    0.04,  # needle_slash
+    0.04,  # hairline_dash
+    0.03,  # vertical_tick
+    0.03,  # pinprick_dot
+    0.04,  # slim_diamond
+    0.03,  # boomerang_hook
+    0.04,  # open_loop
+    0.03,  # zigzag_fill
+    0.03,  # broad_nib_lozenge
+    0.03,  # ink_blot
+    0.03,  # chevron_wedge
+)
+
+
+def _rot_pts(pts_local: np.ndarray, nx: float, ny: float, rad: float) -> np.ndarray:
+    """Rotate local (N, 2) points by ``rad`` radians and translate to ``(nx, ny)``."""
+    cos_a, sin_a = math.cos(rad), math.sin(rad)
+    return np.column_stack((
+        nx + pts_local[:, 0] * cos_a - pts_local[:, 1] * sin_a,
+        ny + pts_local[:, 0] * sin_a + pts_local[:, 1] * cos_a,
+    ))
+
+
+def _notehead_aspect_scales(aspect: float) -> Tuple[float, float, float]:
+    """Map ``notehead_aspect`` in [0.25, 2.20] to ``(rx_mult, ry_mult, stroke_mult)``.
+
+    Values < 1.0 thin the notehead (needle-slim at < 0.55); values > 1.0 stretch it wide.
+    At 1.0 returns (1.0, 1.0, 1.0).
+    """
+    a = float(np.clip(aspect, 0.25, 2.20))
+    if a < 1.0:
+        rx_mult = 1.0 + 0.16 * (1.0 - a)
+        ry_mult = a
+        stroke_mult = max(0.35, a ** 0.72)
+    else:
+        rx_mult = 1.0 + 0.70 * (a - 1.0)
+        ry_mult = 1.0 / (1.0 + 0.16 * (a - 1.0))
+        stroke_mult = 1.0 + 0.18 * (a - 1.0)
+    return rx_mult, ry_mult, stroke_mult
+
+
+def _draw_blob_with_fill_density(
+    canvas: StrokeCanvas,
+    nx: float,
+    ny: float,
+    rx: float,
+    ry: float,
+    angle_deg: float,
+    color_rgb: RGBLike,
+    style: dict,
+    rng: np.random.Generator,
+    fill_density: float,
+    sp: float,
+) -> None:
+    """Draw a filled blob notehead modulated by ``notehead_fill_density``."""
+    fd = float(np.clip(fill_density, 0.25, 1.50))
+    if fd < 0.72:
+        # Hurried sparse fill: crisp calligraphic outline + quick diagonal scribble stroke(s).
+        local_style = dict(style)
+        local_style["hollow_stroke_ratio"] = max(0.24, 0.34 * (0.65 + 0.5 * fd))
+        gap = float(rng.uniform(0.05, 0.18)) if rng.random() < 0.45 else 0.0
+        draw_filled_blob(canvas, nx, ny, rx, ry, angle_deg, color_rgb, local_style, hollow=True, open_gap=gap)
+        rad = math.radians(angle_deg)
+        n_strokes = 1 if fd < 0.50 else 2
+        stroke_w = max(0.75, min(rx, ry) * (0.45 + 0.55 * fd))
+        for k in range(n_strokes):
+            off = (k - 0.5 * (n_strokes - 1)) * ry * 0.52
+            seg = np.array(
+                [[-rx * 0.68, off + ry * 0.12], [rx * 0.68, off - ry * 0.12]],
+                dtype=np.float64,
+            )
+            seg += rng.normal(0.0, 0.03 * sp, size=seg.shape)
+            draw_calligraphic_polyline(
+                canvas,
+                _rot_pts(seg, nx, ny, rad),
+                color_rgb,
+                stroke_w,
+                local_style,
+                kind="notehead_scribble",
+            )
+        return
+
+    local_style = dict(style)
+    base_op = float(style.get("stroke_opacity", style.get("opacity", 0.92)))
+    local_style["stroke_opacity"] = float(np.clip(base_op * (0.82 + 0.18 * fd), 0.25, 1.0))
+    draw_filled_blob(canvas, nx, ny, rx, ry, angle_deg, color_rgb, local_style, hollow=False)
+
+    if fd > 1.12:
+        # Heavy/saturated ink pass across the body of the notehead.
+        rad = math.radians(angle_deg)
+        extra_scale = min(1.12, 0.85 + 0.18 * (fd - 1.0))
+        seg = np.array([[-rx * 0.65, 0.0], [rx * 0.65, 0.0]], dtype=np.float64)
+        draw_calligraphic_polyline(
+            canvas,
+            _rot_pts(seg, nx, ny, rad),
+            color_rgb,
+            max(1.0, ry * 1.15 * extra_scale),
+            local_style,
+            kind="notehead_dense",
+        )
+
 
 def draw_notehead(
     canvas: StrokeCanvas,
@@ -492,8 +613,8 @@ def draw_notehead(
 ) -> None:
     """Draw a handwritten notehead ('filled', 'half', or 'whole').
 
-    Supports 'oval', 'slash', 'teardrop', and 'compact' archetypes with
-    tilt/size jitter and occasional slightly unclosed hollow loops.
+    Supports all 18 morphological archetypes in ``NOTEHEAD_ARCHETYPES``,
+    ``notehead_aspect`` in [0.25, 2.20], and ``notehead_fill_density`` in [0.25, 1.50].
     """
     dk = str(duration_kind).strip().lower()
     if dk in ("quarter", "eighth", "16th", "32nd", "black", "solid"):
@@ -511,111 +632,292 @@ def draw_notehead(
             NOTEHEAD_ARCHETYPES,
             style.get("notehead_archetype_weights"),
             rng,
-            default_weights=(0.38, 0.16, 0.16, 0.12, 0.10, 0.08),
+            default_weights=_DEFAULT_NOTEHEAD_WEIGHTS,
         )
 
     size_j = float(rng.uniform(0.90, 1.12)) * float(style.get("notehead_scale", 1.0))
+    aspect = float(np.clip(style.get("notehead_aspect", 1.0), 0.25, 2.20))
+    fill_density = float(np.clip(style.get("notehead_fill_density", 1.0), 0.25, 1.50))
+    rx_mult, ry_mult, stroke_mult = _notehead_aspect_scales(aspect)
+    fill_w = 0.50 + 0.50 * fill_density  # 0.625 .. 1.25
+
     base_angle = float(style.get("notehead_angle_deg", -30.0))
     ox = float(rng.normal(0.0, 0.03 * sp))
     oy = float(rng.normal(0.0, 0.025 * sp))
     nx, ny = cx + ox, cy + oy
 
-    if dk == "whole":
-        if arch == "hollow_diamond":
-            rx = sp * 0.72 * size_j * float(rng.uniform(0.94, 1.08))
-            ry = sp * 0.50 * size_j * float(rng.uniform(0.92, 1.06))
-            rad = math.radians(float(rng.normal(base_angle * 0.3, 5.0)))
-            cos_a, sin_a = math.cos(rad), math.sin(rad)
-            verts = np.array([[rx, 0.0], [0.0, -ry], [-rx, 0.0], [0.0, ry], [rx, 0.0]], dtype=np.float64)
-            verts += rng.normal(0.0, 0.04 * sp, size=verts.shape)
-            pts = np.column_stack((nx + verts[:, 0] * cos_a - verts[:, 1] * sin_a, ny + verts[:, 0] * sin_a + verts[:, 1] * cos_a))
-            draw_calligraphic_polyline(canvas, pts, color_rgb, max(1.1, sp * 0.22 * size_j), style, kind="hollow_notehead")
-            return
-        rx = sp * 0.72 * size_j * float(rng.uniform(0.94, 1.08))
-        ry = sp * 0.48 * size_j * float(rng.uniform(0.92, 1.06))
-        angle = float(rng.normal(base_angle * 0.4, 6.0))
-        open_prob = float(style.get("hollow_open_prob", 0.30))
-        gap = float(rng.uniform(0.05, 0.15)) if rng.random() < open_prob else 0.0
-        draw_filled_blob(canvas, nx, ny, rx, ry, angle, color_rgb, style, hollow=True, open_gap=gap)
-        return
+    # ------------------------------------------------------------------
+    # Hollow noteheads ("whole" and "half")
+    # ------------------------------------------------------------------
+    if dk in ("whole", "half"):
+        is_whole = dk == "whole"
+        w_boost = 1.12 if is_whole else 1.0
+        open_prob = float(style.get("hollow_open_prob", 0.30 if is_whole else 0.38))
+        gap = float(rng.uniform(0.05, 0.16)) if rng.random() < open_prob else 0.0
 
-    if dk == "half":
         if arch == "hollow_diamond":
-            rx = sp * 0.66 * size_j
-            ry = sp * 0.46 * size_j
-            rad = math.radians(float(rng.normal(base_angle * 0.4, 6.0)))
-            cos_a, sin_a = math.cos(rad), math.sin(rad)
-            verts = np.array([[rx, 0.0], [0.0, -ry], [-rx, 0.0], [0.0, ry], [rx * 0.92, -ry * 0.08]], dtype=np.float64)
-            verts += rng.normal(0.0, 0.04 * sp, size=verts.shape)
-            pts = np.column_stack((nx + verts[:, 0] * cos_a - verts[:, 1] * sin_a, ny + verts[:, 0] * sin_a + verts[:, 1] * cos_a))
-            draw_calligraphic_polyline(canvas, pts, color_rgb, max(1.0, sp * 0.20 * size_j), style, kind="hollow_notehead")
+            rx = sp * (0.72 if is_whole else 0.66) * size_j * rx_mult * float(rng.uniform(0.94, 1.08))
+            ry = sp * (0.50 if is_whole else 0.46) * size_j * ry_mult * float(rng.uniform(0.92, 1.06))
+            rad = math.radians(float(rng.normal(base_angle * (0.3 if is_whole else 0.4), 5.5)))
+            end_pt = [rx, 0.0] if is_whole else [rx * 0.92, -ry * 0.08]
+            verts = np.array([[rx, 0.0], [0.0, -ry], [-rx, 0.0], [0.0, ry], end_pt], dtype=np.float64)
+            verts += rng.normal(0.0, 0.035 * sp, size=verts.shape)
+            pts = _rot_pts(verts, nx, ny, rad)
+            draw_calligraphic_polyline(
+                canvas, pts, color_rgb, max(0.85, sp * (0.22 if is_whole else 0.20) * size_j * stroke_mult), style, kind="hollow_notehead"
+            )
             return
+
+        if arch == "slim_oval":
+            rx = sp * 0.72 * w_boost * size_j * rx_mult * float(rng.uniform(0.94, 1.08))
+            ry = sp * 0.23 * size_j * ry_mult * float(rng.uniform(0.92, 1.08))
+            angle = float(rng.normal(base_angle - 4.0, 5.5))
+            local_style = dict(style)
+            local_style["hollow_stroke_ratio"] = float(style.get("hollow_stroke_ratio", 0.44)) * 0.68
+            draw_filled_blob(canvas, nx, ny, rx, ry, angle, color_rgb, local_style, hollow=True, open_gap=gap)
+            return
+
+        if arch == "needle_slash":
+            # Razor-thin double-hairline needle loop enclosing a narrow slit.
+            rx = sp * 0.76 * w_boost * size_j * rx_mult
+            ry = sp * 0.16 * size_j * ry_mult
+            rad = math.radians(float(rng.normal(base_angle - 14.0, 6.0)))
+            top_arc = _eval_quad(
+                np.array([-rx, 0.0]),
+                np.array([0.0, -ry * 1.45]),
+                np.array([rx, 0.0]),
+                n=10,
+            )
+            bot_arc = _eval_quad(
+                np.array([rx, 0.0]),
+                np.array([0.0, ry * 1.45]),
+                np.array([-rx * (0.85 if gap > 0 else 1.0), ry * (0.25 if gap > 0 else 0.0)]),
+                n=10,
+            )
+            pts = _rot_pts(np.vstack((top_arc, bot_arc[1:])), nx, ny, rad)
+            local_style = dict(style)
+            local_style["wobble_px"] = min(float(style.get("wobble_px", 0.7)), 0.45)
+            draw_calligraphic_polyline(
+                canvas, pts, color_rgb, max(0.55, sp * 0.11 * size_j * stroke_mult), local_style, kind="hollow_notehead"
+            )
+            return
+
+        if arch == "hairline_dash":
+            # Flat horizontal hairline capsule / hollow bracket slit.
+            rx = sp * 0.72 * w_boost * size_j * rx_mult
+            ry = sp * 0.18 * size_j * ry_mult
+            rad = math.radians(float(rng.normal(0.0, 5.0)))
+            upper = _eval_quad(np.array([-rx, -ry * 0.3]), np.array([0.0, -ry * 1.2]), np.array([rx, -ry * 0.2]), n=9)
+            lower = _eval_quad(np.array([rx, ry * 0.2]), np.array([0.0, ry * 1.2]), np.array([-rx, ry * 0.3]), n=9)
+            pts = _rot_pts(np.vstack((upper, lower)), nx, ny, rad)
+            local_style = dict(style)
+            local_style["wobble_px"] = min(float(style.get("wobble_px", 0.7)), 0.45)
+            draw_calligraphic_polyline(
+                canvas, pts, color_rgb, max(0.55, sp * 0.11 * size_j * stroke_mult), local_style, kind="hollow_notehead"
+            )
+            return
+
+        if arch == "vertical_tick":
+            # Tall narrow vertical hollow slit.
+            rx = sp * 0.22 * w_boost * size_j * ry_mult
+            ry = sp * 0.56 * size_j * rx_mult
+            angle = float(rng.normal(0.0, 7.0))
+            local_style = dict(style)
+            local_style["hollow_stroke_ratio"] = float(style.get("hollow_stroke_ratio", 0.44)) * 0.65
+            draw_filled_blob(canvas, nx, ny, rx, ry, angle, color_rgb, local_style, hollow=True, open_gap=gap)
+            return
+
+        if arch == "pinprick_dot":
+            # Tiny delicate hollow eyelet ring.
+            rx = sp * 0.32 * w_boost * size_j * rx_mult
+            ry = sp * 0.26 * size_j * ry_mult
+            angle = float(rng.normal(base_angle * 0.5, 8.0))
+            local_style = dict(style)
+            local_style["hollow_stroke_ratio"] = 0.34
+            draw_filled_blob(canvas, nx, ny, rx, ry, angle, color_rgb, local_style, hollow=True, open_gap=gap)
+            return
+
+        if arch == "slim_diamond":
+            # Razor-sharp elongated narrow hollow diamond.
+            rx = sp * 0.76 * w_boost * size_j * rx_mult
+            ry = sp * 0.24 * size_j * ry_mult
+            rad = math.radians(float(rng.normal(base_angle * 0.6, 5.5)))
+            verts = np.array([[rx, 0.0], [0.0, -ry], [-rx, 0.0], [0.0, ry], [rx, 0.0]], dtype=np.float64)
+            verts += rng.normal(0.0, 0.025 * sp, size=verts.shape)
+            pts = _rot_pts(verts, nx, ny, rad)
+            draw_calligraphic_polyline(
+                canvas, pts, color_rgb, max(0.60, sp * 0.13 * size_j * stroke_mult), style, kind="hollow_notehead"
+            )
+            return
+
+        if arch == "boomerang_hook":
+            # Crescent / curved boomerang hollow loop.
+            rx = sp * 0.68 * w_boost * size_j * rx_mult
+            ry = sp * 0.42 * size_j * ry_mult
+            rad = math.radians(float(rng.normal(base_angle * 0.5, 7.0)))
+            outer = _eval_quad(np.array([-rx, ry * 0.45]), np.array([0.0, -ry * 1.15]), np.array([rx, ry * 0.45]), n=12)
+            inner = _eval_quad(np.array([rx, ry * 0.45]), np.array([0.0, -ry * 0.05]), np.array([-rx * 0.88, ry * 0.38]), n=10)
+            pts = _rot_pts(np.vstack((outer, inner[1:])), nx, ny, rad)
+            draw_calligraphic_polyline(
+                canvas, pts, color_rgb, max(0.75, sp * 0.16 * size_j * stroke_mult), style, kind="hollow_notehead"
+            )
+            return
+
+        if arch == "open_loop":
+            # Deliberately unclosed cursive C/e loop with trailing tail.
+            rx = sp * 0.64 * w_boost * size_j * rx_mult
+            ry = sp * 0.44 * size_j * ry_mult
+            angle = float(rng.normal(base_angle, 7.0))
+            forced_gap = float(rng.uniform(0.22, 0.38))
+            draw_filled_blob(canvas, nx, ny, rx, ry, angle, color_rgb, style, hollow=True, open_gap=forced_gap)
+            return
+
+        if arch == "zigzag_fill":
+            # Angular sketchy polygonal hollow loop with brisk overshoots.
+            rx = sp * 0.66 * w_boost * size_j * rx_mult
+            ry = sp * 0.44 * size_j * ry_mult
+            rad = math.radians(float(rng.normal(base_angle * 0.6, 7.0)))
+            verts = np.array([
+                [-rx * 1.05, -ry * 0.25],
+                [rx * 0.25, -ry * 0.95],
+                [rx * 1.05, ry * 0.10],
+                [-rx * 0.15, ry * 0.95],
+                [-rx * 0.95, -ry * 0.05],
+            ], dtype=np.float64)
+            verts += rng.normal(0.0, 0.05 * sp, size=verts.shape)
+            pts = _rot_pts(verts, nx, ny, rad)
+            draw_calligraphic_polyline(
+                canvas, pts, color_rgb, max(0.80, sp * 0.18 * size_j * stroke_mult), style, kind="hollow_notehead"
+            )
+            return
+
+        if arch == "broad_nib_lozenge":
+            # Sheared calligraphic parallelogram hollow lozenge.
+            rx = sp * 0.66 * w_boost * size_j * rx_mult
+            ry = sp * 0.40 * size_j * ry_mult
+            shear = rx * 0.38
+            rad = math.radians(float(rng.normal(base_angle * 0.45, 5.0)))
+            verts = np.array([
+                [-rx + shear, -ry],
+                [rx + shear, -ry],
+                [rx - shear, ry],
+                [-rx - shear, ry],
+                [-rx + shear * 0.9, -ry * 0.92],
+            ], dtype=np.float64)
+            verts += rng.normal(0.0, 0.03 * sp, size=verts.shape)
+            pts = _rot_pts(verts, nx, ny, rad)
+            draw_calligraphic_polyline(
+                canvas, pts, color_rgb, max(0.85, sp * 0.20 * size_j * stroke_mult), style, kind="hollow_notehead"
+            )
+            return
+
+        if arch == "ink_blot":
+            # Heavy, uneven, heavily-pooled hollow ink ring.
+            rx = sp * 0.70 * w_boost * size_j * rx_mult
+            ry = sp * 0.52 * size_j * ry_mult
+            angle = float(rng.normal(base_angle * 0.6, 8.0))
+            local_style = dict(style)
+            local_style["hollow_stroke_ratio"] = float(style.get("hollow_stroke_ratio", 0.44)) * 1.45
+            local_style["ink_pooling"] = min(0.85, float(style.get("ink_pooling", 0.2)) + 0.30)
+            draw_filled_blob(canvas, nx, ny, rx, ry, angle, color_rgb, local_style, hollow=True, open_gap=gap * 0.5)
+            return
+
+        if arch == "chevron_wedge":
+            # Crisp hollow triangular/chevron arrowhead wedge.
+            rx = sp * 0.70 * w_boost * size_j * rx_mult
+            ry = sp * 0.46 * size_j * ry_mult
+            rad = math.radians(float(rng.normal(base_angle * 0.35, 6.0)))
+            verts = np.array([
+                [-rx, -ry],
+                [rx, 0.0],
+                [-rx, ry],
+                [-rx * 0.82, -ry * 0.90],
+            ], dtype=np.float64)
+            verts += rng.normal(0.0, 0.035 * sp, size=verts.shape)
+            pts = _rot_pts(verts, nx, ny, rad)
+            draw_calligraphic_polyline(
+                canvas, pts, color_rgb, max(0.80, sp * 0.19 * size_j * stroke_mult), style, kind="hollow_notehead"
+            )
+            return
+
         if arch == "heavy_wedge":
-            rx = sp * 0.68 * size_j
-            ry = sp * 0.44 * size_j
+            rx = sp * (0.72 if is_whole else 0.68) * size_j * rx_mult
+            ry = sp * (0.48 if is_whole else 0.44) * size_j * ry_mult
             angle = float(rng.normal(base_angle - 6.0, 5.5))
             local_style = dict(style)
             local_style["hollow_stroke_ratio"] = float(style.get("hollow_stroke_ratio", 0.44)) * 1.28
-            open_prob = float(style.get("hollow_open_prob", 0.32))
-            gap = float(rng.uniform(0.05, 0.15)) if rng.random() < open_prob else 0.0
             draw_filled_blob(canvas, nx, ny, rx, ry, angle, color_rgb, local_style, hollow=True, open_gap=gap)
             return
+
         if arch == "slash":
-            # Brisk open diamond/slash loop.
-            rx = sp * 0.66 * size_j
-            ry = sp * 0.36 * size_j
+            rx = sp * (0.72 if is_whole else 0.66) * size_j * rx_mult
+            ry = sp * (0.40 if is_whole else 0.36) * size_j * ry_mult
             angle = float(rng.normal(base_angle - 8.0, 6.0))
         elif arch == "compact":
-            rx = sp * 0.56 * size_j
-            ry = sp * 0.44 * size_j
+            rx = sp * (0.62 if is_whole else 0.56) * size_j * rx_mult
+            ry = sp * (0.46 if is_whole else 0.44) * size_j * ry_mult
             angle = float(rng.normal(base_angle + 6.0, 7.0))
-        else:
-            rx = sp * 0.64 * size_j
-            ry = sp * 0.46 * size_j
-            angle = float(rng.normal(base_angle, 6.5))
-        open_prob = float(style.get("hollow_open_prob", 0.38))
-        gap = float(rng.uniform(0.06, 0.18)) if rng.random() < open_prob else 0.0
+        elif arch == "teardrop":
+            rx = sp * (0.70 if is_whole else 0.64) * size_j * rx_mult
+            ry = sp * (0.46 if is_whole else 0.44) * size_j * ry_mult
+            angle = float(rng.normal(base_angle - 3.0, 6.0))
+            draw_filled_blob(canvas, nx, ny, rx, ry, angle, color_rgb, style, hollow=True, open_gap=gap)
+            rad = math.radians(angle)
+            sign = 1.0 if rng.random() < 0.5 else -1.0
+            flick = _rot_pts(np.array([[sign * rx * 0.85, 0.0], [sign * rx * 1.22, -ry * 0.12]], dtype=np.float64), nx, ny, rad)
+            draw_calligraphic_polyline(canvas, flick, color_rgb, max(0.7, sp * 0.16 * size_j * stroke_mult), style, kind="notehead_flick")
+            return
+        else:  # "oval"
+            rx = sp * (0.72 if is_whole else 0.64) * size_j * rx_mult * float(rng.uniform(0.94, 1.08))
+            ry = sp * (0.48 if is_whole else 0.46) * size_j * ry_mult * float(rng.uniform(0.92, 1.06))
+            angle = float(rng.normal(base_angle * (0.4 if is_whole else 1.0), 6.5))
+
         draw_filled_blob(canvas, nx, ny, rx, ry, angle, color_rgb, style, hollow=True, open_gap=gap)
         return
 
-    # Filled notehead ("filled")
+    # ------------------------------------------------------------------
+    # Filled noteheads ("filled")
+    # ------------------------------------------------------------------
     if arch == "heavy_wedge":
-        # Bold broad-nib wedge / heavy calligraphic parallelogram notehead.
         angle = math.radians(float(rng.normal(base_angle - 5.0, 6.0)))
-        half_len = sp * 0.64 * size_j
+        half_len = sp * 0.64 * size_j * rx_mult
         dx = half_len * math.cos(angle)
         dy = half_len * math.sin(angle)
-        px = -0.14 * sp * math.sin(angle)
-        py = 0.14 * sp * math.cos(angle)
+        px = -0.14 * sp * ry_mult * math.sin(angle)
+        py = 0.14 * sp * ry_mult * math.cos(angle)
         pts1 = np.array([[nx - dx, ny - dy], [nx + dx, ny + dy]], dtype=np.float64)
         pts2 = np.array([[nx - dx * 0.78 + px, ny - dy * 0.78 + py], [nx + dx * 0.85 - px, ny + dy * 0.85 - py]], dtype=np.float64)
         local_style = dict(style)
         local_style["taper_start"] = 0.04
         local_style["taper_end"] = 0.06
         local_style["nib_min_ratio"] = max(_get_style_min_ratio(style), 0.72)
-        draw_calligraphic_polyline(canvas, pts1, color_rgb, sp * 0.72 * size_j, local_style, kind="notehead_wedge")
-        draw_calligraphic_polyline(canvas, pts2, color_rgb, sp * 0.58 * size_j, local_style, kind="notehead_wedge")
+        draw_calligraphic_polyline(canvas, pts1, color_rgb, max(0.8, sp * 0.72 * size_j * stroke_mult * fill_w), local_style, kind="notehead_wedge")
+        if fill_density >= 0.55:
+            draw_calligraphic_polyline(canvas, pts2, color_rgb, max(0.7, sp * 0.58 * size_j * stroke_mult * fill_w), local_style, kind="notehead_wedge")
         return
 
     if arch == "hollow_diamond":
-        # Faceted handwritten diamond / lozenge head (crisp diamond outline + quick interior dash).
-        rx = sp * 0.62 * size_j * float(rng.uniform(0.92, 1.08))
-        ry = sp * 0.45 * size_j * float(rng.uniform(0.92, 1.08))
+        rx = sp * 0.62 * size_j * rx_mult * float(rng.uniform(0.92, 1.08))
+        ry = sp * 0.45 * size_j * ry_mult * float(rng.uniform(0.92, 1.08))
         rad = math.radians(float(rng.normal(base_angle * 0.5, 6.5)))
-        cos_a, sin_a = math.cos(rad), math.sin(rad)
         verts = np.array([[rx, 0.0], [0.0, -ry], [-rx, 0.0], [0.0, ry], [rx, 0.0]], dtype=np.float64)
         verts += rng.normal(0.0, 0.04 * sp, size=verts.shape)
-        pts = np.column_stack((nx + verts[:, 0] * cos_a - verts[:, 1] * sin_a, ny + verts[:, 0] * sin_a + verts[:, 1] * cos_a))
-        draw_calligraphic_polyline(canvas, pts, color_rgb, max(1.1, sp * 0.24 * size_j), style, kind="notehead_diamond")
-        # Quick interior fill slash so filled diamond reads heavier than half/whole diamond.
+        pts = _rot_pts(verts, nx, ny, rad)
+        draw_calligraphic_polyline(canvas, pts, color_rgb, max(0.85, sp * 0.24 * size_j * stroke_mult), style, kind="notehead_diamond")
         slash = np.array([[-rx * 0.55, ry * 0.12], [rx * 0.55, -ry * 0.12]], dtype=np.float64)
-        s_pts = np.column_stack((nx + slash[:, 0] * cos_a - slash[:, 1] * sin_a, ny + slash[:, 0] * sin_a + slash[:, 1] * cos_a))
-        draw_calligraphic_polyline(canvas, s_pts, color_rgb, max(1.2, sp * 0.38 * size_j), style, kind="notehead_diamond")
+        draw_calligraphic_polyline(
+            canvas, _rot_pts(slash, nx, ny, rad), color_rgb, max(0.85, sp * 0.38 * size_j * stroke_mult * fill_w), style, kind="notehead_diamond"
+        )
+        if fill_density > 1.15:
+            slash2 = np.array([[-rx * 0.35, -ry * 0.28], [rx * 0.35, ry * 0.28]], dtype=np.float64)
+            draw_calligraphic_polyline(
+                canvas, _rot_pts(slash2, nx, ny, rad), color_rgb, max(0.85, sp * 0.32 * size_j * stroke_mult), style, kind="notehead_diamond"
+            )
         return
+
     if arch == "slash":
-        # Beethoven / hurried jazz dash-slash notehead!
         angle = math.radians(float(rng.normal(base_angle - 8.0, 8.0)))
-        half_len = sp * 0.60 * size_j
+        half_len = sp * 0.60 * size_j * rx_mult
         dx = half_len * math.cos(angle)
         dy = half_len * math.sin(angle)
         mid_off = float(rng.normal(0.0, 0.06 * sp))
@@ -628,34 +930,267 @@ def draw_notehead(
         local_style["taper_start"] = 0.16
         local_style["taper_end"] = 0.20
         local_style["nib_min_ratio"] = max(_get_style_min_ratio(style), 0.65)
-        draw_calligraphic_polyline(canvas, pts, color_rgb, sp * 0.56 * size_j, local_style, kind="notehead_slash")
+        draw_calligraphic_polyline(canvas, pts, color_rgb, max(0.75, sp * 0.56 * size_j * stroke_mult * fill_w), local_style, kind="notehead_slash")
+        return
+
+    if arch == "slim_oval":
+        rx = sp * 0.68 * size_j * rx_mult * float(rng.uniform(0.93, 1.08))
+        ry = sp * 0.21 * size_j * ry_mult * float(rng.uniform(0.90, 1.10))
+        angle = float(rng.normal(base_angle - 4.0, 6.0))
+        _draw_blob_with_fill_density(canvas, nx, ny, rx, ry, angle, color_rgb, style, rng, fill_density, sp)
+        return
+
+    if arch == "needle_slash":
+        # Razor-thin, elongated diagonal needle slash.
+        angle = math.radians(float(rng.normal(base_angle - 14.0, 7.0)))
+        half_len = sp * 0.78 * size_j * rx_mult
+        dx = half_len * math.cos(angle)
+        dy = half_len * math.sin(angle)
+        mid_off = float(rng.normal(0.0, 0.03 * sp))
+        pts = np.array([
+            [nx - dx, ny - dy],
+            [nx - mid_off * math.sin(angle), ny + mid_off * math.cos(angle)],
+            [nx + dx, ny + dy],
+        ], dtype=np.float64)
+        local_style = dict(style)
+        local_style["taper_start"] = 0.25
+        local_style["taper_end"] = 0.28
+        local_style["wobble_px"] = min(float(style.get("wobble_px", 0.7)), 0.55)
+        local_style["nib_min_ratio"] = max(_get_style_min_ratio(style), 0.55)
+        draw_calligraphic_polyline(canvas, pts, color_rgb, max(0.50, sp * 0.16 * size_j * stroke_mult * fill_w), local_style, kind="notehead_needle")
+        return
+
+    if arch == "hairline_dash":
+        # Ultra-thin nearly horizontal hairline dash.
+        angle = math.radians(float(rng.normal(0.0, 5.5)))
+        half_len = sp * 0.70 * size_j * rx_mult
+        dx = half_len * math.cos(angle)
+        dy = half_len * math.sin(angle)
+        bow = float(rng.normal(0.0, 0.035 * sp))
+        pts = np.array([
+            [nx - dx, ny - dy],
+            [nx, ny + bow],
+            [nx + dx, ny + dy],
+        ], dtype=np.float64)
+        local_style = dict(style)
+        local_style["taper_start"] = 0.18
+        local_style["taper_end"] = 0.18
+        local_style["wobble_px"] = min(float(style.get("wobble_px", 0.7)), 0.50)
+        local_style["nib_min_ratio"] = max(_get_style_min_ratio(style), 0.60)
+        draw_calligraphic_polyline(canvas, pts, color_rgb, max(0.50, sp * 0.15 * size_j * stroke_mult * fill_w), local_style, kind="notehead_hairline")
+        if fill_density > 1.15:
+            pts2 = pts + np.array([0.0, max(0.6, sp * 0.08 * ry_mult)])
+            draw_calligraphic_polyline(canvas, pts2, color_rgb, max(0.45, sp * 0.11 * size_j * stroke_mult), local_style, kind="notehead_hairline")
+        return
+
+    if arch == "vertical_tick":
+        # Sharp, slim near-vertical pen stab / tick mark.
+        angle = math.radians(float(rng.normal(86.0, 8.0)))
+        half_len = sp * 0.50 * size_j * rx_mult
+        dx = half_len * math.cos(angle)
+        dy = half_len * math.sin(angle)
+        hook_x = float(rng.uniform(-0.14, 0.14)) * sp * size_j
+        pts = np.array([
+            [nx - dx + hook_x, ny - dy],
+            [nx, ny],
+            [nx + dx, ny + dy],
+        ], dtype=np.float64)
+        local_style = dict(style)
+        local_style["taper_start"] = 0.15
+        local_style["taper_end"] = 0.24
+        local_style["wobble_px"] = min(float(style.get("wobble_px", 0.7)), 0.55)
+        draw_calligraphic_polyline(canvas, pts, color_rgb, max(0.55, sp * 0.19 * size_j * stroke_mult * fill_w), local_style, kind="notehead_tick")
+        return
+
+    if arch == "pinprick_dot":
+        # Tiny sharp pinprick / spider-leg dot head.
+        rx = sp * 0.24 * size_j * rx_mult * float(rng.uniform(0.90, 1.10))
+        ry = sp * 0.21 * size_j * ry_mult * float(rng.uniform(0.90, 1.10))
+        angle = float(rng.normal(base_angle * 0.5, 10.0))
+        _draw_blob_with_fill_density(canvas, nx, ny, rx, ry, angle, color_rgb, style, rng, fill_density, sp)
+        return
+
+    if arch == "slim_diamond":
+        # Razor-sharp narrow elongated diamond / spearhead.
+        rx = sp * 0.74 * size_j * rx_mult * float(rng.uniform(0.93, 1.07))
+        ry = sp * 0.22 * size_j * ry_mult * float(rng.uniform(0.90, 1.10))
+        rad = math.radians(float(rng.normal(base_angle * 0.65, 6.0)))
+        verts = np.array([[rx, 0.0], [0.0, -ry], [-rx, 0.0], [0.0, ry], [rx, 0.0]], dtype=np.float64)
+        verts += rng.normal(0.0, 0.025 * sp, size=verts.shape)
+        draw_calligraphic_polyline(
+            canvas, _rot_pts(verts, nx, ny, rad), color_rgb, max(0.60, sp * 0.14 * size_j * stroke_mult), style, kind="notehead_slim_diamond"
+        )
+        spine = np.array([[-rx * 0.72, 0.0], [rx * 0.72, 0.0]], dtype=np.float64)
+        draw_calligraphic_polyline(
+            canvas, _rot_pts(spine, nx, ny, rad), color_rgb, max(0.60, sp * 0.22 * size_j * stroke_mult * fill_w), style, kind="notehead_slim_diamond"
+        )
+        return
+
+    if arch == "boomerang_hook":
+        # Erratic curved boomerang / check-hook flick notehead.
+        rx = sp * 0.68 * size_j * rx_mult
+        ry = sp * 0.42 * size_j * ry_mult
+        rad = math.radians(float(rng.normal(base_angle * 0.55, 8.0)))
+        ctrl = np.array([
+            [-rx, ry * 0.42],
+            [-rx * 0.08, -ry * 0.95],
+            [rx, ry * 0.48],
+        ], dtype=np.float64)
+        ctrl += rng.normal(0.0, 0.04 * sp, size=ctrl.shape)
+        curve = _eval_quad(ctrl[0], ctrl[1], ctrl[2], n=14)
+        draw_calligraphic_polyline(
+            canvas, _rot_pts(curve, nx, ny, rad), color_rgb, max(0.80, sp * 0.34 * size_j * stroke_mult * fill_w), style, kind="notehead_boomerang"
+        )
+        if fill_density > 0.90:
+            inner = _eval_quad(ctrl[0] * 0.65, ctrl[1] * 0.55, ctrl[2] * 0.65, n=10)
+            draw_calligraphic_polyline(
+                canvas, _rot_pts(inner, nx, ny, rad), color_rgb, max(0.70, sp * 0.24 * size_j * stroke_mult * fill_w), style, kind="notehead_boomerang"
+            )
+        return
+
+    if arch == "open_loop":
+        # Hurried unclosed cursive spiral / 'e' loop with optional interior slash.
+        rx = sp * 0.62 * size_j * rx_mult
+        ry = sp * 0.42 * size_j * ry_mult
+        rad = math.radians(float(rng.normal(base_angle, 7.5)))
+        n_pts = 22
+        start_phi = float(rng.uniform(-0.4, 0.4))
+        turns = 1.10 + 0.30 * min(1.3, fill_density)
+        phis = np.linspace(start_phi, start_phi + turns * 2.0 * math.pi, n_pts)
+        shrink = np.linspace(1.05, 0.55, n_pts)
+        spiral = np.column_stack((rx * shrink * np.cos(phis), ry * shrink * np.sin(phis)))
+        draw_calligraphic_polyline(
+            canvas, _rot_pts(spiral, nx, ny, rad), color_rgb, max(0.75, sp * 0.26 * size_j * stroke_mult * fill_w), style, kind="notehead_open_loop"
+        )
+        if fill_density >= 0.65:
+            dash = np.array([[-rx * 0.55, ry * 0.15], [rx * 0.60, -ry * 0.18]], dtype=np.float64)
+            draw_calligraphic_polyline(
+                canvas, _rot_pts(dash, nx, ny, rad), color_rgb, max(0.70, sp * 0.28 * size_j * stroke_mult * fill_w), style, kind="notehead_open_loop"
+            )
+        return
+
+    if arch == "zigzag_fill":
+        # Wild back-and-forth scribbly Z / M zigzag fill notehead.
+        rx = sp * 0.66 * size_j * rx_mult
+        ry = sp * 0.44 * size_j * ry_mult
+        rad = math.radians(float(rng.normal(base_angle * 0.65, 8.0)))
+        n_legs = 2 if fill_density < 0.55 else (3 if fill_density < 1.10 else 4)
+        xs_zig = np.linspace(-rx, rx, n_legs + 2)
+        ys_zig = np.array([(-ry if i % 2 == 0 else ry) * float(rng.uniform(0.78, 1.08)) for i in range(n_legs + 2)])
+        zig = np.column_stack((xs_zig, ys_zig))
+        zig += rng.normal(0.0, 0.04 * sp, size=zig.shape)
+        draw_calligraphic_polyline(
+            canvas, _rot_pts(zig, nx, ny, rad), color_rgb, max(0.75, sp * 0.28 * size_j * stroke_mult * fill_w), style, kind="notehead_zigzag"
+        )
+        return
+
+    if arch == "broad_nib_lozenge":
+        # Calligraphic broad-nib sheared parallelogram lozenge.
+        rx = sp * 0.64 * size_j * rx_mult
+        ry = sp * 0.38 * size_j * ry_mult
+        shear = rx * 0.40
+        rad = math.radians(float(rng.normal(base_angle * 0.45, 5.5)))
+        verts = np.array([
+            [-rx + shear, -ry],
+            [rx + shear, -ry],
+            [rx - shear, ry],
+            [-rx - shear, ry],
+            [-rx + shear, -ry],
+        ], dtype=np.float64)
+        verts += rng.normal(0.0, 0.025 * sp, size=verts.shape)
+        local_style = dict(style)
+        local_style["taper_start"] = 0.04
+        local_style["taper_end"] = 0.05
+        local_style["nib_min_ratio"] = max(_get_style_min_ratio(style), 0.70)
+        draw_calligraphic_polyline(
+            canvas, _rot_pts(verts, nx, ny, rad), color_rgb, max(0.80, sp * 0.22 * size_j * stroke_mult), local_style, kind="notehead_lozenge"
+        )
+        n_bars = 1 if fill_density < 0.60 else (2 if fill_density < 1.15 else 3)
+        for k in range(n_bars):
+            frac = 0.0 if n_bars == 1 else (k / (n_bars - 1) - 0.5) * 1.1
+            y_bar = frac * ry
+            x_shift = -frac * shear
+            bar = np.array([[-rx * 0.85 + x_shift, y_bar], [rx * 0.85 + x_shift, y_bar]], dtype=np.float64)
+            draw_calligraphic_polyline(
+                canvas, _rot_pts(bar, nx, ny, rad), color_rgb, max(0.80, sp * 0.36 * size_j * stroke_mult * fill_w), local_style, kind="notehead_lozenge"
+            )
+        return
+
+    if arch == "ink_blot":
+        # Heavy, irregular, pooled ink-blot notehead with optional satellite lobe.
+        rx = sp * 0.68 * size_j * rx_mult * float(rng.uniform(0.95, 1.12))
+        ry = sp * 0.54 * size_j * ry_mult * float(rng.uniform(0.95, 1.12))
+        angle = float(rng.normal(base_angle * 0.7, 10.0))
+        local_style = dict(style)
+        local_style["wobble_px"] = float(style.get("wobble_px", 0.7)) + 0.8
+        local_style["ink_pooling"] = min(0.85, float(style.get("ink_pooling", 0.2)) + 0.35)
+        _draw_blob_with_fill_density(canvas, nx, ny, rx, ry, angle, color_rgb, local_style, rng, fill_density, sp)
+        if fill_density >= 0.60:
+            lobe_ang = float(rng.uniform(0.0, 2.0 * math.pi))
+            lx = nx + rx * 0.35 * math.cos(lobe_ang)
+            ly = ny + ry * 0.35 * math.sin(lobe_ang)
+            draw_filled_blob(
+                canvas,
+                lx,
+                ly,
+                rx * 0.42 * min(1.2, fill_density),
+                ry * 0.38 * min(1.2, fill_density),
+                angle + float(rng.normal(0.0, 25.0)),
+                color_rgb,
+                local_style,
+                hollow=False,
+            )
+        return
+
+    if arch == "chevron_wedge":
+        # Sharp angular chevron / arrowhead wedge notehead.
+        rx = sp * 0.68 * size_j * rx_mult
+        ry = sp * 0.44 * size_j * ry_mult
+        rad = math.radians(float(rng.normal(base_angle * 0.4, 6.5)))
+        outer = np.array([[-rx, -ry], [rx, 0.0], [-rx, ry]], dtype=np.float64)
+        outer += rng.normal(0.0, 0.03 * sp, size=outer.shape)
+        local_style = dict(style)
+        local_style["taper_start"] = 0.06
+        local_style["taper_end"] = 0.08
+        draw_calligraphic_polyline(
+            canvas, _rot_pts(outer, nx, ny, rad), color_rgb, max(0.80, sp * 0.32 * size_j * stroke_mult * fill_w), local_style, kind="notehead_chevron"
+        )
+        if fill_density >= 0.50:
+            inner = np.array([[-rx * 0.78, -ry * 0.45], [rx * 0.55, 0.0], [-rx * 0.78, ry * 0.45]], dtype=np.float64)
+            draw_calligraphic_polyline(
+                canvas, _rot_pts(inner, nx, ny, rad), color_rgb, max(0.75, sp * 0.30 * size_j * stroke_mult * fill_w), local_style, kind="notehead_chevron"
+            )
+        if fill_density > 1.10:
+            spine = np.array([[-rx * 0.85, 0.0], [rx * 0.65, 0.0]], dtype=np.float64)
+            draw_calligraphic_polyline(
+                canvas, _rot_pts(spine, nx, ny, rad), color_rgb, max(0.75, sp * 0.34 * size_j * stroke_mult), local_style, kind="notehead_chevron"
+            )
         return
 
     if arch == "teardrop":
-        # Asymmetric tapered teardrop: main blob + slight upper-right or lower-left flick.
-        rx = sp * 0.60 * size_j
-        ry = sp * 0.43 * size_j
+        rx = sp * 0.60 * size_j * rx_mult
+        ry = sp * 0.43 * size_j * ry_mult
         angle = float(rng.normal(base_angle - 3.0, 6.0))
-        draw_filled_blob(canvas, nx, ny, rx, ry, angle, color_rgb, style, hollow=False)
+        _draw_blob_with_fill_density(canvas, nx, ny, rx, ry, angle, color_rgb, style, rng, fill_density, sp)
         rad = math.radians(angle)
         sign = 1.0 if rng.random() < 0.5 else -1.0
         tip = np.array([nx + sign * rx * 1.18 * math.cos(rad), ny + sign * rx * 1.18 * math.sin(rad)])
         base = np.array([nx + sign * rx * 0.4 * math.cos(rad), ny + sign * rx * 0.4 * math.sin(rad)])
-        draw_calligraphic_polyline(canvas, np.vstack((base, tip)), color_rgb, sp * 0.24 * size_j, style, kind="notehead_flick")
+        draw_calligraphic_polyline(canvas, np.vstack((base, tip)), color_rgb, max(0.65, sp * 0.24 * size_j * stroke_mult * fill_w), style, kind="notehead_flick")
         return
 
     if arch == "compact":
-        rx = sp * 0.50 * size_j * float(rng.uniform(0.92, 1.08))
-        ry = sp * 0.43 * size_j * float(rng.uniform(0.92, 1.08))
+        rx = sp * 0.50 * size_j * rx_mult * float(rng.uniform(0.92, 1.08))
+        ry = sp * 0.43 * size_j * ry_mult * float(rng.uniform(0.92, 1.08))
         angle = float(rng.normal(base_angle + 8.0, 9.0))
-        draw_filled_blob(canvas, nx, ny, rx, ry, angle, color_rgb, style, hollow=False)
+        _draw_blob_with_fill_density(canvas, nx, ny, rx, ry, angle, color_rgb, style, rng, fill_density, sp)
         return
 
     # Default "oval"
-    rx = sp * 0.62 * size_j * float(rng.uniform(0.93, 1.08))
-    ry = sp * 0.45 * size_j * float(rng.uniform(0.92, 1.08))
+    rx = sp * 0.62 * size_j * rx_mult * float(rng.uniform(0.93, 1.08))
+    ry = sp * 0.45 * size_j * ry_mult * float(rng.uniform(0.92, 1.08))
     angle = float(rng.normal(base_angle, 6.5))
-    draw_filled_blob(canvas, nx, ny, rx, ry, angle, color_rgb, style, hollow=False)
+    _draw_blob_with_fill_density(canvas, nx, ny, rx, ry, angle, color_rgb, style, rng, fill_density, sp)
 
 
 # ---------------------------------------------------------------------------

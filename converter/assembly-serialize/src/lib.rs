@@ -7,10 +7,12 @@
 //!    with a nearest approximation and recorded in the [`LossTable`].
 //! 2. [`to_musicxml`] renders MusicXML 3.1 partwise (lossless except for the
 //!    entries already in the loss table; barline crossings become ties).
-//! 3. [`to_mscx`] renders a minimal MuseScore 3-compatible `.mscx` subset.
-//!    Ties are re-articulated there (one [`LossEntry`] per tie) because the
-//!    subset does not carry spanners.
-//! 4. [`pack_mscz`] zips `META-INF/container.xml` + `*.mscx` into `.mscz`.
+//! 3. [`to_mscx`] renders a MuseScore 4 native `.mscx` (`version="4.20"`)
+//!    with parts, instruments, clefs, key/time signatures, multi-voice layout,
+//!    chords, rests, grace notes, ties, slurs, hairpins, dynamics,
+//!    articulations, fermatas, lyrics, and barlines.
+//! 4. [`pack_mscz`] zips `META-INF/container.xml`, `<stem>.mscx`, and
+//!    `score_style.mss` into `.mscz`.
 //! 5. [`validate_notes`], [`validate_musicxml`], [`validate_mscz`] check each
 //!    stage; [`Issue`] lists use `error` / `warning` severities.
 //!
@@ -1416,7 +1418,7 @@ pub fn to_musicxml(score: &Score, losses: &mut LossTable) -> String {
 }
 
 // ---------------------------------------------------------------------------
-// MuseScore (.mscx subset) rendering + .mscz packing
+// MuseScore 4 (.mscx) rendering + .mscz packing
 // ---------------------------------------------------------------------------
 
 /// Tonal pitch class for MuseScore: C=14 in the line of fifths.
@@ -1439,24 +1441,147 @@ fn mscx_duration_type(dur_ticks: i64, divisions: u32) -> (&'static str, u8) {
     (name, dots)
 }
 
-/// Render a minimal MuseScore 3-compatible `.mscx` document.
+fn gcd_i64(mut a: i64, mut b: i64) -> i64 {
+    a = a.abs();
+    b = b.abs();
+    while b != 0 {
+        let t = a % b;
+        a = b;
+        b = t;
+    }
+    a.max(1)
+}
+
+/// Format a MuseScore 4 `<location>` element from a measure delta and a
+/// tick offset delta (fractions are relative to one whole note = 4 * divisions).
+fn mscx_location_xml(indent: &str, dm: i64, df_ticks: i64, divisions: u32) -> String {
+    let mut out = String::new();
+    out.push_str(&format!("{indent}<location>\n"));
+    if dm != 0 {
+        out.push_str(&format!("{indent}  <measures>{dm}</measures>\n"));
+    }
+    if df_ticks != 0 {
+        let whole = (divisions as i64 * 4).max(1);
+        let g = gcd_i64(df_ticks, whole);
+        let num = df_ticks / g;
+        let den = whole / g;
+        out.push_str(&format!("{indent}  <fractions>{num}/{den}</fractions>\n"));
+    }
+    out.push_str(&format!("{indent}  </location>\n"));
+    out
+}
+
+/// Map MusicXML-style `(sign, line, octave_change)` to a MuseScore 4 clef type.
+fn mscx_clef_type(sign: char, line: u32, octave_change: Option<i32>) -> &'static str {
+    match (sign, line, octave_change.unwrap_or(0)) {
+        ('G', 2, -1) => "G8vb",
+        ('G', 2, 1) => "G8va",
+        ('G', 2, -2) => "G15mb",
+        ('G', 2, 2) => "G15ma",
+        ('G', 1, _) => "G1",
+        ('G', _, _) => "G",
+        ('F', 4, -1) => "F8vb",
+        ('F', 4, 1) => "F8va",
+        ('F', 3, _) => "F3",
+        ('F', 5, _) => "F5",
+        ('F', _, _) => "F",
+        ('C', 1, _) => "C1",
+        ('C', 2, _) => "C2",
+        ('C', 3, _) => "C3",
+        ('C', 4, _) => "C4",
+        ('C', 5, _) => "C5",
+        ('C', _, _) => "C3",
+        ('p' | 'P', _, _) => "PERC",
+        _ => "G",
+    }
+}
+
+fn mscx_articulation_subtype(art: &str) -> Option<&'static str> {
+    match art {
+        "stacc" => Some("articStaccatoAbove"),
+        "accent" => Some("articAccentAbove"),
+        "tenuto" => Some("articTenutoAbove"),
+        _ => None,
+    }
+}
+
+/// One grouped voice item (a rest or a chord of 1+ simultaneous notes) in a
+/// measure, with its tick offset from the start of that measure.
+struct MscxItem<'a> {
+    off_ticks: i64,
+    dur_ticks: i64,
+    is_rest: bool,
+    grace: bool,
+    members: Vec<&'a Segment>,
+}
+
+fn group_voice_items(segs: &[Segment]) -> Vec<MscxItem<'_>> {
+    let mut items = Vec::new();
+    let mut off = 0i64;
+    let mut k = 0;
+    while k < segs.len() {
+        let head = &segs[k];
+        if head.note.rest {
+            let dur = if head.note.grace { 0 } else { head.dur_ticks };
+            items.push(MscxItem {
+                off_ticks: off,
+                dur_ticks: if head.note.grace {
+                    head.note.dur_ticks
+                } else {
+                    head.dur_ticks
+                },
+                is_rest: true,
+                grace: head.note.grace,
+                members: vec![head],
+            });
+            off += dur;
+            k += 1;
+            continue;
+        }
+        let mut run: Vec<&Segment> = vec![head];
+        while k + run.len() < segs.len() && segs[k + run.len()].chord {
+            run.push(&segs[k + run.len()]);
+        }
+        let is_grace = run.iter().any(|s| s.note.grace);
+        let dur_display = if is_grace {
+            head.note.dur_ticks
+        } else {
+            head.dur_ticks
+        };
+        let advance = if is_grace { 0 } else { head.dur_ticks };
+        items.push(MscxItem {
+            off_ticks: off,
+            dur_ticks: dur_display,
+            is_rest: false,
+            grace: is_grace,
+            members: run,
+        });
+        off += advance;
+        k += items.last().unwrap().members.len();
+    }
+    items
+}
+
+/// Render a MuseScore 4 native `.mscx` document (`version="4.20"`).
 ///
-/// One `<Staff>` per part, one `<Measure>` per bar, one `<voice>` per
-/// MusicXML voice. Chord/rest/durationType/dots mirror the MusicXML layout,
-/// so the two renderings stay consistent.
-///
-/// Known subset limits (each logged to `losses` as `mscx-…` loss):
-/// * ties are re-articulated (no spanners in this subset);
-/// * exact tick durations are shown with the nearest `durationType`;
-/// * lyrics, accidentals-as-text and multi-staff parts are dropped.
+/// One `<Part id="N">` + `<Staff id="N">` per part, one `<Measure>` per bar,
+/// one `<voice>` per voice. Emits `<Instrument>`, `<Clef>`, `<KeySig>`
+/// (`<concertKey>`), `<TimeSig>`, `<Chord>`/`<Note>`/`<pitch>`/`<tpc>`,
+/// `<Rest>`, `<appoggiatura/>` grace chords, `<Spanner type="Tie">`,
+/// `<Spanner type="Slur">`, `<Spanner type="HairPin">`, `<Dynamic>`,
+/// `<Articulation>`, `<Fermata>`, `<Lyrics>`, and `<BarLine>` /
+/// `<startRepeat/>` / `<endRepeat>`.
 pub fn to_mscx(score: &Score, losses: &mut LossTable) -> String {
     let mut out = String::new();
     out.push_str("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n");
-    out.push_str("<museScore version=\"3.06\">\n");
+    out.push_str("<museScore version=\"4.20\">\n");
+    out.push_str("  <programVersion>4.2.0</programVersion>\n");
     out.push_str("  <Score>\n");
-    out.push_str("    <LayerTag id=\"0\" tag=\"default\"></LayerTag>\n");
-    out.push_str("    <currentLayer>0</currentLayer>\n");
     out.push_str(&format!("    <Division>{}</Division>\n", score.divisions));
+    out.push_str("    <showInvisible>1</showInvisible>\n");
+    out.push_str("    <showUnprintable>1</showUnprintable>\n");
+    out.push_str("    <showFrames>1</showFrames>\n");
+    out.push_str("    <showMargins>0</showMargins>\n");
     out.push_str(&format!(
         "    <metaTag name=\"workTitle\">{}</metaTag>\n",
         escape_xml(&score.title)
@@ -1468,30 +1593,173 @@ pub fn to_mscx(score: &Score, losses: &mut LossTable) -> String {
         ));
     }
     for (i, part) in score.parts.iter().enumerate() {
-        out.push_str("    <Part>\n");
-        out.push_str(&format!("      <Staff id=\"{}\">\n", i + 1));
+        let pname = escape_xml(&part.name);
+        out.push_str(&format!("    <Part id=\"{}\">\n", i + 1));
+        out.push_str("      <Staff>\n");
         out.push_str("        <StaffType group=\"pitched\">\n");
         out.push_str("          <name>stdNormal</name>\n");
         out.push_str("          </StaffType>\n");
-        out.push_str("        <bracket type=\"-1\" span=\"0\" col=\"0\"/>\n");
         out.push_str("        </Staff>\n");
-        out.push_str(&format!(
-            "      <trackName>{}</trackName>\n",
-            escape_xml(&part.name)
-        ));
+        out.push_str(&format!("      <trackName>{pname}</trackName>\n"));
+        out.push_str("      <Instrument>\n");
+        out.push_str(&format!("        <longName>{pname}</longName>\n"));
+        out.push_str(&format!("        <trackName>{pname}</trackName>\n"));
+        out.push_str("        <Channel>\n");
+        out.push_str("          <program value=\"0\"/>\n");
+        out.push_str("          <synti>Fluid</synti>\n");
+        out.push_str("          </Channel>\n");
+        out.push_str("        </Instrument>\n");
         out.push_str("      </Part>\n");
     }
+
+    let windows = score.measure_windows();
+
     for (i, part) in score.parts.iter().enumerate() {
         out.push_str(&format!("    <Staff id=\"{}\">\n", i + 1));
+        if i == 0 {
+            out.push_str("      <VBox>\n");
+            out.push_str("        <height>10</height>\n");
+            out.push_str("        <Text>\n");
+            out.push_str("          <style>title</style>\n");
+            out.push_str(&format!(
+                "          <text>{}</text>\n",
+                escape_xml(&score.title)
+            ));
+            out.push_str("          </Text>\n");
+            if let Some(c) = &score.composer {
+                out.push_str("        <Text>\n");
+                out.push_str("          <style>composer</style>\n");
+                out.push_str(&format!("          <text>{}</text>\n", escape_xml(c)));
+                out.push_str("          </Text>\n");
+            }
+            out.push_str("        </VBox>\n");
+        }
+
         let layout = layout_part(score, part, losses);
+        let n_measures = layout.len();
+
+        // Group each (measure, voice) into MscxItems for spanner pairing.
+        let grouped: Vec<Vec<(u32, Vec<MscxItem<'_>>)>> = layout
+            .iter()
+            .map(|voices| {
+                voices
+                    .iter()
+                    .map(|(v, segs)| (*v, group_voice_items(segs)))
+                    .collect()
+            })
+            .collect();
+
+        // Pair ties per (voice_id, midi) and slurs per voice_id across measures.
+        // Keys: (measure_idx, voice_idx, item_idx, note_idx) -> (dm, df_ticks)
+        let mut tie_next: BTreeMap<(usize, usize, usize, usize), (i64, i64)> = BTreeMap::new();
+        let mut tie_prev: BTreeMap<(usize, usize, usize, usize), (i64, i64)> = BTreeMap::new();
+        // Keys: (measure_idx, voice_idx, item_idx) -> (dm, df_ticks)
+        let mut slur_next: BTreeMap<(usize, usize, usize), (i64, i64)> = BTreeMap::new();
+        let mut slur_prev: BTreeMap<(usize, usize, usize), (i64, i64)> = BTreeMap::new();
+
+        let n_voices = grouped.first().map(|v| v.len()).unwrap_or(0);
+        for vi in 0..n_voices {
+            let mut open_ties: BTreeMap<i32, (usize, usize, usize, i64)> = BTreeMap::new();
+            let mut open_slur: Option<(usize, usize, i64)> = None;
+            for (m, voices) in grouped.iter().enumerate() {
+                let Some((_, items)) = voices.get(vi) else {
+                    continue;
+                };
+                for (ii, item) in items.iter().enumerate() {
+                    if item.is_rest {
+                        continue;
+                    }
+                    let has_slur_stop = item.members.iter().any(|s| s.note.slur_stop);
+                    let has_slur_start = item.members.iter().any(|s| s.note.slur_start);
+                    if has_slur_stop {
+                        if let Some((sm, si, soff)) = open_slur.take() {
+                            let dm = m as i64 - sm as i64;
+                            let df = item.off_ticks - soff;
+                            slur_next.insert((sm, vi, si), (dm, df));
+                            slur_prev.insert((m, vi, ii), (-dm, -df));
+                        }
+                    }
+                    if has_slur_start {
+                        open_slur = Some((m, ii, item.off_ticks));
+                    }
+                    for (ni, seg) in item.members.iter().enumerate() {
+                        let (t_start, t_stop) = tie_elements(seg);
+                        if t_stop {
+                            if let Some((sm, si, sn, soff)) = open_ties.remove(&seg.note.midi) {
+                                let dm = m as i64 - sm as i64;
+                                let df = item.off_ticks - soff;
+                                tie_next.insert((sm, vi, si, sn), (dm, df));
+                                tie_prev.insert((m, vi, ii, ni), (-dm, -df));
+                            }
+                        }
+                        if t_start {
+                            open_ties.insert(seg.note.midi, (m, ii, ni, item.off_ticks));
+                        }
+                    }
+                }
+            }
+        }
+
+        // Pair measure-scoped hairpins across measures (on voice 0).
+        // hp_start: measure_idx -> (subtype: 0=cresc|1=dim, dm, df_ticks)
+        // hp_stop_start: measure_idx -> Vec<(dm, df_ticks)> (closed at start of measure)
+        // hp_stop_end: measure_idx -> Vec<(dm, df_ticks)> (closed at end of measure)
+        let mut hp_start: BTreeMap<usize, (u8, i64, i64)> = BTreeMap::new();
+        let mut hp_stop_start: BTreeMap<usize, Vec<(i64, i64)>> = BTreeMap::new();
+        let mut hp_stop_end: BTreeMap<usize, Vec<(i64, i64)>> = BTreeMap::new();
+        let mut open_hp: Option<(usize, u8)> = None;
+        for m in 0..n_measures {
+            if let Some(h) = measure_attr(score, m as u32 + 1).and_then(|a| a.hairpin.as_deref()) {
+                match h {
+                    "cresc" | "dim" => {
+                        if let Some((sm, sub)) = open_hp.take() {
+                            if m > sm {
+                                let dm = m as i64 - sm as i64;
+                                hp_start.insert(sm, (sub, dm, 0));
+                                hp_stop_start.entry(m).or_default().push((-dm, 0));
+                            }
+                        }
+                        let sub = if h == "cresc" { 0 } else { 1 };
+                        open_hp = Some((m, sub));
+                    }
+                    _ => {
+                        if let Some((sm, sub)) = open_hp.take() {
+                            if m > sm {
+                                let dm = m as i64 - sm as i64;
+                                hp_start.insert(sm, (sub, dm, 0));
+                                hp_stop_start.entry(m).or_default().push((-dm, 0));
+                            } else {
+                                let mlen = windows
+                                    .get(m)
+                                    .map(|&(a, b)| b - a)
+                                    .unwrap_or_else(|| score.measure_ticks());
+                                hp_start.insert(sm, (sub, 0, mlen));
+                                hp_stop_end.entry(m).or_default().push((0, -mlen));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        if let Some((sm, sub)) = open_hp.take() {
+            if n_measures > 0 {
+                let last = n_measures - 1;
+                let mlen = windows
+                    .get(last)
+                    .map(|&(a, b)| b - a)
+                    .unwrap_or_else(|| score.measure_ticks());
+                let dm = last as i64 - sm as i64;
+                hp_start.insert(sm, (sub, dm, mlen));
+                hp_stop_end.entry(last).or_default().push((-dm, -mlen));
+            }
+        }
+
         let mut cur_sig = (score.beats, score.beat_type);
         let mut cur_key = score.key_fifths;
-        for (m, voices) in layout.iter().enumerate() {
-            out.push_str("      <Measure>\n");
-            // Mid-stream time/key changes render like the opening ones;
-            // every other measure attr (clefs, dynamics, hairpins,
-            // barlines, grace) is outside the .mscx subset and logged.
-            if let Some(a) = measure_attr(score, m as u32 + 1) {
+
+        for (m, voices) in grouped.iter().enumerate() {
+            let attrs = measure_attr(score, m as u32 + 1);
+            if let Some(a) = attrs {
                 if let Some(t) = a.time {
                     cur_sig = (t.beats, t.beat_type);
                 }
@@ -1499,134 +1767,244 @@ pub fn to_mscx(score: &Score, losses: &mut LossTable) -> String {
                     cur_key = k;
                 }
             }
-            if m == 0
-                || measure_attr(score, m as u32 + 1).is_some_and(|a| a.time.is_some())
-            {
-                out.push_str(&format!(
-                    "        <TimeSig><sigN>{}</sigN><sigD>{}</sigD></TimeSig>\n",
-                    cur_sig.0, cur_sig.1
-                ));
+            let mlen = windows
+                .get(m)
+                .map(|&(a, b)| b - a)
+                .unwrap_or_else(|| score.measure_ticks());
+
+            out.push_str("      <Measure>\n");
+            if attrs.and_then(|a| a.barline_left.as_deref()) == Some("repeat-left") {
+                out.push_str("        <startRepeat/>\n");
             }
-            if m == 0
-                || measure_attr(score, m as u32 + 1).is_some_and(|a| a.key_fifths.is_some())
-            {
-                out.push_str(&format!(
-                    "        <KeySig><accidental>{}</accidental></KeySig>\n",
-                    cur_key
-                ));
+            if attrs.and_then(|a| a.barline_right.as_deref()) == Some("repeat-right") {
+                out.push_str("        <endRepeat>2</endRepeat>\n");
             }
-            if let Some(a) = measure_attr(score, m as u32 + 1) {
-                for (present, kind) in [
-                    (
-                        a.clef_sign.is_some()
-                            || a.clef_line.is_some()
-                            || a.clef_octave_change.is_some(),
-                        "mscx-clef-dropped",
-                    ),
-                    (a.dynamic.is_some(), "mscx-dynamic-dropped"),
-                    (a.hairpin.is_some(), "mscx-hairpin-dropped"),
-                    (
-                        a.barline_left.is_some() || a.barline_right.is_some(),
-                        "mscx-barline-dropped",
-                    ),
-                ] {
-                    if present {
-                        losses.push(
-                            "loss",
-                            kind,
-                            format!(
-                                "measure {}: {kind} (outside the .mscx subset)",
-                                m + 1
+
+            for (vi, (_voice, items)) in voices.iter().enumerate() {
+                out.push_str("        <voice>\n");
+                if vi == 0 {
+                    // Opening or mid-stream Clef, KeySig, TimeSig belong inside voice 0.
+                    if m == 0 {
+                        let (clef_s, clef_l, clef_oct) = match attrs {
+                            Some(a) => (
+                                a.clef_sign.unwrap_or('G'),
+                                a.clef_line.unwrap_or(2),
+                                a.clef_octave_change,
                             ),
-                            Some(part.name.clone()),
-                            None,
-                        );
+                            None => ('G', 2, None),
+                        };
+                        let ct = mscx_clef_type(clef_s, clef_l, clef_oct);
+                        out.push_str("          <Clef>\n");
+                        out.push_str(&format!(
+                            "            <concertClefType>{ct}</concertClefType>\n"
+                        ));
+                        out.push_str(&format!(
+                            "            <transposingClefType>{ct}</transposingClefType>\n"
+                        ));
+                        out.push_str("            <isHeader>1</isHeader>\n");
+                        out.push_str("            </Clef>\n");
+                        out.push_str("          <KeySig>\n");
+                        out.push_str(&format!("            <concertKey>{cur_key}</concertKey>\n"));
+                        out.push_str("            </KeySig>\n");
+                        out.push_str("          <TimeSig>\n");
+                        out.push_str(&format!("            <sigN>{}</sigN>\n", cur_sig.0));
+                        out.push_str(&format!("            <sigD>{}</sigD>\n", cur_sig.1));
+                        out.push_str("            </TimeSig>\n");
+                    } else if let Some(a) = attrs {
+                        if a.clef_sign.is_some()
+                            || a.clef_line.is_some()
+                            || a.clef_octave_change.is_some()
+                        {
+                            let ct = mscx_clef_type(
+                                a.clef_sign.unwrap_or('G'),
+                                a.clef_line.unwrap_or(2),
+                                a.clef_octave_change,
+                            );
+                            out.push_str("          <Clef>\n");
+                            out.push_str(&format!(
+                                "            <concertClefType>{ct}</concertClefType>\n"
+                            ));
+                            out.push_str(&format!(
+                                "            <transposingClefType>{ct}</transposingClefType>\n"
+                            ));
+                            out.push_str("            </Clef>\n");
+                        }
+                        if a.key_fifths.is_some() {
+                            out.push_str("          <KeySig>\n");
+                            out.push_str(&format!(
+                                "            <concertKey>{cur_key}</concertKey>\n"
+                            ));
+                            out.push_str("            </KeySig>\n");
+                        }
+                        if a.time.is_some() {
+                            out.push_str("          <TimeSig>\n");
+                            out.push_str(&format!("            <sigN>{}</sigN>\n", cur_sig.0));
+                            out.push_str(&format!("            <sigD>{}</sigD>\n", cur_sig.1));
+                            out.push_str("            </TimeSig>\n");
+                        }
+                    }
+
+                    if let Some(d) = attrs.and_then(|a| a.dynamic.as_deref()) {
+                        out.push_str("          <Dynamic>\n");
+                        out.push_str(&format!(
+                            "            <subtype>{}</subtype>\n",
+                            escape_xml(d)
+                        ));
+                        out.push_str("            </Dynamic>\n");
+                    }
+                    if let Some(stops) = hp_stop_start.get(&m) {
+                        for &(dm, df) in stops {
+                            out.push_str("          <Spanner type=\"HairPin\">\n");
+                            out.push_str("            <prev>\n");
+                            out.push_str(&mscx_location_xml(
+                                "              ",
+                                dm,
+                                df,
+                                score.divisions,
+                            ));
+                            out.push_str("              </prev>\n");
+                            out.push_str("            </Spanner>\n");
+                        }
+                    }
+                    if let Some(&(sub, dm, df)) = hp_start.get(&m) {
+                        out.push_str("          <Spanner type=\"HairPin\">\n");
+                        out.push_str("            <HairPin>\n");
+                        out.push_str(&format!("              <subtype>{sub}</subtype>\n"));
+                        out.push_str("              </HairPin>\n");
+                        out.push_str("            <next>\n");
+                        out.push_str(&mscx_location_xml(
+                            "              ",
+                            dm,
+                            df,
+                            score.divisions,
+                        ));
+                        out.push_str("              </next>\n");
+                        out.push_str("            </Spanner>\n");
                     }
                 }
-            }
-            for (_voice, segs) in voices {
-                out.push_str("        <voice>\n");
-                // Group chord runs: a head segment (chord=false) plus its
-                // following chord=true members form one <Chord>.
-                let mut k = 0;
-                while k < segs.len() {
-                    let head = &segs[k];
-                    let (dtype, dots) = mscx_duration_type(head.dur_ticks, score.divisions);
-                    if head.note.rest {
-                        if head.note.grace {
-                            losses.push(
-                                "loss",
-                                "mscx-grace-dropped",
-                                "grace rest dropped in .mscx (subset has no grace)".to_string(),
-                                Some(part.name.clone()),
-                                None,
-                            );
-                            k += 1;
+
+                for (ii, item) in items.iter().enumerate() {
+                    let has_fermata = item
+                        .members
+                        .iter()
+                        .any(|s| s.note.articulations.iter().any(|a| a == "fermata"));
+                    if has_fermata {
+                        out.push_str("          <Fermata>\n");
+                        out.push_str("            <subtype>fermataAbove</subtype>\n");
+                        out.push_str("            </Fermata>\n");
+                    }
+
+                    if item.is_rest {
+                        if item.grace {
+                            // MuseScore does not support grace rests; skip.
                             continue;
                         }
                         out.push_str("          <Rest>\n");
-                        out.push_str(&format!(
-                            "            <durationType>{dtype}</durationType>\n"
-                        ));
-                        for _ in 0..dots {
-                            out.push_str("            <dots>1</dots>\n");
+                        if items.len() == 1 && item.dur_ticks == mlen {
+                            out.push_str("            <durationType>measure</durationType>\n");
+                            out.push_str(&format!(
+                                "            <duration>{}/{}</duration>\n",
+                                cur_sig.0, cur_sig.1
+                            ));
+                        } else {
+                            let (dtype, dots) =
+                                mscx_duration_type(item.dur_ticks, score.divisions);
+                            if dots > 0 {
+                                out.push_str(&format!("            <dots>{dots}</dots>\n"));
+                            }
+                            out.push_str(&format!(
+                                "            <durationType>{dtype}</durationType>\n"
+                            ));
                         }
                         out.push_str("            </Rest>\n");
-                        k += 1;
                         continue;
                     }
-                    let mut run: Vec<&Segment> = vec![head];
-                    while k + run.len() < segs.len() && segs[k + run.len()].chord {
-                        run.push(&segs[k + run.len()]);
-                    }
-                    if run.iter().any(|s| s.note.grace) {
-                        losses.push(
-                            "loss",
-                            "mscx-grace-dropped",
-                            format!(
-                                "grace run of {} notes dropped in .mscx (subset has no grace)",
-                                run.len()
-                            ),
-                            Some(part.name.clone()),
-                            None,
-                        );
-                        k += run.len();
-                        continue;
-                    }
-                    for s in &run {
-                        if s.tie_in
-                            || s.tie_out
-                            || s.note.tie_start
-                            || s.note.tie_stop
-                        {
-                            losses.push(
-                                "loss",
-                                "mscx-tie-dropped",
-                                "tied segment re-articulated in .mscx (subset has no spanners)"
-                                    .to_string(),
-                                Some(part.name.clone()),
-                                None,
-                            );
-                        }
-                        if s.note.lyric.is_some() {
-                            losses.push(
-                                "loss",
-                                "mscx-lyric-dropped",
-                                "lyrics are not carried by the .mscx subset".to_string(),
-                                Some(part.name.clone()),
-                                None,
-                            );
-                        }
-                    }
+
+                    let (dtype, dots) = mscx_duration_type(item.dur_ticks, score.divisions);
                     out.push_str("          <Chord>\n");
+                    if dots > 0 {
+                        out.push_str(&format!("            <dots>{dots}</dots>\n"));
+                    }
                     out.push_str(&format!(
                         "            <durationType>{dtype}</durationType>\n"
                     ));
-                    for _ in 0..dots {
-                        out.push_str("            <dots>1</dots>\n");
+                    if item.grace {
+                        out.push_str("            <appoggiatura/>\n");
                     }
-                    for s in &run {
+                    if let Some(ly) = item.members.iter().find_map(|s| s.note.lyric.as_deref()) {
+                        out.push_str("            <Lyrics>\n");
+                        out.push_str(&format!("              <text>{}</text>\n", escape_xml(ly)));
+                        out.push_str("              </Lyrics>\n");
+                    }
+                    if let Some(&(dm, df)) = slur_prev.get(&(m, vi, ii)) {
+                        out.push_str("            <Spanner type=\"Slur\">\n");
+                        out.push_str("              <prev>\n");
+                        out.push_str(&mscx_location_xml(
+                            "                ",
+                            dm,
+                            df,
+                            score.divisions,
+                        ));
+                        out.push_str("                </prev>\n");
+                        out.push_str("              </Spanner>\n");
+                    }
+                    if let Some(&(dm, df)) = slur_next.get(&(m, vi, ii)) {
+                        out.push_str("            <Spanner type=\"Slur\">\n");
+                        out.push_str("              <Slur>\n");
+                        out.push_str("                </Slur>\n");
+                        out.push_str("              <next>\n");
+                        out.push_str(&mscx_location_xml(
+                            "                ",
+                            dm,
+                            df,
+                            score.divisions,
+                        ));
+                        out.push_str("                </next>\n");
+                        out.push_str("              </Spanner>\n");
+                    }
+                    let mut emitted_arts = Vec::new();
+                    for s in &item.members {
+                        for a in &s.note.articulations {
+                            if let Some(sub) = mscx_articulation_subtype(a) {
+                                if !emitted_arts.contains(&sub) {
+                                    emitted_arts.push(sub);
+                                    out.push_str("            <Articulation>\n");
+                                    out.push_str(&format!(
+                                        "              <subtype>{sub}</subtype>\n"
+                                    ));
+                                    out.push_str("              </Articulation>\n");
+                                }
+                            }
+                        }
+                    }
+                    for (ni, s) in item.members.iter().enumerate() {
                         out.push_str("            <Note>\n");
+                        if let Some(&(dm, df)) = tie_prev.get(&(m, vi, ii, ni)) {
+                            out.push_str("              <Spanner type=\"Tie\">\n");
+                            out.push_str("                <prev>\n");
+                            out.push_str(&mscx_location_xml(
+                                "                  ",
+                                dm,
+                                df,
+                                score.divisions,
+                            ));
+                            out.push_str("                  </prev>\n");
+                            out.push_str("                </Spanner>\n");
+                        }
+                        if let Some(&(dm, df)) = tie_next.get(&(m, vi, ii, ni)) {
+                            out.push_str("              <Spanner type=\"Tie\">\n");
+                            out.push_str("                <Tie>\n");
+                            out.push_str("                  </Tie>\n");
+                            out.push_str("                <next>\n");
+                            out.push_str(&mscx_location_xml(
+                                "                  ",
+                                dm,
+                                df,
+                                score.divisions,
+                            ));
+                            out.push_str("                  </next>\n");
+                            out.push_str("                </Spanner>\n");
+                        }
                         out.push_str(&format!("              <pitch>{}</pitch>\n", s.note.midi));
                         out.push_str(&format!(
                             "              <tpc>{}</tpc>\n",
@@ -1635,16 +2013,45 @@ pub fn to_mscx(score: &Score, losses: &mut LossTable) -> String {
                         out.push_str("              </Note>\n");
                     }
                     out.push_str("            </Chord>\n");
-                    k += run.len();
                 }
-                out.push_str("        </voice>\n");
+
+                if vi == 0 {
+                    if let Some(stops) = hp_stop_end.get(&m) {
+                        for &(dm, df) in stops {
+                            out.push_str("          <Spanner type=\"HairPin\">\n");
+                            out.push_str("            <prev>\n");
+                            out.push_str(&mscx_location_xml(
+                                "              ",
+                                dm,
+                                df,
+                                score.divisions,
+                            ));
+                            out.push_str("              </prev>\n");
+                            out.push_str("            </Spanner>\n");
+                        }
+                    }
+                    match attrs.and_then(|a| a.barline_right.as_deref()) {
+                        Some("light-heavy") => {
+                            out.push_str("          <BarLine>\n");
+                            out.push_str("            <subtype>end</subtype>\n");
+                            out.push_str("            </BarLine>\n");
+                        }
+                        Some("double") => {
+                            out.push_str("          <BarLine>\n");
+                            out.push_str("            <subtype>double</subtype>\n");
+                            out.push_str("            </BarLine>\n");
+                        }
+                        _ => {}
+                    }
+                }
+                out.push_str("          </voice>\n");
             }
-            out.push_str("      </Measure>\n");
+            out.push_str("        </Measure>\n");
         }
-        out.push_str("    </Staff>\n");
+        out.push_str("      </Staff>\n");
     }
-    out.push_str("  </Score>\n");
-    out.push_str("</museScore>\n");
+    out.push_str("    </Score>\n");
+    out.push_str("  </museScore>\n");
     out
 }
 
@@ -1667,8 +2074,12 @@ pub fn score_stem(title: &str) -> String {
 
 fn container_xml(mscx_name: &str) -> String {
     format!(
-        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<container>\n  <rootfiles>\n    <rootfile full-path=\"{mscx_name}\"/>\n  </rootfiles>\n</container>\n"
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<container>\n  <rootfiles>\n    <rootfile full-path=\"{mscx_name}\"/>\n    <rootfile full-path=\"score_style.mss\"/>\n  </rootfiles>\n</container>\n"
     )
+}
+
+fn score_style_mss() -> &'static str {
+    "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<museScore version=\"4.20\">\n  <Style>\n    <Spatium>1.74978</Spatium>\n  </Style>\n</museScore>\n"
 }
 
 // ---------------------------------------------------------------------------
@@ -1769,7 +2180,7 @@ pub fn ser_for_inputs(
 }
 
 /// Pack rendered `.mscx` into `.mscz` bytes (deflated zip with
-/// `META-INF/container.xml` + `<stem>.mscx`).
+/// `META-INF/container.xml`, `<stem>.mscx`, and `score_style.mss`).
 pub fn pack_mscz(score: &Score, mscx: &str) -> Result<Vec<u8>, String> {
     let stem = score_stem(&score.title);
     let mscx_name = format!("{stem}.mscx");
@@ -1786,6 +2197,10 @@ pub fn pack_mscz(score: &Score, mscx: &str) -> Result<Vec<u8>, String> {
             .map_err(|e| format!("zip score: {e}"))?;
         zip.write_all(mscx.as_bytes())
             .map_err(|e| format!("zip score: {e}"))?;
+        zip.start_file("score_style.mss", opts)
+            .map_err(|e| format!("zip score_style.mss: {e}"))?;
+        zip.write_all(score_style_mss().as_bytes())
+            .map_err(|e| format!("zip score_style.mss: {e}"))?;
         zip.finish().map_err(|e| format!("zip finish: {e}"))?;
     }
     Ok(buf.into_inner())
@@ -2167,49 +2582,57 @@ pub fn validate_mscz(data: &[u8]) -> Vec<Issue> {
         }
     };
     if !container.is_empty() {
-        match container.find("full-path=\"") {
-            None => out.push(error(
+        let mut rootfiles: Vec<String> = Vec::new();
+        let mut search = 0usize;
+        while let Some(rel) = container[search..].find("full-path=\"") {
+            let s = search + rel + "full-path=\"".len();
+            let e = container[s..]
+                .find('"')
+                .map(|q| s + q)
+                .unwrap_or(container.len());
+            rootfiles.push(container[s..e].to_string());
+            search = (e + 1).min(container.len());
+        }
+        if rootfiles.is_empty() {
+            out.push(error(
                 "mscz-container",
                 "container.xml has no rootfile full-path".to_string(),
-            )),
-            Some(p) => {
-                let s = p + "full-path=\"".len();
-                let e = container[s..]
-                    .find('"')
-                    .map(|q| s + q)
-                    .unwrap_or(container.len());
-                let target = &container[s..e];
-                if !target.ends_with(".mscx") {
+            ));
+        } else {
+            let mscx_target = rootfiles.iter().find(|p| p.ends_with(".mscx")).cloned();
+            for rf in &rootfiles {
+                if zip.by_name(rf).is_err() {
                     out.push(error(
-                        "mscz-container",
-                        format!("rootfile {target:?} is not .mscx"),
+                        "mscz-score",
+                        format!("container points at {rf:?} but it is not in the zip"),
                     ));
-                } else {
-                    match zip.by_name(target) {
-                        Ok(mut f) => {
-                            use std::io::Read;
-                            let mut s = String::new();
-                            if f.read_to_string(&mut s).is_err() {
-                                out.push(error("mscz-score", format!("cannot read {target}")));
-                            } else {
-                                if !s.contains("<museScore") {
-                                    out.push(error(
-                                        "mscz-score",
-                                        format!("{target}: missing <museScore> root"),
-                                    ));
-                                }
-                                if !s.contains("<Measure>") {
-                                    out.push(error(
-                                        "mscz-score",
-                                        format!("{target}: no <Measure> found"),
-                                    ));
-                                }
+                }
+            }
+            match mscx_target {
+                None => out.push(error(
+                    "mscz-container",
+                    format!("container.xml has no .mscx rootfile (found {rootfiles:?})"),
+                )),
+                Some(target) => {
+                    if let Ok(mut f) = zip.by_name(&target) {
+                        use std::io::Read;
+                        let mut s = String::new();
+                        if f.read_to_string(&mut s).is_err() {
+                            out.push(error("mscz-score", format!("cannot read {target}")));
+                        } else {
+                            if !s.contains("<museScore") {
+                                out.push(error(
+                                    "mscz-score",
+                                    format!("{target}: missing <museScore> root"),
+                                ));
+                            }
+                            if !s.contains("<Measure>") {
+                                out.push(error(
+                                    "mscz-score",
+                                    format!("{target}: no <Measure> found"),
+                                ));
                             }
                         }
-                        Err(_) => out.push(error(
-                            "mscz-score",
-                            format!("container points at {target:?} but it is not in the zip"),
-                        )),
                     }
                 }
             }
@@ -2417,5 +2840,146 @@ mod tests {
         let (report, _, _) = ser_for_inputs(&reference, &wrong).unwrap();
         assert_eq!(report.distance, 1);
         assert_eq!(report.ser, 1.0);
+    }
+
+    #[test]
+    fn ms4_xml_structure_and_mscz_container() {
+        let (score, _) = simple_score();
+        let mut losses = LossTable::default();
+        let mscx = to_mscx(&score, &mut losses);
+        assert!(mscx.contains("<museScore version=\"4.20\">"));
+        assert!(mscx.contains("<programVersion>4.2.0</programVersion>"));
+        assert!(mscx.contains("<Part id=\"1\">"));
+        assert!(mscx.contains("<Instrument>"));
+        assert!(mscx.contains("<Staff id=\"1\">"));
+        assert!(mscx.contains("<concertKey>0</concertKey>"));
+        assert!(mscx.contains("<concertClefType>G</concertClefType>"));
+        assert!(mscx.contains("<isHeader>1</isHeader>"));
+        assert!(mscx.contains("<sigN>4</sigN>"));
+        assert!(mscx.contains("<sigD>4</sigD>"));
+
+        let data = pack_mscz(&score, &mscx).expect("pack");
+        let issues = validate_mscz(&data);
+        assert!(!has_errors(&issues), "{issues:?}");
+
+        let mut zip = zip::ZipArchive::new(Cursor::new(&data)).expect("zip");
+        assert!(zip.by_name("META-INF/container.xml").is_ok());
+        assert!(zip.by_name("Assembly-Example.mscx").is_ok());
+        assert!(zip.by_name("score_style.mss").is_ok());
+        let mut container = String::new();
+        std::io::Read::read_to_string(
+            &mut zip.by_name("META-INF/container.xml").unwrap(),
+            &mut container,
+        )
+        .unwrap();
+        assert!(container.contains("full-path=\"Assembly-Example.mscx\""));
+        assert!(container.contains("full-path=\"score_style.mss\""));
+    }
+
+    #[test]
+    fn ms4_multivoice_clefs_keys_timesigs() {
+        let input: ScoreInput = serde_json::from_value(serde_json::json!({
+            "title": "Multi Voice",
+            "divisions": 480,
+            "time": {"beats": 4, "beat_type": 4},
+            "key_fifths": 2,
+            "parts": [{
+                "name": "Piano",
+                "notes": [
+                    {"pitch": "C5", "onset": 0.0, "dur": 4.0, "voice": 1},
+                    {"pitch": "C3", "onset": 0.0, "dur": 2.0, "voice": 2},
+                    {"pitch": "G3", "onset": 2.0, "dur": 2.0, "voice": 2},
+                    {"pitch": "D5", "onset": 4.0, "dur": 3.0, "voice": 1},
+                    {"rest": true, "onset": 4.0, "dur": 3.0, "voice": 2}
+                ]
+            }],
+            "measure_attrs": [
+                {"measure": 1, "clef_sign": "G", "clef_line": 2, "clef_octave_change": -1},
+                {"measure": 2, "clef_sign": "F", "clef_line": 4, "key_fifths": -1, "time": {"beats": 3, "beat_type": 4}}
+            ]
+        }))
+        .unwrap();
+        let (score, _) = parse_score(&input).unwrap();
+        let mut losses = LossTable::default();
+        let mscx = to_mscx(&score, &mut losses);
+
+        // Two voices per measure -> 4 <voice> blocks across 2 measures.
+        assert_eq!(mscx.matches("<voice>").count(), 4);
+        // Header clef G8vb in m1, mid-stream clef F in m2 (only in voice 0).
+        assert_eq!(mscx.matches("<Clef>").count(), 2);
+        assert!(mscx.contains("<concertClefType>G8vb</concertClefType>"));
+        assert!(mscx.contains("<concertClefType>F</concertClefType>"));
+        // Opening key +2 and mid-stream key -1 (only in voice 0).
+        assert_eq!(mscx.matches("<KeySig>").count(), 2);
+        assert!(mscx.contains("<concertKey>2</concertKey>"));
+        assert!(mscx.contains("<concertKey>-1</concertKey>"));
+        // Opening 4/4 and mid-stream 3/4 (only in voice 0).
+        assert_eq!(mscx.matches("<TimeSig>").count(), 2);
+        assert!(mscx.contains("<sigN>3</sigN>"));
+        // Voice 2 in measure 2 is a full-measure rest in 3/4.
+        assert!(mscx.contains("<durationType>measure</durationType>"));
+        assert!(mscx.contains("<duration>3/4</duration>"));
+
+        let data = pack_mscz(&score, &mscx).expect("pack");
+        assert!(!has_errors(&validate_mscz(&data)));
+    }
+
+    #[test]
+    fn ms4_ties_slurs_dynamics_articulations_barlines() {
+        let input: ScoreInput = serde_json::from_value(serde_json::json!({
+            "title": "Rich Notation",
+            "composer": "Test Suite",
+            "divisions": 480,
+            "time": {"beats": 4, "beat_type": 4},
+            "key_fifths": 0,
+            "parts": [{
+                "name": "Violin",
+                "notes": [
+                    {"pitch": "B3", "onset": 0.0, "dur": 0.5, "grace": true},
+                    {"pitch": "C4", "onset": 0.0, "dur": 1.0, "slur_start": true, "articulations": ["stacc", "accent", "tenuto", "fermata"], "lyric": "la"},
+                    {"pitch": "D4", "onset": 1.0, "dur": 1.75, "slur_stop": true},
+                    {"pitch": "E4", "onset": 2.75, "dur": 0.25},
+                    {"pitch": "F#4", "onset": 3.0, "dur": 2.0}
+                ]
+            }],
+            "measure_attrs": [
+                {"measure": 1, "dynamic": "mf", "hairpin": "cresc", "barline_left": "repeat-left", "barline_right": "double"},
+                {"measure": 2, "hairpin": "stop", "barline_right": "light-heavy"}
+            ]
+        }))
+        .unwrap();
+        let (score, _) = parse_score(&input).unwrap();
+        let mut losses = LossTable::default();
+        let mscx = to_mscx(&score, &mut losses);
+
+        // Grace note, double-dotted quarter, lyrics, articulations, fermata.
+        assert!(mscx.contains("<appoggiatura/>"));
+        assert!(mscx.contains("<dots>2</dots>"));
+        assert!(mscx.contains("<Lyrics>"));
+        assert!(mscx.contains("<text>la</text>"));
+        assert!(mscx.contains("<subtype>articStaccatoAbove</subtype>"));
+        assert!(mscx.contains("<subtype>articAccentAbove</subtype>"));
+        assert!(mscx.contains("<subtype>articTenutoAbove</subtype>"));
+        assert!(mscx.contains("<Fermata>"));
+        // Dynamic + HairPin spanner.
+        assert!(mscx.contains("<Dynamic>"));
+        assert!(mscx.contains("<subtype>mf</subtype>"));
+        assert!(mscx.contains("<Spanner type=\"HairPin\">"));
+        // Slur spanner (start at 0, stop at +1/4).
+        assert!(mscx.contains("<Spanner type=\"Slur\">"));
+        assert!(mscx.contains("<fractions>1/4</fractions>"));
+        assert!(mscx.contains("<fractions>-1/4</fractions>"));
+        // Cross-bar tie on F#4 (m1 off 3/4 -> m2 off 0): dm=1, df=-3/4 and dm=-1, df=3/4.
+        assert!(mscx.contains("<Spanner type=\"Tie\">"));
+        assert!(mscx.contains("<measures>1</measures>"));
+        assert!(mscx.contains("<fractions>-3/4</fractions>"));
+        assert!(mscx.contains("<measures>-1</measures>"));
+        assert!(mscx.contains("<fractions>3/4</fractions>"));
+        // Barlines.
+        assert!(mscx.contains("<startRepeat/>"));
+        assert!(mscx.contains("<subtype>double</subtype>"));
+        assert!(mscx.contains("<subtype>end</subtype>"));
+        // Zero tie/clef/dynamic/barline/lyric/grace losses in MS4!
+        assert_eq!(losses.loss_count(), 0, "unexpected losses: {:?}", losses.entries);
     }
 }

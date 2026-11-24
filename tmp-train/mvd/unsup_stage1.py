@@ -652,7 +652,7 @@ def run_unsup_round(
     if isinstance(ema_model, nn.Module) and not isinstance(ema_model, EMAModel):
         teacher = ema_model
     teacher_is_wrapper = isinstance(teacher, EMAModel)
-    teacher_net = teacher.model if teacher_is_wrapper else teacher
+    teacher_net = getattr(teacher, "module", getattr(teacher, "model", teacher)) if teacher_is_wrapper else teacher
     teacher_net.to(dev).eval()
 
     rng = np.random.default_rng(int(seed))
@@ -683,13 +683,13 @@ def run_unsup_round(
             x = x.to(memory_format=torch.channels_last)
         opt.zero_grad(set_to_none=True)
         with torch.amp.autocast("cuda", dtype=torch.bfloat16, enabled=use_bf16):
-            loss, _ = stage1_equivariance_loss(
+            eq_out = stage1_equivariance_loss(
                 model,
                 teacher_net,
                 x,
                 sp_mode=sp_mode,
-                out_stride=out_stride,
             )
+            loss = eq_out[0] if isinstance(eq_out, tuple) else eq_out
         if torch.isfinite(loss):
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 2.0)

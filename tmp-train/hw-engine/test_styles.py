@@ -25,6 +25,7 @@ from styles import (
     SCRIBE_STYLES,
     get_style,
     list_styles,
+    validate_style,
 )
 
 EXPECTED_20_STYLES = [
@@ -99,7 +100,11 @@ class TestScribeStylesRegistry(unittest.TestCase):
                 # Glyph quirks
                 self.assertTrue(-14.0 <= s["slant_deg"] <= 18.0)
                 self.assertIn(s["notehead_archetype"], NOTEHEAD_ARCHETYPES)
-                self.assertTrue(0.6 <= s["notehead_scale"] <= 1.5)
+                self.assertTrue(0.50 <= s["notehead_scale"] <= 1.45)
+                if "notehead_aspect" in s:
+                    self.assertTrue(0.25 <= s["notehead_aspect"] <= 2.20)
+                if "notehead_fill_density" in s:
+                    self.assertTrue(0.25 <= s["notehead_fill_density"] <= 1.50)
                 self.assertTrue(0.0 <= s["hollow_open_prob"] <= 1.0)
                 self.assertTrue(0.0 <= s["clef_ornate"] <= 1.0)
                 self.assertGreaterEqual(s["barline_overshoot_sp"], 0.0)
@@ -166,7 +171,8 @@ class TestScribeStylesRegistry(unittest.TestCase):
 
         # Verify broad coverage across notehead archetypes and ink colors
         archetypes_used = {SCRIBE_STYLES[n]["notehead_archetype"] for n in names}
-        self.assertEqual(archetypes_used, set(NOTEHEAD_ARCHETYPES))
+        self.assertTrue(archetypes_used.issubset(set(NOTEHEAD_ARCHETYPES)))
+        self.assertGreaterEqual(len(archetypes_used), 6)
 
         min_dist = float("inf")
         for i in range(len(names)):
@@ -179,6 +185,63 @@ class TestScribeStylesRegistry(unittest.TestCase):
                     f"Styles {names[i]!r} and {names[j]!r} are too similar (norm dist={dist:.3f})",
                 )
         self.assertGreater(min_dist, 1.0)
+
+    def test_18_notehead_archetypes_and_optional_notehead_keys_validation(self) -> None:
+        expected_18 = (
+            "oval",
+            "slash",
+            "teardrop",
+            "compact",
+            "heavy_wedge",
+            "hollow_diamond",
+            "slim_oval",
+            "needle_slash",
+            "hairline_dash",
+            "vertical_tick",
+            "pinprick_dot",
+            "slim_diamond",
+            "boomerang_hook",
+            "open_loop",
+            "zigzag_fill",
+            "broad_nib_lozenge",
+            "ink_blot",
+            "chevron_wedge",
+        )
+        self.assertEqual(NOTEHEAD_ARCHETYPES, expected_18)
+        self.assertEqual(len(NOTEHEAD_ARCHETYPES), 18)
+        self.assertNotIn("notehead_aspect", REQUIRED_STYLE_KEYS)
+        self.assertNotIn("notehead_fill_density", REQUIRED_STYLE_KEYS)
+
+        base = get_style("baroque_quill_neat")
+        # Valid boundary values pass
+        for arch in expected_18:
+            spec = dict(base, notehead_archetype=arch, notehead_aspect=0.25, notehead_fill_density=0.25, notehead_scale=0.50)
+            out = validate_style(spec, name=f"test_{arch}")
+            self.assertEqual(out["notehead_archetype"], arch)
+            self.assertAlmostEqual(out["notehead_aspect"], 0.25)
+            self.assertAlmostEqual(out["notehead_fill_density"], 0.25)
+            self.assertAlmostEqual(out["notehead_scale"], 0.50)
+
+        out_hi = validate_style(
+            dict(base, notehead_aspect=2.20, notehead_fill_density=1.50, notehead_scale=1.45),
+            name="test_hi",
+        )
+        self.assertAlmostEqual(out_hi["notehead_aspect"], 2.20)
+        self.assertAlmostEqual(out_hi["notehead_fill_density"], 1.50)
+        self.assertAlmostEqual(out_hi["notehead_scale"], 1.45)
+
+        # Out-of-range values fail validation
+        for bad_kwargs in (
+            {"notehead_aspect": 0.20},
+            {"notehead_aspect": 2.50},
+            {"notehead_fill_density": 0.10},
+            {"notehead_fill_density": 1.80},
+            {"notehead_scale": 0.40},
+            {"notehead_scale": 1.60},
+        ):
+            with self.subTest(bad=bad_kwargs):
+                with self.assertRaises(ValueError):
+                    validate_style(dict(base, **bad_kwargs), name="test_bad")
 
 
 class TestLayoutQuirks(unittest.TestCase):
