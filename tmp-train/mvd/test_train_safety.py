@@ -442,17 +442,17 @@ class TestListPairsPrefixIndex(unittest.TestCase):
 
 class TestVocabExpansion(unittest.TestCase):
     """T3.2: loading a pre-bekern+ ckpt (133+3=136 rows, e.g. v2.4)
-    under the committed vocab (176+3=179 rows) must keep every
-    overlapping row byte-identical and fresh-init the 43 new rows."""
+    under the committed vocab (178+3=181 rows) must keep every
+    overlapping row byte-identical and fresh-init the 45 new rows."""
 
     OLD_V = 136  # sys-hybrid-v2.4 ckpt rows: 133 vocab + PAD/BOS/EOS
-    NEW_ROWS = 43  # (176 + 3 specials) - 136 ckpt rows
+    NEW_ROWS = 45  # (178 + 3 specials) - 136 ckpt rows
 
     def _nets(self):
         import torch
         import data
         import model
-        self.assertEqual(len(data.VOCAB), 176)
+        self.assertEqual(len(data.VOCAB), 178)
         new_v = len(data.VOCAB) + 3
         torch.manual_seed(0)
         old = model.MvdNet(vocab=self.OLD_V, d_model=64, layers=1,

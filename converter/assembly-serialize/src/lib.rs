@@ -130,6 +130,8 @@ pub struct MeasureAttr {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub clef_line: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub clef_octave_change: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub key_fifths: Option<i32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub time: Option<TimeSig>,
@@ -1223,12 +1225,17 @@ fn push_note_xml(
 /// `<clef>` element for a recorded sign/line. The token spelling for a
 /// percussion clef is `p` (single char); MusicXML spells it
 /// `percussion`, and the pair re-parses to the same token.
-fn clef_xml(sign: char, line: u32) -> String {
+fn clef_xml(sign: char, line: u32, octave_change: Option<i32>) -> String {
     let name = match sign {
         'p' => "percussion".to_string(),
         s => s.to_string(),
     };
-    format!("        <clef><sign>{name}</sign><line>{line}</line></clef>\n")
+    match octave_change {
+        Some(oct) if oct != 0 => format!(
+            "        <clef><sign>{name}</sign><line>{line}</line><clef-octave-change>{oct}</clef-octave-change></clef>\n"
+        ),
+        _ => format!("        <clef><sign>{name}</sign><line>{line}</line></clef>\n"),
+    }
 }
 
 /// Measure-scoped override for one 1-based measure number, if any.
@@ -1326,12 +1333,13 @@ pub fn to_musicxml(score: &Score, losses: &mut LossTable) -> String {
             out.push_str(&format!("    <measure number=\"{}\">\n", m + 1));
             let attrs = measure_attr(score, m as u32 + 1);
             if m == 0 {
-                let (clef_s, clef_l) = match attrs {
+                let (clef_s, clef_l, clef_oct) = match attrs {
                     Some(a) => (
                         a.clef_sign.unwrap_or('G'),
                         a.clef_line.unwrap_or(2),
+                        a.clef_octave_change,
                     ),
-                    None => ('G', 2),
+                    None => ('G', 2, None),
                 };
                 let key = attrs
                     .and_then(|a| a.key_fifths)
@@ -1349,16 +1357,19 @@ pub fn to_musicxml(score: &Score, losses: &mut LossTable) -> String {
                 out.push_str(&format!(
                     "        <time><beats>{beats}</beats><beat-type>{beat_type}</beat-type></time>\n",
                 ));
-                out.push_str(&clef_xml(clef_s, clef_l));
+                out.push_str(&clef_xml(clef_s, clef_l, clef_oct));
                 out.push_str("      </attributes>\n");
             } else if let Some(a) = attrs {
-                let has_clef = a.clef_sign.is_some() || a.clef_line.is_some();
+                let has_clef = a.clef_sign.is_some()
+                    || a.clef_line.is_some()
+                    || a.clef_octave_change.is_some();
                 if has_clef || a.key_fifths.is_some() || a.time.is_some() {
                     out.push_str("      <attributes>\n");
                     if has_clef {
                         out.push_str(&clef_xml(
                             a.clef_sign.unwrap_or('G'),
                             a.clef_line.unwrap_or(2),
+                            a.clef_octave_change,
                         ));
                     }
                     if let Some(k) = a.key_fifths {
@@ -1507,7 +1518,9 @@ pub fn to_mscx(score: &Score, losses: &mut LossTable) -> String {
             if let Some(a) = measure_attr(score, m as u32 + 1) {
                 for (present, kind) in [
                     (
-                        a.clef_sign.is_some() || a.clef_line.is_some(),
+                        a.clef_sign.is_some()
+                            || a.clef_line.is_some()
+                            || a.clef_octave_change.is_some(),
                         "mscx-clef-dropped",
                     ),
                     (a.dynamic.is_some(), "mscx-dynamic-dropped"),

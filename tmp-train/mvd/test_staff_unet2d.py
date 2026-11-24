@@ -105,6 +105,11 @@ class TestStaffUNet2DModel(unittest.TestCase):
         empty_loss, _ = crit(model(x), torch.zeros_like(tgt))
         self.assertTrue(torch.isfinite(empty_loss))
 
+        # return_metrics=False fast path skips host syncs and matches loss identically.
+        fast_loss, fast_metrics = crit(preds, tgt, return_metrics=False)
+        self.assertEqual(fast_metrics, {})
+        self.assertAlmostEqual(float(fast_loss.item()), float(loss.item()), places=6)
+
     def test_onnx_export(self):
         import onnx
 
@@ -339,6 +344,97 @@ class TestRasterizeAndExtract(unittest.TestCase):
         self.assertEqual(len(systems), 2, "vertical ch2 bleed must not merge two 3-staff systems")
         self.assertEqual([len(s.staves) for s in systems], [3, 3])
 
+    def test_vectorized_rasterize_accuracy_and_speed_12_staves(self):
+        """Vectorized rasterize_staff_targets matches scalar math (<1e-5) and runs <15 ms on 768x576 (12 staves)."""
+        w, h = 1152, 1536
+        out_h, out_w = 768, 576
+        xs = np.linspace(80.0, w - 80.0, 64)
+        staves_spec = []
+        for s_idx in range(12):
+            yc = 100.0 + s_idx * 115.0 + 8.0 * np.sin(2.0 * math.pi * (xs - 80.0) / (w - 160.0))
+            staves_spec.append(
+                {
+                    "y_center": yc,
+                    "sp": 11.5,
+                    "x0": 80.0,
+                    "x1": float(w - 80.0),
+                    "system_id": s_idx // 2,
+                }
+            )
+
+        # Reference scalar check on a smaller grid to verify exact mathematical parity (< 1e-5).
+        ref_w, ref_h, ref_oh, ref_ow = 384, 512, 256, 192
+        ref_xs = np.linspace(30.0, ref_w - 30.0, 32)
+        ref_staves = [
+            {"y_center": 120.0 + 4.0 * np.sin(ref_xs / 60.0), "sp": 9.0, "x0": 30.0, "x1": float(ref_w - 30.0), "system_id": 0},
+            {"y_center": 210.0 + 4.0 * np.sin(ref_xs / 60.0), "sp": 9.0, "x0": 30.0, "x1": float(ref_w - 30.0), "system_id": 0},
+            {"y_center": 360.0 - 0.05 * (ref_xs - 192.0), "sp": 8.5, "x0": 40.0, "x1": float(ref_w - 40.0), "system_id": 1},
+        ]
+        for sp_mode in ("rel_h", "log_hm"):
+            vec_tgt = su.rasterize_staff_targets(
+                ref_staves, w=ref_w, h=ref_h, out_h=ref_oh, out_w=ref_ow, sp_mode=sp_mode
+            ).numpy()
+            # Recompute scalar reference.
+            sx = float(ref_ow) / float(ref_w)
+            sy = float(ref_oh) / float(ref_h)
+            col_x = (np.arange(ref_ow, dtype=np.float64) + 0.5) / sx
+            row_y = np.arange(ref_oh, dtype=np.float64) + 0.5
+            ref_tgt = np.zeros((4, ref_oh, ref_ow), dtype=np.float32)
+            parsed = []
+            for entry in ref_staves:
+                lines_orig, x0, x1, sys_id = su._parse_staff_entry(entry, ref_w)
+                src_x = np.linspace(x0, x1, num=lines_orig.shape[1])
+                active = (col_x >= x0) & (col_x <= x1)
+                lines_out = np.empty((5, ref_ow), dtype=np.float64)
+                for k in range(5):
+                    lines_out[k] = np.interp(col_x, src_x, lines_orig[k]) * sy
+                sp_vert_orig = np.maximum(np.mean(np.diff(lines_orig, axis=0), axis=0), 1.0)
+                dy_dx = np.gradient(lines_orig[2], src_x)
+                sp_norm_orig = np.maximum(sp_vert_orig * np.cos(np.arctan(dy_dx)), 1.0)
+                sp_vert_col = np.interp(col_x, src_x, sp_vert_orig)
+                sp_norm_col = np.interp(col_x, src_x, sp_norm_orig)
+                sp_out_col = np.maximum(sp_vert_col * sy, 0.75)
+                for c in np.nonzero(active)[0]:
+                    sp_o = sp_out_col[c]
+                    line_sigma = max(0.55, 0.22 * sp_o)
+                    for k in range(5):
+                        band = np.exp(-0.5 * ((row_y - lines_out[k, c]) / line_sigma) ** 2)
+                        ref_tgt[0, :, c] = np.maximum(ref_tgt[0, :, c], (band >= 0.35).astype(np.float32))
+                    c_sigma = max(0.75, 0.42 * sp_o)
+                    c_band = np.exp(-0.5 * ((row_y - lines_out[2, c]) / c_sigma) ** 2).astype(np.float32)
+                    c_band[c_band < 0.05] = 0.0
+                    ref_tgt[1, :, c] = np.maximum(ref_tgt[1, :, c], c_band)
+                    smask = (row_y >= lines_out[0, c] - sp_o) & (row_y <= lines_out[4, c] + sp_o)
+                    if sp_mode == "log_hm":
+                        hm_scale = float(ref_oh * 2) / float(ref_h)
+                        ref_tgt[3, smask, c] = float(
+                            math.log(float(np.clip(sp_norm_col[c] * hm_scale / 2.0, 0.5, 256.0)))
+                        )
+                    else:
+                        ref_tgt[3, smask, c] = float(sp_norm_col[c] / float(ref_h))
+                parsed.append((lines_out, sp_vert_col, active, sys_id))
+            for grp in ([0, 1], [2]):
+                act_u = np.zeros(ref_ow, dtype=bool)
+                for i in grp:
+                    act_u |= parsed[i][2]
+                for c in np.nonzero(act_u)[0]:
+                    y_tops = [parsed[i][0][0, c] - 0.5 * max(parsed[i][1][c] * sy, 0.75) for i in grp if parsed[i][2][c]]
+                    y_bots = [parsed[i][0][4, c] + 0.5 * max(parsed[i][1][c] * sy, 0.75) for i in grp if parsed[i][2][c]]
+                    mask = (row_y >= min(y_tops)) & (row_y <= max(y_bots))
+                    ref_tgt[2, mask, c] = 1.0
+            max_diff = float(np.max(np.abs(vec_tgt - ref_tgt)))
+            self.assertLess(max_diff, 1e-5, f"sp_mode={sp_mode} max_abs_diff={max_diff}")
+
+        # Speed benchmark on 768x576 with 12 staves (warmup + 5 timed runs).
+        _ = su.rasterize_staff_targets(staves_spec, w=w, h=h, out_h=out_h, out_w=out_w)
+        t0 = time.perf_counter()
+        n_runs = 5
+        for _ in range(n_runs):
+            tgt_big = su.rasterize_staff_targets(staves_spec, w=w, h=h, out_h=out_h, out_w=out_w)
+        ms_per_page = (time.perf_counter() - t0) * 1000.0 / n_runs
+        self.assertEqual(tuple(tgt_big.shape), (4, out_h, out_w))
+        self.assertLess(ms_per_page, 15.0, f"rasterize_staff_targets took {ms_per_page:.2f} ms/page (>= 15 ms)")
+
 
 class TestTrainingSmoke(unittest.TestCase):
     def test_dataset_and_one_epoch_train(self):
@@ -470,6 +566,45 @@ class TestTrainingSmoke(unittest.TestCase):
                 self.assertTrue(torch.isfinite(xa).all())
                 self.assertTrue(torch.isfinite(ya).all())
                 self.assertGreater(float(ya[2].sum()), 0.0)
+
+    def test_clean_frac_preserves_crisp_clean_pages(self):
+        """clean_frac=1.0 skips heavy photo degradation; clean_frac=0.0 applies augmentation."""
+        with tempfile.TemporaryDirectory() as td:
+            td_path = Path(td)
+            arr = np.full((320, 256, 3), 255, dtype=np.uint8)
+            staves = [
+                {"y_center": 80.0, "sp": 6.0, "x0": 24.0, "x1": 232.0, "system_id": 0},
+                {"y_center": 140.0, "sp": 6.0, "x0": 24.0, "x1": 232.0, "system_id": 0},
+            ]
+            for st in staves:
+                for k in range(-2, 3):
+                    ry = int(round(st["y_center"] + k * st["sp"]))
+                    arr[ry, 24:232, :] = 0
+            # Crisp 1-px left system brace/barline.
+            arr[68:153, 24, :] = 0
+            Image.fromarray(arr, mode="RGB").save(td_path / "clean_page.png")
+            manifest = td_path / "manifest.jsonl"
+            manifest.write_text(json.dumps({"image": "clean_page.png", "staves": staves}) + "\n", encoding="utf-8")
+
+            ds_noaug = su.StaffUNetDataset(manifest, target_h=160, target_w=128, augment=False)
+            ds_clean1 = su.StaffUNetDataset(manifest, target_h=160, target_w=128, augment=True, seed=7, clean_frac=1.0)
+            ds_clean0 = su.StaffUNetDataset(manifest, target_h=160, target_w=128, augment=True, seed=7, clean_frac=0.0)
+
+            x_ref, y_ref = ds_noaug[0]
+            for ep in range(4):
+                ds_clean1.set_epoch(ep)
+                xc, yc = ds_clean1[0]
+                self.assertTrue(torch.equal(xc, x_ref), f"clean_frac=1.0 should match unaugmented page at ep={ep}")
+                self.assertTrue(torch.equal(yc, y_ref), f"clean_frac=1.0 targets should match unaugmented at ep={ep}")
+
+            # clean_frac=0.0 should augment and differ from the raw unaugmented image.
+            diffs = 0
+            for ep in range(4):
+                ds_clean0.set_epoch(ep)
+                xa, _ = ds_clean0[0]
+                if not torch.equal(xa, x_ref):
+                    diffs += 1
+            self.assertGreater(diffs, 0, "clean_frac=0.0 should apply photo/geometric augmentations")
 
 
 if __name__ == "__main__":

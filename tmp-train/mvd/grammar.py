@@ -34,6 +34,8 @@ BAR_REST = 'bar-rest'
 CHORD = 'chord'
 BAR = 'bar'
 TUPLET_STOP = 'tuplet-stop'
+# Includes octave-transposing treble clefs (`clef-G-2-8vb`, `clef-G-2-8va`)
+# appended to `data.VOCAB`.
 CLEFS = frozenset(t for t in data.VOCAB if t.startswith('clef-'))
 KEYS = frozenset(t for t in data.VOCAB if t.startswith('key'))
 TIMES = frozenset(t for t in data.VOCAB if t.startswith('time-'))
@@ -100,7 +102,10 @@ class PrefixState:
       remaining measure duration (chord tones add 0; ``bar-rest``
       jumps its voice to the barline; tuplet spans scale by N/A and
       dots count as ``2 - 2**-dots`` — mirroring ``decode.rs``).
-      Under-full (partial/pickup) bars stay legal. Unlike the rules
+      Under-full (partial/pickup) bars — including anacrusis bars,
+      mid-bar split repeats closed by ``bar-repeat-right`` or opened
+      by ``bar-repeat-left``, and 1-note pickup meters (``time-1-16``,
+      ``time-1-32``) — stay legal and are never masked out. Unlike the rules
       above this one is NOT proven GT-safe: the audit found genuine
       GT overlaps (voices the serializer clamp-repairs), so the
       full-corpus strict round-trip flags those pages while legacy

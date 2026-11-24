@@ -43,6 +43,7 @@ import torch  # noqa: E402
 from PIL import Image  # noqa: E402
 
 __all__ = [
+    'MAX_VOICE',
     'split_measures',
     'join_measures',
     'fallback_repair',
@@ -51,9 +52,14 @@ __all__ = [
     'slot_mem_mask',
     'mask_for_strip',
     'window_staves',
+    'merge_chunk_streams',
     'decode_system_with_measure_fallback',
     'decode_multi_staff_system',
 ]
+
+MAX_VOICE = max(
+    int(t.split('-')[1]) for t in data.VOCAB if t.startswith('voice-')
+)
 
 
 def mem_dims_for_strip(height, width, stride='8x16'):
@@ -443,20 +449,91 @@ def _measure_voices(measure):
     return best
 
 
-def _shift_voices(measure, k):
-    """Renumber a chunk's measure voices by +k (``voice-1..``)."""
+def _shift_voices(measure, k, max_voice=MAX_VOICE):
+    """Renumber a chunk's measure voices by +k, dropping any voice > max_voice.
+
+    Caps shifted voices at ``max_voice`` (``data.VOCAB`` stops at
+    ``voice-12``) so mega-systems (>12 staves) preserve the first 12
+    voices as valid bekern instead of emitting OOV ``voice-13+`` tokens
+    that trigger a full-system ``hyp_tokens_valid`` wipeout. Pass
+    ``max_voice=None`` to disable capping.
+    """
     m = list(measure)
-    if k <= 0:
+    if not m:
         return m
-    if not any(t.startswith('voice-') for t in m):
-        return (['voice-%d' % (k + 1)] + m) if m else m
+    if max_voice is not None and k >= max_voice:
+        return []
+    has_voice = any(t.startswith('voice-') for t in m)
+    if not has_voice:
+        if k <= 0:
+            return m
+        v = k + 1
+        if max_voice is not None and v > max_voice:
+            return []
+        return ['voice-%d' % v] + m
     out = []
+    dropping = False
     for t in m:
         if t.startswith('voice-'):
-            out.append('voice-%d' % (int(t.split('-')[1]) + k))
-        else:
+            v = int(t.split('-')[1]) + max(0, k)
+            if max_voice is not None and v > max_voice:
+                dropping = True
+            else:
+                dropping = False
+                out.append('voice-%d' % v)
+        elif not dropping:
             out.append(t)
     return out
+
+
+def merge_chunk_streams(chunk_streams, chunk_staff_counts=None,
+                        max_voice=MAX_VOICE):
+    """Merge multi-staff chunk token streams at the measure/voice level.
+
+    When ``chunk_staff_counts`` is given (e.g. ``[4, 3]`` for a 7-staff
+    system), chunk ``ci > 0`` shifts each measure's voices by
+    ``max(_measure_voices(merged[j]), prev_staves_cum)`` so per-staff
+    voice IDs stay aligned even when earlier chunks contain empty or
+    collapsed bar-rest staves (e.g. ``aloha-oe``).
+
+    Chunks whose cumulative preceding staff count already reaches
+    ``max_voice`` (12) are dropped cleanly, and individual voices that
+    would shift past ``max_voice`` are omitted, guaranteeing 100%
+    in-vocab ``voice-1..voice-12`` output.
+    """
+    if not chunk_streams:
+        return []
+    if len(chunk_streams) == 1:
+        return list(chunk_streams[0])
+    staff_counts = (
+        list(chunk_staff_counts)
+        if chunk_staff_counts is not None
+        else [0] * len(chunk_streams)
+    )
+    if len(staff_counts) != len(chunk_streams):
+        raise ValueError(
+            'chunk_staff_counts length %d != chunk_streams length %d'
+            % (len(staff_counts), len(chunk_streams)))
+    merged_header = []
+    merged = []
+    prev_staves_cum = 0
+    for ci, (toks, n_staves) in enumerate(zip(chunk_streams, staff_counts)):
+        if max_voice is not None and ci > 0 and prev_staves_cum >= max_voice:
+            break
+        header, measures, _tb = split_measures(toks)
+        merged_header.extend(header)
+        while len(merged) < len(measures):
+            merged.append([])
+        for j, m in enumerate(measures):
+            m = _explicit_voice(m)
+            if ci == 0:
+                merged[j].extend(_shift_voices(m, 0, max_voice=max_voice))
+            else:
+                shift = max(_measure_voices(merged[j]), prev_staves_cum)
+                merged[j].extend(
+                    _shift_voices(m, shift, max_voice=max_voice))
+        prev_staves_cum += max(0, int(n_staves))
+    return join_measures(merged_header, merged, True)
 
 
 def decode_multi_staff_system(net, page_img, system_staves_lines,
@@ -471,11 +548,11 @@ def decode_multi_staff_system(net, page_img, system_staves_lines,
 
     ``<= 4`` staves: rectify once, decode once. ``> 4`` staves: slice
     into chunks of up to 4 (``[0:4]``, ``[4:8]``, ...), rectify and
-    fallback-decode each chunk, then concatenate headers and merge
-    per-measure voice runs (chunk voices shift to
-    ``voice-(k+1)..`` where ``k`` is the voice count already merged
-    for that measure) at each ``bar`` token. ``extra_fn`` forwards
-    to :func:`_decode_chunk` (T2.4 hybrid inputs). Returns tokens.
+    fallback-decode each chunk, then merge headers and per-measure
+    voice runs via :func:`merge_chunk_streams` (preserving per-staff
+    voice offsets across bar-rest chunks and capping voices at
+    :data:`MAX_VOICE`). ``extra_fn`` forwards to :func:`_decode_chunk`
+    (T2.4 hybrid inputs). Returns tokens.
     ``mem_mask`` applies to the single-chunk path only (forwarded to
     :func:`_decode_chunk`); chunked decodes build a train-matched slot
     mask per chunk inside :func:`_decode_chunk` (one mask cannot span
@@ -500,9 +577,12 @@ def decode_multi_staff_system(net, page_img, system_staves_lines,
         raise ValueError('mem_mask cannot span chunked (> 4 staff) '
                          'decodes; pass None so each chunk builds its '
                          'own slot mask')
-    merged_header = []
-    merged = []
-    for ci, chunk in enumerate(chunks):
+    chunk_streams = []
+    chunk_staff_counts = []
+    prev_staves_cum = 0
+    for chunk in chunks:
+        if prev_staves_cum >= MAX_VOICE:
+            break
         toks = _decode_chunk(net, page_img, chunk, beam,
                              extra_fn=extra_fn,
                              ink_eos_veto=ink_eos_veto,
@@ -513,15 +593,9 @@ def decode_multi_staff_system(net, page_img, system_staves_lines,
                              target_sp=target_sp, height=height,
                              verify_beam=verify_beam,
                              verify_alpha=verify_alpha)
-        header, measures, _tb = split_measures(toks)
-        merged_header.extend(header)
-        while len(merged) < len(measures):
-            merged.append([])
-        for j, m in enumerate(measures):
-            m = _explicit_voice(m)
-            if ci == 0:
-                merged[j].extend(m)
-            else:
-                merged[j].extend(
-                    _shift_voices(m, _measure_voices(merged[j])))
-    return join_measures(merged_header, merged, True)
+        chunk_streams.append(toks)
+        chunk_staff_counts.append(len(chunk))
+        prev_staves_cum += len(chunk)
+    return merge_chunk_streams(
+        chunk_streams, chunk_staff_counts=chunk_staff_counts,
+        max_voice=MAX_VOICE)

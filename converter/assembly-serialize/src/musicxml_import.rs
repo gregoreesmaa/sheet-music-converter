@@ -453,8 +453,8 @@ struct AttrEv {
     time: Option<TimeSig>,
     key_fifths: Option<i32>,
     staves: Option<u32>,
-    /// `(part-local staff number, sign, line)` in document order.
-    clefs: Vec<(u32, char, u32)>,
+    /// `(part-local staff number, sign, line, clef_octave_change)` in document order.
+    clefs: Vec<(u32, char, u32, Option<i32>)>,
 }
 
 /// Engraved beats for a grace `<type>`; grace notes carry no duration,
@@ -525,6 +525,7 @@ pub struct StaffHeader {
     pub staff: u32,
     pub clef_sign: char,
     pub clef_line: u32,
+    pub clef_octave_change: Option<i32>,
     pub key_fifths: i32,
     pub beats: u32,
     pub beat_type: u32,
@@ -534,7 +535,7 @@ pub struct StaffHeader {
 /// by part-local staff number, first key/time, highest staff seen.
 type PartHeader = (
     u32,
-    Vec<(u32, char, u32)>,
+    Vec<(u32, char, u32, Option<i32>)>,
     Option<i32>,
     Option<TimeSig>,
     u32,
@@ -547,7 +548,7 @@ pub fn staff_headers(xml: &str) -> Result<Vec<StaffHeader>, String> {
     let mut parts: Vec<PartHeader> = Vec::new();
     let mut staff_base = 0u32;
     for part_xml in elements(xml, "part") {
-        let mut clefs: Vec<(u32, char, u32)> = Vec::new();
+        let mut clefs: Vec<(u32, char, u32, Option<i32>)> = Vec::new();
         let mut key: Option<i32> = None;
         let mut time: Option<TimeSig> = None;
         let mut part_staves = 1u32;
@@ -559,9 +560,9 @@ pub fn staff_headers(xml: &str) -> Result<Vec<StaffHeader>, String> {
                         if let Some(s) = a.staves {
                             part_staves = part_staves.max(s.max(1));
                         }
-                        for (n, sign, line) in a.clefs {
+                        for (n, sign, line, oct) in a.clefs {
                             if !clefs.iter().any(|c| c.0 == n) {
-                                clefs.push((n, sign, line));
+                                clefs.push((n, sign, line, oct));
                             }
                         }
                         if key.is_none() {
@@ -625,7 +626,7 @@ pub fn staff_headers_at_measure(
                 }
             }
         }
-        let mut clefs: Vec<(u32, char, u32)> = Vec::new();
+        let mut clefs: Vec<(u32, char, u32, Option<i32>)> = Vec::new();
         let mut key: Option<i32> = None;
         let mut time: Option<TimeSig> = None;
         for (ordinal0, meas) in measures.iter().enumerate() {
@@ -634,10 +635,10 @@ pub fn staff_headers_at_measure(
             }
             for it in measure_items(meas) {
                 if let Item::Attributes(a) = it {
-                    for (n, sign, line) in a.clefs {
+                    for (n, sign, line, oct) in a.clefs {
                         match clefs.iter_mut().find(|c| c.0 == n) {
-                            Some(slot) => *slot = (n, sign, line),
-                            None => clefs.push((n, sign, line)),
+                            Some(slot) => *slot = (n, sign, line, oct),
+                            None => clefs.push((n, sign, line, oct)),
                         }
                     }
                     if a.key_fifths.is_some() {
@@ -666,15 +667,16 @@ fn emit_headers(parts: &[PartHeader]) -> Vec<StaffHeader> {
             beat_type: 4,
         });
         for local in 1..=*max_staff {
-            let (sign, line) = clefs
+            let (sign, line, oct) = clefs
                 .iter()
                 .find(|c| c.0 == local)
-                .map(|c| (c.1, c.2))
-                .unwrap_or(('G', 2));
+                .map(|c| (c.1, c.2, c.3))
+                .unwrap_or(('G', 2, None));
             out.push(StaffHeader {
                 staff: base + local - 1,
                 clef_sign: sign,
                 clef_line: line,
+                clef_octave_change: oct,
                 key_fifths: key.unwrap_or(0),
                 beats: t.beats,
                 beat_type: t.beat_type,
@@ -737,7 +739,7 @@ pub fn measure_staff_headers(xml: &str) -> Result<Vec<MeasureStaffHeader>, Strin
             let mut changed = vec![measure == 1; n_staves];
             for it in measure_items(meas) {
                 if let Item::Attributes(a) = it {
-                    for (n, sign, line) in a.clefs {
+                    for (n, sign, line, _oct) in a.clefs {
                         let idx = n.saturating_sub(1) as usize;
                         if idx < n_staves && cur_clefs[idx] != (sign, line) {
                             cur_clefs[idx] = (sign, line);
@@ -907,7 +909,7 @@ pub struct BekernNote {
     /// Whole-bar rest: emitted as a lone `bar-rest` token.
     pub measure_rest: bool,
     /// Mid-stream clef change taking effect here, if any.
-    pub clef_change: Option<(char, u32)>,
+    pub clef_change: Option<(char, u32, Option<i32>)>,
     /// Mid-stream key change (`fifths`), if any.
     pub key_change: Option<i32>,
     /// Mid-stream time change (`beats`, `beat-type`), if any.
@@ -952,10 +954,10 @@ pub fn bekern_events(xml: &str) -> Result<Vec<BekernNote>, String> {
         // Notation state in effect at the part start (seeded silently by
         // the first attributes block) versus pending changes (diffs that
         // ride on the next non-chord event).
-        let mut cur_clefs: HashMap<u32, (char, u32)> = HashMap::new();
+        let mut cur_clefs: HashMap<u32, (char, u32, Option<i32>)> = HashMap::new();
         let mut cur_key: Option<i32> = None;
         let mut cur_time: Option<(u32, u32)> = None;
-        let mut pend_clef: Option<(char, u32)> = None;
+        let mut pend_clef: Option<(char, u32, Option<i32>)> = None;
         let mut pend_key: Option<i32> = None;
         let mut pend_time: Option<(u32, u32)> = None;
         let mut pend_dyn: Option<String> = None;
@@ -1014,12 +1016,12 @@ pub fn bekern_events(xml: &str) -> Result<Vec<BekernNote>, String> {
             for it in measure_items(meas) {
                 match it {
                     Item::Attributes(a) => {
-                        for (n, sign, line) in a.clefs {
-                            if cur_clefs.get(&n).copied() != Some((sign, line)) {
+                        for (n, sign, line, oct) in a.clefs {
+                            if cur_clefs.get(&n).copied() != Some((sign, line, oct)) {
                                 if cur_clefs.contains_key(&n) {
-                                    pend_clef = Some((sign, line));
+                                    pend_clef = Some((sign, line, oct));
                                 }
-                                cur_clefs.insert(n, (sign, line));
+                                cur_clefs.insert(n, (sign, line, oct));
                             }
                         }
                         if let Some(k) = a.key_fifths {
@@ -1732,7 +1734,10 @@ fn parse_attributes(s: &str) -> AttrEv {
             let line = tag_text(inner, "line")
                 .and_then(|t| t.parse::<u32>().ok())
                 .unwrap_or(2);
-            clefs.push((num, sign, line));
+            let octave_change = tag_text(inner, "clef-octave-change")
+                .and_then(|t| t.parse::<i32>().ok())
+                .filter(|&v| v != 0);
+            clefs.push((num, sign, line, octave_change));
             rest = &body[e..];
         } else {
             break;
@@ -2590,10 +2595,10 @@ mod tests {
              <clef number=\"1\"><sign>G</sign><line>2</line></clef>\
              <clef number=\"2\"><sign>F</sign><line>4</line></clef>",
         );
-        assert_eq!(a.clefs, vec![(1, 'G', 2), (2, 'F', 4)]);
+        assert_eq!(a.clefs, vec![(1, 'G', 2, None), (2, 'F', 4, None)]);
         // Missing number defaults to staff 1.
         let b = parse_attributes("<clef><sign>C</sign><line>3</line></clef>");
-        assert_eq!(b.clefs, vec![(1, 'C', 3)]);
+        assert_eq!(b.clefs, vec![(1, 'C', 3, None)]);
     }
 
     #[test]

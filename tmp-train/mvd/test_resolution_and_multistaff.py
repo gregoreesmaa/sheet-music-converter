@@ -170,9 +170,13 @@ class MultiStaffWindowingTest(unittest.TestCase):
             # Measure 0 had 4 voices in chunk 0 -> chunk 1 shifted to voice-5..voice-(4+rem).
             m0_voices = [t for t in measures[0] if t.startswith('voice-')]
             self.assertEqual(m0_voices, [f'voice-{i}' for i in range(1, 4 + rem + 1)])
-            # Measure 1 had 2 voices in chunk 0 -> chunk 1 shifted to voice-3..voice-(2+rem).
+            # Measure 1 had 2 voices on 4 staves in chunk 0 -> chunk 1 shifted by
+            # max(2, 4) = 4 to voice-5..voice-(4+rem) (preserves per-staff IDs).
             m1_voices = [t for t in measures[1] if t.startswith('voice-')]
-            self.assertEqual(m1_voices, [f'voice-{i}' for i in range(1, 2 + rem + 1)])
+            self.assertEqual(
+                m1_voices,
+                ['voice-1', 'voice-2'] + [f'voice-{i}' for i in range(5, 4 + rem + 1)],
+            )
 
 
 if __name__ == '__main__':

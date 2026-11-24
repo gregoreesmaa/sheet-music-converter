@@ -62,6 +62,7 @@ def logit_jsd_consistency(
             f'{tuple(logits_deg.shape)}'
         )
 
+    lc_in = logits_clean.detach() if detach_clean else logits_clean
     if pad_mask is not None:
         if pad_mask.shape != logits_clean.shape[:-1]:
             raise ValueError(
@@ -69,17 +70,15 @@ def logit_jsd_consistency(
                 f'logits batch/time shape {tuple(logits_clean.shape[:-1])}'
             )
         valid = ~pad_mask.to(device=logits_deg.device, dtype=torch.bool)
-        if not bool(valid.any()):
-            return logits_deg.float().sum() * 0.0
-        lc = logits_clean[valid]
-        ld = logits_deg[valid]
+        valid_exp = valid.unsqueeze(-1)
+        zero_c = torch.zeros((), device=lc_in.device, dtype=lc_in.dtype)
+        zero_d = torch.zeros((), device=logits_deg.device, dtype=logits_deg.dtype)
+        lc = torch.where(valid_exp, lc_in, zero_c)
+        ld = torch.where(valid_exp, logits_deg, zero_d)
     else:
-        v = logits_clean.shape[-1]
-        lc = logits_clean.reshape(-1, v)
-        ld = logits_deg.reshape(-1, v)
-
-    if detach_clean:
-        lc = lc.detach()
+        valid = None
+        lc = lc_in
+        ld = logits_deg
 
     inv_t = 1.0 / float(temperature)
     lc = lc.float() * inv_t
@@ -95,5 +94,8 @@ def logit_jsd_consistency(
 
     kl_pm = (p * (log_p - log_m)).sum(dim=-1)
     kl_qm = (q * (log_q - log_m)).sum(dim=-1)
-    jsd = 0.5 * (kl_pm + kl_qm)
-    return jsd.clamp_min(0.0).mean()
+    jsd = (0.5 * (kl_pm + kl_qm)).clamp_min(0.0)
+    if valid is not None:
+        valid_f = valid.to(dtype=jsd.dtype)
+        return (jsd * valid_f).sum() / valid_f.sum().clamp_min(1.0)
+    return jsd.mean()

@@ -214,10 +214,25 @@ assert all(
     ) for t in _LELAND_ADD
 ), "leland add must be append-only (id stability)"
 
+# Octave-transposing treble clefs (2026-11-24, suite31 luca-gloria
+# Parts 2 & 3 carry <clef-octave-change>-1</clef-octave-change>, 61.5%
+# of notes). Lives AFTER _LELAND_ADD so every pre-existing id 0..175
+# stays put under saved checkpoints (vocab-expand copies prefix rows
+# verbatim and fresh-inits the new rows).
+_OCTAVE_CLEF_ADD = ["clef-G-2-8vb", "clef-G-2-8va"]
+assert all(
+    t not in (
+        _STEPS + _OCTAVES + _DURATIONS + _MARKS + _ALTERS + _SYMBOLS
+        + _CLEFS + _KEYS + _TIMES + _TUPLETS + _BAR_REST + _BREVE + _CHORD
+        + _VOICES + _SQ_ADD + _BEKERNPLUS + _T32_ADD + _LELAND_ADD
+    ) for t in _OCTAVE_CLEF_ADD
+), "octave clef add must be append-only (id stability)"
+
 VOCAB: List[str] = (
     _STEPS + _OCTAVES + _DURATIONS + _MARKS + _ALTERS + _SYMBOLS
     + _CLEFS + _KEYS + _TIMES + _TUPLETS + _BAR_REST + _BREVE + _CHORD
     + _VOICES + _SQ_ADD + _BEKERNPLUS + _T32_ADD + _LELAND_ADD
+    + _OCTAVE_CLEF_ADD
 )
 TOKEN_TO_ID: Dict[str, int] = {t: i for i, t in enumerate(VOCAB)}
 
@@ -231,11 +246,11 @@ EOS_ID: int = len(VOCAB) + 2
 # ---------------------------------------------------------------------------
 # Opt-in extension vocabularies (NOT appended to default VOCAB).
 #
-# Preserves VOCAB IDs 0..175 and len(VOCAB) == 176 byte-identically for
-# existing checkpoints (ckpt-22000) and respects Step 3's Gate-D boundary
-# (no drum-kit / slash-note / tab tokens in Gate A-C training).
-# Call ``build_vocab(...)`` when opting in to extended dynamics, lyric
-# structural markers, or Gate-D percussion/tab notation.
+# Preserves VOCAB IDs 0..177 and len(VOCAB) == 178 byte-identically for
+# existing checkpoints (prefix 0..175 unchanged) and respects Step 3's
+# Gate-D boundary (no drum-kit / slash-note / tab tokens in Gate A-C
+# training). Call ``build_vocab(...)`` when opting in to extended
+# dynamics, lyric structural markers, or Gate-D percussion/tab notation.
 # ---------------------------------------------------------------------------
 
 EXT_DYNAMICS_VOCAB: List[str] = [
@@ -264,10 +279,10 @@ def build_vocab(
     include_lyric_markers: bool = False,
     include_percussion_tab: bool = False,
 ) -> tuple[List[str], Dict[str, int]]:
-    """Build an append-only vocabulary preserving base ``VOCAB`` IDs 0..175.
+    """Build an append-only vocabulary preserving base ``VOCAB`` IDs 0..177.
 
-    Default flags return an exact copy of ``VOCAB`` (len 176). Enabling any
-    extension appends its tokens strictly after index 175 so existing
+    Default flags return an exact copy of ``VOCAB`` (len 178). Enabling any
+    extension appends its tokens strictly after index 177 so existing
     checkpoints load cleanly via vocab-expand.
     """
     vocab = list(VOCAB)

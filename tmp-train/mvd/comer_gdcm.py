@@ -90,6 +90,16 @@ def _build_count_tables() -> Tuple[torch.Tensor, torch.Tensor]:
 
 
 _COUNT_FLAGS_CPU, _VOICE_NUMS_CPU = _build_count_tables()
+_DEVICE_TABLES_CACHE: Dict[torch.device, Tuple[torch.Tensor, torch.Tensor]] = {}
+
+
+def _get_count_tables(device: torch.device) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Return device-cached ``(flags, voice_nums)`` tables (zero per-step H2D)."""
+    cached = _DEVICE_TABLES_CACHE.get(device)
+    if cached is None:
+        cached = (_COUNT_FLAGS_CPU.to(device), _VOICE_NUMS_CPU.to(device))
+        _DEVICE_TABLES_CACHE[device] = cached
+    return cached
 
 
 def extract_strip_counts(
@@ -126,8 +136,7 @@ def extract_strip_counts(
         raise ValueError(f"tgt_ids must be 1D or 2D, got shape {tuple(ids.shape)}")
 
     device = ids.device
-    flags = _COUNT_FLAGS_CPU.to(device)
-    voice_nums = _VOICE_NUMS_CPU.to(device)
+    flags, voice_nums = _get_count_tables(device)
 
     valid = (ids != int(pad_id)) & (ids >= 0) & (ids < _VOCAB_SIZE)
     safe_ids = torch.where(valid, ids, torch.full_like(ids, _VOCAB_SIZE))

@@ -421,6 +421,83 @@ class TestStrideGridAlignment(unittest.TestCase):
         test_scaled_codes_match_overlap()
 
 
+class TestStage2Speedups(unittest.TestCase):
+    """Tests for Tier-1 + width-matched Stage-2 speedups & vocab-resize safety."""
+
+    def test_comer_single_checkpoint_and_t_chunk_128(self):
+        import inspect
+        sig = inspect.signature(model._decoder_layer_comer)
+        self.assertEqual(sig.parameters['t_chunk'].default, 128)
+        torch.manual_seed(0)
+        net = model.MvdNet(vocab=VOCAB_SIZE, d_model=64, layers=2, heads=4,
+                           dim_ff=128, use_comer=True, use_gdcm=True)
+        net.train()
+        img = torch.randn(2, 3, 64, 128)
+        tgt = torch.randint(0, len(VOCAB), (2, 16))
+        ce, _, _, gdcm_loss = net.loss_shared(
+            img, tgt, need_gdcm=True)
+        total = ce + 0.1 * gdcm_loss
+        total.backward()
+        self.assertTrue(bool(torch.isfinite(total)))
+        self.assertIsNotNone(net.comer_bias.conv_out.weight.grad)
+        self.assertGreater(net.comer_bias.conv_out.weight.grad.abs().sum().item(), 0.0)
+
+    def test_coord_monotonic_penalty_all_pad_and_cached_voice_ids(self):
+        xc = torch.randn(2, 6, requires_grad=True)
+        tgt_pad = torch.full((2, 6), data_mod.PAD_ID, dtype=torch.long)
+        p0 = model.coord_monotonic_penalty(xc, tgt_pad, model.VOICE_IDS, data_mod.PAD_ID)
+        self.assertEqual(float(p0.item()), 0.0)
+        p0.backward()
+        self.assertTrue(bool((xc.grad == 0.0).all()))
+        # Device cache populated for CPU.
+        self.assertTrue(len(model._VOICE_IDS_CACHE) >= 1)
+
+    def test_width_matched_mix_supervised_batch(self):
+        import train as _train
+        narrow_base = [(f'b{i}.png', 'b.txt', f'b{i}') for i in range(4)]
+        hw_pool = [
+            ('hw_narrow_1.png', 'h.txt', 'hn1'),
+            ('hw_narrow_2.png', 'h.txt', 'hn2'),
+            ('hw_wide_1.png', 'h.txt', 'hw1'),
+            ('hw_wide_2.png', 'h.txt', 'hw2'),
+        ]
+        widths = {
+            'b0.png': 700, 'b1.png': 720, 'b2.png': 740, 'b3.png': 760,
+            'hw_narrow_1.png': 710, 'hw_narrow_2.png': 750,
+            'hw_wide_1.png': 2400, 'hw_wide_2.png': 2600,
+        }
+        for st in range(1, 50):
+            mixed, hi, _ = _train.mix_supervised_batch(
+                narrow_base, step=st, seed=7,
+                hw_pairs=hw_pool, hw_mix_ratio=0.5,
+                width_by_img=widths)
+            for idx in hi:
+                self.assertIn(mixed[idx][0], ('hw_narrow_1.png', 'hw_narrow_2.png'))
+
+    def test_vocab_resize_plus_two_clefs_copies_clef_g2(self):
+        import train as _train
+        new_v = len(VOCAB) + 3   # 178 + 3 = 181
+        old_v = new_v - 2        # 176 + 3 = 179
+        old_n_tok = old_v - 3    # 176
+        new_n_tok = new_v - 3    # 178
+        torch.manual_seed(3)
+        old = model.MvdNet(vocab=old_v, d_model=64, layers=1, heads=4, dim_ff=128)
+        new = model.MvdNet(vocab=new_v, d_model=64, layers=1, heads=4, dim_ff=128)
+        state = old.state_dict()
+        how = _train.load_weights_compat(new, state)
+        self.assertEqual(how, 'vocab-expand')
+        g2_id = data_mod.TOKEN_TO_ID['clef-G-2']
+        got = new.state_dict()
+        for k in ('tok_emb.weight', 'out.weight', 'out.bias'):
+            # 0..175 copied verbatim
+            self.assertTrue(torch.equal(got[k][:old_n_tok], state[k][:old_n_tok]))
+            # old specials 176..178 -> new specials 178..180
+            self.assertTrue(torch.equal(got[k][new_n_tok:], state[k][old_n_tok:]))
+            # new clef rows 176, 177 -> initialized from clef-G-2
+            for row_idx in range(old_n_tok, new_n_tok):
+                self.assertTrue(torch.equal(got[k][row_idx], state[k][g2_id]))
+
+
 if __name__ == '__main__':
     test_forward_shapes()
     test_long_sequence_no_position_cap()

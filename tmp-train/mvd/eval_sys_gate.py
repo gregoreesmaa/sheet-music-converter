@@ -187,24 +187,99 @@ def trim_max_len_repeat_loop(toks, max_len=564, min_period=8, min_repeats=4):
     return toks
 
 
+def _header_slots(head_toks):
+    """Split a leading header run into per-kind ordered token lists."""
+    clefs, keys, times = [], [], []
+    for t in head_toks:
+        if t.startswith('clef-'):
+            clefs.append(t)
+        elif t.startswith('key'):
+            keys.append(t)
+        elif t.startswith('time-'):
+            times.append(t)
+    return clefs, keys, times
+
+
+def _diff_header_slots(active, incoming):
+    """Compare incoming header tokens of one kind against active slots.
+
+    Updates ``active`` in place and returns deduplicated changed tokens
+    (preserving order). Unchanged courtesy headers return ``[]``.
+    """
+    changed = []
+    for idx, tok in enumerate(incoming):
+        if idx < len(active):
+            if active[idx] != tok:
+                active[idx] = tok
+                if tok not in changed:
+                    changed.append(tok)
+        else:
+            prev = active[-1] if active else None
+            active.append(tok)
+            if prev is not None and tok != prev and tok not in changed:
+                changed.append(tok)
+    return changed
+
+
+def _update_active_from_body(body_toks, active_clefs, active_keys, active_times):
+    """Advance active header state for mid-system clef/key/time changes."""
+    for t in body_toks:
+        if t.startswith('key'):
+            if active_keys:
+                for i in range(len(active_keys)):
+                    active_keys[i] = t
+            else:
+                active_keys.append(t)
+        elif t.startswith('time-'):
+            if active_times:
+                for i in range(len(active_times)):
+                    active_times[i] = t
+            else:
+                active_times.append(t)
+        elif t.startswith('clef-') and len(active_clefs) <= 1:
+            if active_clefs:
+                active_clefs[0] = t
+            else:
+                active_clefs.append(t)
+
+
 def stitch_page_toks(sys_toks_list):
     """Page token stream from per-system token lists.
 
-    Headers (leading clef-/key-/time-) come from the first system with a
-    non-empty body; later systems contribute bodies only. An empty first
-    system (decode crash) must not lock in empty headers and drop the
-    page's headers. All-empty input stitches to [].
+    Leading headers (``clef-`` / ``key`` / ``time-``) are adopted from
+    the first system with a non-empty body. For every subsequent
+    non-empty system, unchanged courtesy headers are stripped while any
+    changed ``clef-``, ``key``, or ``time-`` tokens are emitted before
+    that system's body (and update the active page header state),
+    preserving mid-page clef/key/meter changes. An empty first system
+    (decode crash) does not lock in empty headers. All-empty input
+    stitches to ``[]``.
     """
-    heads, bodies = [], []
+    heads = []
+    out_body = []
+    active_clefs, active_keys, active_times = [], [], []
+    initialized = False
     for toks in sys_toks_list:
         h, b = split_head_body(toks)
-        if not heads and b:
-            heads = h
-        bodies.append(b)
-    if not heads and sys_toks_list:
+        if not b:
+            continue
+        if not initialized:
+            heads = list(h)
+            c, k, tm = _header_slots(h)
+            active_clefs, active_keys, active_times = list(c), list(k), list(tm)
+            initialized = True
+        else:
+            c, k, tm = _header_slots(h)
+            changed = []
+            changed.extend(_diff_header_slots(active_clefs, c))
+            changed.extend(_diff_header_slots(active_keys, k))
+            changed.extend(_diff_header_slots(active_times, tm))
+            out_body.extend(changed)
+        out_body.extend(b)
+        _update_active_from_body(b, active_clefs, active_keys, active_times)
+    if not initialized and sys_toks_list:
         heads, _b = split_head_body(sys_toks_list[0])
-    return canonicalize_bekern_tail_order(
-        list(heads) + [t for b in bodies for t in b])
+    return canonicalize_bekern_tail_order(list(heads) + out_body)
 
 
 def run_cli(args, timeout=600):
@@ -1147,18 +1222,23 @@ def decode_system_v2(net, img_path, row, heat_net, device, height, beam,
 def suite31_page_refs(gt_path, sys_stem, workdir):
     """Page-level refs into ``workdir`` (never gate20).
 
-    The ``gt-p1`` file IS the page-1 cut, so one ``aser bekern --page 1``
-    (+ ``bekern-decode``) gives the reference token stream and one
-    ``aser import`` the reference notes. No ``system-breaks`` spans are
-    needed (several suite31 GT cuts carry no engraved print breaks).
+    Files named ``gt-p1-*`` are already cut to page 1 (and may contain
+    stray ``<print new-page="yes"/>`` elements such as
+    ``gt-p1-luca-gloria.musicxml``), so they convert the full file via
+    ``--measures 1..999999`` instead of ``--page 1`` to avoid premature
+    truncation. Multi-page raw scores without the ``gt-p1-`` prefix keep
+    ``--page 1``. One ``aser import`` gives the reference notes.
     """
     stem = sys_stem + '-page-ref'
     txt = workdir / (stem + '-bekern.txt')
-    p = run_cli([ASER, 'bekern', '--input', str(gt_path), '--page', '1',
+    is_page1_cut = Path(gt_path).name.startswith('gt-p1-')
+    scope_args = (['--measures', '1..999999']
+                  if is_page1_cut else ['--page', '1'])
+    p = run_cli([ASER, 'bekern', '--input', str(gt_path), *scope_args,
                  '--out', str(workdir), '--stem', stem])
     if p.returncode != 0 or not txt.exists():
-        raise RuntimeError('suite31 bekern --page 1 failed: %s'
-                           % ((p.stderr or '')[-200:]))
+        raise RuntimeError('suite31 bekern %s failed: %s'
+                           % (' '.join(scope_args), (p.stderr or '')[-200:]))
     toks = txt.read_text(encoding='utf-8').split()
     notes = workdir / (stem + '-notes.json')
     p = run_cli([ASER, 'bekern-decode', '--input', str(txt),
@@ -1395,8 +1475,12 @@ def decode_curved_system(net, page_img, curved_sys, heat_net, device, height,
         height=height,
     )
     chunk_streams = []
+    chunk_staff_counts = []
+    prev_staves_cum = 0
     with torch.no_grad():
         for rect_img, ref, staff_indices in chunks:
+            if prev_staves_cum >= mdec.MAX_VOICE:
+                break
             ten = rectified_input_tensor_from_rect(
                 rect_img, ref, heat_net, device, extra_chans=extra_chans)
             mem_mask = mdec.mask_for_strip(
@@ -1409,25 +1493,15 @@ def decode_curved_system(net, page_img, curved_sys, heat_net, device, height,
                 verify_alpha=verify_alpha,
                 obs_gray=(rect_img if verify_beam else None))
             chunk_streams.append(ctoks)
+            chunk_staff_counts.append(len(staff_indices))
+            prev_staves_cum += len(staff_indices)
     if len(chunk_streams) == 1:
         toks = chunk_streams[0]
         geom = 'staff-unet2d'
     else:
-        merged_header = []
-        merged = []
-        for ci, ctoks in enumerate(chunk_streams):
-            header, measures, _tb = mdec.split_measures(ctoks)
-            merged_header.extend(header)
-            while len(merged) < len(measures):
-                merged.append([])
-            for j, meas in enumerate(measures):
-                meas = mdec._explicit_voice(meas)
-                if ci == 0:
-                    merged[j].extend(meas)
-                else:
-                    merged[j].extend(
-                        mdec._shift_voices(meas, mdec._measure_voices(merged[j])))
-        toks = mdec.join_measures(merged_header, merged, True)
+        toks = mdec.merge_chunk_streams(
+            chunk_streams, chunk_staff_counts=chunk_staff_counts,
+            max_voice=mdec.MAX_VOICE)
         geom = 'staff-unet2d+chunked'
     secs = time.time() - t0
     valid = hyp_tokens_valid(toks)

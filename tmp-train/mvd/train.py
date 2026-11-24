@@ -302,13 +302,73 @@ def load_rism_incipit_pairs(rism_dir, exclude=(), include_degraded=True):
         str(root), exclude=exclude, include_degraded=include_degraded)
 
 
+def _pick_width_matched_pair(pool_pairs, pool_sorted, target_w, rng,
+                             width_window=16):
+    """Pick a pair from ``pool_pairs`` whose width is closest to ``target_w``.
+
+    When ``target_w`` and ``pool_sorted = (sorted_widths, sorted_pairs)`` are
+    available, restricts selection to a local window around
+    ``bisect_left(sorted_widths, target_w)`` (preferring candidates within
+    ``max(128, 25% of target_w)`` of ``target_w``, or within ``best_dist + 64``
+    if none fall inside the tolerance). Falls back to uniform random selection
+    from ``pool_pairs`` when width metadata is unavailable.
+    """
+    n = len(pool_pairs)
+    if target_w is None or pool_sorted is None:
+        return pool_pairs[rng.randrange(n)]
+    widths, pairs_s = pool_sorted
+    ns = len(pairs_s)
+    if ns == 0:
+        return pool_pairs[rng.randrange(n)]
+    pos = bisect.bisect_left(widths, target_w)
+    k = min(ns, max(1, int(width_window)))
+    lo = max(0, pos - k // 2)
+    hi = min(ns, lo + k)
+    lo = max(0, hi - k)
+    tol = max(128, int(round(0.25 * target_w)))
+    cands = [i for i in range(lo, hi) if abs(widths[i] - target_w) <= tol]
+    if not cands:
+        best_d = None
+        for idx in (pos - 1, pos):
+            if 0 <= idx < ns:
+                d = abs(widths[idx] - target_w)
+                if best_d is None or d < best_d:
+                    best_d = d
+        cands = [i for i in range(lo, hi)
+                 if abs(widths[i] - target_w) <= best_d + 64]
+    if not cands:
+        return pairs_s[min(pos, ns - 1)]
+    return pairs_s[cands[rng.randrange(len(cands))]]
+
+
+def _build_sorted_width_pool(pool_pairs, width_by_img):
+    """Build ``(sorted_widths, sorted_pairs)`` from ``width_by_img`` if complete."""
+    if not pool_pairs or not width_by_img:
+        return None
+    ws = []
+    for p in pool_pairs:
+        w = width_by_img.get(p[0])
+        if w is None:
+            return None
+        ws.append(int(w))
+    order = sorted(range(len(pool_pairs)), key=lambda i: ws[i])
+    return ([ws[i] for i in order], [pool_pairs[i] for i in order])
+
+
 def mix_supervised_batch(base_batch, step, seed, hw_pairs=(),
                          hw_mix_ratio=0.0, rism_pairs=(),
-                         rism_mix_ratio=0.0):
+                         rism_mix_ratio=0.0,
+                         width_by_img=None,
+                         hw_sorted=None,
+                         rism_sorted=None,
+                         width_window=16):
     """Deterministically mix labeled HW and/or RISM incipit items into a batch.
 
     Per-step RNG stream ``f'{seed}:{step}:hw_mix'`` is independent of run
-    history so ``--resume`` stays bit-exact. Returns
+    history so ``--resume`` stays bit-exact. When ``width_by_img`` (and
+    optional pre-sorted ``hw_sorted`` / ``rism_sorted``) is provided, picks
+    candidates closest to ``base_batch``'s median width so a single wide
+    HW/RISM strip never pads a narrow bucketed batch 3x. Returns
     ``(mixed_batch, hw_indices, rism_indices)``.
     """
     hw_r = max(0.0, float(hw_mix_ratio or 0.0))
@@ -323,13 +383,29 @@ def mix_supervised_batch(base_batch, step, seed, hw_pairs=(),
     n_rism = len(rism_pairs)
     eff_hw = hw_r if n_hw > 0 else 0.0
     eff_rism = rism_r if n_rism > 0 else 0.0
+
+    target_w = None
+    if width_by_img is not None:
+        bws = [width_by_img[p[0]] for p in base_batch if p[0] in width_by_img]
+        if bws:
+            bws.sort()
+            target_w = int(bws[len(bws) // 2])
+    if target_w is not None:
+        if eff_hw > 0.0 and hw_sorted is None:
+            hw_sorted = _build_sorted_width_pool(hw_pairs, width_by_img)
+        if eff_rism > 0.0 and rism_sorted is None:
+            rism_sorted = _build_sorted_width_pool(rism_pairs, width_by_img)
+
     for i in range(len(mixed)):
         u = rng.random()
         if eff_hw > 0.0 and u < eff_hw:
-            mixed[i] = hw_pairs[rng.randrange(n_hw)]
+            mixed[i] = _pick_width_matched_pair(
+                hw_pairs, hw_sorted, target_w, rng, width_window=width_window)
             hw_idx.add(i)
         elif eff_rism > 0.0 and u < eff_hw + eff_rism:
-            mixed[i] = rism_pairs[rng.randrange(n_rism)]
+            mixed[i] = _pick_width_matched_pair(
+                rism_pairs, rism_sorted, target_w, rng,
+                width_window=width_window)
             rism_idx.add(i)
     return mixed, frozenset(hw_idx), frozenset(rism_idx)
 
@@ -1846,10 +1922,20 @@ def load_weights_compat(net, state):
     foveal_fresh = bool(own_foveal and not state_foveal)
 
     # Gracefully keep fresh Exp-2B heads (s18_head.*, comer_bias.*, gdcm_head.*)
-    # when warm-starting from a pre-Exp-2B checkpoint (e.g. exp2A ckpt-15000).
+    # when warm-starting from a pre-Exp-2B checkpoint (e.g. exp2A ckpt-15000),
+    # or when vocab expansion grows s18_head.subtype_head.* rows.
     own_s18 = {k for k in own if k.startswith('s18_head.')}
     state_s18 = {k for k in state if k.startswith('s18_head.')}
     s18_fresh = bool(own_s18 and not state_s18)
+    skip_own_s18 = {
+        k for k in own_s18
+        if k not in state or tuple(state[k].shape) != tuple(own[k].shape)
+    }
+    skip_state_s18 = {
+        k for k in state_s18
+        if k not in own or tuple(state[k].shape) != tuple(own[k].shape)
+    }
+    s18_resized = bool(not s18_fresh and (skip_own_s18 or skip_state_s18))
 
     own_comer = {k for k in own if k.startswith('comer_bias.')}
     state_comer = {k for k in state if k.startswith('comer_bias.')}
@@ -1861,7 +1947,8 @@ def load_weights_compat(net, state):
 
     # Legacy strict+aux-fresh fast path (preserves exact return string).
     if (not stem_mismatch and not vocab_mismatch and not foveal_fresh
-            and not s18_fresh and not comer_fresh and not gdcm_fresh
+            and not s18_fresh and not s18_resized
+            and not comer_fresh and not gdcm_fresh
             and own_aux and not state_aux
             and all(k in state and tuple(state[k].shape) == tuple(own[k].shape)
                     for k in own if k not in own_aux)
@@ -1873,11 +1960,12 @@ def load_weights_compat(net, state):
                 else 'strict+aux-fresh')
 
     if not (padconv or stem_mismatch or vocab_mismatch or aux_skipped
-            or foveal_fresh or s18_fresh or comer_fresh or gdcm_fresh):
+            or foveal_fresh or s18_fresh or s18_resized
+            or comer_fresh or gdcm_fresh):
         net.load_state_dict(state)  # re-raise the original error
 
-    skip_own = set(skip_own_aux)
-    skip_state = set(skip_state_aux)
+    skip_own = set(skip_own_aux) | set(skip_own_s18)
+    skip_state = set(skip_state_aux) | set(skip_state_s18)
     if foveal_fresh:
         skip_own |= own_foveal
     if s18_fresh:
@@ -1905,22 +1993,73 @@ def load_weights_compat(net, state):
             if stem.bias is not None and stem_b in state:
                 stem.bias.copy_(state[stem_b])
         if vocab_mismatch:
-            net.tok_emb.weight[:n_old].copy_(state[emb_w])
-            net.out.weight[:n_old].copy_(state[out_w])
-            net.out.bias[:n_old].copy_(state[out_b])
-            torch.nn.init.normal_(net.tok_emb.weight[n_old:])
-            torch.nn.init.kaiming_uniform_(net.out.weight[n_old:],
-                                           a=math.sqrt(5))
-            fan_in = net.out.weight.shape[1]
-            bound = 1 / math.sqrt(fan_in) if fan_in > 0 else 0
-            torch.nn.init.uniform_(net.out.bias[n_old:], -bound, bound)
+            n_new = net.tok_emb.weight.shape[0]
+            n_added = n_new - n_old
+            g2_id = data.TOKEN_TO_ID.get('clef-G-2')
+            old_n_tok = n_old - 3
+            new_n_tok = n_new - 3
             dev = net.tok_emb.weight.device
-            assert torch.equal(net.tok_emb.weight[:n_old],
-                               state[emb_w].to(dev)), 'emb prefix shifted'
-            assert torch.equal(net.out.weight[:n_old],
-                               state[out_w].to(dev)), 'head prefix shifted'
-            assert torch.equal(net.out.bias[:n_old],
-                               state[out_b].to(dev)), 'bias prefix shifted'
+            if (g2_id is not None and 0 <= g2_id < old_n_tok
+                    and n_added == 2):
+                # Clef-appendix expansion (e.g. 176+3=179 -> 178+3=181 adding
+                # clef-G-2-8vb, clef-G-2-8va right before PAD/BOS/EOS):
+                #   * 0..old_n_tok-1  -> copied verbatim
+                #   * old specials    -> shifted to new specials (n_new-3..n_new-1)
+                #   * new clef rows   -> initialized from clef-G-2 row
+                net.tok_emb.weight[:old_n_tok].copy_(state[emb_w][:old_n_tok])
+                net.out.weight[:old_n_tok].copy_(state[out_w][:old_n_tok])
+                net.out.bias[:old_n_tok].copy_(state[out_b][:old_n_tok])
+
+                net.tok_emb.weight[new_n_tok:].copy_(state[emb_w][old_n_tok:])
+                net.out.weight[new_n_tok:].copy_(state[out_w][old_n_tok:])
+                net.out.bias[new_n_tok:].copy_(state[out_b][old_n_tok:])
+
+                net.tok_emb.weight[old_n_tok:new_n_tok].copy_(
+                    state[emb_w][g2_id:g2_id + 1].expand(n_added, -1))
+                net.out.weight[old_n_tok:new_n_tok].copy_(
+                    state[out_w][g2_id:g2_id + 1].expand(n_added, -1))
+                net.out.bias[old_n_tok:new_n_tok].copy_(
+                    state[out_b][g2_id:g2_id + 1].expand(n_added))
+
+                assert torch.equal(net.tok_emb.weight[:old_n_tok],
+                                   state[emb_w][:old_n_tok].to(dev)), 'emb prefix shifted'
+                assert torch.equal(net.tok_emb.weight[new_n_tok:],
+                                   state[emb_w][old_n_tok:].to(dev)), 'emb specials shifted'
+                assert torch.equal(net.out.weight[:old_n_tok],
+                                   state[out_w][:old_n_tok].to(dev)), 'head prefix shifted'
+                assert torch.equal(net.out.weight[new_n_tok:],
+                                   state[out_w][old_n_tok:].to(dev)), 'head specials shifted'
+                assert torch.equal(net.out.bias[:old_n_tok],
+                                   state[out_b][:old_n_tok].to(dev)), 'bias prefix shifted'
+                assert torch.equal(net.out.bias[new_n_tok:],
+                                   state[out_b][old_n_tok:].to(dev)), 'bias specials shifted'
+            else:
+                net.tok_emb.weight[:n_old].copy_(state[emb_w])
+                net.out.weight[:n_old].copy_(state[out_w])
+                net.out.bias[:n_old].copy_(state[out_b])
+                torch.nn.init.normal_(net.tok_emb.weight[n_old:])
+                torch.nn.init.kaiming_uniform_(net.out.weight[n_old:],
+                                               a=math.sqrt(5))
+                fan_in = net.out.weight.shape[1]
+                bound = 1 / math.sqrt(fan_in) if fan_in > 0 else 0
+                torch.nn.init.uniform_(net.out.bias[n_old:], -bound, bound)
+                assert torch.equal(net.tok_emb.weight[:n_old],
+                                   state[emb_w].to(dev)), 'emb prefix shifted'
+                assert torch.equal(net.out.weight[:n_old],
+                                   state[out_w].to(dev)), 'head prefix shifted'
+                assert torch.equal(net.out.bias[:n_old],
+                                   state[out_b].to(dev)), 'bias prefix shifted'
+        if s18_resized:
+            # Preserve overlapping prefix rows on any resized s18_head tensor
+            # (e.g. subtype_head growing when new clef tokens are appended).
+            own_params = dict(net.named_parameters())
+            for k in skip_own_s18:
+                if (k in state and k in own_params
+                        and state[k].ndim == own_params[k].ndim
+                        and state[k].shape[1:] == own_params[k].shape[1:]
+                        and state[k].shape[0] < own_params[k].shape[0]):
+                    n_s = state[k].shape[0]
+                    own_params[k][:n_s].copy_(state[k])
     rest = {k: v for k, v in state.items() if k not in skip_state}
     missing, unexpected = net.load_state_dict(rest, strict=False)
     assert not unexpected, unexpected
@@ -2449,7 +2588,11 @@ def main():
         net.proj = net.proj.to(memory_format=torch.channels_last)
         if args.foveal_tap and hasattr(net, 'foveal_proj'):
             net.foveal_proj = net.foveal_proj.to(memory_format=torch.channels_last)
-        print('memory format: channels_last (NHWC) on encoder+proj')
+        if args.comer and hasattr(net, 'comer_bias'):
+            net.comer_bias = net.comer_bias.to(memory_format=torch.channels_last)
+        print('memory format: channels_last (NHWC) on encoder+proj'
+              + ('+foveal' if args.foveal_tap else '')
+              + ('+comer' if args.comer else ''))
     scaler = torch.amp.GradScaler('cuda', enabled=(amp and amp_dtype == torch.float16))
     heat_net = None
     if use_heatnet:
@@ -2552,12 +2695,29 @@ def main():
         print('batch-size %d: %d batches/epoch over %d pairs'
               % (B, nb, n))
     pair_widths = None
+    width_by_img = None
+    hw_sorted = None
+    rism_sorted = None
     if args.width_bucket and B > 1:
         pair_widths = fast_loader.measure_pair_widths(
             pairs, height=args.height, hybrid_index=hybrid_index)
+        width_by_img = {p[0]: w for p, w in zip(pairs, pair_widths)}
         print('width-bucket: enabled (min=%d, median=%d, max=%d px)'
               % (min(pair_widths), sorted(pair_widths)[len(pair_widths) // 2],
                  max(pair_widths)))
+        if hw_pool_pairs and args.hw_mix_ratio > 0.0:
+            hw_ws = fast_loader.measure_pair_widths(
+                hw_pool_pairs, height=args.height, hybrid_index=hybrid_index)
+            hw_order = sorted(range(len(hw_pool_pairs)), key=lambda i: hw_ws[i])
+            hw_sorted = ([hw_ws[i] for i in hw_order],
+                         [hw_pool_pairs[i] for i in hw_order])
+        if rism_pool_pairs and args.rism_mix_ratio > 0.0:
+            rism_ws = fast_loader.measure_pair_widths(
+                rism_pool_pairs, height=args.height, hybrid_index=hybrid_index)
+            rism_order = sorted(range(len(rism_pool_pairs)),
+                                key=lambda i: rism_ws[i])
+            rism_sorted = ([rism_ws[i] for i in rism_order],
+                           [rism_pool_pairs[i] for i in rism_order])
 
     def _step_batches():
         cached_ep = -1
@@ -2580,7 +2740,10 @@ def main():
                     raw_b, st, args.seed,
                     hw_pairs=hw_pool_pairs, hw_mix_ratio=args.hw_mix_ratio,
                     rism_pairs=rism_pool_pairs,
-                    rism_mix_ratio=args.rism_mix_ratio)
+                    rism_mix_ratio=args.rism_mix_ratio,
+                    width_by_img=width_by_img,
+                    hw_sorted=hw_sorted,
+                    rism_sorted=rism_sorted)
             yield (st, ep, epoch_aug.resolve_epoch_batch(
                 raw_b, ep, args.epoch_redraw_dir))
 
@@ -2725,11 +2888,15 @@ def main():
             elif _b_cur > 2 and (imgs.shape[-1] > 2176 or (args.comer and imgs.shape[-1] > 1408)):
                 _mb = 2
         if _mb > 0:
-            _loss_acc = 0.0
-            _aux_acc = 0.0 if need_aux else None
-            _coord_acc = 0.0 if need_coord else None
-            _s18_acc = 0.0 if need_s18 else None
-            _gdcm_acc = 0.0 if need_gdcm else None
+            _loss_acc = torch.zeros((), device=device, dtype=torch.float32)
+            _aux_acc = (torch.zeros((), device=device, dtype=torch.float32)
+                        if need_aux else None)
+            _coord_acc = (torch.zeros((), device=device, dtype=torch.float32)
+                          if need_coord else None)
+            _s18_acc = (torch.zeros((), device=device, dtype=torch.float32)
+                        if need_s18 else None)
+            _gdcm_acc = (torch.zeros((), device=device, dtype=torch.float32)
+                         if need_gdcm else None)
             mterm = wterm = aterm = jterm = None
             for _s in range(0, _b_cur, _mb):
                 _e = min(_b_cur, _s + _mb)
@@ -2766,27 +2933,27 @@ def main():
                         else:
                             _ax = _ab.mean()
                         _sub = _sub + args.aux_weight * _ax * (_wf / K)
-                        _aux_acc += float(_ax.detach().item()) * _wf
+                        _aux_acc = _aux_acc + _ax.detach().float() * _wf
                     if need_coord:
                         _ct = model.coord_monotonic_penalty(
                             _xc, _tg, model.VOICE_IDS, net.pad_id)
                         _sub = _sub + args.coord_weight * _ct * (_wf / K)
-                        _coord_acc += float(_ct.detach().item()) * _wf
+                        _coord_acc = _coord_acc + _ct.detach().float() * _wf
                     if need_s18:
                         _s18l, _ = net.s18_head.loss_from_tokens(
                             _h, _tg, pad_id=net.pad_id, eos_id=net.eos_id)
                         _sub = _sub + args.s18_weight * _s18l * (_wf / K)
-                        _s18_acc += float(_s18l.detach().item()) * _wf
+                        _s18_acc = _s18_acc + _s18l.detach().float() * _wf
                     if need_gdcm and _gd is not None:
                         _sub = _sub + args.gdcm_weight * _gd * (_wf / K)
-                        _gdcm_acc += float(_gd.detach().item()) * _wf
+                        _gdcm_acc = _gdcm_acc + _gd.detach().float() * _wf
                 scaler.scale(_sub).backward()
-                _loss_acc += float(_sub.detach().item())
-            loss = torch.tensor(_loss_acc)
-            auxterm = torch.tensor(_aux_acc) if _aux_acc is not None else None
-            cterm = torch.tensor(_coord_acc) if _coord_acc is not None else None
-            s18term = torch.tensor(_s18_acc) if _s18_acc is not None else None
-            gterm = torch.tensor(_gdcm_acc) if _gdcm_acc is not None else None
+                _loss_acc = _loss_acc + _sub.detach().float()
+            loss = _loss_acc
+            auxterm = _aux_acc
+            cterm = _coord_acc
+            s18term = _s18_acc
+            gterm = _gdcm_acc
         else:
             with torch.amp.autocast('cuda', enabled=amp, dtype=amp_dtype):
                 shared_out = net.loss_shared(
@@ -3022,7 +3189,8 @@ def main():
                         device, args.stride, hybrid_index=hybrid_index))
                 memd = (m0.mean(dim=1).reshape(-1)
                         - m1.mean(dim=1).reshape(-1)).norm().item()
-                hyp = net.greedy(eimgs, max_len=etgt.shape[1] + 16)
+                hyp = net.greedy_kv(eimgs, max_len=etgt.shape[1] + 16,
+                                    constrain=False)
             ref = etgt[0].tolist()
             ref = [x for x in ref if x != data.PAD_ID]
             hyp = hyp[0].tolist()

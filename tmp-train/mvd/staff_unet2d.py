@@ -310,14 +310,19 @@ class StaffUNetLoss(nn.Module):
         self.sp_mode = str(sp_mode)
 
     def forward(
-        self, preds: torch.Tensor, targets: torch.Tensor
+        self,
+        preds: torch.Tensor,
+        targets: torch.Tensor,
+        return_metrics: bool = True,
     ) -> tuple[torch.Tensor, dict[str, float]]:
-        """Compute total loss and per-head scalar metrics.
+        """Compute total loss and optional per-head scalar metrics.
 
         Args:
             preds: ``[B, 4, Hp, Wp]`` raw model output.
             targets: ``[B, 4, Hp, Wp]`` float targets in ``[0, 1]`` for ch0..2
                 and ``sp_px / H`` for ch3.
+            return_metrics: When ``False``, skip ``.item()`` host-syncs and
+                return an empty metrics dict (fast path for training loop).
         """
         if preds.shape != targets.shape:
             targets = F.interpolate(
@@ -334,26 +339,18 @@ class StaffUNetLoss(nn.Module):
             preds[:, 2], targets[:, 2]
         )
 
-        # Mask sp loss to pixels on/near staves.
+        # Mask sp loss to pixels on/near staves (clamp_min avoids forced .item() GPU sync).
         sp_tgt = targets[:, 3]
         if self.sp_mode == "log_hm":
             sp_pred = preds[:, 3]
             mask = ((targets[:, 0] > 0.3) | (targets[:, 1] > 0.3)).float()
-            denom = mask.sum()
-            if float(denom.item()) > 0.0:
-                elem = F.smooth_l1_loss(sp_pred, sp_tgt, beta=0.15, reduction="none")
-                l_sp = (elem * mask).sum() / denom
-            else:
-                l_sp = sp_pred.sum() * 0.0
+            elem = F.smooth_l1_loss(sp_pred, sp_tgt, beta=0.15, reduction="none")
+            l_sp = (elem * mask).sum() / mask.sum().clamp_min(1.0)
         else:
             sp_pred = F.softplus(preds[:, 3])
             mask = ((targets[:, 0] > 0.25) | (targets[:, 1] > 0.25) | (sp_tgt > 1e-6)).float()
-            denom = mask.sum()
-            if float(denom.item()) > 0.0:
-                elem = F.smooth_l1_loss(sp_pred, sp_tgt, beta=self.smooth_l1_beta, reduction="none")
-                l_sp = (elem * mask).sum() / denom
-            else:
-                l_sp = sp_pred.sum() * 0.0
+            elem = F.smooth_l1_loss(sp_pred, sp_tgt, beta=self.smooth_l1_beta, reduction="none")
+            l_sp = (elem * mask).sum() / mask.sum().clamp_min(1.0)
 
         total = (
             self.w_lines * l_lines
@@ -361,6 +358,8 @@ class StaffUNetLoss(nn.Module):
             + self.w_system * l_system
             + self.w_sp * l_sp
         )
+        if not return_metrics:
+            return total, {}
         metrics = {
             "loss_total": float(total.detach().item()),
             "loss_lines": float(l_lines.detach().item()),
@@ -1019,6 +1018,12 @@ def rasterize_staff_targets(
     sy = float(out_h) / float(h)
     col_x = (np.arange(out_w, dtype=np.float64) + 0.5) / sx  # page x for each out col
     row_y = np.arange(out_h, dtype=np.float64) + 0.5         # out-grid y centers
+    ch0_thresh_mult = math.sqrt(-2.0 * math.log(0.35))
+    hm_scale = (
+        float(iso_scale)
+        if iso_scale is not None
+        else (float(out_h * out_stride) / float(h))
+    )
 
     parsed: list[tuple[np.ndarray, np.ndarray, np.ndarray, int | None]] = []
     # Each item: (lines_5xOutW in out_y, sp_px_OutW in orig px, active_cols bool[OutW], sys_id)
@@ -1050,37 +1055,51 @@ def rasterize_staff_targets(
         sp_out_col = np.maximum(sp_vert_col * sy, 0.75)
 
         act_cols = np.nonzero(active)[0]
-        for c in act_cols:
-            sp_o = sp_out_col[c]
-            # ch0: 5 staff lines (Gaussian band, sigma ~ 0.35 px or 0.22*sp_o)
-            line_sigma = max(0.55, 0.22 * sp_o)
+        c0 = int(act_cols[0])
+        c1 = int(act_cols[-1]) + 1
+        sp_o = sp_out_col[c0:c1]  # (M,)
+        line_sigma = np.maximum(0.55, 0.22 * sp_o)
+        line_thresh = line_sigma * ch0_thresh_mult
+        c_sigma = np.maximum(0.75, 0.42 * sp_o)
+
+        max_pad = max(
+            float(np.max(sp_o)),
+            float(np.max(line_thresh)),
+            float(np.max(c_sigma)) * 2.5,
+        ) + 2.0
+        r_lo = max(0, int(math.floor(float(np.min(lines_out[:, c0:c1])) - max_pad)))
+        r_hi = min(out_h, int(math.ceil(float(np.max(lines_out[:, c0:c1])) + max_pad)) + 1)
+        if r_hi > r_lo:
+            row_y_sub = row_y[r_lo:r_hi, None]  # (R, 1)
+
+            # ch0: 5 staff lines (exact threshold equivalent to exp(-0.5*(dy/line_sigma)^2) >= 0.35)
+            ch0_hit = np.zeros((r_hi - r_lo, c1 - c0), dtype=bool)
             for k in range(5):
-                dy = row_y - lines_out[k, c]
-                band = np.exp(-0.5 * (dy / line_sigma) ** 2)
-                tgt[0, :, c] = np.maximum(tgt[0, :, c], (band >= 0.35).astype(np.float32))
+                ch0_hit |= np.abs(row_y_sub - lines_out[k, None, c0:c1]) <= line_thresh[None, :]
+            np.maximum(tgt[0, r_lo:r_hi, c0:c1], ch0_hit.astype(np.float32), out=tgt[0, r_lo:r_hi, c0:c1])
 
             # ch1: staff centerline (k=2) — smooth Gaussian for sub-pixel centroiding
-            yc = lines_out[2, c]
-            c_sigma = max(0.75, 0.42 * sp_o)
-            c_band = np.exp(-0.5 * ((row_y - yc) / c_sigma) ** 2).astype(np.float32)
+            c_band = np.exp(
+                -0.5 * ((row_y_sub - lines_out[2, None, c0:c1]) / c_sigma[None, :]) ** 2
+            ).astype(np.float32)
             c_band[c_band < 0.05] = 0.0
-            tgt[1, :, c] = np.maximum(tgt[1, :, c], c_band)
+            np.maximum(tgt[1, r_lo:r_hi, c0:c1], c_band, out=tgt[1, r_lo:r_hi, c0:c1])
 
             # ch3: local normal staff-space scale over staff span [line0 - sp, line4 + sp]
-            y_lo = lines_out[0, c] - sp_o
-            y_hi = lines_out[4, c] + sp_o
-            smask = (row_y >= y_lo) & (row_y <= y_hi)
+            y_lo = lines_out[0, c0:c1] - sp_o
+            y_hi = lines_out[4, c0:c1] + sp_o
+            smask = (row_y_sub >= y_lo[None, :]) & (row_y_sub <= y_hi[None, :])
             if sp_mode == "log_hm":
-                hm_scale = (
-                    float(iso_scale)
-                    if iso_scale is not None
-                    else (float(out_h * out_stride) / float(h))
-                )
-                tgt[3, smask, c] = float(
-                    math.log(float(np.clip(sp_norm_col[c] * hm_scale / float(out_stride), 0.5, 256.0)))
-                )
+                sp_vals = np.log(
+                    np.clip(sp_norm_col[c0:c1] * hm_scale / float(out_stride), 0.5, 256.0)
+                ).astype(np.float32)
             else:
-                tgt[3, smask, c] = float(sp_norm_col[c] / float(h))
+                sp_vals = (sp_norm_col[c0:c1] / float(h)).astype(np.float32)
+            np.copyto(
+                tgt[3, r_lo:r_hi, c0:c1],
+                np.broadcast_to(sp_vals[None, :], smask.shape),
+                where=smask,
+            )
 
         parsed.append((lines_out, sp_vert_col, active, sys_id))
 
@@ -1105,20 +1124,32 @@ def rasterize_staff_targets(
         act_union = np.zeros(out_w, dtype=bool)
         for i in valid:
             act_union |= parsed[i][2]
-        for c in np.nonzero(act_union)[0]:
-            y_tops = []
-            y_bots = []
-            for i in valid:
-                lines_out, sp_vert_col, active, _ = parsed[i]
-                if active[c]:
-                    sp_o = max(sp_vert_col[c] * sy, 0.75)
-                    y_tops.append(lines_out[0, c] - 0.5 * sp_o)
-                    y_bots.append(lines_out[4, c] + 0.5 * sp_o)
-            if y_tops:
-                y0 = min(y_tops)
-                y1 = max(y_bots)
-                mask = (row_y >= y0) & (row_y <= y1)
-                tgt[2, mask, c] = 1.0
+        union_cols = np.nonzero(act_union)[0]
+        if union_cols.size == 0:
+            continue
+        c0 = int(union_cols[0])
+        c1 = int(union_cols[-1]) + 1
+        y0_col = np.full(c1 - c0, np.inf, dtype=np.float64)
+        y1_col = np.full(c1 - c0, -np.inf, dtype=np.float64)
+        for i in valid:
+            lines_out, sp_vert_col, active, _ = parsed[i]
+            act_sub = active[c0:c1]
+            if not np.any(act_sub):
+                continue
+            sp_o_sub = np.maximum(sp_vert_col[c0:c1] * sy, 0.75)
+            top_i = lines_out[0, c0:c1] - 0.5 * sp_o_sub
+            bot_i = lines_out[4, c0:c1] + 0.5 * sp_o_sub
+            y0_col = np.where(act_sub, np.minimum(y0_col, top_i), y0_col)
+            y1_col = np.where(act_sub, np.maximum(y1_col, bot_i), y1_col)
+        has_staff = np.isfinite(y0_col)
+        if not np.any(has_staff):
+            continue
+        r_lo = max(0, int(math.floor(float(np.min(y0_col[has_staff])))) - 1)
+        r_hi = min(out_h, int(math.ceil(float(np.max(y1_col[has_staff])))) + 2)
+        if r_hi > r_lo:
+            row_y_sub = row_y[r_lo:r_hi, None]
+            mask = has_staff[None, :] & (row_y_sub >= y0_col[None, :]) & (row_y_sub <= y1_col[None, :])
+            tgt[2, r_lo:r_hi, c0:c1] = np.where(mask, 1.0, tgt[2, r_lo:r_hi, c0:c1])
 
     return torch.from_numpy(tgt)
 
@@ -1259,7 +1290,7 @@ def _augment_page_and_staves(
         if valid_bot:
             blank_frac = float(rng.uniform(0.65, 0.85))
             keep_frac = 1.0 - blank_frac
-            paper_col = np.median(work.reshape(-1, 3), axis=0).astype(np.float32)
+            paper_col = np.median(work[::8, ::8].reshape(-1, 3), axis=0).astype(np.float32)
             for i in valid_bot:
                 pts = curves[i]["pts"]
                 x0_s = float(pts[2, 0, 0])
@@ -1292,7 +1323,7 @@ def _augment_page_and_staves(
             if len(valid_grp) < 2 or rng.random() >= 0.05:
                 continue
             if paper_col_bm is None:
-                paper_col_bm = np.median(work.reshape(-1, 3), axis=0).astype(np.float32)
+                paper_col_bm = np.median(work[::8, ::8].reshape(-1, 3), axis=0).astype(np.float32)
             valid_grp.sort(key=lambda idx_s: float(curves[idx_s]["pts"][2, :, 1].mean()))
             band_mult = float(rng.uniform(1.0, 2.0))
             for top_i, bot_i in zip(valid_grp, valid_grp[1:]):
@@ -1694,6 +1725,11 @@ def run_stage1_unsup_round(
     return summary
 
 
+def _worker_init_fn(_worker_id: int) -> None:
+    """Keep each Windows-spawned DataLoader worker single-threaded to avoid CPU thrashing."""
+    torch.set_num_threads(1)
+
+
 class StaffUNetDataset(Dataset):
     """Dataset reading JSONL rows of full-page images + staff/system annotations.
 
@@ -1733,6 +1769,7 @@ class StaffUNetDataset(Dataset):
         sp_mode: str = "rel_h",
         buckets: Sequence[tuple[int, int]] | None = None,
         hw_hard_neg_prob: float = 0.0,
+        clean_frac: float = 0.30,
     ):
         if sp_mode not in ("rel_h", "log_hm"):
             raise ValueError(f"unsupported sp_mode: {sp_mode!r}")
@@ -1746,6 +1783,7 @@ class StaffUNetDataset(Dataset):
         self.dynamic_res = bool(dynamic_res)
         self.sp_mode = str(sp_mode)
         self.hw_hard_neg_prob = max(0.0, min(1.0, float(hw_hard_neg_prob)))
+        self.clean_frac = max(0.0, min(1.0, float(clean_frac)))
         self.epoch = 0
         self.rows: list[dict[str, Any]] = []
         with open(self.manifest_path, "r", encoding="utf-8") as f:
@@ -1829,22 +1867,37 @@ class StaffUNetDataset(Dataset):
 
             out_h = math.ceil(bh / self.out_stride)
             out_w = math.ceil(bw / self.out_stride)
+            clean_frac = float(getattr(self, "clean_frac", 0.30))
             if self.augment:
                 rng = np.random.default_rng((self.seed, self.epoch, int(idx)))
-                arr_rgb, aug_staves, aug_systems = _augment_page_and_staves(
-                    arr_rgb, scaled_staves, systems_raw, rng
-                )
-                target = rasterize_staff_targets(
-                    aug_staves,
-                    w=bw,
-                    h=bh,
-                    out_h=out_h,
-                    out_w=out_w,
-                    systems=aug_systems,
-                    sp_mode=sp_mode,
-                    iso_scale=1.0,
-                    out_stride=self.out_stride,
-                )
+                is_clean = (clean_frac > 0.0) and (float(rng.random()) < clean_frac)
+                if is_clean:
+                    target = rasterize_staff_targets(
+                        scaled_staves,
+                        w=bw,
+                        h=bh,
+                        out_h=out_h,
+                        out_w=out_w,
+                        systems=systems_raw,
+                        sp_mode=sp_mode,
+                        iso_scale=1.0,
+                        out_stride=self.out_stride,
+                    )
+                else:
+                    arr_rgb, aug_staves, aug_systems = _augment_page_and_staves(
+                        arr_rgb, scaled_staves, systems_raw, rng
+                    )
+                    target = rasterize_staff_targets(
+                        aug_staves,
+                        w=bw,
+                        h=bh,
+                        out_h=out_h,
+                        out_w=out_w,
+                        systems=aug_systems,
+                        sp_mode=sp_mode,
+                        iso_scale=1.0,
+                        out_stride=self.out_stride,
+                    )
             else:
                 target = rasterize_staff_targets(
                     scaled_staves,
@@ -1864,38 +1917,52 @@ class StaffUNetDataset(Dataset):
 
             out_h = math.ceil(self.target_h / self.out_stride)
             out_w = math.ceil(self.target_w / self.out_stride)
+            clean_frac = float(getattr(self, "clean_frac", 0.30))
 
             if self.augment:
-                # Scale raw GT staves into resized (target_w, target_h) coordinates before joint warp.
-                sx = float(self.target_w) / float(orig_w)
-                sy = float(self.target_h) / float(orig_h)
-                scaled_staves = []
-                for entry in staves_raw:
-                    lines_5, x0, x1, sys_id = _parse_staff_entry(entry, orig_w)
-                    d = {
-                        "lines": lines_5 * sy,
-                        "x0": x0 * sx,
-                        "x1": x1 * sx,
-                    }
-                    if sys_id is not None:
-                        d["system_id"] = sys_id
-                    scaled_staves.append(d)
-
                 rng = np.random.default_rng((self.seed, self.epoch, int(idx)))
-                arr_rgb, aug_staves, aug_systems = _augment_page_and_staves(
-                    arr_rgb, scaled_staves, systems_raw, rng
-                )
-                target = rasterize_staff_targets(
-                    aug_staves,
-                    w=self.target_w,
-                    h=self.target_h,
-                    out_h=out_h,
-                    out_w=out_w,
-                    systems=aug_systems,
-                    sp_mode=sp_mode,
-                    iso_scale=(1.0 if sp_mode == "log_hm" else None),
-                    out_stride=self.out_stride,
-                )
+                is_clean = (clean_frac > 0.0) and (float(rng.random()) < clean_frac)
+                if is_clean:
+                    target = rasterize_staff_targets(
+                        staves_raw,
+                        w=orig_w,
+                        h=orig_h,
+                        out_h=out_h,
+                        out_w=out_w,
+                        systems=systems_raw,
+                        sp_mode=sp_mode,
+                        out_stride=self.out_stride,
+                    )
+                else:
+                    # Scale raw GT staves into resized (target_w, target_h) coordinates before joint warp.
+                    sx = float(self.target_w) / float(orig_w)
+                    sy = float(self.target_h) / float(orig_h)
+                    scaled_staves = []
+                    for entry in staves_raw:
+                        lines_5, x0, x1, sys_id = _parse_staff_entry(entry, orig_w)
+                        d = {
+                            "lines": lines_5 * sy,
+                            "x0": x0 * sx,
+                            "x1": x1 * sx,
+                        }
+                        if sys_id is not None:
+                            d["system_id"] = sys_id
+                        scaled_staves.append(d)
+
+                    arr_rgb, aug_staves, aug_systems = _augment_page_and_staves(
+                        arr_rgb, scaled_staves, systems_raw, rng
+                    )
+                    target = rasterize_staff_targets(
+                        aug_staves,
+                        w=self.target_w,
+                        h=self.target_h,
+                        out_h=out_h,
+                        out_w=out_w,
+                        systems=aug_systems,
+                        sp_mode=sp_mode,
+                        iso_scale=(1.0 if sp_mode == "log_hm" else None),
+                        out_stride=self.out_stride,
+                    )
             else:
                 target = rasterize_staff_targets(
                     staves_raw,
@@ -1959,12 +2026,18 @@ def train_staff_unet2d(
     unsup_ema_decay: float = 0.999,
     hw_hard_neg_prob: float = 0.0,
     unsup_round_fn: Any = None,
+    clean_frac: float = 0.30,
 ) -> Path:
     """Minimal self-contained training loop for ``StaffUNet2D``."""
     if sp_mode not in ("rel_h", "log_hm"):
         raise ValueError(f"unsupported sp_mode: {sp_mode!r}")
     torch.manual_seed(seed)
     dev = torch.device(device if device else ("cuda" if torch.cuda.is_available() else "cpu"))
+    use_cuda = dev.type == "cuda"
+    if use_cuda:
+        torch.backends.cudnn.benchmark = True
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
     out_path = Path(out_dir)
     out_path.mkdir(parents=True, exist_ok=True)
 
@@ -1980,10 +2053,11 @@ def train_staff_unet2d(
         sp_mode=sp_mode,
         buckets=buckets,
         hw_hard_neg_prob=hw_hard_neg_prob,
+        clean_frac=clean_frac,
     )
     unlabeled_images = list_unlabeled_page_images(unlabeled_dirs) if unlabeled_dirs else []
     ema_model: nn.Module | None = None
-    use_pin = dev.type == "cuda"
+    use_pin = use_cuda
     batch_sampler = None
     if dynamic_res:
         dyn_res = _get_dynamic_res()
@@ -2009,7 +2083,9 @@ def train_staff_unet2d(
             "pin_memory": use_pin,
         }
     if num_workers > 0:
-        loader_kw["prefetch_factor"] = 2
+        loader_kw["worker_init_fn"] = _worker_init_fn
+        loader_kw["persistent_workers"] = True
+        loader_kw["prefetch_factor"] = 4
     loader = DataLoader(ds, **loader_kw)
 
     model = StaffUNet2D(
@@ -2030,14 +2106,22 @@ def train_staff_unet2d(
                 nn.init.normal_(model.head.weight[3], mean=0.0, std=0.01)
                 if model.head.bias is not None:
                     model.head.bias[3].fill_(1.5 if sp_mode == "log_hm" else 0.0)
+    if use_cuda:
+        model = model.to(memory_format=torch.channels_last)
 
     criterion = StaffUNetLoss(
         w_sp=(1.0 if sp_mode == "log_hm" else 10.0),
         sp_mode=sp_mode,
     )
-    opt = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
+    if use_cuda:
+        try:
+            opt = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4, fused=True)
+        except (TypeError, RuntimeError):
+            opt = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
+    else:
+        opt = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
     sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=max(1, epochs))
-    use_amp = dev.type == "cuda"
+    use_amp = use_cuda
     amp_dtype = torch.bfloat16 if (use_amp and bf16) else torch.float16
     scaler = torch.amp.GradScaler("cuda", enabled=(use_amp and not bf16))
 
@@ -2049,29 +2133,32 @@ def train_staff_unet2d(
             batch_sampler.set_epoch(ep - 1)
         model.train()
         t0 = time.perf_counter()
-        running = 0.0
+        running_loss_t = torch.zeros((), device=dev, dtype=torch.float32)
         steps = 0
         for x, y in loader:
-            x = x.to(dev, non_blocking=use_pin)
+            if use_cuda:
+                x = x.to(dev, non_blocking=use_pin, memory_format=torch.channels_last)
+            else:
+                x = x.to(dev, non_blocking=use_pin)
             y = y.to(dev, non_blocking=use_pin)
             opt.zero_grad(set_to_none=True)
             with torch.amp.autocast(dev.type, dtype=amp_dtype, enabled=use_amp):
                 preds = model(x)
-                loss, _ = criterion(preds, y)
+                loss, _ = criterion(preds, y, return_metrics=False)
             scaler.scale(loss).backward()
             scaler.step(opt)
             scaler.update()
-            running += float(loss.detach().item())
+            running_loss_t += loss.detach().float()
             steps += 1
             if steps % 100 == 0 or steps == 1:
                 print(
                     f"  [ep {ep:02d}/{epochs:02d} step {steps:04d}/{n_batches:04d}] "
-                    f"loss={running / steps:.4f} ({time.perf_counter() - t0:.1f}s)",
+                    f"loss={float(running_loss_t.item()) / steps:.4f} ({time.perf_counter() - t0:.1f}s)",
                     flush=True,
                 )
         sched.step()
         dt = time.perf_counter() - t0
-        avg = running / max(1, steps)
+        avg = float(running_loss_t.item()) / max(1, steps)
         print(
             f"[epoch {ep:03d}/{epochs:03d}] loss={avg:.4f} lr={sched.get_last_lr()[0]:.2e} ({dt:.1f}s)",
             flush=True,
@@ -2182,6 +2269,12 @@ def _main() -> None:
         default=0.0,
         help="Probability of synthetic blank pre-ruled staves & cursive lyric hard negatives via unsup_stage1 (0.0 = off)",
     )
+    p.add_argument(
+        "--clean-frac",
+        type=float,
+        default=0.30,
+        help="Fraction of augmented samples kept clean (skipping heavy photo degradation to preserve crisp 1px braces)",
+    )
     args = p.parse_args()
     ckpt = train_staff_unet2d(
         manifest=args.manifest,
@@ -2210,6 +2303,7 @@ def _main() -> None:
         unsup_round_steps=args.unsup_round_steps,
         unsup_ema_decay=args.unsup_ema_decay,
         hw_hard_neg_prob=args.hw_hard_neg_prob,
+        clean_frac=args.clean_frac,
     )
     print(f"Saved checkpoint: {ckpt}", flush=True)
 

@@ -163,6 +163,32 @@ fn attr_for(attrs: &mut Vec<MeasureAttr>, measure_1based: u32) -> &mut MeasureAt
     attrs.last_mut().expect("just pushed")
 }
 
+/// Parse a `clef-<sign>-<line>` or `clef-<sign>-<line>-8vb|8va` token.
+fn parse_clef_token(t: &str) -> Result<(char, u32, Option<i32>), String> {
+    let body = t
+        .strip_prefix("clef-")
+        .ok_or_else(|| format!("bad clef token {t:?}"))?;
+    let mut parts = body.split('-');
+    let sign = parts
+        .next()
+        .and_then(|s| s.chars().next())
+        .ok_or_else(|| format!("bad clef token {t:?}"))?;
+    let line: u32 = parts
+        .next()
+        .and_then(|s| s.parse().ok())
+        .ok_or_else(|| format!("bad clef token {t:?}"))?;
+    let oct = match parts.next() {
+        None => None,
+        Some("8vb") => Some(-1),
+        Some("8va") => Some(1),
+        Some(_) => return Err(format!("bad clef token {t:?}")),
+    };
+    if parts.next().is_some() {
+        return Err(format!("bad clef token {t:?}"));
+    }
+    Ok((sign, line, oct))
+}
+
 /// Closing-barline short style for a `bar-*` variant token.
 fn barline_right_of(t: &str) -> Option<&'static str> {
     match t {
@@ -306,10 +332,17 @@ fn decode_inner(tokens: &str, merge_ties: bool) -> Result<ScoreInput, String> {
         beat_type: 4,
     };
     let mut time_set = false;
+    let mut leading_clef_oct: Option<(char, u32, i32)> = None;
     let mut i = 0;
     while i < toks.len() {
         let t = toks[i];
         if t.starts_with("clef-") {
+            let (sign, line, oct) = parse_clef_token(t)?;
+            if let Some(o) = oct {
+                if leading_clef_oct.is_none() {
+                    leading_clef_oct = Some((sign, line, o));
+                }
+            }
             i += 1;
         } else if let Some(rest) = t.strip_prefix("key") {
             if !time_set {
@@ -340,6 +373,12 @@ fn decode_inner(tokens: &str, merge_ties: bool) -> Result<ScoreInput, String> {
 
     let mut notes: Vec<NoteInput> = Vec::new();
     let mut measure_attrs: Vec<MeasureAttr> = Vec::new();
+    if let Some((sign, line, oct)) = leading_clef_oct {
+        let a = attr_for(&mut measure_attrs, 1);
+        a.clef_sign = Some(sign);
+        a.clef_line = Some(line);
+        a.clef_octave_change = Some(oct);
+    }
     let mut measure = 0u32;
     // Per-measure voice cursors (offsets within the measure); segment 0
     // is created lazily by the first event.
@@ -440,23 +479,22 @@ fn decode_inner(tokens: &str, merge_ties: bool) -> Result<ScoreInput, String> {
             i += 1;
             continue;
         }
-        if let Some(body) = t.strip_prefix("clef-") {
-            let mut parts = body.split('-');
-            let sign = parts
-                .next()
-                .and_then(|s| s.chars().next())
-                .ok_or_else(|| format!("bad clef token {t:?}"))?;
-            let line: u32 = parts
-                .next()
-                .and_then(|s| s.parse().ok())
-                .ok_or_else(|| format!("bad clef token {t:?}"))?;
+        if t.starts_with("clef-") {
+            let (sign, line, oct) = parse_clef_token(t)?;
             if !seen_event && measure == 0 {
-                // Effectively leading: the renderer always opens on
-                // G/2, so there is no score-level clef to update.
+                // Effectively leading: preserve octave-transposing clefs
+                // (8vb/8va) on measure 1; plain clefs keep default layout.
+                if let Some(o) = oct {
+                    let a = attr_for(&mut measure_attrs, 1);
+                    a.clef_sign = Some(sign);
+                    a.clef_line = Some(line);
+                    a.clef_octave_change = Some(o);
+                }
             } else {
                 let a = attr_for(&mut measure_attrs, measure + 1);
                 a.clef_sign = Some(sign);
                 a.clef_line = Some(line);
+                a.clef_octave_change = oct;
             }
             i += 1;
             continue;

@@ -180,10 +180,10 @@ def _comer_xattn_chunk(qq_c, kk, vv, cov_in_c, mem_mask, comer_bias,
     """One query-chunk of CoMER cross-attention (checkpoint-friendly)."""
     b, nh, tc, _ = qq_c.shape
     s = kk.shape[2]
-    scores_c = (qq_c.float() @ kk.float().transpose(-2, -1)) / math.sqrt(dh)
+    scores_c = (qq_c @ kk.transpose(-2, -1)) * (1.0 / math.sqrt(dh))
     cov_2d = cov_in_c.transpose(1, 2).reshape(b * tc, nh, h_mem, w_mem)
     cov_bias_c = comer_bias(cov_2d).reshape(b, tc, nh, s).transpose(1, 2)
-    biased_c = scores_c + cov_bias_c.float()
+    biased_c = scores_c.float() + cov_bias_c.float()
     if mem_mask is not None:
         biased_c = biased_c.masked_fill(mem_mask[:, None, None, :], float('-inf'))
     attn_w_c = biased_c.softmax(dim=-1)
@@ -193,7 +193,7 @@ def _comer_xattn_chunk(qq_c, kk, vv, cov_in_c, mem_mask, comer_bias,
 
 
 def _decoder_layer_comer(layer, x, mem, tgt_mask, mem_mask,
-                         comer_bias, h_mem, w_mem, t_chunk=64):
+                         comer_bias, h_mem, w_mem, t_chunk=128):
     """Batched teacher-forced decoder layer with CoMER shifted coverage bias.
 
     Uses ``layer.self_attn`` on the fast SDPA path and streams cross-attention
@@ -222,7 +222,7 @@ def _decoder_layer_comer(layer, x, mem, tgt_mask, mem_mask,
         qq_c = qq[:, :, t0:t1, :]
         # Detached shifted cumulative coverage for this chunk (zero autograd RAM).
         with torch.no_grad():
-            raw_scores = (qq_c.float() @ kk.float().transpose(-2, -1)) * scale
+            raw_scores = ((qq_c @ kk.transpose(-2, -1)) * scale).float()
             if mem_mask is not None:
                 raw_scores = raw_scores.masked_fill(
                     mem_mask[:, None, None, :], float('-inf'))
@@ -424,6 +424,21 @@ VOICE_IDS = frozenset(data.VOCAB.index(t) for t in data.VOCAB
                       if t.startswith('voice-'))
 
 
+_VOICE_IDS_CACHE = {}
+
+
+def _get_voice_ids_tensor(voice_ids, device):
+    """Device-cached sorted voice-id tensor (zero per-step H2D copy)."""
+    vkey = (voice_ids if isinstance(voice_ids, (frozenset, tuple))
+            else tuple(voice_ids))
+    key = (device, vkey)
+    t = _VOICE_IDS_CACHE.get(key)
+    if t is None:
+        t = torch.tensor(sorted(voice_ids), device=device, dtype=torch.long)
+        _VOICE_IDS_CACHE[key] = t
+    return t
+
+
 def coord_monotonic_penalty(xc, tgt, voice_ids, pad_id, margin=0.0):
     """Mean backward-jump penalty on x-centroids (S13c).
 
@@ -436,15 +451,14 @@ def coord_monotonic_penalty(xc, tgt, voice_ids, pad_id, margin=0.0):
     ``relu(prev - cur + margin)``, averaged over valid pairs (0 when
     there are none). Pure function; no RNG.
     """
-    vid = torch.tensor(sorted(voice_ids), device=tgt.device)
+    vid = _get_voice_ids_tensor(voice_ids, tgt.device)
     is_voice = torch.isin(tgt, vid)
     valid = (tgt != pad_id) & ~is_voice
     seg = torch.cumsum(is_voice.long(), dim=1)
     prev_ok = valid[:, :-1] & valid[:, 1:] & (seg[:, :-1] == seg[:, 1:])
-    if not bool(prev_ok.any()):
-        return xc.new_zeros(())
     drop = torch.relu(xc[:, :-1] - xc[:, 1:] + margin)
-    return (drop * prev_ok.to(drop.dtype)).sum() / prev_ok.sum()
+    mask = prev_ok.to(drop.dtype)
+    return (drop * mask).sum() / mask.sum().clamp_min(1.0)
 
 
 def attention_spread(w):
@@ -553,6 +567,7 @@ class MvdNet(nn.Module):
         self.use_gdcm = bool(use_gdcm)
         self.use_s18 = bool(use_s18)
         self._last_hw_mem = None
+        self._tensor_cache = {}
 
         trunk = convnext_tiny()
         self.encoder = trunk.features  # [B, 768, H/8, W/16] if
@@ -687,8 +702,6 @@ class MvdNet(nn.Module):
         ``return_counts=True``, appends ``pred_counts`` (or ``None`` if GDCM
         is disabled) to the returned tuple.
         """
-        if mem_mask is not None and not mem_mask.any():
-            mem_mask = None
         if self.foveal_tap:
             p2 = self.encoder[:2](images)     # [B, 96, H/4, W/4]
             feats = self.encoder[2:](p2)      # [B, 768, h, w]
@@ -836,20 +849,35 @@ class MvdNet(nn.Module):
                 hw_mem = (1, mem.shape[1])
         h_mem, w_mem = hw_mem
         x = emb
-        use_ckpt = self.training and torch.is_grad_enabled()
         for layer in self.decoder.layers:
-            if use_ckpt:
-                x = torch.utils.checkpoint.checkpoint(
-                    _decoder_layer_comer,
-                    layer, x, mem, mask, mem_mask, self.comer_bias, h_mem, w_mem,
-                    use_reentrant=False,
-                )
-            else:
-                x = _decoder_layer_comer(
-                    layer, x, mem, mask, mem_mask, self.comer_bias, h_mem, w_mem)
+            x = _decoder_layer_comer(
+                layer, x, mem, mask, mem_mask, self.comer_bias, h_mem, w_mem)
         if self.decoder.norm is not None:
             x = self.decoder.norm(x)
         return x
+
+    def _get_content_ids(self, content_ids, device):
+        """Device-cached content-id tensor for ``tok_dropout``."""
+        ckey = (content_ids if isinstance(content_ids, (tuple, frozenset))
+                else tuple(content_ids))
+        key = ('cid', device, ckey)
+        t = self._tensor_cache.get(key)
+        if t is None:
+            t = torch.tensor(list(content_ids), device=device, dtype=torch.long)
+            self._tensor_cache[key] = t
+        return t
+
+    def _get_tok_weight(self, tok_weight, weight_ids, device):
+        """Device-cached per-token NLL weight vector."""
+        wkey = (weight_ids if isinstance(weight_ids, (tuple, frozenset))
+                else tuple(weight_ids))
+        key = ('tw', device, float(tok_weight), wkey)
+        t = self._tensor_cache.get(key)
+        if t is None:
+            t = torch.ones(self.vocab, device=device)
+            t[list(weight_ids)] = tok_weight
+            self._tensor_cache[key] = t
+        return t
 
     def decode_logits(self, mem, tgt_in, mem_mask=None, hw_mem=None):
         """Decoder-only logits ``[B, T, V]`` for precomputed memory.
@@ -884,7 +912,7 @@ class MvdNet(nn.Module):
         bos = torch.full_like(tgt[:, :1], self.bos_id)
         inp = torch.cat([bos, tgt[:, :-1]], dim=1)
         if tok_dropout > 0.0 and content_ids:
-            cid = torch.tensor(list(content_ids), device=inp.device)
+            cid = self._get_content_ids(content_ids, inp.device)
             is_content = (inp.unsqueeze(-1) == cid).any(-1)
             drop = (torch.rand(inp.shape, device=inp.device)
                     < tok_dropout) & is_content
@@ -895,9 +923,8 @@ class MvdNet(nn.Module):
                 inp)
         ce_kw = {}
         if tok_weight != 1.0 and len(weight_ids) > 0:
-            w = torch.ones(self.vocab, device=tgt.device)
-            w[list(weight_ids)] = tok_weight
-            ce_kw['weight'] = w
+            ce_kw['weight'] = self._get_tok_weight(
+                tok_weight, weight_ids, tgt.device)
         if augment is not None:
             raise ValueError('spike-S8 latent SpecAugment was removed; '
                              'pass augment=None')
@@ -949,7 +976,7 @@ class MvdNet(nn.Module):
         bos = torch.full_like(tgt[:, :1], self.bos_id)
         inp = torch.cat([bos, tgt[:, :-1]], dim=1)
         if tok_dropout > 0.0 and content_ids:
-            cid = torch.tensor(list(content_ids), device=inp.device)
+            cid = self._get_content_ids(content_ids, inp.device)
             is_content = (inp.unsqueeze(-1) == cid).any(-1)
             drop = (torch.rand(inp.shape, device=inp.device)
                     < tok_dropout) & is_content
@@ -960,9 +987,8 @@ class MvdNet(nn.Module):
                 inp)
         ce_kw = {}
         if tok_weight != 1.0 and len(weight_ids) > 0:
-            w = torch.ones(self.vocab, device=tgt.device)
-            w[list(weight_ids)] = tok_weight
-            ce_kw['weight'] = w
+            ce_kw['weight'] = self._get_tok_weight(
+                tok_weight, weight_ids, tgt.device)
 
         dec_in = inp
         if sample_p > 0.0:

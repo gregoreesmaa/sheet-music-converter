@@ -949,9 +949,10 @@ class TestStaffUNet2DWiring(unittest.TestCase):
         # 4ch RGB+staff canonical 256px height on both chunks
         self.assertEqual(chunk_shapes[0][1:3], (4, 256))
         self.assertEqual(chunk_shapes[1][1:3], (4, 256))
-        # Voices merged across chunks: voice-1 from chunk 1, voice-2 from chunk 2
+        # Voices merged across chunks: voice-1 from chunk 1 (4 staves),
+        # voice-5 from chunk 2 (shifted by max(1, 4) = 4 to preserve per-staff IDs)
         self.assertIn('voice-1', dec['tokens'])
-        self.assertIn('voice-2', dec['tokens'])
+        self.assertIn('voice-5', dec['tokens'])
 
     def test_run_suite31_with_staff_unet_bypasses_page_prep_rownet_and_scaled(self):
         with tempfile.TemporaryDirectory(prefix='t_sunet_s31_') as tmp:

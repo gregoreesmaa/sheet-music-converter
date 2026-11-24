@@ -88,6 +88,14 @@ pub fn duration_token(dur_beats: f64) -> Option<(&'static str, u8)> {
     }
 }
 
+fn clef_token(sign: char, line: u32, octave_change: Option<i32>) -> String {
+    match (sign, line, octave_change) {
+        ('G', 2, Some(-1)) => "clef-G-2-8vb".to_string(),
+        ('G', 2, Some(1)) => "clef-G-2-8va".to_string(),
+        _ => format!("clef-{sign}-{line}"),
+    }
+}
+
 fn key_token(fifths: i32) -> String {
     if fifths < 0 {
         format!("key{fifths}")
@@ -254,7 +262,7 @@ pub fn to_bekern(
     heads.sort_by_key(|h| h.staff);
     let mut out = Vec::new();
     for h in &heads {
-        out.push(format!("clef-{}-{}", h.clef_sign, h.clef_line));
+        out.push(clef_token(h.clef_sign, h.clef_line, h.clef_octave_change));
         out.push(key_token(h.key_fifths));
         out.push(format!("time-{}-{}", h.beats, h.beat_type));
     }
@@ -291,7 +299,7 @@ pub fn to_bekern(
     // Carrier marks attached to skipped grace rests or bar-overflow
     // spacing rests are preserved per measure so dynamics, hairpins,
     // mid-stream headers, and barlines are never silently dropped.
-    let mut skipped_clef: std::collections::HashMap<u32, (char, u32)> =
+    let mut skipped_clef: std::collections::HashMap<u32, (char, u32, Option<i32>)> =
         std::collections::HashMap::new();
     let mut skipped_key: std::collections::HashMap<u32, i32> = std::collections::HashMap::new();
     let mut skipped_time: std::collections::HashMap<u32, (u32, u32)> =
@@ -495,11 +503,11 @@ pub fn to_bekern(
         // changes attached to this event emit here, in bound position
         // before the voice marker, in fixed order. Any marks rescued
         // from skipped grace/overflow rests in this measure flush first.
-        if let Some((sign, line)) = skipped_clef.remove(&e.measure) {
-            out.push(format!("clef-{sign}-{line}"));
+        if let Some((sign, line, oct)) = skipped_clef.remove(&e.measure) {
+            out.push(clef_token(sign, line, oct));
         }
-        if let Some((sign, line)) = e.clef_change {
-            out.push(format!("clef-{sign}-{line}"));
+        if let Some((sign, line, oct)) = e.clef_change {
+            out.push(clef_token(sign, line, oct));
         }
         if let Some(k) = skipped_key.remove(&e.measure) {
             out.push(key_token(k));
@@ -1821,6 +1829,7 @@ mod tests {
                 staff: 1,
                 clef_sign: 'F',
                 clef_line: 4,
+                clef_octave_change: None,
                 key_fifths: 0,
                 beats: 4,
                 beat_type: 4,
@@ -1829,6 +1838,7 @@ mod tests {
                 staff: 0,
                 clef_sign: 'G',
                 clef_line: 2,
+                clef_octave_change: None,
                 key_fifths: 0,
                 beats: 4,
                 beat_type: 4,
@@ -1917,6 +1927,7 @@ mod tests {
                 staff: 0,
                 clef_sign: 'G',
                 clef_line: 2,
+                clef_octave_change: None,
                 key_fifths: 0,
                 beats: 4,
                 beat_type: 4,
@@ -1925,6 +1936,7 @@ mod tests {
                 staff: 1,
                 clef_sign: 'G',
                 clef_line: 2,
+                clef_octave_change: None,
                 key_fifths: 0,
                 beats: 4,
                 beat_type: 4,
@@ -2187,6 +2199,7 @@ mod tests {
             staff: 0,
             clef_sign: 'G',
             clef_line: 2,
+            clef_octave_change: None,
             key_fifths: 0,
             beats: 4,
             beat_type: 4,
@@ -2536,6 +2549,7 @@ mod tests {
             staff: 0,
             clef_sign: 'G',
             clef_line: 2,
+            clef_octave_change: None,
             key_fifths: 0,
             beats: 4,
             beat_type: 4,
@@ -2880,6 +2894,7 @@ mod tests {
                 staff: 0,
                 clef_sign: 'G',
                 clef_line: 2,
+                clef_octave_change: None,
                 key_fifths: 0,
                 beats: 4,
                 beat_type: 4,
@@ -2888,6 +2903,7 @@ mod tests {
                 staff: 1,
                 clef_sign: 'F',
                 clef_line: 4,
+                clef_octave_change: None,
                 key_fifths: 0,
                 beats: 4,
                 beat_type: 4,
@@ -3050,5 +3066,63 @@ mod tests {
             .map(|n| n.voice)
             .collect();
         assert_eq!(voices_m1, [1, 2, 3].into_iter().collect());
+    }
+
+    #[test]
+    fn octave_clef_8vb_and_8va_round_trip() {
+        let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<score-partwise version="3.1">
+  <part-list>
+    <score-part id="P1"><part-name>Tenor</part-name></score-part>
+  </part-list>
+  <part id="P1">
+    <measure number="1">
+      <attributes>
+        <divisions>4</divisions>
+        <key><fifths>0</fifths></key>
+        <time><beats>4</beats><beat-type>4</beat-type></time>
+        <clef><sign>G</sign><line>2</line><clef-octave-change>-1</clef-octave-change></clef>
+      </attributes>
+      <note><pitch><step>F</step><octave>3</octave></pitch><duration>16</duration><voice>1</voice><type>whole</type></note>
+    </measure>
+    <measure number="2">
+      <attributes>
+        <clef><sign>G</sign><line>2</line><clef-octave-change>1</clef-octave-change></clef>
+      </attributes>
+      <note><pitch><step>C</step><octave>6</octave></pitch><duration>16</duration><voice>1</voice><type>whole</type></note>
+    </measure>
+  </part>
+</score-partwise>"#;
+        let headers = super::super::musicxml_import::staff_headers(xml).unwrap();
+        assert_eq!(headers[0].clef_octave_change, Some(-1));
+        let events = super::super::musicxml_import::bekern_events(xml).unwrap();
+        let (toks, _) = to_bekern(&events, &headers).unwrap();
+        assert_eq!(
+            toks,
+            vec![
+                "clef-G-2-8vb", "key+0", "time-4-4", "voice-1", "whole", "F", "3", "bar",
+                "clef-G-2-8va", "voice-1", "whole", "C", "6", "bar",
+            ]
+        );
+        // Decode back to MusicXML and verify both <clef-octave-change> tags and sounding pitches.
+        let dec = super::super::decode::decode_bekern_unmerged(&toks.join(" ")).unwrap();
+        let (score, mut losses) = super::super::parse_score(&dec).unwrap();
+        let out_xml = super::super::to_musicxml(&score, &mut losses);
+        assert!(
+            out_xml.contains("<clef><sign>G</sign><line>2</line><clef-octave-change>-1</clef-octave-change></clef>"),
+            "missing 8vb clef in:\n{out_xml}"
+        );
+        assert!(
+            out_xml.contains("<clef><sign>G</sign><line>2</line><clef-octave-change>1</clef-octave-change></clef>"),
+            "missing 8va clef in:\n{out_xml}"
+        );
+        // Re-import and verify exact sounding pitch match (F3 and C6, no octave shift).
+        let reimp = super::super::musicxml_import::score_input_from_musicxml(&out_xml).unwrap();
+        let pitches: Vec<&str> = reimp.parts[0]
+            .notes
+            .iter()
+            .filter_map(|n| n.pitch.as_deref())
+            .collect();
+        assert_eq!(pitches, vec!["F3", "C6"]);
     }
 }
