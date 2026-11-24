@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import argparse
 import bisect
+import importlib
 import json
 import math
 import os
@@ -180,6 +181,371 @@ def load_extra_data_dir(dir_path, exclude=(), include_degraded=True,
     return extra_pairs, extra_hidx
 
 
+def load_real_hw_corpus_pairs(corpus_path, exclude=(), include_degraded=True):
+    """Load strictly labeled real handwritten pairs from ``--real-hw-corpus``.
+
+    Supports:
+      1. Unified corpus registry (``<corpus_path>/train_works.jsonl`` or a
+         direct ``.jsonl`` path) such as ``D:\\tmp\\real-hw-corpus\\``
+         (48 OpenScore Lieder works + 4 Mozart quartet works). Enforces
+         ``bekern_ok == True`` and explicitly excludes any RISM-sourced rows
+         so unlabeled RISM data can never enter the supervised HW pool.
+      2. Split strip layout (``renders/`` + ``targets/`` + optional
+         ``hybrid_staff.jsonl``).
+      3. Flat strip layout (PNG/JPG + ``*-bekern.txt`` + optional
+         ``hybrid_staff.jsonl``).
+
+    Returns ``(pairs, hybrid_index)`` in deterministic sorted order.
+    """
+    root = Path(corpus_path)
+    if not root.exists():
+        raise FileNotFoundError('real-hw-corpus %s does not exist' % root)
+
+    manifest = root if root.is_file() else (root / 'train_works.jsonl')
+    if manifest.is_file():
+        pairs = []
+        hidx = {}
+        seen = set()
+        loaded_hjsonl = set()
+        with open(manifest, encoding='utf-8') as f:
+            for ln in f:
+                ln = ln.strip()
+                if not ln:
+                    continue
+                row = json.loads(ln)
+                if not row.get('bekern_ok', False):
+                    continue
+                src = str(row.get('source', '')).lower()
+                if 'rism' in src:
+                    continue
+                wid = str(row.get('work_id', '')).strip()
+                if wid and any(s in wid for s in exclude):
+                    continue
+                hj = row.get('hybrid_staff_jsonl')
+                if hj and hj not in loaded_hjsonl and Path(hj).is_file():
+                    hidx.update(load_hybrid_index(hj))
+                    loaded_hjsonl.add(hj)
+
+                page_paths = list(row.get('page_paths') or [])
+                bekern_paths = list(row.get('bekern_paths') or [])
+                single_bek = row.get('bekern_path')
+
+                if bekern_paths and len(bekern_paths) == len(page_paths):
+                    stem_to_bek = {}
+                    for ip, bp in zip(page_paths, bekern_paths):
+                        if not Path(ip).is_file() or not Path(bp).is_file():
+                            continue
+                        stem = Path(ip).stem
+                        if any(s in stem for s in exclude):
+                            continue
+                        stem_to_bek[stem] = bp
+                        key = (str(ip), str(bp))
+                        if key not in seen:
+                            seen.add(key)
+                            pairs.append((str(ip), str(bp), stem))
+                    if include_degraded:
+                        for dp in row.get('degraded_strip_paths') or []:
+                            if not Path(dp).is_file():
+                                continue
+                            d_stem = Path(dp).stem
+                            base_stem = d_stem.rsplit('_d', 1)[0]
+                            bp = stem_to_bek.get(base_stem)
+                            if not bp or any(s in base_stem for s in exclude):
+                                continue
+                            key = (str(dp), str(bp))
+                            if key not in seen:
+                                seen.add(key)
+                                pairs.append((str(dp), str(bp), base_stem))
+                elif single_bek and Path(single_bek).is_file():
+                    for ip in page_paths:
+                        if not Path(ip).is_file():
+                            continue
+                        p_stem = Path(ip).stem
+                        stem = ('%s-%s' % (wid, p_stem)) if wid else p_stem
+                        if not stem.lower().startswith('hw-'):
+                            stem = 'hw-' + stem
+                        if any(s in stem for s in exclude):
+                            continue
+                        key = (str(ip), str(single_bek))
+                        if key not in seen:
+                            seen.add(key)
+                            pairs.append((str(ip), str(single_bek), stem))
+        pairs.sort(key=lambda x: (x[2], x[0]))
+        return pairs, hidx
+
+    if (root / 'renders').is_dir() and (root / 'targets').is_dir():
+        return (
+            load_real_hw_pairs(str(root), exclude=exclude,
+                               include_degraded=include_degraded, repeat=1),
+            load_real_hw_hybrid_index(str(root)),
+        )
+    return load_extra_data_dir(
+        str(root), exclude=exclude, include_degraded=include_degraded)
+
+
+def load_rism_incipit_pairs(rism_dir, exclude=(), include_degraded=True):
+    """Load semi-supervised RISM opening-staff incipit strips.
+
+    Tracked separately from full-work labeled HW (``--real-hw-corpus``).
+    Supports flat, ``renders/``+``targets/``, or ``incipit_strips/`` layouts.
+    Returns ``(pairs, hybrid_index)``.
+    """
+    root = Path(rism_dir)
+    if not root.is_dir():
+        raise FileNotFoundError('rism-incipit-dir %s does not exist' % root)
+    if (root / 'incipit_strips').is_dir() and not (
+            (root / 'renders').is_dir() and (root / 'targets').is_dir()):
+        sub = root / 'incipit_strips'
+        if any(sub.glob('*-bekern.txt')) or (sub / 'targets').is_dir():
+            root = sub
+    return load_extra_data_dir(
+        str(root), exclude=exclude, include_degraded=include_degraded)
+
+
+def mix_supervised_batch(base_batch, step, seed, hw_pairs=(),
+                         hw_mix_ratio=0.0, rism_pairs=(),
+                         rism_mix_ratio=0.0):
+    """Deterministically mix labeled HW and/or RISM incipit items into a batch.
+
+    Per-step RNG stream ``f'{seed}:{step}:hw_mix'`` is independent of run
+    history so ``--resume`` stays bit-exact. Returns
+    ``(mixed_batch, hw_indices, rism_indices)``.
+    """
+    hw_r = max(0.0, float(hw_mix_ratio or 0.0))
+    rism_r = max(0.0, float(rism_mix_ratio or 0.0))
+    if (not hw_pairs or hw_r <= 0.0) and (not rism_pairs or rism_r <= 0.0):
+        return base_batch, frozenset(), frozenset()
+    rng = random.Random('%d:%d:hw_mix' % (int(seed), int(step)))
+    mixed = list(base_batch)
+    hw_idx = set()
+    rism_idx = set()
+    n_hw = len(hw_pairs)
+    n_rism = len(rism_pairs)
+    eff_hw = hw_r if n_hw > 0 else 0.0
+    eff_rism = rism_r if n_rism > 0 else 0.0
+    for i in range(len(mixed)):
+        u = rng.random()
+        if eff_hw > 0.0 and u < eff_hw:
+            mixed[i] = hw_pairs[rng.randrange(n_hw)]
+            hw_idx.add(i)
+        elif eff_rism > 0.0 and u < eff_hw + eff_rism:
+            mixed[i] = rism_pairs[rng.randrange(n_rism)]
+            rism_idx.add(i)
+    return mixed, frozenset(hw_idx), frozenset(rism_idx)
+
+
+def apply_epoch_aug_with_hw_pure(
+    rgb_d, batch, seed, epoch, step,
+    aug_p=0.0, clean_p=0.0, geom_strength=0.15,
+    optics_profile='default', hw_indices=frozenset(),
+    hw_pure_frac=0.35, gray_d=None, staff_d=None,
+    aug_fn=None,
+):
+    """Apply ``epoch_aug`` while keeping ``hw_pure_frac`` of HW items pristine.
+
+    For items in ``hw_indices``:
+      - with probability ``hw_pure_frac`` (deterministic in
+        ``(seed, epoch, step, i, basename)``), ``epoch_aug`` is SKIPPED so
+        the model sees pure unaugmented real handwriting scans;
+      - with probability ``1 - hw_pure_frac``, ``epoch_aug`` IS applied
+        (``aug_p=1.0, clean_p=1.0, clean_anchor_frac=0.0``).
+    Non-HW items use the standard ``(aug_p, clean_p)`` path unchanged.
+    When ``hw_indices`` is empty, delegates directly to ``aug_fn`` for
+    bitwise-identical legacy behavior.
+
+    Returns ``(rgb_out, gray_out, staff_out, stats)`` where ``stats`` is
+    ``{'hw_pure': int, 'hw_aug': int}``.
+    """
+    fn = aug_fn if aug_fn is not None else epoch_aug.augment_standardized_batch
+    if not hw_indices:
+        if aug_p <= 0.0 and clean_p <= 0.0:
+            return rgb_d, gray_d, staff_d, {'hw_pure': 0, 'hw_aug': 0}
+        if staff_d is not None:
+            rgb_o, gray_o, staff_o = fn(
+                rgb_d, batch, seed, epoch,
+                aug_p=aug_p, clean_p=clean_p,
+                grayb=gray_d, staffb=staff_d,
+                geom_strength=geom_strength,
+                optics_profile=optics_profile)
+            return rgb_o, gray_o, staff_o, {'hw_pure': 0, 'hw_aug': 0}
+        rgb_o, gray_o = fn(
+            rgb_d, batch, seed, epoch,
+            aug_p=aug_p, clean_p=clean_p,
+            grayb=gray_d,
+            geom_strength=geom_strength,
+            optics_profile=optics_profile)
+        return rgb_o, gray_o, None, {'hw_pure': 0, 'hw_aug': 0}
+
+    p_pure = max(0.0, min(1.0, float(hw_pure_frac)))
+    hw_pure_idx = []
+    hw_aug_idx = []
+    non_hw_idx = []
+    for i, pair in enumerate(batch):
+        if i in hw_indices:
+            key = Path(pair[0]).name
+            rng = random.Random(
+                '%d:%d:%d:%d:%s:hw_pure'
+                % (int(seed), int(epoch), int(step), i, key))
+            if rng.random() < p_pure:
+                hw_pure_idx.append(i)
+            else:
+                hw_aug_idx.append(i)
+        else:
+            non_hw_idx.append(i)
+
+    out_rgb = rgb_d.clone()
+    out_gray = gray_d.clone() if gray_d is not None else None
+    out_staff = staff_d.clone() if staff_d is not None else None
+    dev = rgb_d.device
+
+    def _run_subset(idxs, sub_aug_p, sub_clean_p, extra_kw=None):
+        if not idxs or (sub_aug_p <= 0.0 and sub_clean_p <= 0.0):
+            return
+        idx_t = torch.tensor(idxs, device=dev, dtype=torch.long)
+        sub_rgb = out_rgb.index_select(0, idx_t)
+        sub_gray = (out_gray.index_select(0, idx_t)
+                    if out_gray is not None else None)
+        sub_staff = (out_staff.index_select(0, idx_t)
+                     if out_staff is not None else None)
+        sub_batch = [batch[j] for j in idxs]
+        kw = dict(
+            aug_p=sub_aug_p, clean_p=sub_clean_p,
+            grayb=sub_gray, geom_strength=geom_strength,
+            optics_profile=optics_profile)
+        if extra_kw:
+            kw.update(extra_kw)
+        if sub_staff is not None:
+            kw['staffb'] = sub_staff
+            r_o, g_o, s_o = fn(sub_rgb, sub_batch, seed, epoch, **kw)
+            out_rgb.index_copy_(0, idx_t, r_o)
+            if out_gray is not None and g_o is not None:
+                out_gray.index_copy_(0, idx_t, g_o)
+            if out_staff is not None and s_o is not None:
+                out_staff.index_copy_(0, idx_t, s_o)
+        else:
+            r_o, g_o = fn(sub_rgb, sub_batch, seed, epoch, **kw)
+            out_rgb.index_copy_(0, idx_t, r_o)
+            if out_gray is not None and g_o is not None:
+                out_gray.index_copy_(0, idx_t, g_o)
+
+    _run_subset(non_hw_idx, aug_p, clean_p)
+    _run_subset(hw_aug_idx, 1.0, 1.0, extra_kw={'clean_anchor_frac': 0.0})
+    return out_rgb, out_gray, out_staff, {
+        'hw_pure': len(hw_pure_idx),
+        'hw_aug': len(hw_aug_idx),
+    }
+
+
+_IMAGE_EXTS = frozenset(('.png', '.jpg', '.jpeg', '.webp', '.tif', '.tiff'))
+
+
+def list_unlabeled_images(dirs_raw):
+    """Collect sorted image paths across one or more comma-separated dirs."""
+    dirs = parse_extra_data_dirs(dirs_raw)
+    seen = set()
+    out = []
+    for d in dirs:
+        root = Path(d)
+        if not root.is_dir():
+            continue
+        for p in sorted(root.rglob('*')):
+            if not p.is_file():
+                continue
+            if p.name.startswith('.'):
+                continue
+            if p.suffix.lower() not in _IMAGE_EXTS:
+                continue
+            sp = str(p)
+            if sp not in seen:
+                seen.add(sp)
+                out.append(sp)
+    return out
+
+
+def unsup_round_due(step, every_steps):
+    """True when an unsupervised round should fire after supervised ``step``."""
+    return int(every_steps) > 0 and int(step) > 0 and (int(step) % int(every_steps) == 0)
+
+
+def _lazy_import_mvd_module(name):
+    """Lazy-import an optional sibling module in ``tmp-train/mvd``."""
+    mvd_dir = str(Path(__file__).resolve().parent)
+    if mvd_dir not in sys.path:
+        sys.path.insert(0, mvd_dir)
+    try:
+        return importlib.import_module(name)
+    except ModuleNotFoundError:
+        return None
+
+
+def run_stage2_unsup_round(
+    net, opt, scaler, strip_paths, step, round_steps=100,
+    mode='both', weight=0.25, kl_beta=0.10, height=256,
+    device='cpu', amp=False, amp_dtype=torch.float16,
+    stride='8x16', seed=0, batch_size=2,
+    unsup_stage2_mod=None, unsup_bar_math_mod=None,
+):
+    """Run one scheduled Stage-2 unsupervised round via lazy-imported modules.
+
+    Supports ``mode`` in ``('ema_enc', 'bar_math', 'both')``. Gracefully skips
+    if the target optional module (``unsup_stage2`` / ``unsup_bar_math``) is
+    not present.
+    """
+    summary = {
+        'step': int(step),
+        'mode': str(mode),
+        'round_steps': int(round_steps),
+        'n_strips': len(strip_paths),
+        'ran': [],
+        'metrics': {},
+    }
+    if not strip_paths or int(round_steps) <= 0:
+        return summary
+
+    def _invoke(mod, mod_name, fn_names, extra_kw):
+        if mod is None:
+            print('[unsup] module %s not found; skipping at step %d'
+                  % (mod_name, step), flush=True)
+            return None
+        for fn_name in fn_names:
+            fn = getattr(mod, fn_name, None)
+            if callable(fn):
+                return fn(**extra_kw)
+        print('[unsup] module %s has none of %s; skipping at step %d'
+              % (mod_name, fn_names, step), flush=True)
+        return None
+
+    common_kw = dict(
+        net=net, opt=opt, scaler=scaler, strip_paths=list(strip_paths),
+        step=int(step), steps=int(round_steps), weight=float(weight),
+        kl_beta=float(kl_beta), height=int(height), device=device,
+        amp=bool(amp), amp_dtype=amp_dtype, stride=stride,
+        seed=int(seed) + int(step), batch_size=int(batch_size),
+    )
+
+    if mode in ('ema_enc', 'both'):
+        m2 = (unsup_stage2_mod if unsup_stage2_mod is not None
+              else _lazy_import_mvd_module('unsup_stage2'))
+        res = _invoke(m2, 'unsup_stage2',
+                      ('run_unsup_round', 'run_stage2_round', 'unsup_step'),
+                      common_kw)
+        if res is not None:
+            summary['ran'].append('ema_enc')
+            summary['metrics']['ema_enc'] = res
+
+    if mode in ('bar_math', 'both'):
+        mb = (unsup_bar_math_mod if unsup_bar_math_mod is not None
+              else _lazy_import_mvd_module('unsup_bar_math'))
+        res = _invoke(mb, 'unsup_bar_math',
+                      ('run_bar_math_round', 'run_unsup_round', 'bar_math_step'),
+                      common_kw)
+        if res is not None:
+            summary['ran'].append('bar_math')
+            summary['metrics']['bar_math'] = res
+
+    return summary
+
+
 def filter_pages(pairs, substrings=None, exact_file=None):
     """Select training pairs by page stem.
 
@@ -215,7 +581,10 @@ META_KEYS = ('vocab', 'pages', 'height', 'lr', 'seed', 'exclude',
              'jsd_every', 'bf16', 'channels_last', 'width_bucket',
              'prefetch', 'real_hw_dir', 'real_hw_repeat',
              's18_weight', 'comer', 'gdcm_weight', 'extra_data_dir',
-             'max_tokens')
+             'max_tokens', 'real_hw_corpus', 'hw_mix_ratio', 'hw_pure_frac',
+             'rism_incipit_dir', 'rism_mix_ratio', 'unsup_strips_dir',
+             'unsup_every_steps', 'unsup_round_steps', 'unsup_mode',
+             'unsup_weight', 'unsup_kl_beta')
 
 # Values new flags had implicitly before they existed. An old
 # meta.json missing one of these keys resumes iff the current run uses
@@ -247,6 +616,17 @@ LEGACY_DEFAULTS = {
     'gdcm_weight': 0.0,
     'extra_data_dir': None,
     'max_tokens': 768,
+    'real_hw_corpus': None,
+    'hw_mix_ratio': 0.0,
+    'hw_pure_frac': 0.35,
+    'rism_incipit_dir': None,
+    'rism_mix_ratio': 0.0,
+    'unsup_strips_dir': None,
+    'unsup_every_steps': 0,
+    'unsup_round_steps': 100,
+    'unsup_mode': 'both',
+    'unsup_weight': 0.25,
+    'unsup_kl_beta': 0.10,
 }
 
 # Exact fingerprint enforced on --resume (T0.2): every key here must
@@ -268,7 +648,10 @@ RESUME_KEYS = ('vocab', 'pages', 'height', 'lr', 'seed', 'exclude',
                'jsd_every', 'bf16', 'channels_last', 'width_bucket',
                'prefetch', 'real_hw_dir', 'real_hw_repeat',
                's18_weight', 'comer', 'gdcm_weight', 'extra_data_dir',
-               'max_tokens')
+               'max_tokens', 'real_hw_corpus', 'hw_mix_ratio', 'hw_pure_frac',
+               'rism_incipit_dir', 'rism_mix_ratio', 'unsup_strips_dir',
+               'unsup_every_steps', 'unsup_round_steps', 'unsup_mode',
+               'unsup_weight', 'unsup_kl_beta')
 
 _LOCK_HELD = []
 
@@ -515,6 +898,19 @@ def build_meta(args, pairs):
             parse_extra_data_dirs(getattr(args, 'extra_data_dir', None))
             or None),
         'max_tokens': getattr(args, 'max_tokens', 768),
+        'real_hw_corpus': getattr(args, 'real_hw_corpus', None),
+        'hw_mix_ratio': getattr(args, 'hw_mix_ratio', 0.0),
+        'hw_pure_frac': getattr(args, 'hw_pure_frac', 0.35),
+        'rism_incipit_dir': getattr(args, 'rism_incipit_dir', None),
+        'rism_mix_ratio': getattr(args, 'rism_mix_ratio', 0.0),
+        'unsup_strips_dir': (
+            parse_extra_data_dirs(getattr(args, 'unsup_strips_dir', None))
+            or None),
+        'unsup_every_steps': getattr(args, 'unsup_every_steps', 0),
+        'unsup_round_steps': getattr(args, 'unsup_round_steps', 100),
+        'unsup_mode': getattr(args, 'unsup_mode', 'both'),
+        'unsup_weight': getattr(args, 'unsup_weight', 0.25),
+        'unsup_kl_beta': getattr(args, 'unsup_kl_beta', 0.10),
     }
 
 
@@ -1838,6 +2234,57 @@ def main():
                     help='maximum target token sequence length (default 768; '
                          '0 = unlimited). Recorded in meta.json and enforced on '
                          '--resume.')
+    ap.add_argument('--real-hw-corpus', default=None,
+                    help='optional path to strictly labeled real handwritten '
+                         'corpus (e.g. D:\\tmp\\real-hw-corpus\\ or extracted '
+                         'strip dir; NEVER unlabeled RISM). Works alongside '
+                         '--real-hw-dir. Recorded in meta.json and enforced on '
+                         '--resume.')
+    ap.add_argument('--hw-mix-ratio', type=float, default=0.0,
+                    help='fraction of supervised batch items drawn from the '
+                         'labeled real HW pool (default 0.0 = legacy; '
+                         'recommended 0.12-0.15). Recorded in meta.json and '
+                         'enforced on --resume.')
+    ap.add_argument('--hw-pure-frac', type=float, default=0.35,
+                    help='fraction of labeled HW samples kept pure/unaugmented '
+                         '(epoch_aug skipped) while 1 - hw_pure_frac receive '
+                         'photometric/ink/camera augmentation (default 0.35). '
+                         'Recorded in meta.json and enforced on --resume.')
+    ap.add_argument('--rism-incipit-dir', default=None,
+                    help='optional path to semi-supervised barline-gated RISM '
+                         'opening-staff incipit strips (tracked separately '
+                         'from full labeled HW). Recorded in meta.json and '
+                         'enforced on --resume.')
+    ap.add_argument('--rism-mix-ratio', type=float, default=0.0,
+                    help='fraction of supervised batch items drawn from the '
+                         'semi-supervised RISM incipit pool (default 0.0; '
+                         'recommended 0.05-0.10). Recorded in meta.json and '
+                         'enforced on --resume.')
+    ap.add_argument('--unsup-strips-dir', default=None,
+                    help='comma-separated directories of unlabeled system '
+                         'strips for scheduled unsupervised rounds (e.g. '
+                         'D:\\tmp\\unlabeled-10k-real\\strips,'
+                         'D:\\tmp\\rism-incipit-strips\\unlabeled_strips). '
+                         'Recorded in meta.json and enforced on --resume.')
+    ap.add_argument('--unsup-every-steps', type=int, default=0,
+                    help='run one unsupervised round every N supervised steps '
+                         '(default 0 = off; e.g. 1000). Recorded in meta.json '
+                         'and enforced on --resume.')
+    ap.add_argument('--unsup-round-steps', type=int, default=100,
+                    help='steps per scheduled unsupervised round (default 100). '
+                         'Recorded in meta.json and enforced on --resume.')
+    ap.add_argument('--unsup-mode', default='both',
+                    choices=('ema_enc', 'bar_math', 'both'),
+                    help='unsupervised round mode: ema_enc, bar_math, or both '
+                         '(default both). Recorded in meta.json and enforced '
+                         'on --resume.')
+    ap.add_argument('--unsup-weight', type=float, default=0.25,
+                    help='unsupervised round loss weight (default 0.25). '
+                         'Recorded in meta.json and enforced on --resume.')
+    ap.add_argument('--unsup-kl-beta', type=float, default=0.10,
+                    help='unsupervised round KL regularization beta '
+                         '(default 0.10). Recorded in meta.json and enforced '
+                         'on --resume.')
     args = ap.parse_args()
 
     torch.manual_seed(args.seed)
@@ -1850,6 +2297,8 @@ def main():
                        include_handink=args.handink,
                        include_simshots=args.simshots)
     pairs = filter_pages(pairs, args.pages, args.pages_file)
+    hw_pool_pairs = []
+    hw_corpus_hidx = {}
     if args.real_hw_dir:
         hw_pairs = load_real_hw_pairs(
             args.real_hw_dir, exclude=args.exclude,
@@ -1857,7 +2306,38 @@ def main():
             repeat=args.real_hw_repeat)
         print('real-hw pairs: +%d from %s (repeat=%d)'
               % (len(hw_pairs), args.real_hw_dir, args.real_hw_repeat))
-        pairs = pairs + hw_pairs
+        if args.hw_mix_ratio > 0.0:
+            hw_pool_pairs.extend(hw_pairs)
+        else:
+            pairs = pairs + hw_pairs
+    if args.real_hw_corpus:
+        c_pairs, hw_corpus_hidx = load_real_hw_corpus_pairs(
+            args.real_hw_corpus, exclude=args.exclude,
+            include_degraded=not args.no_degraded)
+        print('real-hw-corpus pairs: +%d (+%d hybrid rows) from %s'
+              % (len(c_pairs), len(hw_corpus_hidx), args.real_hw_corpus))
+        if args.hw_mix_ratio > 0.0:
+            hw_pool_pairs.extend(c_pairs)
+        else:
+            pairs = pairs + c_pairs
+    rism_pool_pairs = []
+    rism_hidx = {}
+    if args.rism_incipit_dir:
+        rism_pool_pairs, rism_hidx = load_rism_incipit_pairs(
+            args.rism_incipit_dir, exclude=args.exclude,
+            include_degraded=not args.no_degraded)
+        print('rism-incipit pairs (semi-supervised): +%d (+%d hybrid rows) '
+              'from %s (mix_ratio=%.3f)'
+              % (len(rism_pool_pairs), len(rism_hidx), args.rism_incipit_dir,
+                 args.rism_mix_ratio))
+    unsup_strip_paths = (
+        list_unlabeled_images(args.unsup_strips_dir)
+        if args.unsup_strips_dir else [])
+    if args.unsup_every_steps > 0:
+        print('unsup schedule: every=%d steps, round_steps=%d, mode=%s, '
+              'strips=%d'
+              % (args.unsup_every_steps, args.unsup_round_steps,
+                 args.unsup_mode, len(unsup_strip_paths)))
     extra_hidxs = []
     for edir in parse_extra_data_dirs(args.extra_data_dir):
         epairs, ehidx = load_extra_data_dir(
@@ -1892,16 +2372,27 @@ def main():
             if hw_hidx:
                 hybrid_index.update(hw_hidx)
                 print('real-hw hybrid index: +%d validated strips' % len(hw_hidx))
+        if hw_corpus_hidx:
+            hybrid_index.update(hw_corpus_hidx)
+        if rism_hidx:
+            hybrid_index.update(rism_hidx)
         for ehidx in extra_hidxs:
             hybrid_index.update(ehidx)
         print('hybrid index: %d validated strips in %s'
               % (len(hybrid_index), args.hybrid_cache))
         pairs, drop_clean, drop_deg = filter_hybrid_pairs(
             pairs, hybrid_index=hybrid_index, allow_on_the_fly=True)
+        if hw_pool_pairs:
+            hw_pool_pairs, _, _ = filter_hybrid_pairs(
+                hw_pool_pairs, hybrid_index=hybrid_index, allow_on_the_fly=True)
+        if rism_pool_pairs:
+            rism_pool_pairs, _, _ = filter_hybrid_pairs(
+                rism_pool_pairs, hybrid_index=hybrid_index, allow_on_the_fly=True)
         print('hybrid filter: kept %d pairs (dropped clean=%d '
               'degraded=%d without sidecars/tables)'
               % (len(pairs), drop_clean, drop_deg))
         assert pairs, 'no training pairs with sidecars or tables selected'
+    hw_img_set = frozenset(p[0] for p in hw_pool_pairs)
     if args.aux_weight > 0 and not use_hybrid:
         sys.exit('refusing: --aux-weight needs --hybrid-cache (aux '
                  'targets are the hybrid-extra channels)')
@@ -2083,6 +2574,13 @@ def main():
             else:
                 b0 = bi * B
                 raw_b = pairs[b0:b0 + B]
+            if (hw_pool_pairs and args.hw_mix_ratio > 0.0) or (
+                    rism_pool_pairs and args.rism_mix_ratio > 0.0):
+                raw_b, _, _ = mix_supervised_batch(
+                    raw_b, st, args.seed,
+                    hw_pairs=hw_pool_pairs, hw_mix_ratio=args.hw_mix_ratio,
+                    rism_pairs=rism_pool_pairs,
+                    rism_mix_ratio=args.rism_mix_ratio)
             yield (st, ep, epoch_aug.resolve_epoch_batch(
                 raw_b, ep, args.epoch_redraw_dir))
 
@@ -2125,7 +2623,17 @@ def main():
             if need_jsd:
                 b_jsd = min(2, imgs.shape[0])
                 clean_imgs_jsd = imgs[:b_jsd].clone()
-            if args.epoch_aug_p > 0 or args.epoch_aug_clean_p > 0:
+            hw_idx = (frozenset(i for i, p in enumerate(batch)
+                                if p[0] in hw_img_set)
+                      if hw_img_set else frozenset())
+            if hw_idx:
+                imgs, _, _, _ = apply_epoch_aug_with_hw_pure(
+                    imgs, batch, args.seed, epoch, step,
+                    aug_p=args.epoch_aug_p, clean_p=args.epoch_aug_clean_p,
+                    geom_strength=args.epoch_aug_geom,
+                    optics_profile=args.optics_profile,
+                    hw_indices=hw_idx, hw_pure_frac=args.hw_pure_frac)
+            elif args.epoch_aug_p > 0 or args.epoch_aug_clean_p > 0:
                 imgs, _ = epoch_aug.augment_standardized_batch(
                     imgs, batch, args.seed, epoch,
                     aug_p=args.epoch_aug_p, clean_p=args.epoch_aug_clean_p,
@@ -2158,7 +2666,18 @@ def main():
                     heat_net, rgb_d[:b_jsd].clone(),
                     gray_d[:b_jsd].clone() if gray_d is not None else None,
                     staff_d[:b_jsd].clone())
-            if args.epoch_aug_p > 0 or args.epoch_aug_clean_p > 0:
+            hw_idx = (frozenset(i for i, p in enumerate(batch)
+                                if p[0] in hw_img_set)
+                      if hw_img_set else frozenset())
+            if hw_idx:
+                rgb_d, gray_d, staff_d, _ = apply_epoch_aug_with_hw_pure(
+                    rgb_d, batch, args.seed, epoch, step,
+                    aug_p=args.epoch_aug_p, clean_p=args.epoch_aug_clean_p,
+                    geom_strength=args.epoch_aug_geom,
+                    optics_profile=args.optics_profile,
+                    hw_indices=hw_idx, hw_pure_frac=args.hw_pure_frac,
+                    gray_d=gray_d, staff_d=staff_d)
+            elif args.epoch_aug_p > 0 or args.epoch_aug_clean_p > 0:
                 rgb_d, gray_d, staff_d = epoch_aug.augment_standardized_batch(
                     rgb_d, batch, args.seed, epoch,
                     aug_p=args.epoch_aug_p, clean_p=args.epoch_aug_clean_p,
@@ -2445,6 +2964,22 @@ def main():
                 torch.cuda.empty_cache()
                 save_checkpoint(out, step, net, opt, sched,
                                 updates, args)
+        if unsup_round_due(step, args.unsup_every_steps) and unsup_strip_paths:
+            if pending:
+                flush()
+                pending = 0
+            u_res = run_stage2_unsup_round(
+                net=net, opt=opt, scaler=scaler,
+                strip_paths=unsup_strip_paths, step=step,
+                round_steps=args.unsup_round_steps, mode=args.unsup_mode,
+                weight=args.unsup_weight, kl_beta=args.unsup_kl_beta,
+                height=args.height, device=device, amp=amp,
+                amp_dtype=amp_dtype, stride=args.stride, seed=args.seed,
+                batch_size=max(1, min(B, 2)))
+            print('  unsup round step=%d mode=%s ran=%s strips=%d'
+                  % (step, args.unsup_mode, u_res['ran'],
+                     u_res['n_strips']), flush=True)
+            net.train()
         if step % args.eval_every == 0 or step == args.steps:
             if pending:
                 flush()

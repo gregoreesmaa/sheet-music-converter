@@ -31,6 +31,7 @@ EVAL_MANIFEST = pathlib.Path(
 TRAIN_WORKS_IN = LABELED_ROOT / "train_works.jsonl"
 RISM_DE = pathlib.Path(r"D:\tmp\rism-pdm-hw\manifest.jsonl")
 RISM_CH = pathlib.Path(r"D:\tmp\rism-pdm-hw-intl\manifest.jsonl")
+RISM_PL = pathlib.Path(r"D:\tmp\rism-pdm-hw-extra\manifest.jsonl")
 
 
 def link_or_copy(src: pathlib.Path, dst: pathlib.Path) -> bool:
@@ -176,11 +177,11 @@ def main() -> None:
             f.write(json.dumps(r, ensure_ascii=False) + "\n")
     os.replace(tmp_l, LABELED_ROOT / "all_labeled_hw.jsonl")
 
-    # 2. UNLABELED: Group RISM DE + CH under D:\tmp\unlabeled-10k-real\rism_hw\
+    # 2. UNLABELED: Group RISM DE + CH + PL under D:\tmp\unlabeled-10k-real\rism_hw\
     unlabeled_rism: list[dict] = []
-    u_counts = {"rism_de": 0, "rism_ch": 0, "portrait": 0, "landscape": 0}
+    u_counts = {"rism_de": 0, "rism_ch": 0, "rism_pl": 0, "portrait": 0, "landscape": 0}
     seen_rism = set()
-    for tag, country, mpath in [("rism-de", "DE", RISM_DE), ("rism-ch", "CH", RISM_CH)]:
+    for tag, country, mpath in [("rism-de", "DE", RISM_DE), ("rism-ch", "CH", RISM_CH), ("rism-pl", "PL", RISM_PL)]:
         base = mpath.parent
         for row in load_jsonl(mpath):
             rid = str(row.get("rism_id") or row.get("source_id") or row.get("id") or "")
@@ -199,8 +200,10 @@ def main() -> None:
             seen_rism.add(rid)
             if tag == "rism-de":
                 u_counts["rism_de"] += 1
-            else:
+            elif tag == "rism-ch":
                 u_counts["rism_ch"] += 1
+            else:
+                u_counts["rism_pl"] += 1
             w = int(row.get("width", 0) or 0)
             h = int(row.get("height", 0) or 0)
             orient = row.get("orientation") or ("portrait" if h > w else "landscape")

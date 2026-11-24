@@ -27,6 +27,8 @@ Also provides:
 from __future__ import annotations
 
 import argparse
+import copy
+import importlib
 import io
 import json
 import math
@@ -56,6 +58,10 @@ __all__ = [
     "preprocess_page_image",
     "StaffUNetDataset",
     "train_staff_unet2d",
+    "parse_unlabeled_dirs",
+    "list_unlabeled_page_images",
+    "unsup_epoch_round_due",
+    "run_stage1_unsup_round",
 ]
 
 
@@ -1544,6 +1550,150 @@ def _get_dynamic_res():
     return _dyn_res
 
 
+_UNSUP_IMAGE_EXTS = frozenset((".png", ".jpg", ".jpeg", ".webp", ".tif", ".tiff"))
+
+
+def parse_unlabeled_dirs(raw: str | Sequence[str] | None) -> list[str]:
+    """Normalize comma-separated or sequence ``--unlabeled-dirs`` values."""
+    if not raw:
+        return []
+    items = [raw] if isinstance(raw, (str, Path)) else list(raw)
+    out: list[str] = []
+    for item in items:
+        if not item:
+            continue
+        for part in str(item).split(","):
+            p = part.strip()
+            if p:
+                out.append(p)
+    return out
+
+
+def list_unlabeled_page_images(dirs_raw: str | Sequence[str] | None) -> list[Path]:
+    """Collect sorted unlabeled full-page image paths across comma-separated dirs."""
+    seen: set[str] = set()
+    out: list[Path] = []
+    for d in parse_unlabeled_dirs(dirs_raw):
+        root = Path(d)
+        if not root.is_dir():
+            continue
+        for p in sorted(root.rglob("*")):
+            if not p.is_file() or p.name.startswith("."):
+                continue
+            if p.suffix.lower() not in _UNSUP_IMAGE_EXTS:
+                continue
+            sp = str(p)
+            if sp not in seen:
+                seen.add(sp)
+                out.append(p)
+    return out
+
+
+def unsup_epoch_round_due(epoch: int, every_epochs: int) -> bool:
+    """True when an unsupervised EMA round should run after supervised ``epoch``."""
+    return int(every_epochs) > 0 and int(epoch) > 0 and (int(epoch) % int(every_epochs) == 0)
+
+
+def _lazy_import_unsup_stage1():
+    """Lazy-import optional sibling ``unsup_stage1`` module."""
+    import sys as _sys
+
+    mvd_dir = str(Path(__file__).resolve().parent)
+    if mvd_dir not in _sys.path:
+        _sys.path.insert(0, mvd_dir)
+    try:
+        return importlib.import_module("unsup_stage1")
+    except ModuleNotFoundError:
+        return None
+
+
+def run_stage1_unsup_round(
+    model: nn.Module,
+    ema_model: nn.Module | None,
+    opt: torch.optim.Optimizer,
+    image_paths: Sequence[Path | str],
+    steps: int = 200,
+    ema_decay: float = 0.999,
+    device: torch.device | str = "cpu",
+    epoch: int = 1,
+    seed: int = 42,
+    batch_size: int = 4,
+    target_h: int = 1024,
+    target_w: int = 768,
+    dynamic_res: bool = False,
+    sp_mode: str = "rel_h",
+    out_stride: int = 2,
+    bf16: bool = False,
+    unsup_stage1_mod: Any = None,
+    unsup_round_fn: Any = None,
+) -> dict[str, Any]:
+    """Run one scheduled Stage-1 unsupervised EMA equivariance round.
+
+    Uses ``unsup_round_fn`` if supplied (for tests/custom hooks), otherwise
+    lazy-imports ``unsup_stage1`` and invokes its round/step entrypoint.
+    Gracefully skips if ``unsup_stage1`` is not installed/present.
+    """
+    summary: dict[str, Any] = {
+        "epoch": int(epoch),
+        "steps": int(steps),
+        "n_images": len(image_paths),
+        "ema_decay": float(ema_decay),
+        "ran": False,
+        "metrics": {},
+    }
+    if int(steps) <= 0:
+        return summary
+    if not image_paths and unsup_round_fn is None:
+        return summary
+
+    kw = dict(
+        model=model,
+        ema_model=ema_model,
+        opt=opt,
+        image_paths=[Path(p) for p in image_paths],
+        steps=int(steps),
+        ema_decay=float(ema_decay),
+        device=device,
+        epoch=int(epoch),
+        seed=int(seed) + int(epoch) * 1009,
+        batch_size=int(batch_size),
+        target_h=int(target_h),
+        target_w=int(target_w),
+        dynamic_res=bool(dynamic_res),
+        sp_mode=str(sp_mode),
+        out_stride=int(out_stride),
+        bf16=bool(bf16),
+    )
+
+    if callable(unsup_round_fn):
+        res = unsup_round_fn(**kw)
+        summary["ran"] = True
+        summary["metrics"] = res if isinstance(res, dict) else {"result": res}
+        return summary
+
+    mod = unsup_stage1_mod if unsup_stage1_mod is not None else _lazy_import_unsup_stage1()
+    if mod is None:
+        print(
+            f"[unsup-stage1] module unsup_stage1 not found; skipping round at epoch {epoch}",
+            flush=True,
+        )
+        return summary
+
+    for fn_name in ("run_unsup_round", "run_stage1_unsup_round", "unsup_ema_round"):
+        fn = getattr(mod, fn_name, None)
+        if callable(fn):
+            res = fn(**kw)
+            summary["ran"] = True
+            summary["metrics"] = res if isinstance(res, dict) else {"result": res}
+            return summary
+
+    print(
+        f"[unsup-stage1] module unsup_stage1 has no round entrypoint; skipping epoch {epoch}",
+        flush=True,
+    )
+    return summary
+
+
 class StaffUNetDataset(Dataset):
     """Dataset reading JSONL rows of full-page images + staff/system annotations.
 
@@ -1582,6 +1732,7 @@ class StaffUNetDataset(Dataset):
         dynamic_res: bool = False,
         sp_mode: str = "rel_h",
         buckets: Sequence[tuple[int, int]] | None = None,
+        hw_hard_neg_prob: float = 0.0,
     ):
         if sp_mode not in ("rel_h", "log_hm"):
             raise ValueError(f"unsupported sp_mode: {sp_mode!r}")
@@ -1594,6 +1745,7 @@ class StaffUNetDataset(Dataset):
         self.seed = int(seed)
         self.dynamic_res = bool(dynamic_res)
         self.sp_mode = str(sp_mode)
+        self.hw_hard_neg_prob = max(0.0, min(1.0, float(hw_hard_neg_prob)))
         self.epoch = 0
         self.rows: list[dict[str, Any]] = []
         with open(self.manifest_path, "r", encoding="utf-8") as f:
@@ -1756,6 +1908,19 @@ class StaffUNetDataset(Dataset):
                     out_stride=self.out_stride,
                 )
 
+        hw_hn_p = float(getattr(self, "hw_hard_neg_prob", 0.0))
+        if self.augment and hw_hn_p > 0.0:
+            u1 = _lazy_import_unsup_stage1()
+            hn_fn = getattr(u1, "augment_hw_hard_negatives", None) if u1 is not None else None
+            if callable(hn_fn):
+                rng_hn = np.random.default_rng((self.seed, self.epoch, int(idx), 9173))
+                if float(rng_hn.random()) < hw_hn_p:
+                    res_hn = hn_fn(arr_rgb, target, rng=rng_hn)
+                    if isinstance(res_hn, tuple) and len(res_hn) == 2:
+                        arr_rgb, target = res_hn
+                    else:
+                        arr_rgb = res_hn
+
         if self.in_channels == 1:
             gray = 0.299 * arr_rgb[:, :, 0] + 0.587 * arr_rgb[:, :, 1] + 0.114 * arr_rgb[:, :, 2]
             x = torch.from_numpy(gray[None, :, :].astype(np.float32))
@@ -1788,6 +1953,12 @@ def train_staff_unet2d(
     init_from: str | Path | None = None,
     buckets: Sequence[tuple[int, int]] | None = None,
     row_ctx: bool = False,
+    unlabeled_dirs: str | Sequence[str] | None = None,
+    unsup_round_every: int = 0,
+    unsup_round_steps: int = 200,
+    unsup_ema_decay: float = 0.999,
+    hw_hard_neg_prob: float = 0.0,
+    unsup_round_fn: Any = None,
 ) -> Path:
     """Minimal self-contained training loop for ``StaffUNet2D``."""
     if sp_mode not in ("rel_h", "log_hm"):
@@ -1808,7 +1979,10 @@ def train_staff_unet2d(
         dynamic_res=dynamic_res,
         sp_mode=sp_mode,
         buckets=buckets,
+        hw_hard_neg_prob=hw_hard_neg_prob,
     )
+    unlabeled_images = list_unlabeled_page_images(unlabeled_dirs) if unlabeled_dirs else []
+    ema_model: nn.Module | None = None
     use_pin = dev.type == "cuda"
     batch_sampler = None
     if dynamic_res:
@@ -1902,6 +2076,38 @@ def train_staff_unet2d(
             f"[epoch {ep:03d}/{epochs:03d}] loss={avg:.4f} lr={sched.get_last_lr()[0]:.2e} ({dt:.1f}s)",
             flush=True,
         )
+        if unsup_epoch_round_due(ep, unsup_round_every) and (
+            unlabeled_images or unsup_round_fn is not None
+        ):
+            if ema_model is None:
+                ema_model = copy.deepcopy(model).to(dev)
+                ema_model.eval()
+                for p_ema in ema_model.parameters():
+                    p_ema.requires_grad_(False)
+            u_res = run_stage1_unsup_round(
+                model=model,
+                ema_model=ema_model,
+                opt=opt,
+                image_paths=unlabeled_images,
+                steps=unsup_round_steps,
+                ema_decay=unsup_ema_decay,
+                device=dev,
+                epoch=ep,
+                seed=seed,
+                batch_size=batch_size,
+                target_h=target_h,
+                target_w=target_w,
+                dynamic_res=dynamic_res,
+                sp_mode=sp_mode,
+                out_stride=out_stride,
+                bf16=bf16,
+                unsup_round_fn=unsup_round_fn,
+            )
+            print(
+                f"  [unsup-stage1 ep {ep:03d}] ran={u_res['ran']} "
+                f"steps={u_res['steps']} images={u_res['n_images']}",
+                flush=True,
+            )
         payload = {
             "state_dict": model.state_dict(),
             "in_channels": in_channels,
@@ -1947,6 +2153,35 @@ def _main() -> None:
     p.add_argument("--sp-mode", default="rel_h", choices=["rel_h", "log_hm"], help="ch3 staff-space parameterization")
     p.add_argument("--init-from", default=None, help="Optional checkpoint path to warm-start from")
     p.add_argument("--row-ctx", action="store_true", help="Enable global horizontal row-context + (2,4) bottleneck dilation")
+    p.add_argument(
+        "--unlabeled-dirs",
+        default=None,
+        help="Comma-separated dirs of unlabeled full pages (e.g. printed, RISM HW, intl HW)",
+    )
+    p.add_argument(
+        "--unsup-round-every",
+        type=int,
+        default=0,
+        help="Run an unsupervised EMA equivariance round every N supervised epochs (0 = off)",
+    )
+    p.add_argument(
+        "--unsup-round-steps",
+        type=int,
+        default=200,
+        help="Number of steps per unsupervised round (default 200)",
+    )
+    p.add_argument(
+        "--unsup-ema-decay",
+        type=float,
+        default=0.999,
+        help="EMA teacher decay for unsupervised rounds (default 0.999)",
+    )
+    p.add_argument(
+        "--hw-hard-neg-prob",
+        type=float,
+        default=0.0,
+        help="Probability of synthetic blank pre-ruled staves & cursive lyric hard negatives via unsup_stage1 (0.0 = off)",
+    )
     args = p.parse_args()
     ckpt = train_staff_unet2d(
         manifest=args.manifest,
@@ -1970,6 +2205,11 @@ def _main() -> None:
         sp_mode=args.sp_mode,
         init_from=args.init_from,
         row_ctx=args.row_ctx,
+        unlabeled_dirs=args.unlabeled_dirs,
+        unsup_round_every=args.unsup_round_every,
+        unsup_round_steps=args.unsup_round_steps,
+        unsup_ema_decay=args.unsup_ema_decay,
+        hw_hard_neg_prob=args.hw_hard_neg_prob,
     )
     print(f"Saved checkpoint: {ckpt}", flush=True)
 
