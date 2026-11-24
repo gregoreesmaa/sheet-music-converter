@@ -1,13 +1,20 @@
 #!/usr/bin/env python3
-"""Consolidate all commercial-safe labeled handwritten training data into ONE place:
-D:\\tmp\\real-hw-corpus\\
+"""Consolidate commercial-safe handwritten data into two strictly separated homes:
 
-Uses NTFS hardlinks (with copy fallback) so every image, MusicXML, and bekern file
-is physically present under D:\\tmp\\real-hw-corpus\\ with zero extra disk usage and
-zero interference with running harvesters (e.g., D:\\tmp\\rism-pdm-hw\\).
+1. LABELED (full-work / system-level transcriptions ONLY):
+   D:\\tmp\\real-hw-corpus\\all_labeled_hw.jsonl
+   - 48 OpenScore Lieder PDM 1.0 x CC0 works (252 full pages; 47/48 bekern OK)
+   - 4 Mozart String Quartet PD x CC0 works (12 clean + 24 degraded strips; 4/4 bekern OK)
+   - NEVER includes RISM incipits (grouped under unlabeled per user rule).
+   - NEVER includes BnF-Gallica-caveat Debussy (kept separate in real-hw-train-debussy).
 
-Keeps BnF-Gallica-caveat Debussy (D:\\tmp\\real-hw-train-debussy\\) strictly OUTSIDE
-this commercial-safe training folder.
+2. UNLABELED (full-page PD/PDM scans, including RISM DE + CH):
+   D:\\tmp\\unlabeled-10k-real\\rism_hw\\
+   - 5,000 RISM Germany (D-B, D-Dl, D-Mbs, PDM 1.0)
+   - 300 RISM Switzerland (CH-Bu, CH-SO, PDM 1.0)
+   (Optional opening-incipit metadata preserved in manifest, but NEVER counted as labeled data.)
+
+Uses NTFS hardlinks (zero extra disk usage).
 """
 from __future__ import annotations
 
@@ -16,11 +23,12 @@ import os
 import pathlib
 import shutil
 
-ROOT = pathlib.Path(r"D:\tmp\real-hw-corpus")
+LABELED_ROOT = pathlib.Path(r"D:\tmp\real-hw-corpus")
+UNLABELED_RISM_ROOT = pathlib.Path(r"D:\tmp\unlabeled-10k-real\rism_hw")
 EVAL_MANIFEST = pathlib.Path(
     r"C:\Users\grego\projects\sheet-music-converter\data-gen\score-corpus\suite31\suite31_hw_manifest.json"
 )
-TRAIN_WORKS_IN = ROOT / "train_works.jsonl"
+TRAIN_WORKS_IN = LABELED_ROOT / "train_works.jsonl"
 RISM_DE = pathlib.Path(r"D:\tmp\rism-pdm-hw\manifest.jsonl")
 RISM_CH = pathlib.Path(r"D:\tmp\rism-pdm-hw-intl\manifest.jsonl")
 
@@ -62,8 +70,14 @@ def main() -> None:
         if slug.startswith("hw-"):
             eval_ids.add(slug[3:])
 
-    unified: list[dict] = []
-    counts = {
+    # Clean up old rism_incipits hardlinks from LABELED_ROOT so RISM never sits inside labeled
+    old_rism_dir = LABELED_ROOT / "rism_incipits"
+    if old_rism_dir.exists():
+        shutil.rmtree(old_rism_dir)
+
+    # 1. LABELED ONLY: Full works & system strips
+    labeled: list[dict] = []
+    l_counts = {
         "openscore_works": 0,
         "openscore_pages": 0,
         "openscore_portrait_pages": 0,
@@ -72,46 +86,40 @@ def main() -> None:
         "quartet_works": 0,
         "quartet_clean_strips": 0,
         "quartet_deg_strips": 0,
-        "rism_de_pairs": 0,
-        "rism_ch_pairs": 0,
-        "rism_portrait": 0,
-        "rism_landscape": 0,
     }
 
-    # 1. Full works & quartet strips from train_works.jsonl
-    fw_rows = load_jsonl(TRAIN_WORKS_IN)
-    for row in fw_rows:
+    for row in load_jsonl(TRAIN_WORKS_IN):
         wid = row["work_id"]
         assert wid not in eval_ids and f"hw-{wid}" not in eval_ids, f"Eval leak: {wid}"
         src_name = row.get("source", "")
         if src_name == "openscore-lieder-pdm":
-            counts["openscore_works"] += 1
+            l_counts["openscore_works"] += 1
             local_pages = []
             for idx, pstr in enumerate(row.get("page_paths", []), 1):
                 sp = pathlib.Path(pstr)
-                dp = ROOT / "full_works" / "pages" / f"{wid}_p{idx:03d}{sp.suffix.lower()}"
+                dp = LABELED_ROOT / "full_works" / "pages" / f"{wid}_p{idx:03d}{sp.suffix.lower()}"
                 if link_or_copy(sp, dp):
-                    local_pages.append(str(dp.relative_to(ROOT)).replace("\\", "/"))
-            counts["openscore_pages"] += len(local_pages)
-            counts["openscore_portrait_pages"] += int(row.get("n_portrait_pages", 0))
-            counts["openscore_landscape_pages"] += int(row.get("n_landscape_pages", 0))
+                    local_pages.append(str(dp.relative_to(LABELED_ROOT)).replace("\\", "/"))
+            l_counts["openscore_pages"] += len(local_pages)
+            l_counts["openscore_portrait_pages"] += int(row.get("n_portrait_pages", 0))
+            l_counts["openscore_landscape_pages"] += int(row.get("n_landscape_pages", 0))
 
             local_xml = None
             if row.get("xml_path"):
                 sx = pathlib.Path(row["xml_path"])
-                dx = ROOT / "full_works" / "xml" / f"{wid}{sx.suffix.lower()}"
+                dx = LABELED_ROOT / "full_works" / "xml" / f"{wid}{sx.suffix.lower()}"
                 if link_or_copy(sx, dx):
-                    local_xml = str(dx.relative_to(ROOT)).replace("\\", "/")
+                    local_xml = str(dx.relative_to(LABELED_ROOT)).replace("\\", "/")
 
             local_bk = None
             if row.get("bekern_ok") and row.get("bekern_path"):
-                counts["openscore_bekern_ok"] += 1
+                l_counts["openscore_bekern_ok"] += 1
                 sb = pathlib.Path(row["bekern_path"])
-                db = ROOT / "full_works" / "bekern" / f"{wid}-bekern.txt"
+                db = LABELED_ROOT / "full_works" / "bekern" / f"{wid}-bekern.txt"
                 if link_or_copy(sb, db):
-                    local_bk = str(db.relative_to(ROOT)).replace("\\", "/")
+                    local_bk = str(db.relative_to(LABELED_ROOT)).replace("\\", "/")
 
-            unified.append({
+            labeled.append({
                 "id": wid,
                 "label_scope": "full_work",
                 "source": "openscore-lieder-pdm",
@@ -128,27 +136,26 @@ def main() -> None:
                 "bekern_ok": bool(row.get("bekern_ok", False)),
             })
         elif src_name == "real-hw-train-quartets":
-            counts["quartet_works"] += 1
-            # Hardlink all clean + degraded strips and targets for this quartet work
+            l_counts["quartet_works"] += 1
             rdir = pathlib.Path(r"D:\tmp\real-hw-train\renders")
             tdir = pathlib.Path(r"D:\tmp\real-hw-train\targets")
             clean_local, deg_local, bk_local = [], [], []
             for sp in sorted(rdir.glob(f"{wid}-*")):
                 if sp.is_file():
-                    dp = ROOT / "full_works" / "strips" / sp.name
+                    dp = LABELED_ROOT / "full_works" / "strips" / sp.name
                     if link_or_copy(sp, dp):
-                        rel = str(dp.relative_to(ROOT)).replace("\\", "/")
+                        rel = str(dp.relative_to(LABELED_ROOT)).replace("\\", "/")
                         if "-deg" in sp.name or sp.suffix.lower() == ".jpg":
                             deg_local.append(rel)
                         else:
                             clean_local.append(rel)
             for tp in sorted(tdir.glob(f"{wid}-*-bekern.txt")):
-                dp = ROOT / "full_works" / "bekern" / tp.name
+                dp = LABELED_ROOT / "full_works" / "bekern" / tp.name
                 if link_or_copy(tp, dp):
-                    bk_local.append(str(dp.relative_to(ROOT)).replace("\\", "/"))
-            counts["quartet_clean_strips"] += len(clean_local)
-            counts["quartet_deg_strips"] += len(deg_local)
-            unified.append({
+                    bk_local.append(str(dp.relative_to(LABELED_ROOT)).replace("\\", "/"))
+            l_counts["quartet_clean_strips"] += len(clean_local)
+            l_counts["quartet_deg_strips"] += len(deg_local)
+            labeled.append({
                 "id": wid,
                 "label_scope": "system_strip",
                 "source": "real-hw-train-quartets",
@@ -163,101 +170,76 @@ def main() -> None:
                 "bekern_ok": len(bk_local) > 0,
             })
 
-    # 2. RISM Opening-Incipit Labeled Pairs (DE + CH)
+    tmp_l = LABELED_ROOT / "all_labeled_hw.jsonl.tmp"
+    with tmp_l.open("w", encoding="utf-8") as f:
+        for r in labeled:
+            f.write(json.dumps(r, ensure_ascii=False) + "\n")
+    os.replace(tmp_l, LABELED_ROOT / "all_labeled_hw.jsonl")
+
+    # 2. UNLABELED: Group RISM DE + CH under D:\tmp\unlabeled-10k-real\rism_hw\
+    unlabeled_rism: list[dict] = []
+    u_counts = {"rism_de": 0, "rism_ch": 0, "portrait": 0, "landscape": 0}
     seen_rism = set()
-    for tag, country, mpath in [
-        ("rism-de", "DE", RISM_DE),
-        ("rism-ch", "CH", RISM_CH),
-    ]:
+    for tag, country, mpath in [("rism-de", "DE", RISM_DE), ("rism-ch", "CH", RISM_CH)]:
         base = mpath.parent
         for row in load_jsonl(mpath):
             rid = str(row.get("rism_id") or row.get("source_id") or row.get("id") or "")
             if not rid or rid in seen_rism:
                 continue
             assert rid not in eval_ids, f"Eval leak: {rid}"
-
-            # Locate page image
             img_rel = row.get("image_path") or row.get("page_path") or f"pages/{rid}.jpg"
             img_src = pathlib.Path(img_rel)
             if not img_src.is_absolute():
                 img_src = base / img_src
             if not img_src.exists():
                 continue
-
-            # Locate or materialize bekern text
-            bk_dst = ROOT / "rism_incipits" / "bekern" / f"{tag}_{rid}-bekern.txt"
-            bk_ok = False
-            bk_rel = row.get("bekern_path")
-            if bk_rel:
-                bk_src = pathlib.Path(bk_rel)
-                if not bk_src.is_absolute():
-                    bk_src = base / bk_src
-                bk_ok = link_or_copy(bk_src, bk_dst)
-            elif row.get("bekern"):
-                bk_dst.parent.mkdir(parents=True, exist_ok=True)
-                if not bk_dst.exists():
-                    bk_dst.write_text(str(row["bekern"]), encoding="utf-8")
-                bk_ok = True
-            if not bk_ok:
-                continue
-
-            img_dst = ROOT / "rism_incipits" / "pages" / f"{tag}_{rid}{img_src.suffix.lower()}"
+            img_dst = UNLABELED_RISM_ROOT / "images" / f"{tag}_{rid}{img_src.suffix.lower()}"
             if not link_or_copy(img_src, img_dst):
                 continue
-
             seen_rism.add(rid)
             if tag == "rism-de":
-                counts["rism_de_pairs"] += 1
+                u_counts["rism_de"] += 1
             else:
-                counts["rism_ch_pairs"] += 1
-
+                u_counts["rism_ch"] += 1
             w = int(row.get("width", 0) or 0)
             h = int(row.get("height", 0) or 0)
             orient = row.get("orientation") or ("portrait" if h > w else "landscape")
             if orient == "portrait":
-                counts["rism_portrait"] += 1
+                u_counts["portrait"] += 1
             else:
-                counts["rism_landscape"] += 1
-
-            unified.append({
+                u_counts["landscape"] += 1
+            unlabeled_rism.append({
                 "id": f"{tag}_{rid}",
-                "label_scope": "opening_incipit",
+                "corpus_group": "unlabeled",
                 "source": tag,
                 "country": country,
                 "library": row.get("institution", row.get("siglum", "")),
                 "license": row.get("license", row.get("rights", "PDM 1.0")),
-                "label_license": "CC-BY-4.0 (RISM)",
                 "orientation": orient,
-                "image_paths": [str(img_dst.relative_to(ROOT)).replace("\\", "/")],
-                "bekern_path": str(bk_dst.relative_to(ROOT)).replace("\\", "/"),
-                "bekern_ok": True,
-                "n_bars": row.get("n_bars"),
-                "n_tokens": row.get("n_tokens"),
+                "image_path": str(img_dst.relative_to(UNLABELED_RISM_ROOT)).replace("\\", "/"),
+                "optional_opening_incipit_bars": row.get("n_bars"),
+                "optional_opening_incipit_tokens": row.get("n_tokens"),
             })
 
-    out_manifest = ROOT / "all_labeled_hw.jsonl"
-    tmp_manifest = ROOT / "all_labeled_hw.jsonl.tmp"
-    with tmp_manifest.open("w", encoding="utf-8") as f:
-        for r in unified:
+    UNLABELED_RISM_ROOT.mkdir(parents=True, exist_ok=True)
+    tmp_u = UNLABELED_RISM_ROOT / "manifest.jsonl.tmp"
+    with tmp_u.open("w", encoding="utf-8") as f:
+        for r in unlabeled_rism:
             f.write(json.dumps(r, ensure_ascii=False) + "\n")
-    os.replace(tmp_manifest, out_manifest)
+    os.replace(tmp_u, UNLABELED_RISM_ROOT / "manifest.jsonl")
 
-    total_items = len(unified)
-    total_images = (
-        counts["openscore_pages"]
-        + counts["quartet_clean_strips"]
-        + counts["quartet_deg_strips"]
-        + counts["rism_de_pairs"]
-        + counts["rism_ch_pairs"]
-    )
     summary = {
-        "root": str(ROOT),
-        "total_labeled_entries": total_items,
-        "total_labeled_images_on_disk": total_images,
-        "counts": counts,
+        "labeled_root": str(LABELED_ROOT),
+        "labeled_works": len(labeled),
+        "labeled_images": l_counts["openscore_pages"] + l_counts["quartet_clean_strips"] + l_counts["quartet_deg_strips"],
+        "labeled_counts": l_counts,
+        "unlabeled_rism_root": str(UNLABELED_RISM_ROOT),
+        "unlabeled_rism_pages": len(unlabeled_rism),
+        "unlabeled_rism_counts": u_counts,
         "eval_overlap": 0,
     }
-    (ROOT / "summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
+    (LABELED_ROOT / "summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
+    (UNLABELED_RISM_ROOT / "summary.json").write_text(json.dumps(u_counts, indent=2), encoding="utf-8")
     print(json.dumps(summary, indent=2))
 
 

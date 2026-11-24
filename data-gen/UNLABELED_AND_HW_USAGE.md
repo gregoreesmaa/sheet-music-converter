@@ -2,22 +2,31 @@
 
 This guide documents every real handwritten and unlabeled sheet-music corpus staged on disk, its verified license, and **how to use each one cleanly without corrupting our `>= 0.9973` accuracy ceiling**.
 
-> **Standing Quality Rule:** **Never** train Stage 2 (`MvdNet`) on raw single-model pseudo-labels from an inferior OMR model. All supervised transcriptions must be **human-authored** (CC0/CC-BY symbolic scores, RISM human-cataloged incipits, or verified 3-edition 100%-consensus prints).
+> **Standing Quality Rules:**
+> 1. **Never** train Stage 2 (`MvdNet`) on raw single-model pseudo-labels from an inferior OMR model. All supervised transcriptions must be **human-authored** (CC0/CC-BY symbolic scores or verified 3-edition 100%-consensus prints).
+> 2. **Never count RISM as labeled data** (RISM only has 2–5 bar monophonic opening incipits, not full-page/full-work transcriptions). All RISM manuscripts are grouped under **`D:\tmp\unlabeled-10k-real\rism_hw\`** as **unlabeled** data.
 
 ---
 
 ## Corpus Inventory & Intended Use
 
+### A. Commercial-Safe **LABELED** Real Handwritten Data (`D:\tmp\real-hw-corpus\`, full-work / system-level ONLY)
 | Corpus Path | Size | License | Labels | Best Use |
 | :--- | :---: | :---: | :--- | :--- |
-| **`D:\tmp\real-hw-corpus\`** *(Unified HW Registry: Route B + Quartets)* | **52 train works** (`48` OpenScore PDM 1.0 Lieder = `252` pages [`68` portrait, `184` landscape] + `4` Mozart SQ = `12` strips) + **5 commercial-safe portrait holdout works** in `suite31_hw` | **PDM 1.0** (SBB/SLUB) / **PD** × **CC0-1.0** (`OpenScore`) | `51/52` train + `5/5` eval post-`I1` `bekern` (`bekern-decode` rc=0) | **Primary supervised commercial-safe HW training** (`train_works.jsonl` via Sheet↔Symbolic DTW) + **zero-Gallica portrait holdout** (`suite31_hw_manifest.json` 45 pieces). |
-| **`D:\tmp\rism-pdm-hw\`** *(Route A — DE, also linked into `real-hw-corpus`)* | **5,000 verified pages** (`2,841` portrait `56.8%` / `2,159` landscape; `D-B: 1,664`, `D-Dl: 1,690`, `D-Mbs: 1,646`) | **PDM 1.0** (SLUB/BSB/SBB) × **CC-BY 4.0** (RISM) | `5,000/5,000` human-cataloged **opening incipit** `bekern` (`~55–95` tok, 2–5 bars, `98.18%` conv) | **1)** Stage-1 EMA geometric+scale equivariance; **2)** Crop opening staff via Stage 1 + barline/DTW align → **5,000 human-labeled HW opening-staff pairs** for Stage 2; **3)** Per-scribe style bank. |
-| **`D:\tmp\rism-pdm-hw-intl\`** *(Route A — CH)* | **300 verified pages** (`299` UB Basel `CH-Bu`, `1` ZB Solothurn `CH-SO`; `22` portrait / `278` landscape) | **PDM 1.0** (`e-manuscripta.ch`) × **CC-BY 4.0** (RISM) | `300/300` (`100%`) post-`I1` opening incipit `bekern` (`bekern-decode` rc=0) | Same 3 uses as `rism-pdm-hw` (Stage-1 equivariance, Stage-2 opening-staff incipit pairs, Swiss scribe style bank). |
-| **`D:\tmp\unlabeled-10k-real\intl_hw\`** *(Unlabeled CH)* | **450 verified HW music pages** (`126` MSS; **`76.7%` portrait** / `23.3%` landscape; CLIP mean `0.9950`) | **PDM 1.0** (`e-manuscripta.ch`: UB Basel `227`, ZB Zürich `217`, Solothurn `4`, Schaffhausen `2`) | None (unlabeled) | High-portrait Swiss handwritten pool for Stage-1 equivariance, Stage-2 encoder-only EMA consistency, and Per-Scribe ControlNet style bank. |
-| **`D:\tmp\real-hw-train\`** *(from `handwritten-500`)* | **4 works / 12 systems** (landscape string quartets) | **PD** (IMSLP) × **CC0** (`OpenScore SQ`) | Exact system-level post-`I1` `bekern` | Direct Stage-2 supervised HW training (`--real-hw-dir`). |
-| **`D:\tmp\real-hw-train-debussy\`** *(33 works)* | **440 systems / 94 pages** (`89` portrait) | HF `CC-BY-4.0` *(BnF Gallica scan caveat: verify before commercial training)* | Human-transcribed MusicXML 4.0 → post-`I1` `bekern` | Research/benchmark & messy-autograph ablation; holdout 4 portrait works in `suite31_hw`. |
-| **`D:\tmp\unlabeled-10k-real\`** | **9,977 full pages** (`p_music >= 0.65`) | **Public Domain** (IA/IMSLP/Wikimedia) | None (unlabeled) | **1)** Stage-1 EMA geometric + `log_hm` scale equivariance; **2)** Stage-2 encoder-only multi-view `mem`+`GDCM` consistency; **3)** Style bank; **4)** 3-print consensus mining. |
-| **`D:\tmp\unlabeled-10k\hw_crops\`** | **629 HW music crops** (`p_music >= 0.65`) | **Public Domain** | None (unlabeled) | Stage-2 encoder-only multi-view consistency + combined per-scribe style reference pool. |
+| **`D:\tmp\real-hw-corpus\`** (`all_labeled_hw.jsonl`) | **52 train works / 288 images** (`48` OpenScore Lieder = `252` full pages [`68` portrait, `184` landscape] + `4` Mozart SQ = `36` strips) + **5 commercial-safe portrait holdout works** in `suite31_hw` | **PDM 1.0** (SBB/SLUB) / **PD** × **CC0-1.0** (`OpenScore`) | `51/52` train + `5/5` eval full post-`I1` `bekern` (`bekern-decode` rc=0) | **Primary supervised commercial-safe HW training** (via Sheet↔Symbolic DTW) + **zero-Gallica portrait holdout** (`suite31_hw_manifest.json` 45 pieces). |
+
+### B. Research-Only Labeled HW (Kept Separate — BnF Gallica Caveat)
+| Corpus Path | Size | License | Labels | Best Use |
+| :--- | :---: | :---: | :--- | :--- |
+| **`D:\tmp\real-hw-train-debussy\`** *(33 works)* | **440 systems / 94 pages** (`89` portrait) | HF `CC-BY-4.0` *(BnF Gallica scan caveat: exclude from commercial training)* | Human-transcribed MusicXML 4.0 → post-`I1` `bekern` | Research/benchmark & messy-autograph ablation; holdout 4 portrait works in `suite31_hw`. |
+
+### C. **UNLABELED** Real Sheet-Music & Handwritten Corpora (`D:\tmp\unlabeled-10k-real\` + `unlabeled-10k\`)
+| Corpus Path | Size | License | Labels | Best Use |
+| :--- | :---: | :---: | :--- | :--- |
+| **`D:\tmp\unlabeled-10k-real\images\`** | **9,977 full pages** (`p_music >= 0.65`) | **Public Domain** (IA/IMSLP/Wikimedia) | Unlabeled | **1)** Stage-1 EMA geometric + `log_hm` scale equivariance; **2)** Stage-2 encoder-only multi-view `mem`+`GDCM` consistency; **3)** Style bank; **4)** 3-print consensus mining. |
+| **`D:\tmp\unlabeled-10k-real\rism_hw\`** *(DE + CH RISM, never counted as labeled)* | **5,300 full HW pages** (`5,000` DE `D-B/D-Dl/D-Mbs` + `300` CH `CH-Bu/CH-SO`; `2,863` portrait / `2,437` landscape) | **PDM 1.0** (SLUB/BSB/SBB/`e-manuscripta.ch`) | **Unlabeled** *(optional 2–5 bar opening incipits preserved in `rism-pdm-hw*`)* | **1)** Stage-1 EMA equivariance; **2)** **5,300-scribe commercial-safe style bank** for Structure-Locked ControlNet over `CC0 PDMX`; **3)** Stage-2 encoder-only EMA consistency. |
+| **`D:\tmp\unlabeled-10k-real\intl_hw\`** *(Unlabeled CH)* | **450 verified HW music pages** (`126` MSS; **`76.7%` portrait** / `23.3%` landscape; CLIP mean `0.9950`) | **PDM 1.0** (`e-manuscripta.ch`: UB Basel `227`, ZB Zürich `217`, Solothurn `4`, Schaffhausen `2`) | Unlabeled | High-portrait Swiss handwritten pool for Stage-1 equivariance, Stage-2 encoder-only EMA consistency, and Per-Scribe ControlNet style bank. |
+| **`D:\tmp\unlabeled-10k\hw_crops\`** | **629 HW music crops** (`p_music >= 0.65`) | **Public Domain** | Unlabeled | Stage-2 encoder-only multi-view consistency + combined per-scribe style reference pool. |
 
 ---
 
