@@ -874,3 +874,107 @@ def bar_math_unsup_step(
         "accepted_indices": accepted_indices,
     }
     return total_loss, stats
+
+
+def run_bar_math_round(
+    net: nn.Module,
+    opt: torch.optim.Optimizer,
+    scaler,
+    strip_paths: list,
+    step: int = 0,
+    steps: int = 50,
+    weight: float = 0.25,
+    kl_beta: float = 0.10,
+    height: int = 256,
+    device: torch.device | str = "cpu",
+    amp: bool = False,
+    amp_dtype=torch.bfloat16,
+    seed: int = 0,
+    batch_size: int = 2,
+    **_extra,
+) -> dict:
+    """Execute one KL-anchored bar-math-validated unsupervised round on unlabeled strips."""
+    import copy
+    import numpy as np
+    from PIL import Image
+    import data as _mvd_data
+
+    if not strip_paths or int(steps) <= 0:
+        return {"ran_steps": 0, "accepted_frac": 0.0, "mean_loss": 0.0}
+
+    dev = torch.device(device)
+    ref_model = copy.deepcopy(net).to(dev).eval()
+    for p in ref_model.parameters():
+        p.requires_grad_(False)
+
+    rng = np.random.default_rng(int(seed))
+    n_imgs = len(strip_paths)
+    in_ch = int(getattr(net, "in_chans", 4))
+    was_train = net.training
+    net.train()
+    use_amp = bool(amp and dev.type == "cuda")
+    total_loss = 0.0
+    total_acc = 0.0
+    ran = 0
+    bs = max(1, int(batch_size))
+
+    for _ in range(int(steps)):
+        idxs = rng.integers(0, n_imgs, size=bs)
+        imgs = []
+        max_w = 0
+        for idx in idxs:
+            try:
+                im = Image.open(strip_paths[int(idx)]).convert("RGB")
+                ow, oh = im.size
+                nw = max(32, min(1536, int(round(ow * (height / max(1, oh))))))
+                im = im.resize((nw, int(height)), Image.BOX)
+                arr = np.asarray(im, dtype=np.float32) / 255.0
+                t = (torch.from_numpy(arr).permute(2, 0, 1) - 0.85) / 0.25
+                if in_ch > 3:
+                    pad_c = torch.zeros((in_ch - 3, int(height), nw), dtype=torch.float32)
+                    t = torch.cat([t, pad_c], dim=0)
+                imgs.append(t)
+                max_w = max(max_w, nw)
+            except Exception:
+                continue
+        if not imgs:
+            continue
+        padded = []
+        for t in imgs:
+            pw = max_w - t.shape[2]
+            if pw > 0:
+                t = F.pad(t, (0, pw, 0, 0), value=0.6)
+            padded.append(t)
+        x = torch.stack(padded, dim=0).to(dev, non_blocking=True)
+
+        opt.zero_grad(set_to_none=True)
+        with torch.amp.autocast("cuda", dtype=amp_dtype, enabled=use_amp):
+            res = bar_math_unsup_step(
+                net,
+                ref_model,
+                _mvd_data.VOCAB,
+                x,
+                kl_beta=float(kl_beta),
+                min_valid_ratio=0.95,
+                max_len=192,
+            )
+            loss = res["loss"] * float(weight)
+        acc = float(res.get("accepted_frac", 0.0))
+        total_acc += acc
+        if acc > 0.0 and torch.isfinite(loss) and loss.requires_grad:
+            if scaler is not None and use_amp and amp_dtype == torch.float16:
+                scaler.scale(loss).backward()
+                scaler.step(opt)
+                scaler.update()
+            else:
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(net.parameters(), 1.0)
+                opt.step()
+            total_loss += float(loss.detach().item())
+        ran += 1
+
+    net.train(was_train)
+    mean_acc = total_acc / max(1, ran)
+    mean_loss = total_loss / max(1, ran)
+    print(f"  [unsup-bar-math step {step}] ran_steps={ran}/{steps} accepted={mean_acc:.2%} mean_loss={mean_loss:.4f}", flush=True)
+    return {"ran_steps": ran, "accepted_frac": mean_acc, "mean_loss": mean_loss}

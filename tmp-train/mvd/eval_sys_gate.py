@@ -155,7 +155,7 @@ def canonicalize_bekern_tail_order(toks):
 def trim_max_len_repeat_loop(toks, max_len=564, min_period=8, min_repeats=4):
     """Trim an infinite verbatim repeating tail ONLY when a strip hit max_len.
 
-    Does nothing for normal strips (``len(toks) < min(max_len, 564) - 2``)
+    Does nothing for normal strips (``len(toks) < int(max_len) - 2``)
     or non-repeating max-length strips. When a strip hits the decode length
     cap with a verbatim ``>=min_period``-token block repeated at least
     ``min_repeats`` times at the tail (allowing a partial final copy cut by
@@ -163,7 +163,7 @@ def trim_max_len_repeat_loop(toks, max_len=564, min_period=8, min_repeats=4):
     trims the runaway copies.
     """
     toks = list(toks)
-    cap = min(int(max_len), 564)
+    cap = int(max_len)
     if len(toks) < cap - 2:
         return toks
     n = len(toks)
@@ -937,6 +937,7 @@ def main():
     report = {
         'gate': 'gate20-sys-v2',
         'gate_manifest_sha256': gate_sha,
+        'suite31_manifest_sha256': suite31_summary.get('suite31_manifest_sha256'),
         'test_pages_touched': 0,
         'blind_photo': bool(args.blind_photo),
         'ckpt': args.ckpt,
@@ -951,7 +952,10 @@ def main():
                    'dynamic_staff_unet': bool(args.dynamic_staff_unet),
                    'rectify': args.rectify,
                    'suite31': args.suite31,
-                   'suite31_dir': args.suite31_dir if args.suite31 else None},
+                   'suite31_dir': args.suite31_dir if args.suite31 else None,
+                   'suite31_manifest': (
+                       suite31_summary.get('suite31_manifest')
+                       if args.suite31 else None)},
         'decoding': {'search': 'beam_search', 'beam': args.beam,
                      'strict': True, 'constrain': True,
                      'ilme_lambda': args.ilme_lambda,
@@ -963,10 +967,10 @@ def main():
                      'max_len': args.max_len, 'image_height': args.height,
                      'preprocessing': preproc,
                      'device': device, 'torch': torch.__version__},
-        'stitch': 'reading order by sys_idx; first-system headers + all '
-                  'bodies concatenated; page ref stitched identically; '
-                  'mid-page clef/key/time changes carried only in dropped '
-                  'non-first headers (known limitation)',
+        'stitch': 'reading order by sys_idx; first-system headers adopted + '
+                  'subsequent unchanged courtesy headers stripped while '
+                  'changed mid-page clef/key/time headers are propagated; '
+                  'page ref stitched identically',
         'summary': summary,
         'systems': sys_rows,
         'pages': page_rows,
@@ -1183,7 +1187,8 @@ def decode_system_v2(net, img_path, row, heat_net, device, height, beam,
                 ink_eos_veto=ink_eos_veto, ilme_lambda=ilme_lambda,
                 lattice_repair=lattice_repair, adapt_steps=adapt_steps,
                 adapt_lr=adapt_lr, stride=stride,
-                verify_beam=verify_beam, verify_alpha=verify_alpha)
+                verify_beam=verify_beam, verify_alpha=verify_alpha,
+                max_len=max_len)
         else:
             if verify_beam:
                 rect_img, ref = rect_mod.rectify_system_strip(
@@ -1203,7 +1208,8 @@ def decode_system_v2(net, img_path, row, heat_net, device, height, beam,
                 ink_eos_veto=ink_eos_veto, ilme_lambda=ilme_lambda,
                 lattice_repair=lattice_repair, adapt_steps=adapt_steps,
                 adapt_lr=adapt_lr, verify_beam=verify_beam,
-                verify_alpha=verify_alpha, obs_gray=obs_gray)
+                verify_alpha=verify_alpha, obs_gray=obs_gray,
+                max_len=max_len)
     secs = time.time() - t0
     valid = hyp_tokens_valid(toks)
     loop_trimmed = False
@@ -1491,7 +1497,8 @@ def decode_curved_system(net, page_img, curved_sys, heat_net, device, height,
                 lattice_repair=lattice_repair, adapt_steps=adapt_steps,
                 adapt_lr=adapt_lr, verify_beam=verify_beam,
                 verify_alpha=verify_alpha,
-                obs_gray=(rect_img if verify_beam else None))
+                obs_gray=(rect_img if verify_beam else None),
+                max_len=max_len)
             chunk_streams.append(ctoks)
             chunk_staff_counts.append(len(staff_indices))
             prev_staves_cum += len(staff_indices)
@@ -1545,6 +1552,60 @@ def decode_row_system(net, img_file, row, heat_net, device, height, beam,
                             verify_alpha=verify_alpha)
 
 
+def classify_suite31_stratum(piece):
+    """Classify a Suite31 / Suite31+HW manifest entry into its protocol stratum.
+
+    Returns one of:
+    - ``'typeset'``: printed engravings (the 31 frozen Suite31 pieces)
+    - ``'hw_landscape'``: IMSLP PD + OpenScore CC0 landscape quartet holographs (5)
+    - ``'hw_portrait_debussy'``: CC-BY-4.0 Debussy portrait manuscripts (4)
+    - ``'hw_portrait_pdm'``: PDM 1.0 SBB Berlin + CC0 OpenScore portrait Lieder (5)
+    - ``'hw_portrait_other'``: any future portrait HW piece outside the above
+    """
+    if not piece.get('handwritten'):
+        return 'typeset'
+    slug = str(piece.get('slug', ''))
+    source = str(piece.get('source', '') or '')
+    lic = str(piece.get('license', '') or '')
+    if source == 'openscore-lieder-pdm' or slug.endswith('-d-b'):
+        return 'hw_portrait_pdm'
+    if 'debussy' in slug or 'debussy-omr' in lic:
+        return 'hw_portrait_debussy'
+    if piece.get('orientation') == 'portrait':
+        return 'hw_portrait_other'
+    return 'hw_landscape'
+
+
+def _summarize_suite31_slice(rows):
+    """Compute per-stratum Suite31 metrics (clean & photo strictly separated)."""
+    def _mean(xs):
+        xs = [x for x in xs if x is not None]
+        return sum(xs) / len(xs) if xs else None
+
+    def _med(xs):
+        xs = [x for x in xs if x is not None]
+        return statistics.median(xs) if xs else None
+
+    ok = [r for r in rows if not r.get('skipped')]
+    return {
+        'n_pieces': len(rows),
+        'n_scored': len(ok),
+        'blind_photo_detected_rate': (
+            sum(1 for r in ok
+                if r.get('deg_box_source') in ('detected', 'staff-unet2d'))
+            / len(ok)
+            if ok else None),
+        'clean_f1_mean': _mean([r.get('clean_f1') for r in ok]),
+        'photo_f1_mean': _mean([r.get('photo_f1') for r in ok]),
+        'clean_notation_f1_mean': _mean([r.get('clean_notation_f1') for r in ok]),
+        'photo_notation_f1_mean': _mean([r.get('photo_notation_f1') for r in ok]),
+        'clean_ser_mean': _mean([r.get('clean_ser') for r in ok]),
+        'photo_ser_mean': _mean([r.get('photo_ser') for r in ok]),
+        'clean_fixes_median': _med([r.get('clean_fixes') for r in ok]),
+        'photo_fixes_median': _med([r.get('photo_fixes') for r in ok]),
+    }
+
+
 def run_suite31(args, net, heat_net, workdir, device, extra_chans=None,
                 staff_unet=None, staff_unet_meta=None):
     """Suite31 photo+clean page eval (T2.4 / Exp 1): boxes or StaffUNet2D, decode, stitch.
@@ -1561,6 +1622,7 @@ def run_suite31(args, net, heat_net, workdir, device, extra_chans=None,
     manifest_path = (Path(args.suite31_manifest)
                      if getattr(args, 'suite31_manifest', None)
                      else (suite / 'suite31_manifest.json'))
+    manifest_sha = sha256_file(manifest_path)
     manifest = json.loads(manifest_path.read_text(encoding='utf-8'))
     pieces = manifest['pieces']
     if getattr(args, 'pieces', None):
@@ -1572,7 +1634,11 @@ def run_suite31(args, net, heat_net, workdir, device, extra_chans=None,
     photo_loop_trimmed = 0
     for piece in pieces:
         slug = piece['slug']
-        prow = {'piece': slug, 'handwritten': bool(piece.get('handwritten', False))}
+        prow = {
+            'piece': slug,
+            'handwritten': bool(piece.get('handwritten', False)),
+            'stratum': classify_suite31_stratum(piece),
+        }
         try:
             gt = suite / piece['gt']['file']
             clean = suite / piece['clean']['file']
@@ -1820,6 +1886,8 @@ def run_suite31(args, net, heat_net, workdir, device, extra_chans=None,
 
     scored_rows = [r for r in piece_rows if not r.get('skipped')]
     summary = {
+        'suite31_manifest': str(manifest_path),
+        'suite31_manifest_sha256': manifest_sha,
         'n_pieces': len(pieces),
         'n_scored': len(scored_rows),
         'blind_photo': blind_photo,
@@ -1834,6 +1902,10 @@ def run_suite31(args, net, heat_net, workdir, device, extra_chans=None,
             [r.get('photo_f1') for r in scored_rows]),
         'suite31_clean_f1_mean': _mean(
             [r.get('clean_f1') for r in scored_rows]),
+        'suite31_photo_ser_mean': _mean(
+            [r.get('photo_ser') for r in scored_rows]),
+        'suite31_clean_ser_mean': _mean(
+            [r.get('clean_ser') for r in scored_rows]),
         'suite31_photo_mod_f1_mean': _mean(
             [r.get('photo_mod_f1') for r in scored_rows]),
         'suite31_clean_mod_f1_mean': _mean(
@@ -1842,6 +1914,12 @@ def run_suite31(args, net, heat_net, workdir, device, extra_chans=None,
             [r.get('photo_notation_f1') for r in scored_rows]),
         'suite31_clean_notation_f1_mean': _mean(
             [r.get('clean_notation_f1') for r in scored_rows]),
+        'suite31_clean_fixes_median': (
+            statistics.median(
+                [r['clean_fixes'] for r in scored_rows
+                 if r.get('clean_fixes') is not None])
+            if any(r.get('clean_fixes') is not None
+                   for r in scored_rows) else None),
         'suite31_photo_fixes_median': (
             statistics.median(
                 [r['photo_fixes'] for r in scored_rows
@@ -1849,8 +1927,15 @@ def run_suite31(args, net, heat_net, workdir, device, extra_chans=None,
             if any(r.get('photo_fixes') is not None
                    for r in scored_rows) else None),
     }
+    strata_summary = {}
+    for stratum_name in ('typeset', 'hw_landscape', 'hw_portrait_debussy',
+                         'hw_portrait_pdm', 'hw_portrait_other'):
+        s_rows = [r for r in piece_rows if r.get('stratum') == stratum_name]
+        if s_rows:
+            strata_summary[stratum_name] = _summarize_suite31_slice(s_rows)
     hw_rows = [r for r in piece_rows if r.get('handwritten')]
     if hw_rows:
+        strata_summary['hw_all'] = _summarize_suite31_slice(hw_rows)
         hw_ok = [r for r in hw_rows if not r.get('skipped')]
         summary.update({
             'suite31_hw_n_pieces': len(hw_rows),
@@ -1871,6 +1956,7 @@ def run_suite31(args, net, heat_net, workdir, device, extra_chans=None,
                 'suite31_typeset_clean_notation_f1_mean': _mean([r.get('clean_notation_f1') for r in ts_ok]),
                 'suite31_typeset_photo_notation_f1_mean': _mean([r.get('photo_notation_f1') for r in ts_ok]),
             })
+    summary['suite31_strata'] = strata_summary
     return piece_rows, summary
 
 

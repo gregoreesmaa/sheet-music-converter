@@ -1976,13 +1976,19 @@ class StaffUNetDataset(Dataset):
                 )
 
         hw_hn_p = float(getattr(self, "hw_hard_neg_prob", 0.0))
-        if self.augment and hw_hn_p > 0.0:
+        if self.augment and (not is_clean) and hw_hn_p > 0.0:
             u1 = _lazy_import_unsup_stage1()
             hn_fn = getattr(u1, "augment_hw_hard_negatives", None) if u1 is not None else None
             if callable(hn_fn):
                 rng_hn = np.random.default_rng((self.seed, self.epoch, int(idx), 9173))
                 if float(rng_hn.random()) < hw_hn_p:
-                    res_hn = hn_fn(arr_rgb, target, rng=rng_hn)
+                    res_hn = hn_fn(
+                        arr_rgb,
+                        target,
+                        rng=rng_hn,
+                        p_blank_staves=0.20,
+                        p_cursive_text=0.45,
+                    )
                     if isinstance(res_hn, tuple) and len(res_hn) == 2:
                         arr_rgb, target = res_hn
                     else:

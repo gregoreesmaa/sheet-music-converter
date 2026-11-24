@@ -297,11 +297,12 @@ def decode_system_with_measure_fallback(net, img_tensor, beam=3,
                                         adapt_lr=0.1,
                                         verify_beam=False,
                                         verify_alpha=2.0,
-                                        obs_gray=None):
+                                        obs_gray=None,
+                                        max_len=564):
     """Beam-decode one system strip with per-measure bar-rest fallback.
 
     Runs ``net.beam_search(img_tensor, beam=beam, strict=True,
-    max_len=564)``; every measure is repaired by :func:`_repair_measure`
+    max_len=max_len)``; every measure is repaired by :func:`_repair_measure`
     (strict-clean passes through, trailing partial events are trimmed
     under a non-strict re-check, ``['bar-rest']`` only when the
     non-strict walk also fails) so surviving measures keep their bar
@@ -338,7 +339,7 @@ def decode_system_with_measure_fallback(net, img_tensor, beam=3,
                          'pass lattice_repair=False')
     if verify_beam and beam >= 2:
         all_beams, all_scores = net.beam_search(
-            img_tensor, beam=beam, strict=True, max_len=564,
+            img_tensor, beam=beam, strict=True, max_len=int(max_len),
             return_beams=True, **bs_kwargs)
         beams_row = all_beams[0]
         scores_row = all_scores[0]
@@ -356,7 +357,7 @@ def decode_system_with_measure_fallback(net, img_tensor, beam=3,
             return list(res['best_toks'])
         return cand_toks[0] if cand_toks else []
     out = net.beam_search(img_tensor, beam=beam, strict=True,
-                          max_len=564, **bs_kwargs)
+                          max_len=int(max_len), **bs_kwargs)
     toks = _ids_to_tokens(out)
     fixed, _, _ = fallback_repair(toks)
     return fixed
@@ -393,7 +394,8 @@ def _decode_chunk(net, page_img, chunk_staves, beam, extra_fn=None,
                   mem_mask=None, ink_eos_veto=False, ilme_lambda=0.0,
                   lattice_repair=False, adapt_steps=0, adapt_lr=0.1,
                   stride='8x16', target_sp=rectify.REF_TARGET_SP,
-                  height=None, verify_beam=False, verify_alpha=2.0):
+                  height=None, verify_beam=False, verify_alpha=2.0,
+                  max_len=564):
     """Rectify one <=4-staff chunk and fallback-decode it.
 
     ``extra_fn`` (T2.4 hybrid hook): ``(rect_img, staff_ref) ->
@@ -421,7 +423,8 @@ def _decode_chunk(net, page_img, chunk_staves, beam, extra_fn=None,
         lattice_repair=lattice_repair, adapt_steps=adapt_steps,
         adapt_lr=adapt_lr, verify_beam=verify_beam,
         verify_alpha=verify_alpha,
-        obs_gray=(rect_img if verify_beam else None))
+        obs_gray=(rect_img if verify_beam else None),
+        max_len=max_len)
 
 
 def _explicit_voice(measure):
@@ -543,7 +546,7 @@ def decode_multi_staff_system(net, page_img, system_staves_lines,
                               adapt_lr=0.1, stride='8x16',
                               target_sp=rectify.REF_TARGET_SP,
                               height=None, verify_beam=False,
-                              verify_alpha=2.0):
+                              verify_alpha=2.0, max_len=564):
     """Decode a system of any staff count with measure-level merging.
 
     ``<= 4`` staves: rectify once, decode once. ``> 4`` staves: slice
@@ -572,7 +575,8 @@ def decode_multi_staff_system(net, page_img, system_staves_lines,
                              adapt_lr=adapt_lr, stride=stride,
                              target_sp=target_sp, height=height,
                              verify_beam=verify_beam,
-                             verify_alpha=verify_alpha)
+                             verify_alpha=verify_alpha,
+                             max_len=max_len)
     if mem_mask is not None:
         raise ValueError('mem_mask cannot span chunked (> 4 staff) '
                          'decodes; pass None so each chunk builds its '
@@ -592,7 +596,8 @@ def decode_multi_staff_system(net, page_img, system_staves_lines,
                              adapt_lr=adapt_lr, stride=stride,
                              target_sp=target_sp, height=height,
                              verify_beam=verify_beam,
-                             verify_alpha=verify_alpha)
+                             verify_alpha=verify_alpha,
+                             max_len=max_len)
         chunk_streams.append(toks)
         chunk_staff_counts.append(len(chunk))
         prev_staves_cum += len(chunk)

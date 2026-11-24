@@ -745,9 +745,9 @@ class TestLoopTrimmedTracking(unittest.TestCase):
         loop_bar = ['voice-1', 'quarter', 'C', '4', 'quarter', 'E', '4',
                     'quarter', 'G', '4', 'quarter', 'C', '5', 'bar']
         toks = list(prefix)
-        while len(toks) < 564:
+        while len(toks) < 576:
             toks.extend(loop_bar)
-        toks = toks[:564]
+        toks = toks[:576]
         with tempfile.TemporaryDirectory(prefix='t_loop_v2_') as tmp:
             tmpd = Path(tmp)
             img_path = tmpd / 'strip.png'

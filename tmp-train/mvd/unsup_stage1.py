@@ -620,3 +620,90 @@ def augment_hw_hard_negatives(
         out_img = out_np.astype(orig_dtype, copy=False)
 
     return out_img, heatmaps
+
+
+def run_unsup_round(
+    model: nn.Module,
+    ema_model: nn.Module | None,
+    opt: torch.optim.Optimizer,
+    image_paths: list,
+    steps: int = 200,
+    ema_decay: float = 0.999,
+    device: torch.device | str = "cpu",
+    epoch: int = 1,
+    seed: int = 42,
+    batch_size: int = 4,
+    target_h: int = 1024,
+    target_w: int = 768,
+    dynamic_res: bool = False,
+    sp_mode: str = "log_hm",
+    out_stride: int = 2,
+    bf16: bool = False,
+    **_extra,
+) -> dict:
+    """Execute one Stage-1 unsupervised EMA geometric + log_hm scale equivariance round."""
+    from PIL import Image
+
+    if not image_paths or int(steps) <= 0:
+        return {"ran_steps": 0, "mean_loss": 0.0}
+
+    dev = torch.device(device)
+    teacher = ema_model if isinstance(ema_model, EMAModel) else EMAModel(model, decay=ema_decay)
+    if isinstance(ema_model, nn.Module) and not isinstance(ema_model, EMAModel):
+        teacher = ema_model
+    teacher_is_wrapper = isinstance(teacher, EMAModel)
+    teacher_net = teacher.model if teacher_is_wrapper else teacher
+    teacher_net.to(dev).eval()
+
+    rng = np.random.default_rng(int(seed))
+    n_imgs = len(image_paths)
+    was_train = model.training
+    model.train()
+    use_bf16 = bool(bf16 and dev.type == "cuda")
+    total_loss = 0.0
+    ran = 0
+    bs = max(1, min(int(batch_size), 4))
+    in_h, in_w = (1024, 768) if dynamic_res else (int(target_h), int(target_w))
+
+    for s in range(int(steps)):
+        idxs = rng.integers(0, n_imgs, size=bs)
+        batch_tensors = []
+        for idx in idxs:
+            try:
+                im = Image.open(image_paths[int(idx)]).convert("RGB")
+                im = im.resize((in_w, in_h), Image.BOX)
+                arr = np.asarray(im, dtype=np.float32) / 255.0
+                batch_tensors.append(torch.from_numpy(arr).permute(2, 0, 1))
+            except Exception:
+                continue
+        if not batch_tensors:
+            continue
+        x = torch.stack(batch_tensors, dim=0).to(dev, non_blocking=True)
+        if dev.type == "cuda":
+            x = x.to(memory_format=torch.channels_last)
+        opt.zero_grad(set_to_none=True)
+        with torch.amp.autocast("cuda", dtype=torch.bfloat16, enabled=use_bf16):
+            loss, _ = stage1_equivariance_loss(
+                model,
+                teacher_net,
+                x,
+                sp_mode=sp_mode,
+                out_stride=out_stride,
+            )
+        if torch.isfinite(loss):
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 2.0)
+            opt.step()
+            if teacher_is_wrapper:
+                teacher.update(model, decay=ema_decay)
+            else:
+                with torch.no_grad():
+                    for p_t, p_s in zip(teacher_net.parameters(), model.parameters()):
+                        p_t.mul_(ema_decay).add_(p_s, alpha=1.0 - ema_decay)
+            total_loss += float(loss.detach().item())
+            ran += 1
+
+    model.train(was_train)
+    mean_loss = total_loss / max(1, ran)
+    print(f"  [unsup-stage1 ep {epoch:03d}] ran_steps={ran}/{steps} mean_loss={mean_loss:.4f}", flush=True)
+    return {"ran_steps": ran, "mean_loss": mean_loss}

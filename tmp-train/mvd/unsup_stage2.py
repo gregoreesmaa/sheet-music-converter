@@ -281,3 +281,97 @@ def episodic_page_ln_tta(
         for p, rg in orig_req_grad.items():
             p.requires_grad_(rg)
         model.train(was_training)
+
+
+def run_unsup_round(
+    net: nn.Module,
+    opt: torch.optim.Optimizer,
+    scaler,
+    strip_paths: list,
+    step: int = 0,
+    steps: int = 100,
+    weight: float = 0.25,
+    height: int = 256,
+    device: torch.device | str = "cpu",
+    amp: bool = False,
+    amp_dtype=torch.bfloat16,
+    seed: int = 0,
+    batch_size: int = 2,
+    **_extra,
+) -> dict:
+    """Execute one Stage-2 encoder-only multi-view EMA consistency round (zero pseudo-labels)."""
+    import numpy as np
+    from PIL import Image
+
+    if not strip_paths or int(steps) <= 0:
+        return {"ran_steps": 0, "mean_loss": 0.0}
+
+    dev = torch.device(device)
+    ema = EMAModel(net, decay=0.995)
+    ema.model.to(dev).eval()
+    rng = np.random.default_rng(int(seed))
+    n_imgs = len(strip_paths)
+    in_ch = int(getattr(net, "in_chans", 4))
+    was_train = net.training
+    net.train()
+    use_amp = bool(amp and dev.type == "cuda")
+    total_loss = 0.0
+    ran = 0
+    bs = max(1, int(batch_size))
+
+    for _ in range(int(steps)):
+        idxs = rng.integers(0, n_imgs, size=bs)
+        imgs = []
+        max_w = 0
+        for idx in idxs:
+            try:
+                im = Image.open(strip_paths[int(idx)]).convert("RGB")
+                ow, oh = im.size
+                nw = max(32, min(2048, int(round(ow * (height / max(1, oh))))))
+                im = im.resize((nw, int(height)), Image.BOX)
+                arr = np.asarray(im, dtype=np.float32) / 255.0
+                t = (torch.from_numpy(arr).permute(2, 0, 1) - 0.85) / 0.25
+                if in_ch > 3:
+                    pad_c = torch.zeros((in_ch - 3, int(height), nw), dtype=torch.float32)
+                    t = torch.cat([t, pad_c], dim=0)
+                imgs.append(t)
+                max_w = max(max_w, nw)
+            except Exception:
+                continue
+        if not imgs:
+            continue
+        padded = []
+        for t in imgs:
+            pw = max_w - t.shape[2]
+            if pw > 0:
+                t = F.pad(t, (0, pw, 0, 0), value=0.6)
+            padded.append(t)
+        weak = torch.stack(padded, dim=0).to(dev, non_blocking=True)
+        # Photometric-only strong view (geom=0 so spatial coordinates align 1-to-1)
+        gain = torch.empty((weak.shape[0], 1, 1, 1), device=dev).uniform_(0.78, 1.22)
+        bias = torch.empty((weak.shape[0], 1, 1, 1), device=dev).uniform_(-0.25, 0.25)
+        noise = torch.randn_like(weak) * 0.08
+        strong = weak.clone()
+        strong[:, :3] = weak[:, :3] * gain + bias + noise
+
+        opt.zero_grad(set_to_none=True)
+        with torch.amp.autocast("cuda", dtype=amp_dtype, enabled=use_amp):
+            loss, _ = stage2_encoder_ema_consistency_loss(net, ema.model, weak, strong)
+            scaled = loss * float(weight)
+        if torch.isfinite(scaled):
+            if scaler is not None and use_amp and amp_dtype == torch.float16:
+                scaler.scale(scaled).backward()
+                scaler.step(opt)
+                scaler.update()
+            else:
+                scaled.backward()
+                torch.nn.utils.clip_grad_norm_(net.parameters(), 1.0)
+                opt.step()
+            ema.update(net)
+            total_loss += float(loss.detach().item())
+            ran += 1
+
+    net.train(was_train)
+    mean_loss = total_loss / max(1, ran)
+    print(f"  [unsup-stage2-ema step {step}] ran_steps={ran}/{steps} mean_loss={mean_loss:.4f}", flush=True)
+    return {"ran_steps": ran, "mean_loss": mean_loss}
