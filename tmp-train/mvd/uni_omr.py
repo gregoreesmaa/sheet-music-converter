@@ -3501,6 +3501,7 @@ def run_train(args: argparse.Namespace, cfg: UniOMRConfig) -> Dict[str, Any]:
             last_n_out = 0
             last_kind = args.curriculum
 
+            oom_hit = False
             for micro in range(grad_accum):
                 images, seq, uv_target, kind = _next_batch(step, micro)
                 tgt_in = seq[:, :-1]
@@ -3512,59 +3513,78 @@ def run_train(args: argparse.Namespace, cfg: UniOMRConfig) -> Dict[str, Any]:
                     if use_bf16
                     else contextlib.nullcontext()
                 )
-                with amp_ctx:
-                    if cass_prob > 0.0 and tgt_in.shape[1] > 1:
-                        # Two-pass parallel scheduled sampling (CASS): encode image ONCE,
-                        # run a no-grad draft decode to get parallel argmax predictions,
-                        # replace cass_prob of non-BOS/non-PAD tgt_in[:, 1:] with pred_ids[:, :-1],
-                        # then run the real gradient-enabled decoder pass reusing mem.
-                        mem, uv_pred, router_info = model.encode_image(images, return_aux=want_aux)
-                        with torch.no_grad():
-                            draft_logits, _ = model.decode_tokens(tgt_in, mem.detach(), return_mtp=False)
-                            pred_ids = draft_logits.argmax(dim=-1)
-                            tail_in = tgt_in[:, 1:]
-                            cass_mask = (
-                                (torch.rand_like(tail_in, dtype=torch.float32) < cass_prob)
-                                & (tail_in != PAD_ID)
-                                & (tail_in != BOS_ID)
-                            )
-                            dec_in = torch.cat(
-                                [tgt_in[:, :1], torch.where(cass_mask, pred_ids[:, :-1], tail_in)],
-                                dim=1,
-                            )
-                        logits, mtp_logits = model.decode_tokens(dec_in, mem, return_mtp=(cfg.mtp_k > 1))
-                        out = {
-                            "logits": logits,
-                            "mtp_logits": mtp_logits,
-                            "uv_pred": uv_pred,
-                            "router_info": router_info,
-                        }
-                    else:
-                        out = model(images, tgt_in, return_aux=want_aux, return_mtp=(cfg.mtp_k > 1))
-                    losses = model.compute_loss(
-                        out,
-                        tgt_out,
-                        uv_target=uv_target,
-                        mtp_loss_weight=args.mtp_loss_weight,
-                        uv_loss_weight=args.uv_loss_weight,
-                        saliency_loss_weight=saliency_loss_weight,
-                    )
+                try:
+                    with amp_ctx:
+                        if cass_prob > 0.0 and tgt_in.shape[1] > 1:
+                            # Two-pass parallel scheduled sampling (CASS): encode image ONCE,
+                            # run a no-grad draft decode to get parallel argmax predictions,
+                            # replace cass_prob of non-BOS/non-PAD tgt_in[:, 1:] with pred_ids[:, :-1],
+                            # then run the real gradient-enabled decoder pass reusing mem.
+                            mem, uv_pred, router_info = model.encode_image(images, return_aux=want_aux)
+                            with torch.no_grad():
+                                draft_logits, _ = model.decode_tokens(tgt_in, mem.detach(), return_mtp=False)
+                                pred_ids = draft_logits.argmax(dim=-1)
+                                tail_in = tgt_in[:, 1:]
+                                cass_mask = (
+                                    (torch.rand_like(tail_in, dtype=torch.float32) < cass_prob)
+                                    & (tail_in != PAD_ID)
+                                    & (tail_in != BOS_ID)
+                                )
+                                dec_in = torch.cat(
+                                    [tgt_in[:, :1], torch.where(cass_mask, pred_ids[:, :-1], tail_in)],
+                                    dim=1,
+                                )
+                            logits, mtp_logits = model.decode_tokens(dec_in, mem, return_mtp=(cfg.mtp_k > 1))
+                            out = {
+                                "logits": logits,
+                                "mtp_logits": mtp_logits,
+                                "uv_pred": uv_pred,
+                                "router_info": router_info,
+                            }
+                        else:
+                            out = model(images, tgt_in, return_aux=want_aux, return_mtp=(cfg.mtp_k > 1))
+                        losses = model.compute_loss(
+                            out,
+                            tgt_out,
+                            uv_target=uv_target,
+                            mtp_loss_weight=args.mtp_loss_weight,
+                            uv_loss_weight=args.uv_loss_weight,
+                            saliency_loss_weight=saliency_loss_weight,
+                        )
 
-                (losses["loss"] * inv_ga).backward()
-                acc_loss_t.add_(losses["loss"].detach().float(), alpha=inv_ga)
-                acc_ce_t.add_(losses["ce_loss"].detach().float(), alpha=inv_ga)
-                acc_mtp_t.add_(losses["mtp_loss"].detach().float(), alpha=inv_ga)
-                acc_uv_t.add_(losses["uv_loss"].detach().float(), alpha=inv_ga)
-                acc_sal_t.add_(losses["saliency_loss"].detach().float(), alpha=inv_ga)
-                last_n_in = int(out["router_info"]["n_in"])
-                last_n_out = int(out["router_info"]["n_out"])
-                last_kind = kind
+                    (losses["loss"] * inv_ga).backward()
+                    acc_loss_t.add_(losses["loss"].detach().float(), alpha=inv_ga)
+                    acc_ce_t.add_(losses["ce_loss"].detach().float(), alpha=inv_ga)
+                    acc_mtp_t.add_(losses["mtp_loss"].detach().float(), alpha=inv_ga)
+                    acc_uv_t.add_(losses["uv_loss"].detach().float(), alpha=inv_ga)
+                    acc_sal_t.add_(losses["saliency_loss"].detach().float(), alpha=inv_ga)
+                    last_n_in = int(out["router_info"]["n_in"])
+                    last_n_out = int(out["router_info"]["n_out"])
+                    last_kind = kind
+                except Exception as e:
+                    if device.type == "cuda" and "out of memory" in str(e).lower():
+                        print(
+                            f"  [WARN OOM skip] step {step} micro {micro} kind={kind} "
+                            f"img={tuple(images.shape)} seq={tuple(seq.shape)} "
+                            f"alloc={torch.cuda.memory_allocated(device)/1e9:.2f}GB "
+                            f"resv={torch.cuda.memory_reserved(device)/1e9:.2f}GB"
+                        )
+                        oom_hit = True
+                        mem = uv_pred = router_info = logits = mtp_logits = dec_in = draft_logits = pred_ids = None
+                        del images, seq, uv_target, tgt_in, tgt_out
+                        opt.zero_grad(set_to_none=True)
+                        torch.cuda.empty_cache()
+                        break
+                    raise
                 del images, seq, uv_target, tgt_in, tgt_out, out, losses
                 mem = uv_pred = router_info = logits = mtp_logits = dec_in = draft_logits = pred_ids = None
 
+            if oom_hit:
+                continue
+
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             opt.step()
-            if device.type == "cuda" and torch.cuda.memory_reserved(device) > 10 * (1024 ** 3):
+            if device.type == "cuda" and torch.cuda.memory_reserved(device) > 8 * (1024 ** 3):
                 torch.cuda.empty_cache()
 
             if ema_teacher is not None:
