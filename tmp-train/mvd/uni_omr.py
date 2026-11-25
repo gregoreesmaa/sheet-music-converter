@@ -158,6 +158,7 @@ class UniOMRConfig:
     mtp_k: int = 4
     max_dec_len: int = 4096
     rope_base: float = 10000.0
+    grad_checkpoint: bool = False
 
     def __post_init__(self) -> None:
         self.backbone_stride = normalize_backbone_stride(self.backbone_stride)
@@ -1043,8 +1044,17 @@ class UniOMRNet(nn.Module):
         )
         cos2d, sin2d = self.rope2d(routed_coords, dtype=routed_tokens.dtype)
         mem = routed_tokens + pos2d
-        for layer in self.enc_layers:
-            mem = layer(mem, rope_cos=cos2d, rope_sin=sin2d)
+        if self.training and self.cfg.grad_checkpoint and torch.is_grad_enabled():
+            from torch.utils.checkpoint import checkpoint as _grad_ckpt
+            for layer in self.enc_layers:
+                mem = _grad_ckpt(
+                    lambda _m, _c, _s, _l=layer: _l(_m, rope_cos=_c, rope_sin=_s),
+                    mem, cos2d, sin2d,
+                    use_reentrant=False,
+                )
+        else:
+            for layer in self.enc_layers:
+                mem = layer(mem, rope_cos=cos2d, rope_sin=sin2d)
         mem = self.enc_norm(mem) + pos2d
 
         # Auxiliary UV-flow head: skipped at inference unless explicitly requested.
@@ -1104,6 +1114,13 @@ class UniOMRNet(nn.Module):
                     past_kv=layer_past, use_cache=True,
                 )
                 new_past_kvs.append(layer_kv)
+            elif self.training and self.cfg.grad_checkpoint and torch.is_grad_enabled():
+                from torch.utils.checkpoint import checkpoint as _grad_ckpt
+                x = _grad_ckpt(
+                    lambda _x, _m, _c, _s, _l=layer: _l(_x, memory=_m, rope_cos=_c, rope_sin=_s),
+                    x, memory, cos1d, sin1d,
+                    use_reentrant=False,
+                )
             else:
                 x = layer(x, memory=memory, rope_cos=cos1d, rope_sin=sin1d)
         h = self.dec_norm(x)
@@ -3761,6 +3778,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
     # Runtime / training
     p.add_argument("--bf16", action="store_true", help="Enable bfloat16 autocast")
+    p.add_argument("--grad-checkpoint", action="store_true", help="Enable gradient checkpointing on encoder/decoder transformer layers")
     p.add_argument("--steps", type=int, default=100)
     p.add_argument("--batch-size", type=int, default=2)
     p.add_argument("--eval-batch-size", type=int, default=None, help="Batch size for eval_dataset (default: 8 on CUDA, falls back to --batch-size on CPU/dry-run)")
@@ -3799,6 +3817,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         mixstyle_prob=args.mixstyle_prob,
         tok_dropout=args.tok_dropout,
         mtp_k=args.mtp_k,
+        grad_checkpoint=bool(args.grad_checkpoint),
     )
 
     if args.mode == "bench_browser":

@@ -52,8 +52,28 @@ SUITE31_MANIFESTS: Tuple[Path, ...] = (
     _REPO_ROOT / "data-gen" / "score-corpus" / "suite31" / "suite31_hw_only_manifest.json",
 )
 
+GATE20_EXCLUSION_JSON: Path = _REPO_ROOT / "data-gen" / "score-corpus" / "gate20" / "exclusion.json"
+GATE20_MANIFEST_JSON: Path = _REPO_ROOT / "data-gen" / "score-corpus" / "gate20" / "gate_manifest.json"
+
+# Separator-preserving raw patterns for opus+number pairs that would collide with unrelated
+# opus numbers if stripped of punctuation (e.g. "op6-2" normalized -> "op62" would falsely
+# block Opus 62 works!). Matched on raw lowercased path/stem with digit-boundary guards.
+_EXTRA_RAW_EVAL_REGEXES: Tuple[re.Pattern[str], ...] = tuple(
+    re.compile(pat, re.IGNORECASE)
+    for pat in (
+        r"(?:^|[^a-z0-9])op\.?\s*0?6[\s_\-\.]+(?:no\.?\s*)?2(?:[^0-9]|$)",
+        r"(?:^|[^a-z0-9])op\.?\s*17[\s_\-\.]+(?:no\.?\s*)?3(?:[^0-9]|$)",
+        r"(?:^|[^a-z0-9])op\.?\s*18[\s_\-\.]+(?:no\.?\s*|n)?1(?:[^0-9]|$)",
+        r"(?:^|[^a-z0-9])op\.?\s*41[\s_\-\.]+(?:no\.?\s*|n)?1(?:[^0-9]|$)",
+        r"(?:^|[^a-z0-9])op\.?\s*74[\s_\-\.]+(?:no\.?\s*|n)?1(?:[^0-9]|$)",
+        r"(?:^|[^a-z0-9])op\.?\s*0?1[\s_\-\.]+(?:no\.?\s*|n)?1(?:[^0-9]|$)",
+        r"(?:^|[^a-z0-9])op\.?\s*19(?:[^0-9]|$)",
+    )
+)
+
 # Explicit normalized substring tokens derived from all 45 suite31 + hw eval pieces
 # to catch differently-named copies of the exact same compositions across repos.
+# NOTE: Never put bare "op6-2" here (normalizes to "op62" -> false-positive on Opus 62).
 _EXTRA_EVAL_TOKENS: Tuple[str, ...] = (
     "bwv66",
     "bwv_66",
@@ -61,9 +81,6 @@ _EXTRA_EVAL_TOKENS: Tuple[str, ...] = (
     "maple_leaf",
     "maple-leaf",
     "mapleleaf",
-    "op19",
-    "op_19",
-    "op-19",
     "grosse_fuge",
     "grosse-fuge",
     "grossefuge",
@@ -74,25 +91,16 @@ _EXTRA_EVAL_TOKENS: Tuple[str, ...] = (
     "k_458",
     "k-458",
     "op18n1",
-    "op18_1",
-    "op18-1",
     "op18_no1",
     "op74n1",
-    "op74_1",
-    "op74-1",
     "op74_no1",
     "mazurka06",
     "op06_no2",
     "op6_no2",
-    "op6-2",
     "lindenbaum",
     "dichterliebe",
     "op41n1",
-    "op41_1",
-    "op41-1",
     "op1n1",
-    "op17-3",
-    "op17_3",
     "concertino",
     "la_donna",
     "la-donna",
@@ -147,7 +155,7 @@ def _norm_key(s: str) -> str:
 
 
 def load_eval_blocklist() -> Tuple[Set[str], Set[str], Set[str]]:
-    """Return (raw_slugs, norm_tokens, gt_sha256s) from all suite31 manifests."""
+    """Return (raw_slugs, norm_tokens, gt_sha256s) from all suite31_hw + gate20 manifests."""
     raw_slugs: Set[str] = set()
     norm_tokens: Set[str] = set()
     gt_sha256s: Set[str] = set()
@@ -169,6 +177,31 @@ def load_eval_blocklist() -> Tuple[Set[str], Set[str], Set[str]]:
             if isinstance(gt, dict) and gt.get("sha256"):
                 gt_sha256s.add(str(gt["sha256"]).lower())
 
+    # Strict gate20 work-level exclusion (page stems -> work stems + upstream lc* IDs + GT sha256)
+    if GATE20_EXCLUSION_JSON.exists():
+        g_ex = json.loads(GATE20_EXCLUSION_JSON.read_text(encoding="utf-8"))
+        for key in ("do_not_train", "held_out_4page_gate"):
+            for page_id in g_ex.get(key, []):
+                work_stem = re.sub(r"-\d+$", "", str(page_id).strip().lower())
+                if work_stem:
+                    raw_slugs.add(work_stem)
+                    norm_tokens.add(_norm_key(work_stem))
+
+    if GATE20_MANIFEST_JSON.exists():
+        g_man = json.loads(GATE20_MANIFEST_JSON.read_text(encoding="utf-8"))
+        for page in g_man.get("pages", []):
+            score_id = str(page.get("score", "")).strip().lower()
+            if score_id:
+                raw_slugs.add(score_id)
+                norm_tokens.add(_norm_key(score_id))
+            src = str(page.get("source", ""))
+            for lc_m in re.findall(r"lc\d{5,}", src, flags=re.IGNORECASE):
+                raw_slugs.add(lc_m.lower())
+                norm_tokens.add(lc_m.lower())
+            gt_sha = page.get("ground_truth_musicxml_sha256")
+            if gt_sha:
+                gt_sha256s.add(str(gt_sha).lower())
+
     for tok in _EXTRA_EVAL_TOKENS:
         norm_tokens.add(_norm_key(tok))
 
@@ -184,14 +217,18 @@ def is_eval_blocked(
     gt_sha256s: Set[str],
     check_sha: bool = True,
 ) -> bool:
-    """Return True if `path` matches any eval slug, normalized token, or GT SHA-256."""
+    """Return True if `path` matches any eval slug, regex, normalized token, or GT SHA-256."""
     full_str = str(path).lower()
     stem_l = path.stem.lower()
+    parent_and_stem = f"{path.parent.name}/{path.stem}".lower()
     norm_full = _norm_key(path.parent.name + "_" + path.stem)
     norm_stem = _norm_key(path.stem)
 
     for slug in raw_slugs:
         if slug in full_str or slug in stem_l:
+            return True
+    for pat in _EXTRA_RAW_EVAL_REGEXES:
+        if pat.search(parent_and_stem) or pat.search(stem_l):
             return True
     for tok in norm_tokens:
         if tok in norm_stem or tok in norm_full:
@@ -355,86 +392,42 @@ PAGE_SIZES: Tuple[Tuple[int, int], ...] = (
     (1700, 2200),
 )
 
+LANDSCAPE_PAGE_SIZES: Tuple[Tuple[int, int], ...] = (
+    (2200, 1650),
+    (2339, 1654),
+    (2200, 1550),
+)
 
-_CLEAN_PAPER_PATCHED = False
 
-
-def _enable_clean_paper_mode() -> None:
-    """Strip all paper texture, tint, vignette, stains, bleed, folds, foxing, blots, smears & wear.
-
-    Keeps 100% of pure handwritten ink, nib physics, 234+random scribe morphologies,
-    86 expressive glyphs, rastrum staves, cursive ligatures, ductus/spacing quirks,
-    and pure-ink annotations/chords/measure numbers on crisp [1.0, 1.0, 1.0] white paper,
-    so downstream online augmentation (epoch_aug / doc-photo-degrade) owns all paper/photo
-    effects without double-degrading.
-    """
-    global _CLEAN_PAPER_PATCHED
-    if _CLEAN_PAPER_PATCHED:
-        return
-    from hw_score_sim import layout_quirks, manuscript_marks, profile_resolver
-
-    def _pure_white_paper(
-        width: int,
-        height: int,
-        style: Dict[str, Any],
-        rng: np.random.Generator,
-    ) -> np.ndarray:
-        return np.ones((int(height), int(width), 3), dtype=np.float32)
-
-    def _noop_pre_ink(
-        canvas: Any,
-        style: Dict[str, Any],
-        rng: np.random.Generator,
-        marks_out: List[Dict[str, Any]],
-    ) -> None:
-        return None
-
-    _orig_resolve = profile_resolver.resolve_page_and_expressive_profile
-
-    def _clean_resolve(raw_style: Dict[str, Any]) -> Dict[str, Any]:
-        resolved = dict(_orig_resolve(raw_style))
-        resolved.update(
-            {
-                "paper_rgb": (1.0, 1.0, 1.0),
-                "paper_type": "bright_white",
-                "paper_grain": 0.0,
-                "paper_mottle": 0.0,
-                "bleed_through": 0.0,
-                "stain_prob": 0.0,
-                "eraser_smudge_prob": 0.0,
-                "verso_bleed_strength": 0.0,
-                "fold_crease_prob": 0.0,
-                "foxing_cluster_prob": 0.0,
-                "ink_blot_prob": 0.0,
-                "palm_smear_prob": 0.0,
-                "dog_ear_prob": 0.0,
-                "dog_ear_wear_prob": 0.0,
-                "paper_border_mode": "none",
-                "paper_border_style": "clean",
-                "paper_binding_mode": "none",
-                "binding_edge": "none",
-                "paper_background_grid": "none",
-                "paper_crease_fold": "none",
-            }
-        )
-        return resolved
-
-    layout_quirks.make_manuscript_paper = _pure_white_paper
-    manuscript_marks.apply_pre_ink_manuscript_layers = _noop_pre_ink
-    profile_resolver.resolve_page_and_expressive_profile = _clean_resolve
-    _CLEAN_PAPER_PATCHED = True
+def _validate_strip_bekern(
+    bek_path: Path,
+    expected_n_meas: int,
+    mvd_data: Any,
+) -> Tuple[bool, str, int]:
+    """Strict inline hard gate: verify 0 OOV against closed VOCAB (237) and n_bar_toks == expected_n_meas."""
+    try:
+        toks = mvd_data.load_bekern(bek_path)
+    except Exception as exc:
+        return False, f"load_bekern_failed: {exc}", 0
+    if len(toks) < 4:
+        return False, "too_few_tokens", 0
+    try:
+        mvd_data.encode(toks)
+    except Exception as exc:
+        return False, f"oov_token: {exc}", 0
+    n_bar_toks = sum(1 for t in toks if t == "bar")
+    if n_bar_toks != expected_n_meas:
+        return False, f"barline_mismatch:{n_bar_toks}!={expected_n_meas}", n_bar_toks
+    return True, "ok", n_bar_toks
 
 
 def _worker_render_one(job: Dict[str, Any]) -> Dict[str, Any]:
-    """Render one handwritten page, validate Stage-2 bekern strips, and return metadata."""
+    """Render one handwritten page, enforce barline + 0-OOV gates on every system, and return metadata."""
     os.environ["CUDA_VISIBLE_DEVICES"] = ""
     if str(_THIS_DIR) not in sys.path:
         sys.path.insert(0, str(_THIS_DIR))
     if str(_MVD_DIR) not in sys.path:
         sys.path.insert(0, str(_MVD_DIR))
-
-    if job.get("clean_paper"):
-        _enable_clean_paper_mode()
 
     import data as mvd_data
     from hw_score_sim import parse_score, render_score_handwritten, sample_random_scribe, styles as hw_styles, renderer as hw_renderer
@@ -456,7 +449,6 @@ def _worker_render_one(job: Dict[str, Any]) -> Dict[str, Any]:
             hw_renderer._find_assembly_serialize_bin = _repo_find_bin
 
     # Allow passing a continuous sampled style dict directly to render_score_handwritten
-    # (hw-score-sim 0.3.0's styles.get_style expects a str key).
     if not getattr(hw_styles.get_style, "_dict_passthrough", False):
         _orig_get_style = hw_styles.get_style
 
@@ -476,6 +468,9 @@ def _worker_render_one(job: Dict[str, Any]) -> Dict[str, Any]:
     style_name_arg = job["style_name"]
     seed = int(job["seed"])
     page_w, page_h = int(job["page_w"]), int(job["page_h"])
+    is_landscape = bool(page_w > page_h)
+    clean_paper = bool(job.get("clean_paper", False))
+    max_parts = int(job.get("max_parts", 6))
     pages_dir = Path(job["pages_dir"])
     strips_dir = Path(job["strips_dir"])
     tmp_export_dir = Path(job["tmp_export_dir"])
@@ -483,13 +478,43 @@ def _worker_render_one(job: Dict[str, Any]) -> Dict[str, Any]:
     page_png = pages_dir / f"{stem}.png"
     page_json = pages_dir / f"{stem}.json"
 
-    # Resume check: if page PNG + JSON already exist and are valid, collect existing strips
+    # Resume check: if page PNG + JSON already exist and are valid, re-validate strips
     if page_png.exists() and page_json.exists() and page_png.stat().st_size > 1000:
         try:
             gt_payload = json.loads(page_json.read_text(encoding="utf-8"))
-            if gt_payload.get("systems"):
-                existing_strips = sorted(strips_dir.glob(f"{stem}_s*-bekern.txt"))
+            nonblank_sys = [s for s in gt_payload.get("systems", []) if not s.get("is_blank_prerule")]
+            if nonblank_sys:
                 s1_row = gt_payload_to_stage1_row(gt_payload, page_png)
+                valid_beks: List[str] = []
+                n_bar_ok = 0
+                n_bar_fail = 0
+                n_oov_fail = 0
+                for sys_obj in nonblank_sys:
+                    k = int(sys_obj["system_index"])
+                    n_meas = int(sys_obj["measure_end"]) - int(sys_obj["measure_start"])
+                    bek_p = strips_dir / f"{stem}_s{k}-bekern.txt"
+                    png_p = strips_dir / f"{stem}_s{k}.png"
+                    if bek_p.exists() and png_p.exists():
+                        ok_s, reason, _ = _validate_strip_bekern(bek_p, n_meas, mvd_data)
+                        if ok_s:
+                            valid_beks.append(str(bek_p.resolve()))
+                            n_bar_ok += 1
+                        elif reason.startswith("barline_mismatch"):
+                            n_bar_fail += 1
+                        elif reason.startswith("oov_token"):
+                            n_oov_fail += 1
+                fullpage_ok = len(valid_beks) == len(nonblank_sys) and len(nonblank_sys) > 0
+                fullpage_row = (
+                    {
+                        "image": str(page_png.resolve()),
+                        "bekerns": valid_beks,
+                        "domain": "hw",
+                        "n_systems": len(nonblank_sys),
+                        "n_staves": len(s1_row["staves"]),
+                    }
+                    if fullpage_ok
+                    else None
+                )
                 return {
                     "ok": True,
                     "resumed": True,
@@ -499,19 +524,31 @@ def _worker_render_one(job: Dict[str, Any]) -> Dict[str, Any]:
                     "score_path": str(score_path),
                     "mode": mode,
                     "style": gt_payload.get("style", str(style_name_arg)),
+                    "clean_paper": bool(gt_payload.get("clean_paper", clean_paper)),
+                    "is_landscape": bool(int(gt_payload.get("page_w", page_w)) > int(gt_payload.get("page_h", page_h))),
+                    "n_parts": len(nonblank_sys[0].get("staves", [])),
+                    "n_systems": len(nonblank_sys),
                     "n_staves": len(s1_row["staves"]),
-                    "n_strips_ok": len(existing_strips),
+                    "n_strips_ok": len(valid_beks),
+                    "n_strips_rejected": len(nonblank_sys) - len(valid_beks),
+                    "n_bar_ok": n_bar_ok,
+                    "n_bar_fail": n_bar_fail,
+                    "n_oov_fail": n_oov_fail,
+                    "fullpage_ok": fullpage_ok,
+                    "fullpage_row": fullpage_row,
                     "stage1_row": s1_row,
                 }
         except Exception:
             pass
 
-    # Pre-check score parseability and part count (<= 4 parts so Stage-2 bekern matches rendered staves 1:1)
+    # Pre-check score parseability and part count (<= max_parts so Stage-2 bekern matches rendered staves 1:1)
     try:
         parsed = parse_score(score_path)
         if not parsed.parts or parsed.num_measures < 2:
             return {"ok": False, "idx": idx, "stem": stem, "error": "empty_or_too_short"}
-        export_stage2 = len(parsed.parts) <= 4
+        if len(parsed.parts) > max_parts:
+            return {"ok": False, "idx": idx, "stem": stem, "error": f"too_many_parts:{len(parsed.parts)}>{max_parts}"}
+        n_parts = len(parsed.parts)
     except Exception as exc:
         return {"ok": False, "idx": idx, "stem": stem, "error": f"parse_failed: {exc}"}
 
@@ -534,7 +571,9 @@ def _worker_render_one(job: Dict[str, Any]) -> Dict[str, Any]:
             seed=seed,
             page_w=page_w,
             page_h=page_h,
-            export_train_dir=work_strip_dir if export_stage2 else None,
+            export_train_dir=work_strip_dir,
+            clean_paper=clean_paper,
+            max_parts=max_parts,
         )
     except Exception as exc:
         if work_strip_dir.exists():
@@ -546,7 +585,8 @@ def _worker_render_one(job: Dict[str, Any]) -> Dict[str, Any]:
 
     # Validate we actually drew staves
     s1_row = gt_payload_to_stage1_row(gt_payload, page_png)
-    if not s1_row["staves"]:
+    nonblank_sys = [s for s in gt_payload.get("systems", []) if not s.get("is_blank_prerule")]
+    if not s1_row["staves"] or not nonblank_sys:
         if work_strip_dir.exists():
             shutil.rmtree(work_strip_dir, ignore_errors=True)
         for p in (page_png, page_json):
@@ -554,13 +594,30 @@ def _worker_render_one(job: Dict[str, Any]) -> Dict[str, Any]:
                 p.unlink(missing_ok=True)
         return {"ok": False, "idx": idx, "stem": stem, "error": "zero_staves"}
 
-    # Move & validate Stage-2 strips into exact `<stem>_s<k>.png` + `<stem>_s<k>-bekern.txt`
+    # Map system_index -> expected n_meas from GT layout
+    expected_meas_by_sys: Dict[int, int] = {
+        int(s["system_index"]): int(s["measure_end"]) - int(s["measure_start"])
+        for s in nonblank_sys
+    }
+    exports_by_sys: Dict[int, Dict[str, Any]] = {
+        int(exp["system_index"]): exp for exp in gt_payload.get("train_exports", [])
+    }
+
+    # Move & validate Stage-2 strips with strict barline + 0-OOV gates
     n_strips_ok = 0
     n_strips_rejected = 0
-    if export_stage2 and work_strip_dir.exists():
+    n_bar_ok = 0
+    n_bar_fail = 0
+    n_oov_fail = 0
+    ordered_valid_beks: List[str] = []
+
+    if work_strip_dir.exists():
         strips_dir.mkdir(parents=True, exist_ok=True)
-        for exp in gt_payload.get("train_exports", []):
-            if not exp.get("bekern_ok") or not exp.get("bekern"):
+        for sys_obj in nonblank_sys:
+            k = int(sys_obj["system_index"])
+            n_meas = expected_meas_by_sys[k]
+            exp = exports_by_sys.get(k)
+            if not exp or not exp.get("bekern_ok") or not exp.get("bekern"):
                 n_strips_rejected += 1
                 continue
             src_png = Path(exp["image"])
@@ -568,24 +625,38 @@ def _worker_render_one(job: Dict[str, Any]) -> Dict[str, Any]:
             if not src_png.exists() or not src_bek.exists():
                 n_strips_rejected += 1
                 continue
-            # Validate tokens strictly against tmp-train/mvd/data.py closed VOCAB
-            try:
-                toks = mvd_data.load_bekern(src_bek)
-                if len(toks) < 4:
-                    n_strips_rejected += 1
-                    continue
-            except Exception:
+
+            ok_s, reason, _ = _validate_strip_bekern(src_bek, n_meas, mvd_data)
+            if not ok_s:
                 n_strips_rejected += 1
+                if reason.startswith("barline_mismatch"):
+                    n_bar_fail += 1
+                elif reason.startswith("oov_token"):
+                    n_oov_fail += 1
                 continue
 
-            k = int(exp["system_index"])
             dst_png = strips_dir / f"{stem}_s{k}.png"
             dst_bek = strips_dir / f"{stem}_s{k}-bekern.txt"
             shutil.move(str(src_png), str(dst_png))
             shutil.move(str(src_bek), str(dst_bek))
+            ordered_valid_beks.append(str(dst_bek.resolve()))
             n_strips_ok += 1
+            n_bar_ok += 1
 
         shutil.rmtree(work_strip_dir, ignore_errors=True)
+
+    fullpage_ok = (len(ordered_valid_beks) == len(nonblank_sys)) and (len(nonblank_sys) > 0)
+    fullpage_row = (
+        {
+            "image": str(page_png.resolve()),
+            "bekerns": ordered_valid_beks,
+            "domain": "hw",
+            "n_systems": len(nonblank_sys),
+            "n_staves": len(s1_row["staves"]),
+        }
+        if fullpage_ok
+        else None
+    )
 
     return {
         "ok": True,
@@ -596,9 +667,18 @@ def _worker_render_one(job: Dict[str, Any]) -> Dict[str, Any]:
         "score_path": str(score_path),
         "mode": mode,
         "style": gt_payload.get("style", str(style_name_arg)),
+        "clean_paper": clean_paper,
+        "is_landscape": is_landscape,
+        "n_parts": n_parts,
+        "n_systems": len(nonblank_sys),
         "n_staves": len(s1_row["staves"]),
         "n_strips_ok": n_strips_ok,
         "n_strips_rejected": n_strips_rejected,
+        "n_bar_ok": n_bar_ok,
+        "n_bar_fail": n_bar_fail,
+        "n_oov_fail": n_oov_fail,
+        "fullpage_ok": fullpage_ok,
+        "fullpage_row": fullpage_row,
         "stage1_row": s1_row,
     }
 
@@ -667,6 +747,29 @@ def run_verification(
             }
         )
 
+    # 4. Full-page manifest verification (100% barline match + 0 OOV across all rows)
+    fullpage_manifest = stage1_manifest.parent / "fullpage_manifest.jsonl"
+    fp_rows = 0
+    fp_strips = 0
+    fp_oov = 0
+    if fullpage_manifest.exists():
+        with open(fullpage_manifest, "r", encoding="utf-8") as fh:
+            for line in fh:
+                if not line.strip():
+                    continue
+                row = json.loads(line)
+                fp_rows += 1
+                assert Path(row["image"]).exists(), f"missing fullpage image {row['image']}"
+                beks = row.get("bekerns", [])
+                assert len(beks) == int(row["n_systems"]) and len(beks) > 0
+                for bp in beks:
+                    toks = mvd_data.load_bekern(bp)
+                    try:
+                        mvd_data.encode(toks)
+                    except Exception:
+                        fp_oov += 1
+                    fp_strips += 1
+
     return {
         "eval_overlap": len(overlap_hits),
         "overlap_hits": overlap_hits[:10],
@@ -674,12 +777,16 @@ def run_verification(
         "stage1_augment_checks": s1_checks,
         "stage2_strip_count": len(bek_files),
         "stage2_loader_checks": s2_checks,
+        "fullpage_manifest_rows": fp_rows,
+        "fullpage_manifest_strips": fp_strips,
+        "fullpage_oov_count": fp_oov,
+        "vocab_size": len(mvd_data.VOCAB),
     }
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
     parser = argparse.ArgumentParser(
-        description="Generate leak-free simulated handwritten Stage-1 & Stage-2 training data."
+        description="Generate leak-free simulated handwritten Stage-1, Stage-2 & full-page UniOMR training data."
     )
     parser.add_argument("--count", type=int, default=600, help="Target number of full handwritten pages")
     parser.add_argument("--workers", type=int, default=6, help="Parallel worker processes (default 6)")
@@ -696,6 +803,24 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     )
     parser.add_argument("--seed", type=int, default=20261124, help="Base deterministic seed")
     parser.add_argument(
+        "--max-parts",
+        type=int,
+        default=6,
+        help="Maximum number of staves/parts per score (default 6)",
+    )
+    parser.add_argument(
+        "--landscape-frac",
+        type=float,
+        default=0.45,
+        help="Fraction of pages rendered in landscape orientation (default 0.45)",
+    )
+    parser.add_argument(
+        "--clean-paper-frac",
+        type=float,
+        default=0.40,
+        help="Fraction of pages rendered with clean_paper=True vs native historical paper (default 0.40)",
+    )
+    parser.add_argument(
         "--hero-frac",
         type=float,
         default=0.50,
@@ -710,7 +835,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     parser.add_argument(
         "--clean-paper",
         action="store_true",
-        help="Strip all paper texture, tint, stains, bleed, folds, foxing, blots & smears (pure white paper; augmentation owns paper/photo effects)",
+        help="Force clean_paper=True on 100%% of pages (overrides --clean-paper-frac)",
     )
     parser.add_argument("--verify-only", action="store_true", help="Skip generation and only run verification")
     args = parser.parse_args(argv)
@@ -723,6 +848,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     strips_dir = out_root / "stage2_strips"
     tmp_export_dir = out_root / "_tmp_export"
     stage1_manifest = out_root / "stage1_manifest.jsonl"
+    fullpage_manifest = out_root / "fullpage_manifest.jsonl"
     summary_path = out_root / "generation_summary.json"
 
     pages_dir.mkdir(parents=True, exist_ok=True)
@@ -757,23 +883,27 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     if not args.verify_only:
         t0 = time.time()
         target_count = int(args.count)
+        max_parts = max(1, int(args.max_parts))
+        landscape_frac = float(np.clip(args.landscape_frac, 0.0, 1.0))
+        clean_paper_frac = 1.0 if bool(args.clean_paper) else float(np.clip(args.clean_paper_frac, 0.0, 1.0))
         hero_frac = float(np.clip(args.hero_frac, 0.0, 1.0)) if hero_style_names else 0.0
         rand_frac = float(np.clip(args.rand_frac, 0.0, 1.0 - hero_frac))
         n_hero_target = int(round(target_count * hero_frac))
         n_rand_target = int(round(target_count * rand_frac))
         n_other_target = max(0, target_count - n_hero_target - n_rand_target)
+        n_land_target = int(round(target_count * landscape_frac))
+        n_clean_target = int(round(target_count * clean_paper_frac))
         print(
-            f"[init] target mix ({target_count} pages): "
+            f"[init] target mix ({target_count} pages, max_parts={max_parts}): "
             f"hero={n_hero_target} ({100.0*n_hero_target/max(1,target_count):.1f}%), "
             f"other_named={n_other_target} ({100.0*n_other_target/max(1,target_count):.1f}%), "
-            f"random_scribe={n_rand_target} ({100.0*n_rand_target/max(1,target_count):.1f}%)",
+            f"random_scribe={n_rand_target} ({100.0*n_rand_target/max(1,target_count):.1f}%), "
+            f"landscape={n_land_target} ({100.0*n_land_target/max(1,target_count):.1f}%), "
+            f"clean_paper={n_clean_target} ({100.0*n_clean_target/max(1,target_count):.1f}%)",
             flush=True,
         )
 
-        # Build deterministic style assignment preferring Flagship Hero Scribes:
-        #   - n_hero_target: uniform across all 75 Hero Scribes
-        #   - n_other_target: uniform across the remaining 159 named styles
-        #   - n_rand_target: continuous sample_random_scribe(rng, jitter=0.25)
+        # Build deterministic style, orientation, and paper-mode assignments
         rng = np.random.default_rng(args.seed + 7)
 
         def _fill_uniform(names: List[str], n: int) -> List[Tuple[str, Optional[str]]]:
@@ -797,6 +927,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         perm_all = rng.permutation(len(all_assign))
         interleaved_assign: List[Tuple[str, Optional[str]]] = [all_assign[int(i)] for i in perm_all]
 
+        land_flags = [True] * n_land_target + [False] * (target_count - n_land_target)
+        land_flags = [land_flags[int(i)] for i in rng.permutation(target_count)]
+
+        clean_flags = [True] * n_clean_target + [False] * (target_count - n_clean_target)
+        clean_flags = [clean_flags[int(i)] for i in rng.permutation(target_count)]
+
         results_by_idx: Dict[int, Dict[str, Any]] = {}
         pool_cursor = 0
         pool_pass = 0
@@ -807,7 +943,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         # when target_count > len(pool) so scores render in fresh handwritten styles.
         pending_slots: List[int] = list(range(target_count))
         failed_attempts = 0
-        max_failures = target_count * 3
+        max_failures = target_count * 5
 
         def make_job(slot_idx: int) -> Optional[Dict[str, Any]]:
             nonlocal pool_cursor, pool_pass, pool_order
@@ -826,7 +962,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 if is_eval_blocked(score_path, raw_slugs, norm_tokens, gt_sha256s, check_sha=True):
                     continue
                 mode, sname = interleaved_assign[slot_idx]
-                pw, ph = PAGE_SIZES[slot_idx % len(PAGE_SIZES)]
+                sizes = LANDSCAPE_PAGE_SIZES if land_flags[slot_idx] else PAGE_SIZES
+                pw, ph = sizes[slot_idx % len(sizes)]
                 stem = f"hwsim_{slot_idx:05d}"
                 return {
                     "idx": slot_idx,
@@ -838,10 +975,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     "seed": args.seed + slot_idx * 97 + failed_attempts * 13 + pool_pass * 7919,
                     "page_w": pw,
                     "page_h": ph,
+                    "max_parts": max_parts,
                     "pages_dir": str(pages_dir),
                     "strips_dir": str(strips_dir),
                     "tmp_export_dir": str(tmp_export_dir),
-                    "clean_paper": bool(args.clean_paper),
+                    "clean_paper": bool(clean_flags[slot_idx]),
                 }
             return None
 
@@ -869,30 +1007,37 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                             elapsed = time.time() - t0
                             rate = done / max(elapsed, 1e-3)
                             tot_strips = sum(r["n_strips_ok"] for r in results_by_idx.values())
+                            fp_ok_cnt = sum(1 for r in results_by_idx.values() if r.get("fullpage_ok"))
                             print(
                                 f"[progress] {done}/{target_count} pages "
-                                f"({tot_strips} stage2 strips, {failed_attempts} retries, "
-                                f"{rate:.2f} pages/s, elapsed {elapsed:.1f}s)",
+                                f"(fullpage_ok={fp_ok_cnt}/{done}, {tot_strips} stage2 strips, "
+                                f"{failed_attempts} retries, {rate:.2f} pages/s, elapsed {elapsed:.1f}s)",
                                 flush=True,
                             )
                     else:
                         failed_attempts += 1
-                        if failed_attempts <= max_failures and pool_cursor < len(pool):
+                        if failed_attempts <= max_failures:
                             pending_slots.append(slot)
                     # Refill queue promptly
                     break
 
         shutil.rmtree(tmp_export_dir, ignore_errors=True)
 
-        # Write Stage-1 manifest.jsonl in deterministic slot order
+        # Write Stage-1 manifest.jsonl and UniOMR fullpage_manifest.jsonl in deterministic slot order
         ordered = [results_by_idx[k] for k in sorted(results_by_idx.keys())]
         with open(stage1_manifest, "w", encoding="utf-8") as fh:
             for r in ordered:
                 fh.write(json.dumps(r["stage1_row"], ensure_ascii=False) + "\n")
 
+        fullpage_rows = [r["fullpage_row"] for r in ordered if r.get("fullpage_ok") and r.get("fullpage_row")]
+        with open(fullpage_manifest, "w", encoding="utf-8") as fh:
+            for row in fullpage_rows:
+                fh.write(json.dumps(row, ensure_ascii=False) + "\n")
+
         # Write non-destructive merged Stage-1 manifest
         base_manifest = Path(args.base_stage1_manifest)
         merged_manifest = Path(args.merged_stage1_manifest)
+        merged_manifest.parent.mkdir(parents=True, exist_ok=True)
         base_rows = 0
         with open(merged_manifest, "w", encoding="utf-8") as out_f:
             if base_manifest.exists():
@@ -908,9 +1053,17 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         named_used = sorted({r["style"] for r in ordered if r["mode"] == "named"})
         n_named_done = sum(1 for r in ordered if r["mode"] == "named")
         n_rand_done = sum(1 for r in ordered if r["mode"] == "random_scribe")
+        n_land_done = sum(1 for r in ordered if r.get("is_landscape"))
+        n_clean_done = sum(1 for r in ordered if r.get("clean_paper"))
+        tot_bar_ok = sum(int(r.get("n_bar_ok", 0)) for r in ordered)
+        tot_bar_fail = sum(int(r.get("n_bar_fail", 0)) for r in ordered)
+        tot_oov_fail = sum(int(r.get("n_oov_fail", 0)) for r in ordered)
         pool_hist: Dict[str, int] = {}
+        parts_hist: Dict[str, int] = {}
         for r in ordered:
             pool_hist[r["pool_name"]] = pool_hist.get(r["pool_name"], 0) + 1
+            pk = str(r.get("n_parts", 0))
+            parts_hist[pk] = parts_hist.get(pk, 0) + 1
 
         ver = run_verification(
             stage1_manifest=stage1_manifest,
@@ -921,14 +1074,27 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             gt_sha256s=gt_sha256s,
         )
         assert ver["eval_overlap"] == 0, f"EVAL OVERLAP DETECTED: {ver['overlap_hits']}"
+        assert ver["fullpage_oov_count"] == 0, f"OOV TOKENS DETECTED: {ver['fullpage_oov_count']}"
 
         summary = {
-            "clean_paper": bool(args.clean_paper),
+            "max_parts": max_parts,
+            "landscape_frac_target": landscape_frac,
+            "clean_paper_frac_target": clean_paper_frac,
             "pages_generated": len(ordered),
+            "fullpage_ok_pages": len(fullpage_rows),
+            "fullpage_survival_rate": round(len(fullpage_rows) / max(1, len(ordered)), 4),
+            "landscape_pages": n_land_done,
+            "clean_paper_pages": n_clean_done,
+            "native_paper_pages": len(ordered) - n_clean_done,
             "named_style_pages": n_named_done,
             "unique_named_styles_used": len(named_used),
             "random_scribe_pages": n_rand_done,
             "failed_retries": failed_attempts,
+            "barline_ok_strips": tot_bar_ok,
+            "barline_fail_strips": tot_bar_fail,
+            "oov_fail_strips": tot_oov_fail,
+            "parts_breakdown": parts_hist,
+            "fullpage_manifest": str(fullpage_manifest),
             "stage1_manifest": str(stage1_manifest),
             "stage1_new_rows": len(ordered),
             "base_stage1_rows": base_rows,
