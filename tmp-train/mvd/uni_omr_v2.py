@@ -11,15 +11,18 @@ FP16/INT4-QAT) encoder-decoder architecture:
      so tiny accidentals, augmentation dots, and ledger lines are never erased.
      (~5-6M params vs 15.4M in v1 ResNet).
 
-  2. ``HybridAxialMergerEncoder`` (DeepSeek-OCR / Qwen2.5-VL inspired):
+  2. ``HybridAxialMergerEncoder`` (DeepSeek-OCR / Qwen3-VL inspired):
      - 2 layers of Row-then-Column Axial Attention (``O(N*(H'+W'))``) on the
-       high-res ``/8`` grid with aspect-normalized 1D RoPE.
+       high-res ``/8`` grid with aspect-normalized 1D RoPE + QK-Norm.
      - 2x2 MLP Patch Merger (``/8 -> /16``) + ``InkTokenRouterV2`` (reusing
        v1's 2-patch eroded ``paper_gate``) capping dense memory tokens at
        ``k <= 3,072`` (25-50x fewer global attention FLOPs).
-     - 4 layers of Global Aspect-Normalized 2D-RoPE Attention (``(y, x)``
-       normalized to ``[0, 1]`` so 1280px and 1536px share identical rotary
-       phases).
+     - 4 layers of Global Interleaved ``[y, x]`` Aspect-Normalized 2D-RoPE
+       Attention + QK-Norm (``(y, x)`` normalized to ``[0, 1]`` so 1280px and
+       1536px share identical rotary phases).
+     - Qwen3-VL DeepStack multi-level visual memory export: returns
+       ``mem_levels = (mem_post_merger, mem_global_mid, mem_final)`` sharing
+       the exact same routed spatial indices ``K <= 3,072``.
 
   3. Training-Only Zero-Inference-Cost Layout Aux Heads:
      - ``SysYHead``: predicts normalized ``y_center`` on ``<sys>`` decoder
@@ -31,10 +34,13 @@ FP16/INT4-QAT) encoder-decoder architecture:
      - All 3 heads are bypassed at inference and stripped cleanly via
        ``strip_aux_heads()`` for ONNX/WebGPU export (0% browser cost).
 
-  4. GQA Decoder + MTP-4 + Hybrid FP16/INT4-QAT (``UniOMRv2Net``):
-     - Grouped-Query Attention (``8 Q-heads / 2 KV-heads``) in both decoder
-       self-attention and cross-attention (4x smaller WebGPU KV-cache RAM &
-       bandwidth).
+  4. GQA Decoder + QK-Norm + DeepStack + MTP-4 + Hybrid FP16/INT4-QAT (``UniOMRv2Net``):
+     - Grouped-Query Attention (``8 Q-heads / 2 KV-heads``) with ``RMSNorm(head_dim)``
+       QK-Norm in both decoder self-attention and cross-attention (4x smaller
+       WebGPU KV-cache RAM & bandwidth).
+     - DeepStack early-layer visual fusion (layer 0 fuses ``mem_post_merger``,
+       layer 1 fuses ``mem_global_mid``, layers >= 2 use ``mem_final`` directly)
+       with 0% extra KV cache and < 0.5M params.
      - Preserves ``MTP-4`` (``mtp_k=4``) and reuses ``QATInt4Controller`` /
        ``fake_quant_int4_ste`` from ``uni_omr.py``.
      - Presets: ``UniOMRv2Config.small_45m()`` (~43M, <25 MB INT4) and
@@ -111,6 +117,7 @@ __all__ = [
     "SysCountHead",
     "StaffSegHead",
     "GroupedQueryAttention",
+    "DeepStackFusion",
     "GQADecoderLayer",
     "QATInt4ControllerV2",
     "UniOMRv2Net",
@@ -427,11 +434,12 @@ class AspectNormalizedRoPE1D(nn.Module):
 
 
 class AspectNormalizedRoPE2D(nn.Module):
-    """Aspect-Normalized 2D RoPE mapping ``(y, x)`` into ``[0, 1] * coord_scale``.
+    """Interleaved ``[y0, x0, y1, x1, ...]`` Aspect-Normalized 2D RoPE (Qwen3-VL MRoPE style).
 
-    Because coordinates are normalized by ``(H' - 1, W' - 1)`` before applying
-    rotary frequencies, 1280px and 1536px pages share identical rotary phases
-    at corresponding relative page coordinates.
+    Maps ``(y, x)`` into ``[0, 1] * coord_scale`` and interleaves ``y`` and ``x``
+    rotary frequencies across the full spectrum so both spatial axes share high
+    and low frequency bands while preserving exact resolution invariance across
+    e.g. 1280px and 1536px pages.
     """
 
     def __init__(self, head_dim: int, base: float = 10000.0, coord_scale: float = 128.0) -> None:
@@ -455,7 +463,8 @@ class AspectNormalizedRoPE2D(nn.Module):
         x_norm = coords[..., 1].to(torch.float32) / float(max(1, w_p - 1))
         fy = (y_norm * self.coord_scale).unsqueeze(-1) * inv_f
         fx = (x_norm * self.coord_scale).unsqueeze(-1) * inv_f
-        emb_half = torch.cat([fy, fx], dim=-1)
+        # Interleaved [y0, x0, y1, x1, ...] across rotary frequencies
+        emb_half = torch.stack([fy, fx], dim=-1).flatten(-2)
         emb = torch.cat([emb_half, emb_half], dim=-1)
         cos = emb.cos().to(dtype).unsqueeze(1)
         sin = emb.sin().to(dtype).unsqueeze(1)
@@ -472,6 +481,8 @@ class _SelfAttention(nn.Module):
         self.k_proj = nn.Linear(d_model, d_model, bias=False)
         self.v_proj = nn.Linear(d_model, d_model, bias=False)
         self.o_proj = nn.Linear(d_model, d_model, bias=False)
+        self.q_norm = RMSNorm(self.head_dim)
+        self.k_norm = RMSNorm(self.head_dim)
 
     def forward(
         self,
@@ -480,8 +491,8 @@ class _SelfAttention(nn.Module):
         rope_sin: torch.Tensor,
     ) -> torch.Tensor:
         B, L, _ = x.shape
-        q = self.q_proj(x).view(B, L, self.n_heads, self.head_dim).transpose(1, 2)
-        k = self.k_proj(x).view(B, L, self.n_heads, self.head_dim).transpose(1, 2)
+        q = self.q_norm(self.q_proj(x).view(B, L, self.n_heads, self.head_dim)).transpose(1, 2)
+        k = self.k_norm(self.k_proj(x).view(B, L, self.n_heads, self.head_dim)).transpose(1, 2)
         v = self.v_proj(x).view(B, L, self.n_heads, self.head_dim).transpose(1, 2)
         q, k = apply_rope(q, k, rope_cos, rope_sin)
         out = _sdpa(q, k, v, attn_mask=None, is_causal=False)
@@ -840,8 +851,12 @@ class HybridAxialMergerEncoder(nn.Module):
         feat_2d: torch.Tensor,
         images: Optional[torch.Tensor] = None,
         keep_ratio_override: Optional[float] = None,
-    ) -> Tuple[torch.Tensor, Dict[str, Any]]:
-        """Encode ``(B, D, H', W')`` into compact memory ``(B, L_mem, D)`` with ``L_mem <= max_mem_tokens``."""
+    ) -> Tuple[Tuple[torch.Tensor, torch.Tensor, torch.Tensor], Dict[str, Any]]:
+        """Encode ``(B, D, H', W')`` into DeepStack multi-level memory
+        ``mem_levels = (mem_post_merger, mem_global_mid, mem_final)``, each
+        ``(B, L_mem, D)`` sharing the exact same routed spatial indices
+        ``L_mem <= max_mem_tokens``.
+        """
         _, _, H_p, W_p = feat_2d.shape
         x = feat_2d.permute(0, 2, 3, 1).contiguous()  # (B, H', W', D)
 
@@ -869,12 +884,19 @@ class HybridAxialMergerEncoder(nn.Module):
         )
         router_info["axial_grid_hw"] = (H_p, W_p)
 
-        # Aspect-Normalized 2D-RoPE Global Attention
+        # DeepStack Level 0: post-merger fine-grained visual tokens (same routed indices K <= 3,072)
+        mem_post_merger = routed_tokens
+
+        # Aspect-Normalized Interleaved 2D-RoPE Global Attention
         grid_hw = router_info["grid_hw"]
         pos2d = self.pos2d_proj(self._sinusoidal_pos2d(routed_coords, grid_hw=grid_hw, dtype=routed_tokens.dtype))
         cos2d, sin2d = self.rope2d(routed_coords, grid_hw=grid_hw, dtype=routed_tokens.dtype)
         mem = routed_tokens + pos2d
-        for layer in self.global_layers:
+
+        n_global = len(self.global_layers)
+        mid_idx = max(0, (n_global // 2) - 1)
+        mem_global_mid = mem_post_merger
+        for i, layer in enumerate(self.global_layers):
             if use_ckpt and (mem.shape[0] * mem.shape[1] > 4000):
                 mem = _grad_ckpt(
                     lambda _m, _c, _s, _l=layer: _l(_m, rope_cos=_c, rope_sin=_s),
@@ -883,8 +905,12 @@ class HybridAxialMergerEncoder(nn.Module):
                 )
             else:
                 mem = layer(mem, rope_cos=cos2d, rope_sin=sin2d)
-        mem = self.enc_norm(mem) + pos2d
-        return mem, router_info
+            if i == mid_idx:
+                mem_global_mid = mem
+
+        mem_final = self.enc_norm(mem) + pos2d
+        mem_levels = (mem_post_merger, mem_global_mid, mem_final)
+        return mem_levels, router_info
 
 
 # ---------------------------------------------------------------------------
@@ -1034,6 +1060,8 @@ class GroupedQueryAttention(nn.Module):
         self.k_proj = nn.Linear(d_model, self.kv_dim, bias=False)
         self.v_proj = nn.Linear(d_model, self.kv_dim, bias=False)
         self.o_proj = nn.Linear(d_model, d_model, bias=False)
+        self.q_norm = RMSNorm(self.head_dim)
+        self.k_norm = RMSNorm(self.head_dim)
 
     def _expand_kv(self, x: torch.Tensor) -> torch.Tensor:
         if self.n_rep == 1:
@@ -1054,7 +1082,7 @@ class GroupedQueryAttention(nn.Module):
         is_cross: bool = False,
     ) -> Any:
         B, Lq, _ = q_in.shape
-        q = self.q_proj(q_in).view(B, Lq, self.n_heads, self.head_dim).transpose(1, 2)
+        q = self.q_norm(self.q_proj(q_in).view(B, Lq, self.n_heads, self.head_dim)).transpose(1, 2)
 
         if is_cross and past_kv is not None:
             k, v = past_kv
@@ -1062,7 +1090,7 @@ class GroupedQueryAttention(nn.Module):
             if kv_in is None:
                 raise ValueError("kv_in must be provided when past_kv is None")
             Lk = kv_in.shape[1]
-            k = self.k_proj(kv_in).view(B, Lk, self.n_kv_heads, self.head_dim).transpose(1, 2)
+            k = self.k_norm(self.k_proj(kv_in).view(B, Lk, self.n_kv_heads, self.head_dim)).transpose(1, 2)
             v = self.v_proj(kv_in).view(B, Lk, self.n_kv_heads, self.head_dim).transpose(1, 2)
             if rope_cos is not None and rope_sin is not None:
                 q, k = apply_rope(q, k, rope_cos, rope_sin)
@@ -1093,6 +1121,32 @@ class GroupedQueryAttention(nn.Module):
         if use_cache:
             return out, present_kv
         return out
+
+
+class DeepStackFusion(nn.Module):
+    """Qwen3-VL DeepStack multi-level visual memory injector.
+
+    Fuses an earlier encoder level into ``mem_final`` via
+    ``mem_final + tanh(gate) * proj(norm(mem_level))`` using a compact
+    bottleneck (< 0.5M total params across early decoder layers) with 0% extra
+    KV-cache storage (fused once before step-0 cross-attention K/V projection).
+    """
+
+    def __init__(self, d_model: int, bottleneck_ratio: float = 0.25, init_gate: float = 0.1) -> None:
+        super().__init__()
+        raw_mid = max(32, int(round(d_model * bottleneck_ratio)))
+        d_mid = max(32, ((raw_mid + 15) // 32) * 32)
+        self.norm = RMSNorm(d_model)
+        self.proj = nn.Sequential(
+            nn.Linear(d_model, d_mid, bias=False),
+            nn.SiLU(inplace=True),
+            nn.Linear(d_mid, d_model, bias=False),
+        )
+        self.gate = nn.Parameter(torch.tensor(float(init_gate)))
+
+    def forward(self, mem_final: torch.Tensor, mem_level: torch.Tensor) -> torch.Tensor:
+        delta = self.proj(self.norm(mem_level))
+        return mem_final + torch.tanh(self.gate).to(mem_final.dtype) * delta
 
 
 class GQADecoderLayer(nn.Module):
@@ -1170,6 +1224,7 @@ class QATInt4ControllerV2(QATInt4Controller):
         "encoder.axial_layers",
         "encoder.patch_merger",
         "encoder.global_layers",
+        "deepstack_fusions",
         "dec_layers",
         "mtp_heads",
         "lm_head",
@@ -1229,10 +1284,13 @@ class UniOMRv2Net(nn.Module):
             StaffSegHead(self.backbone.p2_ch, self.backbone.p3_ch) if c.use_staff_seg_aux else None
         )
 
-        # 4. GQA Causal Decoder + MTP-4
+        # 4. GQA Causal Decoder + DeepStack Multi-Level Visual Injection + MTP-4
         pad_idx = PAD_ID if PAD_ID < c.vocab_size else (c.vocab_size - 4 if c.vocab_size >= 4 else None)
         self.tok_emb = nn.Embedding(c.vocab_size, c.d_model, padding_idx=pad_idx)
         self.rope1d = RoPE1D(head_dim=head_dim, base=c.rope_base)
+        self.deepstack_fusions = nn.ModuleList([
+            DeepStackFusion(c.d_model) for _ in range(min(2, c.n_dec_layers))
+        ])
         self.dec_layers = nn.ModuleList([
             GQADecoderLayer(
                 d_model=c.d_model,
@@ -1268,8 +1326,8 @@ class UniOMRv2Net(nn.Module):
         images: torch.Tensor,
         keep_ratio_override: Optional[float] = None,
         return_aux: Optional[bool] = None,
-    ) -> Tuple[torch.Tensor, Dict[str, Optional[torch.Tensor]], Dict[str, Any]]:
-        """Encode arbitrary-resolution ``(B, 3, H, W)`` images into routed memory tokens."""
+    ) -> Tuple[Tuple[torch.Tensor, torch.Tensor, torch.Tensor], Dict[str, Optional[torch.Tensor]], Dict[str, Any]]:
+        """Encode arbitrary-resolution ``(B, 3, H, W)`` images into DeepStack ``mem_levels``."""
         want_aux = self.training if return_aux is None else bool(return_aux)
         need_pyramid = want_aux and (self.staff_seg_head is not None)
 
@@ -1279,9 +1337,10 @@ class UniOMRv2Net(nn.Module):
             feat_2d = self.backbone(images, return_pyramid=False)
             p2 = p3 = None
 
-        mem, router_info = self.encoder(
+        mem_levels, router_info = self.encoder(
             feat_2d, images=images, keep_ratio_override=keep_ratio_override
         )
+        mem_final = mem_levels[-1]
 
         aux_enc: Dict[str, Optional[torch.Tensor]] = {
             "sys_count_pred": None,
@@ -1289,23 +1348,23 @@ class UniOMRv2Net(nn.Module):
         }
         if want_aux:
             if self.sys_count_head is not None:
-                aux_enc["sys_count_pred"] = self.sys_count_head(mem)
+                aux_enc["sys_count_pred"] = self.sys_count_head(mem_final)
             if self.staff_seg_head is not None and p2 is not None and p3 is not None:
                 aux_enc["staff_seg_logits"] = self.staff_seg_head(p2, p3)
 
-        return mem, aux_enc, router_info
+        return mem_levels, aux_enc, router_info
 
     def decode_tokens(
         self,
         tgt_ids: torch.Tensor,
-        memory: Optional[torch.Tensor],
+        memory: Optional[Any],
         return_mtp: Optional[bool] = None,
         return_aux: Optional[bool] = None,
         past_kvs: Optional[List[Any]] = None,
         use_cache: bool = False,
         apply_tok_dropout: bool = True,
     ) -> Any:
-        """Run causal GQA decoder over ``tgt_ids`` ``(B, T)`` conditioned on ``memory``."""
+        """Run causal GQA decoder over ``tgt_ids`` ``(B, T)`` conditioned on DeepStack ``mem_levels`` or tensor ``memory``."""
         _, T = tgt_ids.shape
         inp_ids = tgt_ids
         if self.training and apply_tok_dropout and self.cfg.tok_dropout > 0.0 and not use_cache:
@@ -1326,6 +1385,16 @@ class UniOMRv2Net(nn.Module):
         cos1d = cos_all[:, :, past_len : past_len + T, :]
         sin1d = sin_all[:, :, past_len : past_len + T, :]
 
+        # Unpack DeepStack mem_levels = (mem_post_merger, mem_global_mid, mem_final) if provided.
+        mem_final: Optional[torch.Tensor] = None
+        level_mems: Optional[Tuple[torch.Tensor, torch.Tensor]] = None
+        if memory is not None:
+            if isinstance(memory, (tuple, list)):
+                mem_post_merger, mem_global_mid, mem_final = memory
+                level_mems = (mem_post_merger, mem_global_mid)
+            else:
+                mem_final = memory
+
         use_dec_ckpt = (
             self.training
             and self.cfg.grad_checkpoint
@@ -1335,20 +1404,27 @@ class UniOMRv2Net(nn.Module):
         new_past_kvs: List[Any] = []
         for idx, layer in enumerate(self.dec_layers):
             layer_past = past_kvs[idx] if past_kvs is not None else None
+            if mem_final is None:
+                layer_mem = None
+            elif level_mems is not None and idx < len(self.deepstack_fusions):
+                layer_mem = self.deepstack_fusions[idx](mem_final, level_mems[idx])
+            else:
+                layer_mem = mem_final
+
             if use_cache:
                 x, layer_kv = layer(
-                    x, memory=memory, rope_cos=cos1d, rope_sin=sin1d,
+                    x, memory=layer_mem, rope_cos=cos1d, rope_sin=sin1d,
                     past_kv=layer_past, use_cache=True,
                 )
                 new_past_kvs.append(layer_kv)
             elif use_dec_ckpt:
                 x = _grad_ckpt(
                     lambda _x, _m, _c, _s, _l=layer: _l(_x, memory=_m, rope_cos=_c, rope_sin=_s),
-                    x, memory, cos1d, sin1d,
+                    x, layer_mem, cos1d, sin1d,
                     use_reentrant=False,
                 )
             else:
-                x = layer(x, memory=memory, rope_cos=cos1d, rope_sin=sin1d)
+                x = layer(x, memory=layer_mem, rope_cos=cos1d, rope_sin=sin1d)
         h = self.dec_norm(x)
 
         logits = self.lm_head(h)
@@ -1520,7 +1596,14 @@ class UniOMRv2Net(nn.Module):
         backbone_params = _count(self.backbone)
         encoder_params = _count(self.encoder)
         router_params = _count(self.encoder.router)
-        decoder_params = _count(self.tok_emb) + _count(self.dec_layers) + _count(self.dec_norm) + _count(self.lm_head)
+        deepstack_params = _count(self.deepstack_fusions)
+        decoder_params = (
+            _count(self.tok_emb)
+            + deepstack_params
+            + _count(self.dec_layers)
+            + _count(self.dec_norm)
+            + _count(self.lm_head)
+        )
         mtp_params = _count(self.mtp_heads)
         aux_params = _count(self.sys_y_head) + _count(self.sys_count_head) + _count(self.staff_seg_head)
         infer_params = total_params - aux_params - mtp_params
@@ -1530,6 +1613,7 @@ class UniOMRv2Net(nn.Module):
             self.encoder.axial_layers,
             self.encoder.patch_merger,
             self.encoder.global_layers,
+            self.deepstack_fusions,
             self.dec_layers,
             self.lm_head,
         )
@@ -1554,6 +1638,7 @@ class UniOMRv2Net(nn.Module):
             "backbone_params": backbone_params,
             "encoder_params": encoder_params,
             "router_params": router_params,
+            "deepstack_params": deepstack_params,
             "decoder_params": decoder_params,
             "mtp_params": mtp_params,
             "aux_params": aux_params,

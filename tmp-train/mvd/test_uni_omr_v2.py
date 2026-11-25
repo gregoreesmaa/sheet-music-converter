@@ -35,7 +35,7 @@ def _tiny_cfg(**overrides) -> UniOMRv2Config:
         n_kv_heads=2,
         n_axial_layers=2,
         n_global_layers=2,
-        n_dec_layers=2,
+        n_dec_layers=3,
         ffn_mult=2.0,
         dropout=0.0,
         backbone_channels=(16, 32, 48, 64),
@@ -60,6 +60,10 @@ def _check_presets_param_counts_and_byte_budgets() -> dict:
     # Backbone must be ~5-7M (down from 15.4M in v1 ResNet).
     assert 4_500_000 <= s_small["backbone_params"] <= 7_500_000, f"small backbone={s_small['backbone_params']}"
     assert 4_500_000 <= s_edge["backbone_params"] <= 7_500_000, f"edge backbone={s_edge['backbone_params']}"
+
+    # DeepStack fusion must stay < 0.5M params for both presets.
+    assert 0 < s_small["deepstack_params"] < 500_000, f"small deepstack={s_small['deepstack_params']}"
+    assert 0 < s_edge["deepstack_params"] < 500_000, f"edge deepstack={s_edge['deepstack_params']}"
 
     # small_45m: ~43M total, < 25 MB pure INT4 (even with scales!), < 55 MB hybrid.
     assert 40_000_000 <= s_small["total_params"] <= 46_000_000, f"small total={s_small['total_params']}"
@@ -93,8 +97,9 @@ def test_presets_param_counts_and_byte_budgets() -> None:
 
 
 def test_aspect_normalized_rope2d_resolution_invariance() -> None:
-    """1280px and 1536px grids must share identical rotary phases at matching relative (y, x)."""
-    rope = AspectNormalizedRoPE2D(head_dim=64, base=10000.0, coord_scale=128.0)
+    """1280px and 1536px grids must share identical rotary phases and use interleaved [y0, x0, y1, x1, ...]."""
+    head_dim = 64
+    rope = AspectNormalizedRoPE2D(head_dim=head_dim, base=10000.0, coord_scale=128.0)
 
     # 1280x960 at /16 -> (80, 60); 1536x1152 at /16 -> (96, 72)
     h1, w1 = 80, 60
@@ -109,6 +114,20 @@ def test_aspect_normalized_rope2d_resolution_invariance() -> None:
 
     assert (cos1 - cos2).abs().max().item() < 1e-6
     assert (sin1 - sin2).abs().max().item() < 1e-6
+
+    # Verify interleaved [y0, x0, y1, x1, ...] layout in emb_half (first head_dim // 2 channels):
+    half = head_dim // 2
+    y_only = torch.tensor([[[float(h1 - 1) * 0.37, 0.0]]], dtype=torch.float32)
+    cos_y, sin_y = rope(y_only, grid_hw=(h1, w1), dtype=torch.float32)
+    assert sin_y[0, 0, 0, 0:half:2].abs().max().item() > 1e-3, "Expected non-zero y phases on even indices"
+    assert sin_y[0, 0, 0, 1:half:2].abs().max().item() == 0.0, "Expected zero x phases on odd indices"
+    assert (cos_y[0, 0, 0, 1:half:2] - 1.0).abs().max().item() == 0.0
+
+    x_only = torch.tensor([[[0.0, float(w1 - 1) * 0.43]]], dtype=torch.float32)
+    cos_x, sin_x = rope(x_only, grid_hw=(h1, w1), dtype=torch.float32)
+    assert sin_x[0, 0, 0, 1:half:2].abs().max().item() > 1e-3, "Expected non-zero x phases on odd indices"
+    assert sin_x[0, 0, 0, 0:half:2].abs().max().item() == 0.0, "Expected zero y phases on even indices"
+    assert (cos_x[0, 0, 0, 0:half:2] - 1.0).abs().max().item() == 0.0
 
 
 def test_forward_backward_portrait_landscape_and_mem_cap() -> None:
@@ -156,13 +175,27 @@ def test_forward_backward_portrait_landscape_and_mem_cap() -> None:
             assert float(losses[k].item()) > 0.0, f"{shape_name}: zero {k}"
 
         losses["loss"].backward()
-        # Verify gradients flow through backbone, encoder, decoder, MTP, and all 3 aux heads.
+        # Verify gradients flow through backbone, encoder, QK-Norm, DeepStack, decoder, MTP, and all 3 aux heads.
         assert model.backbone.stage1.down[0].weight.grad is not None
         assert model.backbone.p2_to_p3.proj.weight.grad is not None
         assert model.encoder.axial_layers[0].row_attn.q_proj.weight.grad is not None
+        assert model.encoder.axial_layers[0].row_attn.q_norm.weight.grad is not None
+        assert model.encoder.axial_layers[0].row_attn.k_norm.weight.grad is not None
+        assert model.encoder.axial_layers[0].col_attn.q_norm.weight.grad is not None
+        assert model.encoder.axial_layers[0].col_attn.k_norm.weight.grad is not None
         assert model.encoder.patch_merger.fc1.weight.grad is not None
         assert model.encoder.global_layers[0].self_attn.q_proj.weight.grad is not None
+        assert model.encoder.global_layers[0].self_attn.q_norm.weight.grad is not None
+        assert model.encoder.global_layers[0].self_attn.k_norm.weight.grad is not None
+        assert model.deepstack_fusions[0].gate.grad is not None
+        assert model.deepstack_fusions[0].proj[0].weight.grad is not None
+        assert model.deepstack_fusions[1].gate.grad is not None
+        assert model.deepstack_fusions[1].proj[0].weight.grad is not None
         assert model.dec_layers[0].self_attn.k_proj.weight.grad is not None
+        assert model.dec_layers[0].self_attn.q_norm.weight.grad is not None
+        assert model.dec_layers[0].self_attn.k_norm.weight.grad is not None
+        assert model.dec_layers[0].cross_attn.q_norm.weight.grad is not None
+        assert model.dec_layers[0].cross_attn.k_norm.weight.grad is not None
         assert model.sys_y_head.net[1].weight.grad is not None
         assert model.sys_count_head.net[1].weight.grad is not None
         assert model.staff_seg_head.head[0].weight.grad is not None
@@ -191,24 +224,37 @@ def _check_gqa_kv_cache_decode_parity_and_4x_shrink() -> float:
     tgt_ids[:, 0] = BOS_ID
 
     with torch.no_grad():
-        mem, aux_enc, _ = model.encode_image(images, return_aux=False)
+        mem_levels, aux_enc, _ = model.encode_image(images, return_aux=False)
+        # Verify DeepStack mem_levels = (mem_post_merger, mem_global_mid, mem_final) share exact routed shape
+        assert isinstance(mem_levels, tuple) and len(mem_levels) == 3
+        mem_post_merger, mem_global_mid, mem_final = mem_levels
+        assert mem_post_merger.shape == mem_global_mid.shape == mem_final.shape
+        assert mem_final.shape[1] <= cfg.max_mem_tokens
+        assert not torch.allclose(mem_post_merger, mem_final)
+        assert not torch.allclose(mem_global_mid, mem_final)
         # Aux heads must be skipped at inference.
         assert aux_enc["sys_count_pred"] is None
         assert aux_enc["staff_seg_logits"] is None
 
         full_logits, full_mtp, full_sys_y = model.decode_tokens(
-            tgt_ids, mem, return_mtp=False, return_aux=False, use_cache=False
+            tgt_ids, mem_levels, return_mtp=False, return_aux=False, use_cache=False
         )
         assert full_mtp == []
         assert full_sys_y is None
 
-        # Step-by-step KV-cached decode
+        # Verify DeepStack multi-level fusion actively modulates decoder outputs vs mem_final-only fallback.
+        final_only_logits, _, _ = model.decode_tokens(
+            tgt_ids, mem_final, return_mtp=False, return_aux=False, use_cache=False
+        )
+        assert float((full_logits - final_only_logits).abs().max().item()) > 1e-4
+
+        # Step-by-step KV-cached decode with DeepStack active (0% extra KV cache!)
         past_kvs = None
         step_logits = []
         for t in range(T):
             logits_t, _, past_kvs = model.decode_tokens(
                 tgt_ids[:, t : t + 1],
-                memory=mem if t == 0 else None,
+                memory=mem_levels if t == 0 else None,
                 return_mtp=False,
                 return_aux=False,
                 past_kvs=past_kvs,
@@ -218,13 +264,14 @@ def _check_gqa_kv_cache_decode_parity_and_4x_shrink() -> float:
 
         cached_logits = torch.cat(step_logits, dim=1)
         max_abs_diff = float((full_logits - cached_logits).abs().max().item())
-        assert max_abs_diff < 1e-4, f"GQA KV-cache parity failed: max_abs_diff={max_abs_diff}"
+        assert max_abs_diff < 1e-4, f"GQA+DeepStack KV-cache parity failed: max_abs_diff={max_abs_diff}"
 
-        # Verify KV cache stores n_kv_heads=2 (4x smaller than n_heads=8) for both self & cross attn!
+        # Verify KV cache stores n_kv_heads=2 (4x smaller than n_heads=8) and ONLY 1 KV cache per decoder layer!
         assert past_kvs is not None and len(past_kvs) == cfg.n_dec_layers
-        self_kv, cross_kv = past_kvs[0]
-        assert self_kv[0].shape == (B, cfg.n_kv_heads, T, cfg.d_model // cfg.n_heads)
-        assert cross_kv[0].shape == (B, cfg.n_kv_heads, mem.shape[1], cfg.d_model // cfg.n_heads)
+        for layer_idx in range(cfg.n_dec_layers):
+            self_kv, cross_kv = past_kvs[layer_idx]
+            assert self_kv[0].shape == (B, cfg.n_kv_heads, T, cfg.d_model // cfg.n_heads)
+            assert cross_kv[0].shape == (B, cfg.n_kv_heads, mem_final.shape[1], cfg.d_model // cfg.n_heads)
 
         # Smoke-test greedy generate()
         gen_seq = model.generate(images, max_len=6)
@@ -291,7 +338,8 @@ def main() -> None:
         print(
             f"[{name}] total={s['total_params']:,} | infer={s['infer_params']:,} | "
             f"backbone={s['backbone_params']:,} | enc={s['encoder_params']:,} | "
-            f"dec={s['decoder_params']:,} | mtp={s['mtp_params']:,} | aux={s['aux_params']:,}"
+            f"dec={s['decoder_params']:,} (deepstack={s['deepstack_params']:,}) | "
+            f"mtp={s['mtp_params']:,} | aux={s['aux_params']:,}"
         )
         print(
             f"  sizes: FP16={s['fp16_mb']:.2f} MB | pure_INT4={s['pure_int4_mb']:.2f} MB "
