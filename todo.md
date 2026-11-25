@@ -198,3 +198,36 @@ Sources: file-backed workflow findings (`D:/tmp/omr-trimmed/*.md`); public numbe
 - **SDPA:** Keep **CUTLASS `EFFICIENT_ATTENTION`** (NEVER `CUDNN_ATTENTION` on variable `(mem, T)` batches — cuDNN 9.10 recompiles a CPU plan ~640 ms/shape = 49× slower).
 - **Prefetcher:** NEVER call `.pin_memory()` inside `ThreadPoolExecutor` background threads on Windows WDDM (global `cudaHostAlloc` lock stalls GPU).
 - **VRAM / Logging:** Always run `.\.venv\Scripts\python.exe -u` (unbuffered), keep VRAM `< 14 GB` (Windows WDDM silently swaps instead of OOMing), and use PowerShell `;` (never `&&`).
+
+---
+
+### Queued 2027–2028 Frontier Trials (Post-Iter 10 / Post-v2)
+
+Standing frontier prototypes built & CPU-verified ahead of schedule; queue on GPU **only after** Iter 10 / UniOMR v2 closes out (one solo-GPU trial at a time; promote only on strict `suite31_hw` GO pass).
+
+1. [ ] **F1 — Render-and-Diff Visual RLVR (`tmp-train/mvd/trial_2027_render_diff_rlvr.py`)**
+   - **Idea:** Closed-loop verifiable RL (GRPO / RLVR) combining `bekern` grammar validity + bar-duration conservation + fast render-and-diff ink-IoU reward against the input page so the decoder optimizes pixel-level notation fidelity directly on unlabeled / hard OOD pages.
+   - **Ready-to-run commands:**
+     - CPU unit test: `$env:CUDA_VISIBLE_DEVICES=""; .\.venv\Scripts\python.exe -m unittest tmp-train/mvd/test_trial_2027_render_diff_rlvr.py -v`
+     - GPU trial (post-Iter 10): `.\.venv\Scripts\python.exe -u tmp-train/mvd/trial_2027_render_diff_rlvr.py --ckpt <best_uniomr_ckpt.pt> --out-dir D:\tmp\mvd-runs\trial-2027-rlvr`
+   - **GO / NO-GO Criteria:**
+     - **GO:** `suite31_hw` Strict Note F1 improves `>= +0.015` on `printed_photo` OR `hw_photo` with `<= -0.005` regression on any other split, `0` grammar/DecOK regressions, and VRAM `< 14 GB`.
+     - **NO-GO (KILL):** Gain `< +0.010` after reward-convergence window, reward hacking (ink-IoU rises while Strict Note F1 drops), or wall-clock overhead `> 3×` supervised fine-tuning per update.
+
+2. [ ] **F2 — Test-Time Training / Per-Page Adaptation (`tmp-train/mvd/trial_2028_ttt_adapt.py`)**
+   - **Idea:** Lightweight test-time adaptation (TTT / LoRA or LayerNorm-only self-supervised entropy + masked-patch / render-consistency adaptation) for `1–5` gradient steps per hard OOD/manuscript page before decoding, resetting weights between pages.
+   - **Ready-to-run commands:**
+     - CPU unit test: `$env:CUDA_VISIBLE_DEVICES=""; .\.venv\Scripts\python.exe -m unittest tmp-train/mvd/test_trial_2028_ttt_adapt.py -v`
+     - GPU trial (post-Iter 10): `.\.venv\Scripts\python.exe -u tmp-train/mvd/trial_2028_ttt_adapt.py --ckpt <best_uniomr_ckpt.pt> --manifest data-gen/score-corpus/suite31/suite31_hw_manifest.json`
+   - **GO / NO-GO Criteria:**
+     - **GO:** `suite31_hw` `hw_clean` or `hw_photo` Strict Note F1 improves `>= +0.020` (or `printed_photo` `>= +0.015`) with `<= -0.003` regression on clean printed pages AND added latency `<= +1.5 s/page` (staying inside the `<= 5.0 s/page` p95 autonomous repair budget).
+     - **NO-GO (KILL):** Gain `< +0.010`, catastrophic drift on single-page adaptation, or latency `> 3.0 s/page` overhead.
+
+3. [ ] **F3 — Masked Block-Diffusion Measure Refinement (`tmp-train/mvd/trial_2028_block_diffusion.py`)**
+   - **Idea:** Lightweight bidirectional 4-layer Transformer denoiser (`BlockDiffusionMeasureRefiner`, `d_model=384`, `n_heads=6`, `5.69M` params, `< 6M` budget) trained with MDLM/LLaDA `1/t` weighted masked diffusion (`t ~ U(0.15, 0.85)`) over measure blocks (`L <= 128`) cross-attending to encoder `mem`, resolving low-confidence / duration-conflicting measures bidirectionally in `4` parallel confidence-guided passes instead of `~60` sequential AR steps.
+   - **Ready-to-run commands:**
+     - CPU unit test (verified `6/6` green): `$env:CUDA_VISIBLE_DEVICES=""; .\.venv\Scripts\python.exe -m unittest tmp-train/mvd/test_trial_2028_block_diff.py -v`
+     - CPU smoke check: `$env:CUDA_VISIBLE_DEVICES=""; .\.venv\Scripts\python.exe tmp-train/mvd/trial_2028_block_diffusion.py --smoke`
+   - **GO / NO-GO Criteria:**
+     - **GO:** On duration-conflicting / low-confidence `suite31_hw` measures, 4-step parallel block-diffusion refinement fixes `>= 30%` of flagged measure errors (net page Strict Note F1 `>= +0.010`), runs `>= 3×` faster than AR beam-5 measure re-decoding, and adds `< 6M` parameters.
+     - **NO-GO (KILL):** Measure repair rate `< 15%`, introduces new bar-duration violations on already-valid measures, or fails to beat AR beam-5 at equal wall-clock latency.
