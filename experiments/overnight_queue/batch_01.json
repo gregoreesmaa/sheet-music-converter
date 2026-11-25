@@ -1,0 +1,38 @@
+[
+  {
+    "id": "2026-11-26T01-38-ov-13-muon-lr-sweep",
+    "wave": 4,
+    "priority": 1,
+    "provider": "colab_l4",
+    "gpu": "L4",
+    "est_minutes": 30,
+    "est_cu": 1.5,
+    "script": "experiments/2026-11-26T01-38-ov-13-muon-lr-sweep/run_colab.py",
+    "hf_eval_target": "evals/2026-11-26T01-38-ov-13-muon-lr-sweep.json",
+    "status": "QUEUED"
+  },
+  {
+    "id": "2026-11-26T01-38-ov-14-wsd-cooldown-shape",
+    "wave": 4,
+    "priority": 2,
+    "provider": "colab_l4",
+    "gpu": "L4",
+    "est_minutes": 35,
+    "est_cu": 1.8,
+    "script": "experiments/2026-11-26T01-38-ov-14-wsd-cooldown-shape/run_colab.py",
+    "hf_eval_target": "evals/2026-11-26T01-38-ov-14-wsd-cooldown-shape.json",
+    "status": "QUEUED"
+  },
+  {
+    "id": "2026-11-26T01-38-ov-15-ema-decay-soup-sweep",
+    "wave": 4,
+    "priority": 3,
+    "provider": "colab_l4",
+    "gpu": "L4",
+    "est_minutes": 32,
+    "est_cu": 1.6,
+    "script": "experiments/2026-11-26T01-38-ov-15-ema-decay-soup-sweep/run_colab.py",
+    "hf_eval_target": "evals/2026-11-26T01-38-ov-15-ema-decay-soup-sweep.json",
+    "status": "QUEUED"
+  }
+]

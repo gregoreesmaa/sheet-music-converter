@@ -1,0 +1,64 @@
+{
+  "batch_id": "batch_07",
+  "wave": 7,
+  "theme": "Unlabeled RISM V-JEPA 2.1 + DINOv3 Gram Pretraining & Transfer Sweep",
+  "status": "QUEUED",
+  "baseline_commit": "164852f",
+  "platform": "colab-L4",
+  "hf_repo": "gregoreesmaa/sheet-music-converter-omr",
+  "experiments": [
+    {
+      "exp_num": 31,
+      "exp_id": "2026-11-26T01-38-ov-31-vjepa21-mask-ratio-sweep",
+      "title": "V-JEPA 2.1 Masking Ratio Sweep (0.45, 0.60, 0.75) on RISM 5,707",
+      "status": "QUEUED",
+      "gpu": "L4",
+      "est_minutes": 38,
+      "est_cu": 3.2,
+      "dir": "experiments/2026-11-26T01-38-ov-31-vjepa21-mask-ratio-sweep",
+      "script": "experiments/2026-11-26T01-38-ov-31-vjepa21-mask-ratio-sweep/run_colab.py",
+      "datasets": [
+        "datasets/rism_hw_5707.tar"
+      ],
+      "hf_eval_path": "evals/2026-11-26T01-38-ov-31-vjepa21-mask-ratio-sweep.json",
+      "hf_run_path": "runs/2026-11-26T01-38-ov-31-vjepa21-mask-ratio-sweep.json",
+      "primary_metric": "ridge_staff_r2 & knn5_staff_r2 + tail100_loss_std"
+    },
+    {
+      "exp_num": 32,
+      "exp_id": "2026-11-26T01-38-ov-32-dinov3-gram-weight-sweep",
+      "title": "DINOv3 Gram Anchoring Weight Sweep (0.0, 0.1, 0.5) on RISM 5,707",
+      "status": "QUEUED",
+      "gpu": "L4",
+      "est_minutes": 38,
+      "est_cu": 3.2,
+      "dir": "experiments/2026-11-26T01-38-ov-32-dinov3-gram-weight-sweep",
+      "script": "experiments/2026-11-26T01-38-ov-32-dinov3-gram-weight-sweep/run_colab.py",
+      "datasets": [
+        "datasets/rism_hw_5707.tar"
+      ],
+      "hf_eval_path": "evals/2026-11-26T01-38-ov-32-dinov3-gram-weight-sweep.json",
+      "hf_run_path": "runs/2026-11-26T01-38-ov-32-dinov3-gram-weight-sweep.json",
+      "primary_metric": "dense_erank_mean & dense_norm_spectral_entropy & dense_offdiag_cosine_mean"
+    },
+    {
+      "exp_num": 33,
+      "exp_id": "2026-11-26T01-38-ov-33-vjepa-warmstart-vs-scratch",
+      "title": "Transfer Probe: V-JEPA 2.1 RISM Warm-Start vs Scratch on iter10_5_proxy_2k + suite31_hw",
+      "status": "QUEUED",
+      "gpu": "L4",
+      "est_minutes": 42,
+      "est_cu": 3.5,
+      "dir": "experiments/2026-11-26T01-38-ov-33-vjepa-warmstart-vs-scratch",
+      "script": "experiments/2026-11-26T01-38-ov-33-vjepa-warmstart-vs-scratch/run_colab.py",
+      "datasets": [
+        "datasets/iter10_5_proxy_2k.tar",
+        "datasets/suite31_hw_eval.tar",
+        "datasets/rism_hw_5707.tar"
+      ],
+      "hf_eval_path": "evals/2026-11-26T01-38-ov-33-vjepa-warmstart-vs-scratch.json",
+      "hf_run_path": "runs/2026-11-26T01-38-ov-33-vjepa-warmstart-vs-scratch.json",
+      "primary_metric": "suite31_hw hw_clean & hw_photo Strict Note F1 / Token F1 delta"
+    }
+  ]
+}

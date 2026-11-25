@@ -1,0 +1,69 @@
+{
+  "batch_id": "batch_04",
+  "wave": 5,
+  "status": "QUEUED",
+  "created_at_utc": "2026-11-25T23:45:00Z",
+  "baseline_sha": "164852f",
+  "theme": "Curriculum Mix, HW Fraction & MixStyle Domain-Invariance Sweep",
+  "hf_repo": "gregoreesmaa/sheet-music-converter-omr",
+  "experiments": [
+    {
+      "exp_num": 22,
+      "exp_id": "2026-11-26T01-38-ov-22-fullpage-frac-sweep",
+      "dir": "experiments/2026-11-26T01-38-ov-22-fullpage-frac-sweep",
+      "runner": "experiments/2026-11-26T01-38-ov-22-fullpage-frac-sweep/run_colab.py",
+      "platform": "colab",
+      "gpu": "L4",
+      "colab_session": "ov-22-fp-frac",
+      "est_minutes": 35,
+      "est_cu": 2.8,
+      "status": "QUEUED",
+      "variable": "fullpage_frac",
+      "arms": ["fp_070 (0.70)", "fp_085 (0.85)", "fp_100 (1.00)"],
+      "datasets": ["datasets/iter10_5_proxy_2k.tar"],
+      "hf_eval_path": "evals/2026-11-26T01-38-ov-22-fullpage-frac-sweep.json",
+      "hf_run_path": "runs/2026-11-26T01-38-ov-22-fullpage-frac-sweep.json"
+    },
+    {
+      "exp_num": 23,
+      "exp_id": "2026-11-26T01-38-ov-23-hw-sim-v06-ratio-sweep",
+      "dir": "experiments/2026-11-26T01-38-ov-23-hw-sim-v06-ratio-sweep",
+      "runner": "experiments/2026-11-26T01-38-ov-23-hw-sim-v06-ratio-sweep/run_colab.py",
+      "platform": "colab",
+      "gpu": "L4",
+      "colab_session": "ov-23-hw-v06-ratio",
+      "est_minutes": 38,
+      "est_cu": 3.1,
+      "status": "QUEUED",
+      "variable": "hw_sim_v06_ratio",
+      "arms": ["hw_10 (10%)", "hw_25 (25%)", "hw_40 (40%)"],
+      "datasets": [
+        "datasets/iter10_5_proxy_2k.tar",
+        "datasets/hw_sim_v06_500.tar",
+        "datasets/suite31_hw_eval.tar"
+      ],
+      "hf_eval_path": "evals/2026-11-26T01-38-ov-23-hw-sim-v06-ratio-sweep.json",
+      "hf_run_path": "runs/2026-11-26T01-38-ov-23-hw-sim-v06-ratio-sweep.json"
+    },
+    {
+      "exp_num": 24,
+      "exp_id": "2026-11-26T01-38-ov-24-mixstyle-domain-invariance",
+      "dir": "experiments/2026-11-26T01-38-ov-24-mixstyle-domain-invariance",
+      "runner": "experiments/2026-11-26T01-38-ov-24-mixstyle-domain-invariance/run_colab.py",
+      "platform": "colab",
+      "gpu": "L4",
+      "colab_session": "ov-24-mixstyle",
+      "est_minutes": 36,
+      "est_cu": 2.9,
+      "status": "QUEUED",
+      "variable": "mixstyle_prob",
+      "arms": ["ms_00 (0.0)", "ms_20 (0.20)", "ms_40 (0.40)"],
+      "datasets": [
+        "datasets/iter10_5_proxy_2k.tar",
+        "datasets/suite31_hw_eval.tar"
+      ],
+      "hf_eval_path": "evals/2026-11-26T01-38-ov-24-mixstyle-domain-invariance.json",
+      "hf_run_path": "runs/2026-11-26T01-38-ov-24-mixstyle-domain-invariance.json"
+    }
+  ]
+}

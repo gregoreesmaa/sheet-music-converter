@@ -2,19 +2,15 @@
 
 ## 1. Platform Chosen & Rationale
 
-- **Platform:** **Modal `L4` (`24 GB`, `cc=8.9`)** with `32 GB` RAM and `4 vCPU` (`~$0.80/hr`).
-- **Rationale:** Full-size `small_45m` + `edge85m` FP32/INT4 parity across 12 real `1024px` `suite31_hw` pages runs cleanly in `24 GB` VRAM without touching the local RTX 4080 SUPER, while `32 GB` host RAM gives generous headroom for full-size `edge85m` multi-target ONNX export (`webgpu`, `npu`, `cpu`) and `MatMulNBitsQuantizer`.
-- **Estimated Wall-Clock & Cost:** `~10–15 min` total (`~$0.15–$0.20` of `$30/mo` free credit).
+- **Platform (Executed):** **Google Colab `L4` (`22.03 GB`, `cc=8.9`)** via `.\.venv\Scripts\colab.exe` session `exp8-spinquant` (`torch 2.14.1+cu130` pre-installed, `~4.8 CU/hr`).
+  - *Note:* Originally queued on Modal `L4` (`ap-UF5TSgqpk19Vh8ifT7xkw0`), which was stopped cleanly (`modal app stop -y ap-UF5TSgqpk19Vh8ifT7xkw0`) and moved to Google Colab `L4` for immediate execution.
+- **Rationale:** Full-size `small_45m` + `edge85m` FP32/INT4 parity across 12 real `1024px` `suite31_hw` pages runs cleanly in `22 GB` VRAM without touching the local RTX 4080 SUPER, while Colab `L4` (`torch 2.14.1+cu130` pre-installed + `uv` package install) completed the entire benchmark + multi-target ONNX export in **`72.9 s`** (`~0.10 CU`).
 
 ## 2. Identifiers for Follow-Up Queries (Zero-Prior-Context Handoff)
 
-- **Modal Profile:** `gregoreesmaa1`
-- **Modal App Name:** `exp8-ablation-spinquant-int4-parity`
-- **Modal App ID:** `ap-UF5TSgqpk19Vh8ifT7xkw0`
-- **Modal Function Call ID:** `fc-01M8AG6HGY2FPZMBHNBYX83839`
-- **Modal Dashboard URL:** `https://modal.com/apps/gregoreesmaa1/main/ap-UF5TSgqpk19Vh8ifT7xkw0`
-- **Modal Volume:** `omr-cache` mounted at `/vol` (cached eval tar at `/vol/datasets/suite31_hw_eval/`, output JSON at `/vol/evals/2026-11-26T00-55-ablation-spinquant-int4-parity.json`)
-- **Modal Secret:** `hf-secret` (`HF_TOKEN`)
+- **Colab Session Name:** `exp8-spinquant` (stopped immediately after completion via `colab stop -s exp8-spinquant`)
+- **Colab Runner Script:** `experiments/2026-11-26T00-55-ablation-spinquant-int4-parity/run_colab.py`
+- **Superseded Modal App ID:** `ap-UF5TSgqpk19Vh8ifT7xkw0` (stopped before execution)
 - **Hugging Face Repo:** `gregoreesmaa/sheet-music-converter-omr` (`repo_type="dataset"`)
   - Eval Report: `evals/2026-11-26T00-55-ablation-spinquant-int4-parity.json`
   - Run Ledger: `runs/2026-11-26T00-55-ablation-spinquant-int4-parity.json`
@@ -22,14 +18,8 @@
 ### Copy-Paste Monitoring / Retrieval Commands
 
 ```powershell
-# Check app status
-.\.venv\Scripts\modal.exe app list
-
-# Stream live logs
-.\.venv\Scripts\modal.exe app logs ap-UF5TSgqpk19Vh8ifT7xkw0
-
-# Stop runaway job if needed
-.\.venv\Scripts\modal.exe app stop ap-UF5TSgqpk19Vh8ifT7xkw0
+# Check active Colab sessions (confirm exp8-spinquant is stopped)
+.\.venv\Scripts\colab.exe sessions
 
 # Download completed eval JSON from Hugging Face
 $env:CUDA_VISIBLE_DEVICES=""

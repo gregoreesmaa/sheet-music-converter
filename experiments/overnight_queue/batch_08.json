@@ -1,0 +1,61 @@
+{
+  "batch": "batch_08",
+  "title": "Inference-Time Decoding, Header-Guarded Measure-Beam & HW TTA Sweep (Exps 34-36)",
+  "wave": 4,
+  "status": "QUEUED",
+  "created_utc": "2026-11-26T01:38:00Z",
+  "baseline_commit": "164852f",
+  "baseline_ckpt": "checkpoints/iter10_soup_baseline/uni_omr_soup.pt",
+  "eval_dataset": "datasets/suite31_hw_eval.tar",
+  "hf_repo": "gregoreesmaa/sheet-music-converter-omr",
+  "experiments": [
+    {
+      "exp_num": 34,
+      "exp_id": "2026-11-26T01-38-ov-34-measure-beam-header-guard-sweep",
+      "wave": 4,
+      "status": "QUEUED",
+      "platform": "colab",
+      "gpu": "L4",
+      "est_minutes": 20,
+      "est_cu": 1.6,
+      "dir": "experiments/2026-11-26T01-38-ov-34-measure-beam-header-guard-sweep",
+      "runner": "experiments/2026-11-26T01-38-ov-34-measure-beam-header-guard-sweep/run_colab.py",
+      "hf_eval_path": "evals/2026-11-26T01-38-ov-34-measure-beam-header-guard-sweep.json",
+      "hf_run_path": "runs/2026-11-26T01-38-ov-34-measure-beam-header-guard-sweep.json",
+      "scope": "all 45 suite31_hw pieces (clean + photo = 90 pages)",
+      "sweep": "measure_beam_size in {1, 2, 4, 8} x const_offset_limit in {2, 3, 5}"
+    },
+    {
+      "exp_num": 35,
+      "exp_id": "2026-11-26T01-38-ov-35-maxlen-resolution-inference-sweep",
+      "wave": 4,
+      "status": "QUEUED",
+      "platform": "colab",
+      "gpu": "L4",
+      "est_minutes": 14,
+      "est_cu": 1.1,
+      "dir": "experiments/2026-11-26T01-38-ov-35-maxlen-resolution-inference-sweep",
+      "runner": "experiments/2026-11-26T01-38-ov-35-maxlen-resolution-inference-sweep/run_colab.py",
+      "hf_eval_path": "evals/2026-11-26T01-38-ov-35-maxlen-resolution-inference-sweep.json",
+      "hf_run_path": "runs/2026-11-26T01-38-ov-35-maxlen-resolution-inference-sweep.json",
+      "scope": "all 45 suite31_hw pieces (clean + photo = 90 pages)",
+      "sweep": "max_len in {3840, 5120, 6144} x max_dim in {1280, 1536, 1792}"
+    },
+    {
+      "exp_num": 36,
+      "exp_id": "2026-11-26T01-38-ov-36-hw-multiview-tta-voting",
+      "wave": 4,
+      "status": "QUEUED",
+      "platform": "colab",
+      "gpu": "L4",
+      "est_minutes": 12,
+      "est_cu": 1.0,
+      "dir": "experiments/2026-11-26T01-38-ov-36-hw-multiview-tta-voting",
+      "runner": "experiments/2026-11-26T01-38-ov-36-hw-multiview-tta-voting/run_colab.py",
+      "hf_eval_path": "evals/2026-11-26T01-38-ov-36-hw-multiview-tta-voting.json",
+      "hf_run_path": "runs/2026-11-26T01-38-ov-36-hw-multiview-tta-voting.json",
+      "scope": "14 real historical HW pieces (clean + photo = 28 pages)",
+      "sweep": "6 views (base_1536, scale_1280, scale_1792, clahe_1536, deskew_1536, deskew_clahe_1536) + FSA/beat & MBR voting"
+    }
+  ]
+}

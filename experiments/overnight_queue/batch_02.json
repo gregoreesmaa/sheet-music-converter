@@ -1,0 +1,69 @@
+[
+  {
+    "exp_num": 16,
+    "exp_id": "2026-11-26T01-38-ov-16-resolution-multiscale-sweep",
+    "title": "Vision Resolution & Multi-Scale Sweep (1024px vs 1280px vs 1536px Multi-Scale) on UniOMR v2 small_45m",
+    "wave": 4,
+    "status": "QUEUED",
+    "platform": "colab-l4",
+    "est_minutes": 38,
+    "est_cu": 3.2,
+    "baseline_sha": "164852f",
+    "dir": "experiments/2026-11-26T01-38-ov-16-resolution-multiscale-sweep",
+    "runner": "experiments/2026-11-26T01-38-ov-16-resolution-multiscale-sweep/run_colab.py",
+    "dataset_hf": "datasets/iter10_5_proxy_2k.tar",
+    "hf_eval_path": "evals/2026-11-26T01-38-ov-16-resolution-multiscale-sweep.json",
+    "hf_run_path": "runs/2026-11-26T01-38-ov-16-resolution-multiscale-sweep.json",
+    "arms": [
+      "1024px_fixed",
+      "1280px_fixed",
+      "1536px_multiscale"
+    ]
+  },
+  {
+    "exp_num": 17,
+    "exp_id": "2026-11-26T01-38-ov-17-irope-registers-jitter-sweep",
+    "title": "ViT-5/DINOv3 Register Tokens (0, 4, 8, 16) & V2PE RoPE Box-Jitter Sweep on UniOMR v2 small_45m",
+    "wave": 4,
+    "status": "QUEUED",
+    "platform": "colab-l4",
+    "est_minutes": 40,
+    "est_cu": 3.4,
+    "baseline_sha": "164852f",
+    "dir": "experiments/2026-11-26T01-38-ov-17-irope-registers-jitter-sweep",
+    "runner": "experiments/2026-11-26T01-38-ov-17-irope-registers-jitter-sweep/run_colab.py",
+    "dataset_hf": "datasets/iter10_5_proxy_2k.tar",
+    "hf_eval_path": "evals/2026-11-26T01-38-ov-17-irope-registers-jitter-sweep.json",
+    "hf_run_path": "runs/2026-11-26T01-38-ov-17-irope-registers-jitter-sweep.json",
+    "arms": [
+      "reg0_jit008",
+      "reg4_jit008",
+      "reg8_jit008",
+      "reg16_jit008",
+      "reg4_jit000",
+      "reg4_jit016"
+    ]
+  },
+  {
+    "exp_num": 18,
+    "exp_id": "2026-11-26T01-38-ov-18-sobel-hog-weight-sweep",
+    "title": "MonkeyOCRv2 Sobel-HOG Aux Loss Weight Sweep (0.0, 0.05, 0.15, 0.30) for Faint HW Stroke Invariance",
+    "wave": 5,
+    "status": "QUEUED",
+    "platform": "colab-l4",
+    "est_minutes": 38,
+    "est_cu": 3.2,
+    "baseline_sha": "164852f",
+    "dir": "experiments/2026-11-26T01-38-ov-18-sobel-hog-weight-sweep",
+    "runner": "experiments/2026-11-26T01-38-ov-18-sobel-hog-weight-sweep/run_colab.py",
+    "dataset_hf": "datasets/iter10_5_proxy_2k.tar",
+    "hf_eval_path": "evals/2026-11-26T01-38-ov-18-sobel-hog-weight-sweep.json",
+    "hf_run_path": "runs/2026-11-26T01-38-ov-18-sobel-hog-weight-sweep.json",
+    "arms": [
+      "hog_000",
+      "hog_005",
+      "hog_015",
+      "hog_030"
+    ]
+  }
+]

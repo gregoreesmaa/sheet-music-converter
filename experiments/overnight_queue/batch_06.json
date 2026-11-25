@@ -1,0 +1,53 @@
+{
+  "wave": 6,
+  "batch_id": "batch_06",
+  "theme": "Historical HW Augmentation, Droop/Warp & Continuation-Header Sweep",
+  "status": "QUEUED",
+  "baseline_sha": "164852f",
+  "platform": "colab-L4",
+  "hf_repo_id": "gregoreesmaa/sheet-music-converter-omr",
+  "experiments": [
+    {
+      "exp_num": 28,
+      "exp_id": "2026-11-26T01-38-ov-28-droop-warp-broken-staff-aug",
+      "title": "Curved-Staff Droop, Elastic Warp & Broken-Staff-Line Augmentation Sweep",
+      "session_name": "ov-28-droop-warp",
+      "gpu": "L4",
+      "est_minutes": 35,
+      "status": "QUEUED",
+      "dir": "experiments/2026-11-26T01-38-ov-28-droop-warp-broken-staff-aug",
+      "script": "experiments/2026-11-26T01-38-ov-28-droop-warp-broken-staff-aug/run_colab.py",
+      "sweep": ["none", "mild", "strong"],
+      "hf_eval_path": "evals/2026-11-26T01-38-ov-28-droop-warp-broken-staff-aug.json",
+      "hf_run_path": "runs/2026-11-26T01-38-ov-28-droop-warp-broken-staff-aug.json"
+    },
+    {
+      "exp_num": 29,
+      "exp_id": "2026-11-26T01-38-ov-29-ink-fade-bleedthrough-aug-prob",
+      "title": "Yellowed-Paper, Ink-Fade & Mirrored Bleed-Through aug_prob Sweep",
+      "session_name": "ov-29-fade-bleed",
+      "gpu": "L4",
+      "est_minutes": 35,
+      "status": "QUEUED",
+      "dir": "experiments/2026-11-26T01-38-ov-29-ink-fade-bleedthrough-aug-prob",
+      "script": "experiments/2026-11-26T01-38-ov-29-ink-fade-bleedthrough-aug-prob/run_colab.py",
+      "sweep": [0.30, 0.55, 0.75],
+      "hf_eval_path": "evals/2026-11-26T01-38-ov-29-ink-fade-bleedthrough-aug-prob.json",
+      "hf_run_path": "runs/2026-11-26T01-38-ov-29-ink-fade-bleedthrough-aug-prob.json"
+    },
+    {
+      "exp_num": 30,
+      "exp_id": "2026-11-26T01-38-ov-30-cont-header-omission-sweep",
+      "title": "Continuation-Header Omission Sweep (Systems 2+)",
+      "session_name": "ov-30-cont-header",
+      "gpu": "L4",
+      "est_minutes": 35,
+      "status": "QUEUED",
+      "dir": "experiments/2026-11-26T01-38-ov-30-cont-header-omission-sweep",
+      "script": "experiments/2026-11-26T01-38-ov-30-cont-header-omission-sweep/run_colab.py",
+      "sweep": [0.00, 0.35, 0.60],
+      "hf_eval_path": "evals/2026-11-26T01-38-ov-30-cont-header-omission-sweep.json",
+      "hf_run_path": "runs/2026-11-26T01-38-ov-30-cont-header-omission-sweep.json"
+    }
+  ]
+}

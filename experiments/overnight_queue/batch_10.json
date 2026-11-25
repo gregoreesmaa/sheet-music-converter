@@ -1,0 +1,55 @@
+{
+  "batch": 10,
+  "wave": 8,
+  "status": "QUEUED",
+  "theme": "Model Scale (small_45m vs edge85m), QAT-INT4 & SpinQuant, and v1->v2 Distillation Sweep",
+  "baseline_sha": "164852f",
+  "hf_repo": "gregoreesmaa/sheet-music-converter-omr",
+  "experiments": [
+    {
+      "exp_num": 40,
+      "exp_id": "2026-11-26T01-38-ov-40-small45m-vs-edge85m-pareto",
+      "title": "Controlled Capacity Pareto: small_45m (~31 MB) vs edge85m (~52 MB) at 1,000 steps + suite31_hw",
+      "dir": "experiments/2026-11-26T01-38-ov-40-small45m-vs-edge85m-pareto",
+      "run_script": "experiments/2026-11-26T01-38-ov-40-small45m-vs-edge85m-pareto/run_colab.py",
+      "colab_session": "ov-40-pareto",
+      "gpu": "L4",
+      "est_minutes": 40,
+      "est_cu": 3.2,
+      "wave": 8,
+      "status": "QUEUED",
+      "hf_eval_path": "evals/2026-11-26T01-38-ov-40-small45m-vs-edge85m-pareto.json",
+      "hf_run_path": "runs/2026-11-26T01-38-ov-40-small45m-vs-edge85m-pareto.json"
+    },
+    {
+      "exp_num": 41,
+      "exp_id": "2026-11-26T01-38-ov-41-qat-int4-blocksize-spinquant",
+      "title": "QAT-INT4 block_size (32/64/128) x SpinQuant Hadamard Folding Sweep on UniOMR v2 small_45m",
+      "dir": "experiments/2026-11-26T01-38-ov-41-qat-int4-blocksize-spinquant",
+      "run_script": "experiments/2026-11-26T01-38-ov-41-qat-int4-blocksize-spinquant/run_colab.py",
+      "colab_session": "ov-41-qat-spinquant",
+      "gpu": "L4",
+      "est_minutes": 35,
+      "est_cu": 2.9,
+      "wave": 8,
+      "status": "QUEUED",
+      "hf_eval_path": "evals/2026-11-26T01-38-ov-41-qat-int4-blocksize-spinquant.json",
+      "hf_run_path": "runs/2026-11-26T01-38-ov-41-qat-int4-blocksize-spinquant.json"
+    },
+    {
+      "exp_num": 42,
+      "exp_id": "2026-11-26T01-38-ov-42-v1-to-v2-distill-temp-jsd",
+      "title": "v1 (uni_omr_soup.pt) -> v2 (small_45m) Online Distillation Temp (1/2/4) x G-JSD/KL x Alpha (0.25/0.50/0.75)",
+      "dir": "experiments/2026-11-26T01-38-ov-42-v1-to-v2-distill-temp-jsd",
+      "run_script": "experiments/2026-11-26T01-38-ov-42-v1-to-v2-distill-temp-jsd/run_colab.py",
+      "colab_session": "ov-42-v1-v2-kd",
+      "gpu": "L4",
+      "est_minutes": 40,
+      "est_cu": 3.2,
+      "wave": 8,
+      "status": "QUEUED",
+      "hf_eval_path": "evals/2026-11-26T01-38-ov-42-v1-to-v2-distill-temp-jsd.json",
+      "hf_run_path": "runs/2026-11-26T01-38-ov-42-v1-to-v2-distill-temp-jsd.json"
+    }
+  ]
+}

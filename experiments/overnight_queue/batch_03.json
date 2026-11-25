@@ -1,0 +1,90 @@
+{
+  "batch_id": "batch_03",
+  "wave": 5,
+  "status": "QUEUED",
+  "created_at": "2026-11-26T01:38:00Z",
+  "baseline_commit": "164852f",
+  "theme": "Router Compression, ViR+ViCO Schedule & Flood-Fill paper_gate Sweep",
+  "platform": "colab",
+  "gpu": "L4",
+  "hf_repo": "gregoreesmaa/sheet-music-converter-omr",
+  "experiments": [
+    {
+      "id": "ov-19",
+      "exp_id": "2026-11-26T01-38-ov-19-router-saliency-keep-sweep",
+      "title": "Router saliency_thr x max_keep_ratio Compression Sweep",
+      "wave": 5,
+      "status": "QUEUED",
+      "platform": "colab",
+      "gpu": "L4",
+      "colab_session": "ov-19-router-sweep",
+      "est_minutes": 32,
+      "est_cu": 2.7,
+      "script": "experiments/2026-11-26T01-38-ov-19-router-saliency-keep-sweep/run_colab.py",
+      "readme": "experiments/2026-11-26T01-38-ov-19-router-saliency-keep-sweep/README.md",
+      "plan": "experiments/2026-11-26T01-38-ov-19-router-saliency-keep-sweep/PLAN.md",
+      "hf_eval_path": "evals/2026-11-26T01-38-ov-19-router-saliency-keep-sweep.json",
+      "hf_run_path": "runs/2026-11-26T01-38-ov-19-router-saliency-keep-sweep.json",
+      "datasets": [
+        "datasets/iter10_5_proxy_2k.tar"
+      ],
+      "sweep": [
+        {"arm": "arm_003_055", "saliency_thr": 0.03, "max_keep_ratio": 0.55},
+        {"arm": "arm_005_045", "saliency_thr": 0.05, "max_keep_ratio": 0.45},
+        {"arm": "arm_008_035", "saliency_thr": 0.08, "max_keep_ratio": 0.35}
+      ]
+    },
+    {
+      "id": "ov-20",
+      "exp_id": "2026-11-26T01-38-ov-20-vir-vico-weight-schedule",
+      "title": "ViR+ViCO Loss Weight & Target Compression Ratio Sweep",
+      "wave": 5,
+      "status": "QUEUED",
+      "platform": "colab",
+      "gpu": "L4",
+      "colab_session": "ov-20-vir-vico-sweep",
+      "est_minutes": 35,
+      "est_cu": 2.9,
+      "script": "experiments/2026-11-26T01-38-ov-20-vir-vico-weight-schedule/run_colab.py",
+      "readme": "experiments/2026-11-26T01-38-ov-20-vir-vico-weight-schedule/README.md",
+      "plan": "experiments/2026-11-26T01-38-ov-20-vir-vico-weight-schedule/PLAN.md",
+      "hf_eval_path": "evals/2026-11-26T01-38-ov-20-vir-vico-weight-schedule.json",
+      "hf_run_path": "runs/2026-11-26T01-38-ov-20-vir-vico-weight-schedule.json",
+      "datasets": [
+        "datasets/iter10_5_proxy_2k.tar"
+      ],
+      "sweep": [
+        {"arm": "vico_w002_kr035", "vico_loss_weight": 0.02, "keep_ratio": 0.35},
+        {"arm": "vico_w008_kr035", "vico_loss_weight": 0.08, "keep_ratio": 0.35},
+        {"arm": "vico_w020_kr035", "vico_loss_weight": 0.20, "keep_ratio": 0.35},
+        {"arm": "vico_w008_kr025", "vico_loss_weight": 0.08, "keep_ratio": 0.25}
+      ]
+    },
+    {
+      "id": "ov-21",
+      "exp_id": "2026-11-26T01-38-ov-21-paper-gate-border-threshold",
+      "title": "Edge-Connected Flood-Fill paper_gate Dark-Border Threshold Sweep",
+      "wave": 5,
+      "status": "QUEUED",
+      "platform": "colab",
+      "gpu": "L4",
+      "colab_session": "ov-21-paper-gate-sweep",
+      "est_minutes": 20,
+      "est_cu": 1.7,
+      "script": "experiments/2026-11-26T01-38-ov-21-paper-gate-border-threshold/run_colab.py",
+      "readme": "experiments/2026-11-26T01-38-ov-21-paper-gate-border-threshold/README.md",
+      "plan": "experiments/2026-11-26T01-38-ov-21-paper-gate-border-threshold/PLAN.md",
+      "hf_eval_path": "evals/2026-11-26T01-38-ov-21-paper-gate-border-threshold.json",
+      "hf_run_path": "runs/2026-11-26T01-38-ov-21-paper-gate-border-threshold.json",
+      "datasets": [
+        "datasets/suite31_hw_eval.tar",
+        "datasets/rism_hw_5707.tar"
+      ],
+      "sweep": {
+        "luma_stop": [0.35, 0.45, 0.55],
+        "dark_thr": [0.22, 0.30, 0.38],
+        "n_pages": 290
+      }
+    }
+  ]
+}

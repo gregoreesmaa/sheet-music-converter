@@ -1,0 +1,67 @@
+{
+  "batch_id": "batch_09",
+  "wave": 7,
+  "status": "QUEUED",
+  "theme": "RLVR/GRPO, SCRIBE/DocTTT & Confidence-Gated RISM Pseudo-Labeling Sweep",
+  "created_utc": "2026-11-26T01:38:00Z",
+  "baseline_sha": "164852f",
+  "baseline_ckpt": "checkpoints/iter10_soup_baseline/uni_omr_soup.pt",
+  "hf_repo": "gregoreesmaa/sheet-music-converter-omr",
+  "default_platform": "colab-L4",
+  "experiments": [
+    {
+      "num": 37,
+      "exp_id": "2026-11-26T01-38-ov-37-rlvr-kl-group-sweep",
+      "title": "Beat-Conservation + <sys>-Loop RLVR kl_beta x Group Size Sweep",
+      "wave": 7,
+      "status": "QUEUED",
+      "platform": "colab-L4",
+      "est_minutes": 35,
+      "folder": "experiments/2026-11-26T01-38-ov-37-rlvr-kl-group-sweep",
+      "runner": "experiments/2026-11-26T01-38-ov-37-rlvr-kl-group-sweep/run_colab.py",
+      "hf_eval_path": "evals/2026-11-26T01-38-ov-37-rlvr-kl-group-sweep.json",
+      "hf_run_path": "runs/2026-11-26T01-38-ov-37-rlvr-kl-group-sweep.json",
+      "sweep_grid": {
+        "kl_beta": [0.02, 0.06, 0.15],
+        "group_size": [4, 8],
+        "updates_per_arm": 40
+      }
+    },
+    {
+      "num": 38,
+      "exp_id": "2026-11-26T01-38-ov-38-scribe-ttt-lr-steps-sweep",
+      "title": "SCRIBE/DocTTT Per-Manuscript TTA steps x lr x scope Sweep",
+      "wave": 7,
+      "status": "QUEUED",
+      "platform": "colab-L4",
+      "est_minutes": 30,
+      "folder": "experiments/2026-11-26T01-38-ov-38-scribe-ttt-lr-steps-sweep",
+      "runner": "experiments/2026-11-26T01-38-ov-38-scribe-ttt-lr-steps-sweep/run_colab.py",
+      "hf_eval_path": "evals/2026-11-26T01-38-ov-38-scribe-ttt-lr-steps-sweep.json",
+      "hf_run_path": "runs/2026-11-26T01-38-ov-38-scribe-ttt-lr-steps-sweep.json",
+      "sweep_grid": {
+        "steps": [2, 4, 8],
+        "lr": [1e-5, 3e-5, 1e-4],
+        "adapt_scope": ["encoder_norm_only", "full_encoder"]
+      }
+    },
+    {
+      "num": 39,
+      "exp_id": "2026-11-26T01-38-ov-39-rism-pseudolabel-threshold-sweep",
+      "title": "Confidence- & Beat-Gated RISM Pseudo-Labeling Threshold Sweep",
+      "wave": 7,
+      "status": "QUEUED",
+      "platform": "colab-L4",
+      "est_minutes": 35,
+      "folder": "experiments/2026-11-26T01-38-ov-39-rism-pseudolabel-threshold-sweep",
+      "runner": "experiments/2026-11-26T01-38-ov-39-rism-pseudolabel-threshold-sweep/run_colab.py",
+      "hf_eval_path": "evals/2026-11-26T01-38-ov-39-rism-pseudolabel-threshold-sweep.json",
+      "hf_run_path": "runs/2026-11-26T01-38-ov-39-rism-pseudolabel-threshold-sweep.json",
+      "sweep_grid": {
+        "n_rism_pages": 300,
+        "mean_logprob": [-0.35, -0.20, -0.10],
+        "beat_valid_frac": [0.70, 0.85, 0.95]
+      }
+    }
+  ]
+}

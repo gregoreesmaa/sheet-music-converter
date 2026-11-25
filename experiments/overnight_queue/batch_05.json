@@ -1,0 +1,73 @@
+{
+  "batch_id": "batch_05",
+  "title": "Exps 25-27: CASS Scheduled Sampling, Label Smoothing & MTP-k Decoder Sweep",
+  "wave": 6,
+  "status": "QUEUED",
+  "created_utc": "2026-11-25T23:40:00Z",
+  "baseline_commit": "164852f",
+  "hf_repo": "gregoreesmaa/sheet-music-converter-omr",
+  "experiments": [
+    {
+      "exp_num": 25,
+      "exp_id": "2026-11-26T01-38-ov-25-cass-prob-sweep",
+      "title": "CASS Scheduled Sampling Probability Sweep (0.0, 0.10, 0.25)",
+      "wave": 6,
+      "status": "QUEUED",
+      "platform": "colab",
+      "gpu": "L4",
+      "est_minutes": 34,
+      "session_name": "ov-25-cass-prob-sweep",
+      "folder": "experiments/2026-11-26T01-38-ov-25-cass-prob-sweep",
+      "script": "experiments/2026-11-26T01-38-ov-25-cass-prob-sweep/run_colab.py",
+      "hf_eval_path": "evals/2026-11-26T01-38-ov-25-cass-prob-sweep.json",
+      "hf_run_path": "runs/2026-11-26T01-38-ov-25-cass-prob-sweep.json",
+      "sweep": {
+        "cass_prob": [0.0, 0.10, 0.25],
+        "steps_per_arm": 700,
+        "arms": 3
+      }
+    },
+    {
+      "exp_num": 26,
+      "exp_id": "2026-11-26T01-38-ov-26-label-smoothing-struct-weight",
+      "title": "Label Smoothing (0.0, 0.05, 0.10) x Struct Token Weight (1.0, 1.25)",
+      "wave": 6,
+      "status": "QUEUED",
+      "platform": "colab",
+      "gpu": "L4",
+      "est_minutes": 36,
+      "session_name": "ov-26-ls-struct-weight",
+      "folder": "experiments/2026-11-26T01-38-ov-26-label-smoothing-struct-weight",
+      "script": "experiments/2026-11-26T01-38-ov-26-label-smoothing-struct-weight/run_colab.py",
+      "hf_eval_path": "evals/2026-11-26T01-38-ov-26-label-smoothing-struct-weight.json",
+      "hf_run_path": "runs/2026-11-26T01-38-ov-26-label-smoothing-struct-weight.json",
+      "sweep": {
+        "label_smoothing": [0.0, 0.05, 0.10],
+        "struct_tok_weight": [1.0, 1.25],
+        "steps_per_arm": 450,
+        "arms": 6
+      }
+    },
+    {
+      "exp_num": 27,
+      "exp_id": "2026-11-26T01-38-ov-27-mtp-k-weight-sweep",
+      "title": "MTP-k (2, 4, 6) x MTP Loss Weight (0.15, 0.30, 0.50) + Speculative Decode",
+      "wave": 6,
+      "status": "QUEUED",
+      "platform": "colab",
+      "gpu": "L4",
+      "est_minutes": 38,
+      "session_name": "ov-27-mtp-k-weight-sweep",
+      "folder": "experiments/2026-11-26T01-38-ov-27-mtp-k-weight-sweep",
+      "script": "experiments/2026-11-26T01-38-ov-27-mtp-k-weight-sweep/run_colab.py",
+      "hf_eval_path": "evals/2026-11-26T01-38-ov-27-mtp-k-weight-sweep.json",
+      "hf_run_path": "runs/2026-11-26T01-38-ov-27-mtp-k-weight-sweep.json",
+      "sweep": {
+        "mtp_k": [2, 4, 6],
+        "mtp_loss_weight": [0.15, 0.30, 0.50],
+        "steps_per_arm": 300,
+        "arms": 9
+      }
+    }
+  ]
+}

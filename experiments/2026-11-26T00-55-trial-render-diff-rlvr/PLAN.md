@@ -8,8 +8,9 @@
 ## 2. Identifiers for Follow-Up Queries (Zero-Prior-Context Handoff)
 - **Modal Profile:** `gregoreesmaa1`
 - **Modal App Name:** `exp7-trial-render-diff-rlvr`
-- **Modal App ID:** `ap-oLzdkXJmNcYxbzj8bkCLKT`
-- **Modal Dashboard URL:** `https://modal.com/apps/gregoreesmaa1/main/ap-oLzdkXJmNcYxbzj8bkCLKT`
+- **Modal App ID:** `ap-otKKVyElX8m8GGwPd1zeVa`
+- **Modal Function Call ID:** `fc-01M8AG82RY2G46TF6FQKC4T5V7`
+- **Modal Dashboard URL:** `https://modal.com/apps/gregoreesmaa1/main/ap-otKKVyElX8m8GGwPd1zeVa`
 - **Modal Volume:** `omr-cache` mounted at `/vol` (checkpoints at `/vol/ckpts/exp7_render_diff_rlvr/`)
 - **Modal Secret:** `hf-secret` (`HF_TOKEN`)
 - **Hugging Face Repo:** `gregoreesmaa/sheet-music-converter-omr` (private dataset repo)
@@ -24,10 +25,10 @@
 .\.venv\Scripts\modal.exe app list
 
 # Tail live logs
-.\.venv\Scripts\modal.exe app logs ap-oLzdkXJmNcYxbzj8bkCLKT
+.\.venv\Scripts\modal.exe app logs ap-otKKVyElX8m8GGwPd1zeVa
 
 # Stop/cancel runaway run
-.\.venv\Scripts\modal.exe app stop ap-oLzdkXJmNcYxbzj8bkCLKT
+.\.venv\Scripts\modal.exe app stop ap-otKKVyElX8m8GGwPd1zeVa
 
 # Download final eval & run ledger from Hugging Face once completed
 $env:CUDA_VISIBLE_DEVICES=""
