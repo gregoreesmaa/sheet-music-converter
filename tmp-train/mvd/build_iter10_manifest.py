@@ -52,6 +52,8 @@ def main() -> int:
     ap.add_argument("--base", type=Path, default=Path(r"D:\tmp\uni_fullpage_iter8_clean.jsonl"))
     ap.add_argument("--verovio", type=Path, default=Path(r"D:\tmp\uni-verovio-iter10\manifest.jsonl"))
     ap.add_argument("--osmd", type=Path, default=Path(r"D:\tmp\uni-osmd-iter10\manifest.jsonl"))
+    ap.add_argument("--verovio-spacing", type=Path, default=Path(r"D:\tmp\uni-verovio-spacing-iter10\manifest.jsonl"))
+    ap.add_argument("--osmd-spacing", type=Path, default=Path(r"D:\tmp\uni-osmd-spacing-iter10\manifest.jsonl"))
     ap.add_argument("--out", type=Path, default=Path(r"D:\tmp\uni_fullpage_iter10_rich.jsonl"))
     ap.add_argument("--verovio-upsample", type=int, default=1)
     ap.add_argument("--osmd-upsample", type=int, default=1)
@@ -133,7 +135,7 @@ def main() -> int:
                 continue
 
             clean = {"image": img, "bekerns": bks, "domain": dom}
-            if tag in ("verovio", "osmd"):
+            if tag in ("verovio", "osmd", "verovio_spacing", "osmd_spacing"):
                 font_counts[f"{tag}/{row.get('font', 'unknown')}"] += copies
             for _ in range(copies):
                 out_rows.append(clean)
@@ -143,6 +145,8 @@ def main() -> int:
     _ingest(args.base, "iter8_base", "printed", 1, check_prefix=args.check_prefix_base)
     _ingest(args.verovio, "verovio", "printed", args.verovio_upsample, check_prefix=True)
     _ingest(args.osmd, "osmd", "printed", args.osmd_upsample, check_prefix=True)
+    _ingest(args.verovio_spacing, "verovio_spacing", "printed", 1, check_prefix=True)
+    _ingest(args.osmd_spacing, "osmd_spacing", "printed", 1, check_prefix=True)
 
     rng = random.Random(args.seed)
     rng.shuffle(out_rows)

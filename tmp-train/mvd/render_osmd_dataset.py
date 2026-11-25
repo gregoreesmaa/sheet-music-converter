@@ -126,6 +126,7 @@ def main() -> int:
     ap.add_argument("--max-measures", type=int, default=32)
     ap.add_argument("--batch-size", type=int, default=200)
     ap.add_argument("--seed", type=int, default=20261129)
+    ap.add_argument("--spacing-stress", action="store_true", help="Randomize bar counts per line & OSMD spacing/EngravingRules")
     ap.add_argument("--resume", action="store_true")
     args = ap.parse_args()
 
@@ -175,33 +176,95 @@ def main() -> int:
             batch = pending[idx : idx + args.batch_size]
             idx += len(batch)
 
-            node_jobs = []
-            for j_i, c in enumerate(batch):
-                g_idx = len(done_ids) + idx - len(batch) + j_i
-                font = OSMD_FONTS[g_idx % len(OSMD_FONTS)]
-                dp = OSMD_DRAWING_PARAMS[(g_idx // len(OSMD_FONTS)) % len(OSMD_DRAWING_PARAMS)]
-                vw = OSMD_VIEWPORTS[(g_idx // (len(OSMD_FONTS) * len(OSMD_DRAWING_PARAMS))) % len(OSMD_VIEWPORTS)]
-                jseed = int(hashlib.sha256(f"{args.seed}:{c['score_id']}".encode()).hexdigest()[:8], 16)
-                rng = random.Random(jseed)
-                zoom = round(rng.uniform(0.78, 1.10), 2)
-                margin_px = rng.randint(20, 52)
-                draw_title = rng.random() < 0.20
-                stem = f"{c['score_id']}__osmd_{font}_{dp}"
-                node_jobs.append({
-                    "score_id": c["score_id"],
-                    "xml_path": c["xml_path"],
-                    "png_path": str(pages_dir / f"{stem}.png"),
-                    "drawing_params": dp,
-                    "font": font,
-                    "viewport_w": vw,
-                    "zoom": zoom,
-                    "margin_px": margin_px,
-                    "draw_title": draw_title,
-                    "max_height_px": 2400,
-                })
-
             with tempfile.TemporaryDirectory() as td:
                 td_p = Path(td)
+                node_jobs = []
+                for j_i, c in enumerate(batch):
+                    g_idx = len(done_ids) + idx - len(batch) + j_i
+                    font = OSMD_FONTS[g_idx % len(OSMD_FONTS)]
+                    dp = OSMD_DRAWING_PARAMS[(g_idx // len(OSMD_FONTS)) % len(OSMD_DRAWING_PARAMS)]
+                    vw = OSMD_VIEWPORTS[(g_idx // (len(OSMD_FONTS) * len(OSMD_DRAWING_PARAMS))) % len(OSMD_VIEWPORTS)]
+                    jseed = int(hashlib.sha256(f"{args.seed}:{c['score_id']}:{int(args.spacing_stress)}".encode()).hexdigest()[:8], 16)
+                    rng = random.Random(jseed)
+                    zoom = round(rng.uniform(0.78, 1.10), 2)
+                    margin_px = rng.randint(20, 52)
+                    draw_title = rng.random() < 0.20
+                    max_h = 2400
+                    xml_for_node = c["xml_path"]
+                    new_sys_from_xml = False
+                    engraving_rules: Dict[str, Any] = {}
+                    stress_info: Dict[str, Any] = {}
+
+                    if args.spacing_stress:
+                        max_h = 2800
+                        if rng.random() < 0.60:
+                            mps = rng.choice([2, 2, 3, 4, 5, 6, 6, 7, 7, 8, 8])
+                            engraving_rules["RenderXMeasuresPerLineAkaSystem"] = mps
+                            target_pat = [mps]
+                        else:
+                            irreg_presets = [
+                                [2, 6, 3, 5],
+                                [1, 4, 2],
+                                [3, 7, 2],
+                                [2, 5, 1, 4],
+                                [6, 2, 4],
+                                [1, 5, 3, 6],
+                            ]
+                            target_pat = list(rng.choice(irreg_presets))
+                            injected = rvd.inject_system_breaks_xml(Path(c["xml_path"]), target_pat)
+                            tmp_xml = td_p / f"inj_{j_i}.musicxml"
+                            tmp_xml.write_text(injected, encoding="utf-8")
+                            xml_for_node = str(tmp_xml)
+                            new_sys_from_xml = True
+                            engraving_rules["RenderXMeasuresPerLineAkaSystem"] = 0
+
+                        max_pat = max(target_pat)
+                        if max_pat >= 7:
+                            vw = rng.choice([1200, 1350])
+                            zoom = round(rng.uniform(0.68, 0.90), 2)
+                        elif max_pat <= 2:
+                            zoom = round(rng.uniform(0.85, 1.15), 2)
+                        else:
+                            zoom = round(rng.uniform(0.74, 1.08), 2)
+
+                        min_sky_sys = round(rng.uniform(1.0, 8.0), 2)
+                        engraving_rules.update({
+                            "VoiceSpacingMultiplierVexflow": round(rng.uniform(0.65, 1.45), 2),
+                            "VoiceSpacingAddendVexflow": round(rng.uniform(1.5, 6.0), 2),
+                            "MinSkyBottomDistBetweenSystems": min_sky_sys,
+                            "MinimumDistanceBetweenSystems": round(max(1.5, min_sky_sys + rng.uniform(0.5, 3.0)), 2),
+                            "MinSkyBottomDistBetweenStaves": round(rng.uniform(1.0, 6.0), 2),
+                            "StaffDistance": round(rng.uniform(4.0, 12.0), 2),
+                            "BetweenStaffDistance": round(rng.uniform(3.0, 10.0), 2),
+                            "MeasureLeftMargin": round(rng.uniform(0.2, 2.2), 2),
+                            "MeasureRightMargin": round(rng.uniform(0.0, 1.5), 2),
+                            "StaffLineWidth": round(rng.uniform(0.08, 0.20), 2),
+                            "StretchLastSystemLine": rng.random() < 0.40,
+                        })
+                        stress_info = {
+                            "spacing_stress": True,
+                            "target_bars_pattern": target_pat,
+                            "new_system_from_xml": new_sys_from_xml,
+                            "engraving_rules": engraving_rules,
+                        }
+
+                    stem = f"{c['score_id']}__osmd_{font}_{dp}{'_sp' if args.spacing_stress else ''}"
+                    node_jobs.append({
+                        "score_id": c["score_id"],
+                        "xml_path": xml_for_node,
+                        "png_path": str(pages_dir / f"{stem}.png"),
+                        "drawing_params": dp,
+                        "font": font,
+                        "viewport_w": vw,
+                        "zoom": zoom,
+                        "margin_px": margin_px,
+                        "draw_title": draw_title,
+                        "max_height_px": max_h,
+                        "new_system_from_xml": new_sys_from_xml,
+                        "engraving_rules": engraving_rules if args.spacing_stress else None,
+                    })
+                    c["_stress_info"] = stress_info
+
                 jobs_json = td_p / "jobs.json"
                 res_jsonl = td_p / "results.jsonl"
                 jobs_json.write_text(json.dumps(node_jobs), encoding="utf-8")
@@ -315,6 +378,8 @@ def main() -> int:
                         "width": im_w,
                         "height": im_h,
                     }
+                    if c.get("_stress_info"):
+                        row.update(c["_stress_info"])
                     valid_pages.append(row)
                     sf.write(json.dumps({"score_id": sid, "valid": True, "row": row}, separators=(",", ":")) + "\n")
                 sf.flush()
