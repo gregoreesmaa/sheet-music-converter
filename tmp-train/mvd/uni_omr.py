@@ -3560,9 +3560,12 @@ def run_train(args: argparse.Namespace, cfg: UniOMRConfig) -> Dict[str, Any]:
                 last_n_out = int(out["router_info"]["n_out"])
                 last_kind = kind
                 del images, seq, uv_target, tgt_in, tgt_out, out, losses
+                mem = uv_pred = router_info = logits = mtp_logits = dec_in = draft_logits = pred_ids = None
 
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             opt.step()
+            if device.type == "cuda" and torch.cuda.memory_reserved(device) > 10 * (1024 ** 3):
+                torch.cuda.empty_cache()
 
             if ema_teacher is not None:
                 ema_teacher.update(model)
