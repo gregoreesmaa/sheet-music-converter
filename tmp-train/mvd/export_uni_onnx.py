@@ -94,20 +94,18 @@ def _causal_sdpa(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
-    causal_mask: torch.Tensor,
+    causal_bias: torch.Tensor,
 ) -> torch.Tensor:
     """Explicit causal SDPA for variable-length decode (T=1 or T=4 MTP verify).
 
-    ``causal_mask`` is a bool tensor broadcastable to ``(1, 1, T, P+T)`` where
-    ``True`` marks future positions to mask out with ``-1e9``.
+    ``causal_bias`` is a pure float32 additive tensor broadcastable to
+    ``(1, 1, T, P+T)`` with ``0.0`` for allowed positions and ``-1e9`` for
+    future positions (avoids int64 Greater + bool Where which ORT-Web WebGPU
+    EP misbroadcasts at T=4).
     """
     scale = 1.0 / math.sqrt(q.shape[-1])
     scores = torch.matmul(q, k.transpose(-2, -1)) * scale
-    scores = torch.where(
-        causal_mask,
-        torch.full_like(scores, -1e9),
-        scores,
-    )
+    scores = scores + causal_bias
     attn = F.softmax(scores, dim=-1)
     return torch.matmul(attn, v)
 
@@ -566,10 +564,15 @@ class UniOMRDecoderMTPWebGPUONNX(nn.Module):
         cos1d = emb.cos().unsqueeze(1)                                      # (1, 1, T, head_dim)
         sin1d = emb.sin().unsqueeze(1)                                      # (1, 1, T, head_dim)
 
-        # Causal mask: key position j > query position (past_len + i) is masked out.
-        q_pos = past_len + torch.arange(t_len, device=token_ids.device, dtype=torch.long)
-        k_pos = torch.arange(total_len, device=token_ids.device, dtype=torch.long)
-        causal_mask = (k_pos.unsqueeze(0) > q_pos.unsqueeze(1)).unsqueeze(0).unsqueeze(0)
+        # Pure float32 additive causal bias (zero int64 Greater, zero bool Where).
+        # row_pos: [1, 1, T, 1] = past_len + [0..T-1]
+        # col_pos: [1, 1, 1, P+T] = [0..P+T-1]
+        # is_future = clamp(col_pos - row_pos, 0.0, 1.0) -> 0.0 if col <= row else 1.0
+        past_len_f = torch._shape_as_tensor(past_ks[0])[2].to(torch.float32)
+        row_pos = (past_len_f + t_arange).view(1, 1, -1, 1)
+        col_pos = torch.arange(total_len, device=token_ids.device, dtype=torch.float32).view(1, 1, 1, -1)
+        is_future = torch.clamp(col_pos - row_pos, min=0.0, max=1.0)
+        causal_bias = is_future * (-1e9)
 
         present_ks: List[torch.Tensor] = []
         present_vs: List[torch.Tensor] = []
@@ -589,7 +592,7 @@ class UniOMRDecoderMTPWebGPUONNX(nn.Module):
             present_vs.append(v_cat)
 
             sa_out = (
-                _causal_sdpa(q, k_cat, v_cat, causal_mask)
+                _causal_sdpa(q, k_cat, v_cat, causal_bias)
                 .transpose(1, 2)
                 .contiguous()
                 .view(1, -1, self.d_model)

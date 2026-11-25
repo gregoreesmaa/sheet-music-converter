@@ -311,7 +311,15 @@ function initWorker() {
   worker.postMessage({ type: 'init', forceBackend });
 }
 
-function workerRecognizePage(nchwFloat32, width, height, pageIndex, pageCount, onProgress) {
+function workerRecognizePage(
+  nchwFloat32,
+  width,
+  height,
+  pageIndex,
+  pageCount,
+  onProgress,
+  prevTailState = null,
+) {
   const requestId = state.nextRequestId++;
   return new Promise((resolve, reject) => {
     state.pendingRequests.set(requestId, { resolve, reject, onProgress });
@@ -324,6 +332,7 @@ function workerRecognizePage(nchwFloat32, width, height, pageIndex, pageCount, o
         height,
         pageIndex,
         pageCount,
+        prevTailState,
       },
       [nchwFloat32.buffer],
     );
@@ -567,6 +576,7 @@ async function runConversion() {
 
   try {
     const pageBekerns = [];
+    let prevTailState = null;
     let totalTokens = 0;
     let totalSystems = 0;
     let totalDecodeMs = 0;
@@ -636,6 +646,7 @@ async function runConversion() {
             );
           }
         },
+        prevTailState,
       );
 
       if (pageRes.cancelled || state.cancelRequested) {
@@ -646,6 +657,7 @@ async function runConversion() {
       if (pageRes.bekern && pageRes.bekern.trim()) {
         pageBekerns.push(pageRes.bekern.trim());
       }
+      prevTailState = pageRes.tailState || prevTailState;
       totalTokens += pageRes.tokens || 0;
       totalSystems += pageRes.systems || 0;
       totalDecodeMs += pageRes.decodeMs || 0;
