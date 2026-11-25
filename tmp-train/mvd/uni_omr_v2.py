@@ -116,6 +116,7 @@ __all__ = [
     "SysYHead",
     "SysCountHead",
     "StaffSegHead",
+    "StrokeHogHead",
     "GroupedQueryAttention",
     "DeepStackFusion",
     "GQADecoderLayer",
@@ -124,6 +125,8 @@ __all__ = [
     "compute_sys_y_loss",
     "compute_sys_count_loss",
     "compute_staff_seg_loss",
+    "compute_stroke_hog_target",
+    "compute_stroke_hog_loss",
     "fake_quant_int4_ste",
     "QATInt4Controller",
 ]
@@ -196,10 +199,16 @@ class UniOMRv2Config:
     use_ink_prior: bool = True
     router_hidden: int = 64
 
-    # Training-only layout auxiliary heads (0% inference cost)
+    # Training-only layout & stroke-gradient auxiliary heads (0% inference cost)
     use_sys_y_aux: bool = True
     use_sys_count_aux: bool = True
     use_staff_seg_aux: bool = True
+    use_stroke_hog_head: bool = True
+
+    # Frontier 2025-2026 visual upgrades (iRoPE, RoPE-exempt registers, V2PE RoPE jitter)
+    irope_nope_every: int = 4
+    n_register_tokens: int = 4
+    rope_jitter: float = 0.08
 
     # Decoder / MTP / RoPE
     mtp_k: int = 4
@@ -219,6 +228,11 @@ class UniOMRv2Config:
             raise ValueError(f"head_dim ({head_dim}) must be divisible by 4 for RoPE2D")
         if self.max_mem_tokens < max(1, self.n_bg_summary + 1):
             raise ValueError(f"max_mem_tokens ({self.max_mem_tokens}) must exceed n_bg_summary ({self.n_bg_summary})")
+        if self.n_register_tokens < 0:
+            raise ValueError(f"n_register_tokens ({self.n_register_tokens}) must be >= 0")
+        if self.irope_nope_every < 0:
+            raise ValueError(f"irope_nope_every ({self.irope_nope_every}) must be >= 0")
+        self.rope_jitter = float(max(0.0, self.rope_jitter))
         self.mixstyle_prob = float(max(0.0, min(1.0, self.mixstyle_prob)))
 
     @classmethod
@@ -416,22 +430,35 @@ class AspectNormalizedRoPE1D(nn.Module):
     """1D RoPE over coordinates normalized to ``[0, 1] * coord_scale``.
 
     Ensures identical rotary phases across different image resolutions
-    (e.g. 1280px vs 1536px).
+    (e.g. 1280px vs 1536px). Supports training-only V2PE box jitter.
     """
 
-    def __init__(self, head_dim: int, base: float = 10000.0, coord_scale: float = 128.0) -> None:
+    def __init__(
+        self,
+        head_dim: int,
+        base: float = 10000.0,
+        coord_scale: float = 128.0,
+        rope_jitter: float = 0.0,
+    ) -> None:
         super().__init__()
         if head_dim % 2 != 0:
             raise ValueError(f"head_dim must be even, got {head_dim}")
         self.coord_scale = float(coord_scale)
+        self.rope_jitter = float(max(0.0, rope_jitter))
         inv_freq = 1.0 / (base ** (torch.arange(0, head_dim, 2, dtype=torch.float32) / head_dim))
         self.register_buffer("inv_freq", inv_freq, persistent=False)
 
     def forward(self, seq_len: int, device: torch.device, dtype: torch.dtype) -> Tuple[torch.Tensor, torch.Tensor]:
         if seq_len <= 1:
-            pos = torch.zeros(seq_len, device=device, dtype=torch.float32)
+            pos_norm = torch.zeros(seq_len, device=device, dtype=torch.float32)
         else:
-            pos = torch.linspace(0.0, self.coord_scale, steps=seq_len, device=device, dtype=torch.float32)
+            pos_norm = torch.linspace(0.0, 1.0, steps=seq_len, device=device, dtype=torch.float32)
+        if self.training and self.rope_jitter > 0.0:
+            j = self.rope_jitter
+            scale = 1.0 + (torch.rand((), device=device, dtype=torch.float32) * 2.0 - 1.0) * j
+            shift = (torch.rand((), device=device, dtype=torch.float32) * 2.0 - 1.0) * (0.5 * j)
+            pos_norm = pos_norm * scale + shift
+        pos = pos_norm * self.coord_scale
         freqs = torch.outer(pos, self.inv_freq.to(device))  # (L, D/2)
         emb = torch.cat([freqs, freqs], dim=-1)             # (L, D)
         cos = emb.cos().to(dtype)[None, None, :, :]
@@ -445,14 +472,21 @@ class AspectNormalizedRoPE2D(nn.Module):
     Maps ``(y, x)`` into ``[0, 1] * coord_scale`` and interleaves ``y`` and ``x``
     rotary frequencies across the full spectrum so both spatial axes share high
     and low frequency bands while preserving exact resolution invariance across
-    e.g. 1280px and 1536px pages.
+    e.g. 1280px and 1536px pages. Supports training-only V2PE box jitter.
     """
 
-    def __init__(self, head_dim: int, base: float = 10000.0, coord_scale: float = 128.0) -> None:
+    def __init__(
+        self,
+        head_dim: int,
+        base: float = 10000.0,
+        coord_scale: float = 128.0,
+        rope_jitter: float = 0.0,
+    ) -> None:
         super().__init__()
         if head_dim % 4 != 0:
             raise ValueError(f"AspectNormalizedRoPE2D requires head_dim % 4 == 0, got {head_dim}")
         self.coord_scale = float(coord_scale)
+        self.rope_jitter = float(max(0.0, rope_jitter))
         half_dim = head_dim // 2
         inv_freq = 1.0 / (base ** (torch.arange(0, half_dim, 2, dtype=torch.float32) / half_dim))
         self.register_buffer("inv_freq", inv_freq, persistent=False)
@@ -467,6 +501,18 @@ class AspectNormalizedRoPE2D(nn.Module):
         inv_f = self.inv_freq.to(coords.device, dtype=torch.float32)
         y_norm = coords[..., 0].to(torch.float32) / float(max(1, h_p - 1))
         x_norm = coords[..., 1].to(torch.float32) / float(max(1, w_p - 1))
+        if self.training and self.rope_jitter > 0.0:
+            j = self.rope_jitter
+            if y_norm.ndim >= 2:
+                bcast_shape = (y_norm.shape[0],) + (1,) * (y_norm.ndim - 1)
+            else:
+                bcast_shape = ()
+            scale_y = 1.0 + (torch.rand(bcast_shape, device=coords.device, dtype=torch.float32) * 2.0 - 1.0) * j
+            scale_x = 1.0 + (torch.rand(bcast_shape, device=coords.device, dtype=torch.float32) * 2.0 - 1.0) * j
+            shift_y = (torch.rand(bcast_shape, device=coords.device, dtype=torch.float32) * 2.0 - 1.0) * (0.5 * j)
+            shift_x = (torch.rand(bcast_shape, device=coords.device, dtype=torch.float32) * 2.0 - 1.0) * (0.5 * j)
+            y_norm = y_norm * scale_y + shift_y
+            x_norm = x_norm * scale_x + shift_x
         fy = (y_norm * self.coord_scale).unsqueeze(-1) * inv_f
         fx = (x_norm * self.coord_scale).unsqueeze(-1) * inv_f
         # Interleaved [y0, x0, y1, x1, ...] across rotary frequencies
@@ -850,7 +896,10 @@ class HybridAxialMergerEncoder(nn.Module):
         head_dim = d_model // cfg.n_heads
 
         self.axial_rope = AspectNormalizedRoPE1D(
-            head_dim=head_dim, base=cfg.rope_base, coord_scale=cfg.rope_coord_scale
+            head_dim=head_dim,
+            base=cfg.rope_base,
+            coord_scale=cfg.rope_coord_scale,
+            rope_jitter=cfg.rope_jitter,
         )
         self.axial_layers = nn.ModuleList([
             AxialEncoderLayer(d_model, cfg.n_heads, axial_d_ff, dropout=cfg.dropout)
@@ -872,7 +921,15 @@ class HybridAxialMergerEncoder(nn.Module):
         )
 
         self.rope2d = AspectNormalizedRoPE2D(
-            head_dim=head_dim, base=cfg.rope_base, coord_scale=cfg.rope_coord_scale
+            head_dim=head_dim,
+            base=cfg.rope_base,
+            coord_scale=cfg.rope_coord_scale,
+            rope_jitter=cfg.rope_jitter,
+        )
+        self.register_tokens: Optional[nn.Parameter] = (
+            nn.Parameter(torch.randn(1, cfg.n_register_tokens, d_model) * 0.02)
+            if cfg.n_register_tokens > 0
+            else None
         )
         self.pos2d_proj = nn.Linear(d_model, d_model, bias=False)
         nn.init.zeros_(self.pos2d_proj.weight)
@@ -946,10 +1003,22 @@ class HybridAxialMergerEncoder(nn.Module):
         mem_post_merger = routed_tokens
 
         # Aspect-Normalized Interleaved 2D-RoPE Global Attention
+        # Prepend RoPE-exempt ViT-5 / DINOv3 register tokens (cos=1, sin=0 -> identity rotation)
+        # and slice them off after global layers so DeepStack/decoder shapes remain identical.
         grid_hw = router_info["grid_hw"]
         pos2d = self.pos2d_proj(self._sinusoidal_pos2d(routed_coords, grid_hw=grid_hw, dtype=routed_tokens.dtype))
         cos2d, sin2d = self.rope2d(routed_coords, grid_hw=grid_hw, dtype=routed_tokens.dtype)
         mem = routed_tokens + pos2d
+
+        n_reg = int(self.cfg.n_register_tokens) if self.register_tokens is not None else 0
+        if n_reg > 0 and self.register_tokens is not None:
+            B = mem.shape[0]
+            reg = self.register_tokens.expand(B, -1, -1).to(mem.dtype)
+            mem = torch.cat([reg, mem], dim=1)
+            ones_c = torch.ones((B, 1, n_reg, cos2d.shape[-1]), device=cos2d.device, dtype=cos2d.dtype)
+            zeros_s = torch.zeros((B, 1, n_reg, sin2d.shape[-1]), device=sin2d.device, dtype=sin2d.dtype)
+            cos2d = torch.cat([ones_c, cos2d], dim=2)
+            sin2d = torch.cat([zeros_s, sin2d], dim=2)
 
         n_global = len(self.global_layers)
         mid_idx = max(0, (n_global // 2) - 1)
@@ -964,8 +1033,10 @@ class HybridAxialMergerEncoder(nn.Module):
             else:
                 mem = layer(mem, rope_cos=cos2d, rope_sin=sin2d)
             if i == mid_idx:
-                mem_global_mid = mem
+                mem_global_mid = mem[:, n_reg:, :] if n_reg > 0 else mem
 
+        if n_reg > 0:
+            mem = mem[:, n_reg:, :]
         mem_final = self.enc_norm(mem) + pos2d
         mem_levels = (mem_post_merger, mem_global_mid, mem_final)
         return mem_levels, router_info
@@ -1034,6 +1105,90 @@ class StaffSegHead(nn.Module):
         p3_up = F.interpolate(self.p3_proj(p3), size=p2.shape[-2:], mode="bilinear", align_corners=False)
         fused = torch.cat([self.p2_proj(p2), p3_up], dim=1)
         return self.head(fused)
+
+
+class StrokeHogHead(nn.Module):
+    """Training-only MonkeyOCRv2 / MaskFeat Sobel-HOG stroke-gradient aux head on ``P2 (/4)``.
+
+    Zero inference cost: skipped at inference and stripped cleanly by ``strip_aux_heads()``.
+    """
+
+    def __init__(self, in_ch: int, n_bins: int = 8, mid_ch: int = 64) -> None:
+        super().__init__()
+        self.in_ch = int(in_ch)
+        self.n_bins = int(n_bins)
+        g = _group_count(mid_ch, 8)
+        self.net = nn.Sequential(
+            nn.Conv2d(in_ch, mid_ch, kernel_size=3, padding=1, bias=False),
+            nn.GroupNorm(g, mid_ch),
+            nn.SiLU(inplace=True),
+            nn.Conv2d(mid_ch, self.n_bins, kernel_size=1, bias=True),
+        )
+
+    def forward(self, p2: torch.Tensor) -> torch.Tensor:
+        """Returns ``(B, n_bins, H/4, W/4)`` predicted Sobel-HOG orientation histogram."""
+        return self.net(p2)
+
+
+def compute_stroke_hog_target(
+    img: torch.Tensor,
+    target_hw: Tuple[int, int],
+    n_bins: int = 8,
+) -> torch.Tensor:
+    """Fast pure-PyTorch Sobel-HOG unsigned orientation histogram pooled to ``target_hw``.
+
+    Zero CUDA-CPU syncs; outputs L2-normalized ``(B, n_bins, H_t, W_t)`` float32 targets.
+    """
+    img_f = img.float()
+    if img_f.shape[1] == 3:
+        luma = 0.299 * img_f[:, 0:1] + 0.587 * img_f[:, 1:2] + 0.114 * img_f[:, 2:3]
+    else:
+        luma = img_f.mean(dim=1, keepdim=True)
+
+    device = luma.device
+    kx = torch.tensor(
+        [[[[-1.0, 0.0, 1.0], [-2.0, 0.0, 2.0], [-1.0, 0.0, 1.0]]]],
+        device=device,
+        dtype=torch.float32,
+    ) * 0.25
+    ky = torch.tensor(
+        [[[[-1.0, -2.0, -1.0], [0.0, 0.0, 0.0], [1.0, 2.0, 1.0]]]],
+        device=device,
+        dtype=torch.float32,
+    ) * 0.25
+
+    gx = F.conv2d(luma, kx, padding=1)
+    gy = F.conv2d(luma, ky, padding=1)
+    mag = torch.sqrt(gx * gx + gy * gy + 1e-8)
+    angle = torch.remainder(torch.atan2(gy, gx), math.pi)
+
+    bin_f = angle * (float(n_bins) / math.pi)
+    bin_lo = torch.floor(bin_f).to(torch.long) % n_bins
+    bin_hi = (bin_lo + 1) % n_bins
+    w_hi = bin_f - torch.floor(bin_f)
+    w_lo = 1.0 - w_hi
+
+    B, _, H, W = luma.shape
+    hog_full = luma.new_zeros((B, n_bins, H, W))
+    hog_full.scatter_add_(1, bin_lo, mag * w_lo)
+    hog_full.scatter_add_(1, bin_hi, mag * w_hi)
+
+    hog_pooled = F.adaptive_avg_pool2d(hog_full, (int(target_hw[0]), int(target_hw[1])))
+    norm = torch.sqrt((hog_pooled * hog_pooled).sum(dim=1, keepdim=True) + 1e-4)
+    return hog_pooled / norm
+
+
+def compute_stroke_hog_loss(
+    pred_hog: torch.Tensor,
+    img: torch.Tensor,
+) -> torch.Tensor:
+    """Smooth-L1 loss between predicted ``StrokeHogHead`` output and Sobel-HOG target (0 syncs)."""
+    n_bins = int(pred_hog.shape[1])
+    target_hw = (int(pred_hog.shape[2]), int(pred_hog.shape[3]))
+    with torch.no_grad():
+        target = compute_stroke_hog_target(img, target_hw=target_hw, n_bins=n_bins)
+    loss = F.smooth_l1_loss(pred_hog.float(), target.float(), beta=0.1)
+    return loss.to(pred_hog.dtype)
 
 
 def compute_sys_y_loss(
@@ -1105,6 +1260,7 @@ class GroupedQueryAttention(nn.Module):
         n_heads: int = 8,
         n_kv_heads: int = 2,
         use_native_gqa: bool = True,
+        use_rope: bool = True,
     ) -> None:
         super().__init__()
         if d_model % n_heads != 0:
@@ -1118,6 +1274,7 @@ class GroupedQueryAttention(nn.Module):
         self.head_dim = d_model // n_heads
         self.kv_dim = n_kv_heads * self.head_dim
         self.use_native_gqa = bool(use_native_gqa)
+        self.use_rope = bool(use_rope)
 
         self.q_proj = nn.Linear(d_model, d_model, bias=False)
         self.k_proj = nn.Linear(d_model, self.kv_dim, bias=False)
@@ -1155,7 +1312,7 @@ class GroupedQueryAttention(nn.Module):
             Lk = kv_in.shape[1]
             k = self.k_norm(self.k_proj(kv_in).view(B, Lk, self.n_kv_heads, self.head_dim)).transpose(1, 2)
             v = self.v_proj(kv_in).view(B, Lk, self.n_kv_heads, self.head_dim).transpose(1, 2)
-            if rope_cos is not None and rope_sin is not None:
+            if self.use_rope and rope_cos is not None and rope_sin is not None:
                 q, k = apply_rope(q, k, rope_cos, rope_sin)
             if not is_cross and past_kv is not None:
                 k = torch.cat([past_kv[0], k], dim=2)
@@ -1223,12 +1380,18 @@ class GQADecoderLayer(nn.Module):
         n_kv_heads: int,
         d_ff: int,
         dropout: float = 0.1,
+        use_rope: bool = True,
     ) -> None:
         super().__init__()
+        self.use_rope = bool(use_rope)
         self.norm1 = RMSNorm(d_model)
-        self.self_attn = GroupedQueryAttention(d_model, n_heads=n_heads, n_kv_heads=n_kv_heads)
+        self.self_attn = GroupedQueryAttention(
+            d_model, n_heads=n_heads, n_kv_heads=n_kv_heads, use_rope=self.use_rope
+        )
         self.norm2 = RMSNorm(d_model)
-        self.cross_attn = GroupedQueryAttention(d_model, n_heads=n_heads, n_kv_heads=n_kv_heads)
+        self.cross_attn = GroupedQueryAttention(
+            d_model, n_heads=n_heads, n_kv_heads=n_kv_heads, use_rope=False
+        )
         self.norm3 = RMSNorm(d_model)
         self.ffn = SwiGLU(d_model, d_ff, dropout=dropout)
         self.drop = nn.Dropout(dropout)
@@ -1243,13 +1406,15 @@ class GQADecoderLayer(nn.Module):
         use_cache: bool = False,
     ) -> Any:
         h = self.norm1(x)
+        r_cos = rope_cos if self.use_rope else None
+        r_sin = rope_sin if self.use_rope else None
         if use_cache:
             self_past = past_kv[0] if past_kv is not None else None
             cross_past = past_kv[1] if past_kv is not None else None
             sa_out, new_self_kv = self.self_attn(
                 h, h,
-                rope_cos=rope_cos,
-                rope_sin=rope_sin,
+                rope_cos=r_cos,
+                rope_sin=r_sin,
                 is_causal=True,
                 past_kv=self_past,
                 use_cache=True,
@@ -1266,7 +1431,7 @@ class GQADecoderLayer(nn.Module):
             x = x + self.drop(self.ffn(self.norm3(x)))
             return x, (new_self_kv, new_cross_kv)
 
-        x = x + self.drop(self.self_attn(h, h, rope_cos=rope_cos, rope_sin=rope_sin, is_causal=True))
+        x = x + self.drop(self.self_attn(h, h, rope_cos=r_cos, rope_sin=r_sin, is_causal=True))
         x = x + self.drop(self.cross_attn(self.norm2(x), memory))
         x = x + self.drop(self.ffn(self.norm3(x)))
         return x
@@ -1362,14 +1527,17 @@ class UniOMRv2Net(nn.Module):
         # 2. DeepSeek-OCR / Qwen2.5-VL Hybrid Encoder (Axial -> 2x2 Merger + Router -> Global 2D-RoPE)
         self.encoder = HybridAxialMergerEncoder(c)
 
-        # 3. Training-Only Zero-Inference-Cost Layout Aux Heads
+        # 3. Training-Only Zero-Inference-Cost Layout & Stroke-Gradient Aux Heads
         self.sys_y_head: Optional[SysYHead] = SysYHead(c.d_model) if c.use_sys_y_aux else None
         self.sys_count_head: Optional[SysCountHead] = SysCountHead(c.d_model) if c.use_sys_count_aux else None
         self.staff_seg_head: Optional[StaffSegHead] = (
             StaffSegHead(self.backbone.p2_ch, self.backbone.p3_ch) if c.use_staff_seg_aux else None
         )
+        self.stroke_hog_head: Optional[StrokeHogHead] = (
+            StrokeHogHead(self.backbone.p2_ch, n_bins=8) if c.use_stroke_hog_head else None
+        )
 
-        # 4. GQA Causal Decoder + DeepStack Multi-Level Visual Injection + MTP-4
+        # 4. GQA Causal Decoder (Llama 4 iRoPE) + DeepStack Multi-Level Visual Injection + MTP-4
         pad_idx = PAD_ID if PAD_ID < c.vocab_size else (c.vocab_size - 4 if c.vocab_size >= 4 else None)
         self.tok_emb = nn.Embedding(c.vocab_size, c.d_model, padding_idx=pad_idx)
         self.rope1d = _CachedRoPE1D(head_dim=head_dim, base=c.rope_base)
@@ -1383,8 +1551,9 @@ class UniOMRv2Net(nn.Module):
                 n_kv_heads=c.n_kv_heads,
                 d_ff=d_ff,
                 dropout=c.dropout,
+                use_rope=(c.irope_nope_every <= 0) or (((i + 1) % c.irope_nope_every) != 0),
             )
-            for _ in range(c.n_dec_layers)
+            for i in range(c.n_dec_layers)
         ])
         self.dec_norm = RMSNorm(c.d_model)
         self.lm_head = nn.Linear(c.d_model, c.vocab_size, bias=False)
@@ -1394,10 +1563,11 @@ class UniOMRv2Net(nn.Module):
         self._struct_weight_cache: Dict[Tuple[int, float, torch.device, torch.dtype], torch.Tensor] = {}
 
     def strip_aux_heads(self, strip_mtp: bool = False) -> "UniOMRv2Net":
-        """Strip training-only layout aux heads (and optionally MTP heads) for 0%-cost export."""
+        """Strip training-only layout & stroke-HOG aux heads (and optionally MTP heads) for 0%-cost export."""
         self.sys_y_head = None
         self.sys_count_head = None
         self.staff_seg_head = None
+        self.stroke_hog_head = None
         if strip_mtp:
             self.mtp_heads = nn.ModuleList()
         return self
@@ -1414,7 +1584,9 @@ class UniOMRv2Net(nn.Module):
     ) -> Tuple[Tuple[torch.Tensor, torch.Tensor, torch.Tensor], Dict[str, Optional[torch.Tensor]], Dict[str, Any]]:
         """Encode arbitrary-resolution ``(B, 3, H, W)`` images into DeepStack ``mem_levels``."""
         want_aux = self.training if return_aux is None else bool(return_aux)
-        need_pyramid = want_aux and (self.staff_seg_head is not None)
+        need_pyramid = want_aux and (
+            (self.staff_seg_head is not None) or (self.stroke_hog_head is not None)
+        )
 
         if need_pyramid:
             feat_2d, p2, p3 = self.backbone(images, return_pyramid=True)
@@ -1430,12 +1602,15 @@ class UniOMRv2Net(nn.Module):
         aux_enc: Dict[str, Optional[torch.Tensor]] = {
             "sys_count_pred": None,
             "staff_seg_logits": None,
+            "stroke_hog_pred": None,
         }
         if want_aux:
             if self.sys_count_head is not None:
                 aux_enc["sys_count_pred"] = self.sys_count_head(mem_final)
             if self.staff_seg_head is not None and p2 is not None and p3 is not None:
                 aux_enc["staff_seg_logits"] = self.staff_seg_head(p2, p3)
+            if self.stroke_hog_head is not None and p2 is not None:
+                aux_enc["stroke_hog_pred"] = self.stroke_hog_head(p2)
 
         return mem_levels, aux_enc, router_info
 
@@ -1615,6 +1790,7 @@ class UniOMRv2Net(nn.Module):
             "sys_y_pred": sys_y_pred,
             "sys_count_pred": aux_enc["sys_count_pred"],
             "staff_seg_logits": aux_enc["staff_seg_logits"],
+            "stroke_hog_pred": aux_enc["stroke_hog_pred"],
             "router_info": router_info,
         }
 
@@ -1626,13 +1802,15 @@ class UniOMRv2Net(nn.Module):
         sys_y_mask: Optional[torch.Tensor] = None,
         sys_count_target: Optional[torch.Tensor] = None,
         staff_seg_target: Optional[torch.Tensor] = None,
+        images: Optional[torch.Tensor] = None,
         mtp_loss_weight: float = 0.30,
         saliency_loss_weight: float = 0.10,
         sys_y_loss_weight: float = 0.25,
         sys_count_loss_weight: float = 0.15,
         staff_seg_loss_weight: float = 0.20,
+        stroke_hog_loss_weight: float = 0.15,
     ) -> Dict[str, torch.Tensor]:
-        """Compute combined CE + MTP-4 + router saliency + layout aux losses."""
+        """Compute combined CE + MTP-4 + router saliency + layout & stroke-HOG aux losses."""
         logits: torch.Tensor = out["logits"]
         V = logits.shape[-1]
         ce_loss = F.cross_entropy(logits.reshape(-1, V), targets.reshape(-1), ignore_index=PAD_ID)
@@ -1661,7 +1839,7 @@ class UniOMRv2Net(nn.Module):
         else:
             saliency_loss = logits.new_zeros(())
 
-        # Training-only layout auxiliary losses
+        # Training-only layout & stroke-HOG auxiliary losses
         sys_y_pred: Optional[torch.Tensor] = out.get("sys_y_pred")
         if sys_y_pred is not None and sys_y_target is not None and sys_y_loss_weight > 0.0:
             sys_y_loss = compute_sys_y_loss(sys_y_pred, sys_y_target, sys_y_mask=sys_y_mask)
@@ -1680,6 +1858,12 @@ class UniOMRv2Net(nn.Module):
         else:
             staff_seg_loss = logits.new_zeros(())
 
+        stroke_hog_pred: Optional[torch.Tensor] = out.get("stroke_hog_pred")
+        if stroke_hog_pred is not None and images is not None and stroke_hog_loss_weight > 0.0:
+            stroke_hog_loss = compute_stroke_hog_loss(stroke_hog_pred, images)
+        else:
+            stroke_hog_loss = logits.new_zeros(())
+
         total_loss = (
             ce_loss
             + mtp_loss_weight * mtp_loss
@@ -1687,6 +1871,7 @@ class UniOMRv2Net(nn.Module):
             + sys_y_loss_weight * sys_y_loss
             + sys_count_loss_weight * sys_count_loss
             + staff_seg_loss_weight * staff_seg_loss
+            + stroke_hog_loss_weight * stroke_hog_loss
         )
         return {
             "loss": total_loss,
@@ -1696,6 +1881,7 @@ class UniOMRv2Net(nn.Module):
             "sys_y_loss": sys_y_loss,
             "sys_count_loss": sys_count_loss,
             "staff_seg_loss": staff_seg_loss,
+            "stroke_hog_loss": stroke_hog_loss,
         }
 
     def param_summary(self, int4_block_size: int = 32) -> Dict[str, Any]:
@@ -1716,7 +1902,12 @@ class UniOMRv2Net(nn.Module):
             + _count(self.lm_head)
         )
         mtp_params = _count(self.mtp_heads)
-        aux_params = _count(self.sys_y_head) + _count(self.sys_count_head) + _count(self.staff_seg_head)
+        aux_params = (
+            _count(self.sys_y_head)
+            + _count(self.sys_count_head)
+            + _count(self.staff_seg_head)
+            + _count(self.stroke_hog_head)
+        )
         infer_params = total_params - aux_params - mtp_params
 
         # Exact Hybrid FP16/INT4-QAT split (matching QATInt4ControllerV2 target roots, excluding MTP/aux):

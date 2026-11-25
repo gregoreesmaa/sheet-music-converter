@@ -34,6 +34,7 @@ from dataclasses import dataclass
 import difflib
 import inspect
 from pathlib import Path
+import random
 import sys
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, Union
 
@@ -60,10 +61,18 @@ W_METER: float = 0.15
 W_NOLOOP: float = 0.15
 W_NOTE: float = 0.35
 
+# Unlabeled structural-validity reward weights (sum to 1.00)
+W_UNLABELED_PARSE: float = 0.30
+W_UNLABELED_RHYTHM: float = 0.45
+W_UNLABELED_COMPLETENESS: float = 0.25
+UNLABELED_LOOP_MULT: float = 0.25
+
 METER_TOL: float = 1e-3
 LOOP_MIN_PERIOD: int = 8
 LOOP_MAX_PERIOD: int = 16
 LOOP_MIN_REPEATS: int = 4
+
+_IMAGE_EXTS = frozenset({".png", ".jpg", ".jpeg", ".webp", ".bmp", ".tif", ".tiff"})
 
 
 # ---------------------------------------------------------------------------
@@ -361,6 +370,266 @@ def compute_omr_rlvr_reward(
     }
 
 
+def _check_balanced_ties_and_tuplets(tokens: Sequence[str]) -> Tuple[bool, bool]:
+    """Verify balanced ``tie-start``/``tie-stop`` and ``tuplet-start-*``/``tuplet-stop`` spans."""
+    tie_depth = 0
+    ties_ok = True
+    tuplet_depth = 0
+    tuplets_ok = True
+
+    for tok in tokens:
+        if tok == uni_omr.SYS_TOKEN:
+            # Tuplets must close within a system; ties may span across systems.
+            if tuplet_depth != 0:
+                tuplets_ok = False
+                tuplet_depth = 0
+            continue
+        if tok == grammar.TIE_START:
+            tie_depth += 1
+        elif tok == grammar.TIE_STOP:
+            if tie_depth <= 0:
+                ties_ok = False
+            else:
+                tie_depth -= 1
+        elif tok in grammar.TUPLET_STARTS:
+            tuplet_depth += 1
+        elif tok == grammar.TUPLET_STOP:
+            if tuplet_depth <= 0:
+                tuplets_ok = False
+            else:
+                tuplet_depth -= 1
+
+    if tie_depth != 0:
+        ties_ok = False
+    if tuplet_depth != 0:
+        tuplets_ok = False
+    return ties_ok, tuplets_ok
+
+
+def _normalize_pred_tokens_and_vocab(
+    pred_tokens: Union[str, Sequence[str], Sequence[int]],
+    vocab: Optional[Union[Sequence[str], Dict[int, str], Dict[str, int]]] = None,
+) -> Tuple[List[str], Optional[bool], bool]:
+    """Normalize ``pred_tokens`` to bekern strings, detect explicit ``<eos>``, and check vocab."""
+    id_to_tok: Optional[Dict[int, str]] = None
+    valid_toks: Optional[frozenset[str]] = None
+
+    if vocab is not None:
+        if isinstance(vocab, dict):
+            if vocab:
+                sample_k = next(iter(vocab.keys()))
+                if isinstance(sample_k, int):
+                    id_to_tok = {int(k): str(v) for k, v in vocab.items()}
+                    valid_toks = frozenset(id_to_tok.values())
+                else:
+                    valid_toks = frozenset(str(k) for k in vocab.keys())
+                    id_to_tok = {int(v): str(k) for k, v in vocab.items()}
+        else:
+            tok_list = [str(t) for t in vocab]
+            valid_toks = frozenset(tok_list)
+            id_to_tok = {i: t for i, t in enumerate(tok_list)}
+
+    if id_to_tok is None:
+        id_to_tok = uni_omr.UNI_ID_TO_TOKEN
+
+    explicit_eos: Optional[bool] = None
+    raw_toks: List[str] = []
+    all_in_vocab = True
+
+    if isinstance(pred_tokens, str):
+        raw_toks = pred_tokens.split()
+    else:
+        seq_list = list(pred_tokens)
+        if seq_list and isinstance(seq_list[0], int):
+            for idx in seq_list:
+                i = int(idx)
+                if i == uni_omr.EOS_ID:
+                    explicit_eos = True
+                    break
+                if i in (uni_omr.PAD_ID, uni_omr.BOS_ID):
+                    continue
+                tok = id_to_tok.get(i)
+                if tok is None:
+                    all_in_vocab = False
+                else:
+                    raw_toks.append(tok)
+            if explicit_eos is None:
+                explicit_eos = False
+        else:
+            raw_toks = [str(t) for t in seq_list]
+
+    cleaned: List[str] = []
+    for tok in raw_toks:
+        if tok == "<eos>":
+            explicit_eos = True
+            break
+        if tok in ("<bos>", "<pad>"):
+            continue
+        if valid_toks is not None and tok not in valid_toks:
+            all_in_vocab = False
+        cleaned.append(tok)
+
+    return cleaned, explicit_eos, all_in_vocab
+
+
+def compute_unlabeled_structural_reward(
+    pred_tokens: Union[str, Sequence[str], Sequence[int]],
+    vocab: Optional[Union[Sequence[str], Dict[int, str], Dict[str, int]]] = None,
+    *,
+    terminated_eos: Optional[bool] = None,
+    check_decode_fn: Optional[Callable[[Sequence[str]], bool]] = None,
+) -> Dict[str, Any]:
+    """Compute fast, deterministic, label-free structural-validity RLVR reward in ``[0, 1]``.
+
+    Inspired by olmOCR-2 / LightOnOCR-2 / FireRed-OCR unlabeled verifiable rewards:
+      1. ``r_parse`` (0.30): valid ``bekern`` FSA grammar legality (clefs/keys/meters/
+         barlines well-formed, in-vocab, balanced ties/tuplets, ``>= 1`` pitched note).
+      2. ``r_rhythm`` (0.45): per-measure beat-duration conservation against the active
+         time signature (``|vcurs - tsig| < 1e-3``).
+      3. ``r_completeness`` (0.25): non-empty musical output with reasonable ``<sys>``
+         count (``>= 1``), clean ``<eos>`` termination, and no runaway repetition loop.
+
+    Combines additive + multiplicative structural verification so valid multi-measure
+    ``bekern`` scores ``> 0.75`` while empty, malformed, looping, or rhythm-broken
+    sequences score ``< 0.35``.
+    """
+    pred_toks, explicit_eos, all_in_vocab = _normalize_pred_tokens_and_vocab(
+        pred_tokens, vocab=vocab
+    )
+
+    if not pred_toks:
+        return {
+            "reward": 0.0,
+            "r_parse": 0.0,
+            "r_rhythm": 0.0,
+            "r_meter": 0.0,
+            "r_completeness": 0.0,
+            "r_noloop": 0.0,
+            "parse_ok": False,
+            "ties_balanced": True,
+            "tuplets_balanced": True,
+            "has_eos": bool(terminated_eos if terminated_eos is not None else explicit_eos),
+            "has_loop": False,
+            "n_notes": 0,
+            "n_sys_pred": 0,
+            "n_valid_interior_bars": 0,
+            "n_interior_bars": 0,
+        }
+
+    # 1. FSA grammar legality + bar-duration conservation walk
+    parse_ok, n_notes, n_valid_bars, n_checked_bars = _walk_parse_and_meter(
+        pred_toks, tol=METER_TOL
+    )
+    if not all_in_vocab:
+        parse_ok = False
+    if parse_ok and check_decode_fn is not None:
+        try:
+            parse_ok = bool(check_decode_fn(pred_toks))
+        except Exception:
+            parse_ok = False
+
+    ties_ok, tuplets_ok = _check_balanced_ties_and_tuplets(pred_toks)
+    if parse_ok and n_notes >= 1:
+        if ties_ok and tuplets_ok:
+            r_parse = 1.0
+        else:
+            r_parse = 0.5
+    else:
+        r_parse = 0.0
+
+    # 2. Per-measure beat-duration conservation against active time signature
+    if parse_ok and n_checked_bars > 0:
+        r_rhythm = float(n_valid_bars) / float(n_checked_bars)
+    else:
+        r_rhythm = 0.0
+
+    # 3. Completeness: non-empty pitched music, <sys> structure, <eos> termination, no loops
+    loop_detected = has_repetition_loop(
+        pred_toks,
+        min_period=LOOP_MIN_PERIOD,
+        max_period=LOOP_MAX_PERIOD,
+        min_repeats=LOOP_MIN_REPEATS,
+    )
+    r_noloop = 0.0 if loop_detected else 1.0
+    n_sys_pred = sum(1 for t in pred_toks if t == uni_omr.SYS_TOKEN)
+
+    if terminated_eos is not None:
+        has_eos = bool(terminated_eos)
+    elif explicit_eos is not None:
+        has_eos = bool(explicit_eos)
+    else:
+        # Decoded string without explicit <eos>: clean grammar end counts as valid termination.
+        has_eos = bool(parse_ok)
+
+    if loop_detected or n_notes == 0 or not parse_ok:
+        r_completeness = 0.0
+    else:
+        note_score = min(1.0, float(n_notes) / 4.0)
+        sys_score = 1.0 if n_sys_pred >= 1 else 0.75
+        eos_score = 1.0 if has_eos else 0.40
+        r_completeness = float(note_score * sys_score * eos_score)
+
+    if not parse_ok or n_notes == 0:
+        reward = 0.0
+    else:
+        additive = (
+            W_UNLABELED_PARSE * r_parse
+            + W_UNLABELED_RHYTHM * r_rhythm
+            + W_UNLABELED_COMPLETENESS * r_completeness
+        )
+        multiplicative = r_parse * r_rhythm * r_completeness
+        reward = 0.5 * additive + 0.5 * multiplicative
+        if loop_detected:
+            reward *= UNLABELED_LOOP_MULT
+        reward = float(max(0.0, min(1.0, reward)))
+
+    return {
+        "reward": reward,
+        "r_parse": float(r_parse),
+        "r_rhythm": float(r_rhythm),
+        "r_meter": float(r_rhythm),
+        "r_completeness": float(r_completeness),
+        "r_noloop": float(r_noloop),
+        "parse_ok": bool(parse_ok),
+        "ties_balanced": bool(ties_ok),
+        "tuplets_balanced": bool(tuplets_ok),
+        "has_eos": bool(has_eos),
+        "has_loop": bool(loop_detected),
+        "n_notes": int(n_notes),
+        "n_sys_pred": int(n_sys_pred),
+        "n_valid_interior_bars": int(n_valid_bars),
+        "n_interior_bars": int(n_checked_bars),
+    }
+
+
+def collect_unlabeled_image_paths(unlabeled_dir: Union[str, Path]) -> List[Path]:
+    """Deterministically collect sorted image paths from ``unlabeled_dir``."""
+    root = Path(unlabeled_dir)
+    if not root.exists():
+        raise FileNotFoundError(f"Unlabeled directory does not exist: {root}")
+    paths = [
+        p for p in root.rglob("*")
+        if p.is_file() and p.suffix.lower() in _IMAGE_EXTS
+    ]
+    paths.sort()
+    return paths
+
+
+def mix_labeled_unlabeled_flags(
+    batch_size: int,
+    unlabeled_frac: float = 0.30,
+    rng: Optional[random.Random] = None,
+) -> List[bool]:
+    """Return length-``batch_size`` booleans (``True`` = unlabeled page) at rate ``unlabeled_frac``."""
+    frac = float(max(0.0, min(1.0, unlabeled_frac)))
+    if frac <= 0.0:
+        return [False] * int(batch_size)
+    if frac >= 1.0:
+        return [True] * int(batch_size)
+    r = rng if rng is not None else random
+    return [r.random() < frac for _ in range(int(batch_size))]
+
+
 # ---------------------------------------------------------------------------
 # Model Compatibility Layer (UniOMRNet v1 & UniOMRv2Net v2)
 # ---------------------------------------------------------------------------
@@ -493,6 +762,7 @@ class RolloutBatch:
     old_log_probs: torch.Tensor    # (B, G, L - 1) float32
     action_mask: torch.Tensor      # (B, G, L - 1) float32
     decoded_tokens: List[List[List[str]]]  # [B][G] decoded bekern token lists
+    terminated_eos: Optional[torch.Tensor] = None  # (B, G) bool, True if rollout hit <eos>
 
 
 @torch.no_grad()
@@ -623,6 +893,7 @@ def sample_rollouts(
             old_log_probs=old_log_probs,
             action_mask=action_mask,
             decoded_tokens=decoded,
+            terminated_eos=finished.view(B, G),
         )
     finally:
         if was_training:
@@ -755,22 +1026,29 @@ class GRPOConfig:
     use_grammar: bool = True
     strict_grammar: bool = False
     keep_ratio_override: Optional[float] = None
+    unlabeled_dir: Optional[str] = None
+    unlabeled_frac: float = 0.30
 
 
 def grpo_step(
     model: nn.Module,
     ref_model: nn.Module,
     images: torch.Tensor,
-    ref_bekerns: Sequence[Union[str, Sequence[str]]],
+    ref_bekerns: Sequence[Optional[Union[str, Sequence[str]]]],
     *,
     cfg: Optional[GRPOConfig] = None,
     check_decode_fn: Optional[Callable[[Sequence[str]], bool]] = None,
     reward_fn: Optional[Callable[[Sequence[str], Union[str, Sequence[str]]], Dict[str, Any]]] = None,
+    unlabeled_reward_fn: Optional[Callable[[Sequence[str]], Dict[str, Any]]] = None,
+    unlabeled_vocab: Optional[Union[Sequence[str], Dict[int, str], Dict[str, int]]] = None,
 ) -> Tuple[torch.Tensor, Dict[str, Any]]:
-    """Run one complete RLVR GRPO step on a batch of pages.
+    """Run one complete RLVR GRPO step on a batch of labeled and/or unlabeled pages.
 
     1. Samples ``G`` rollouts per page under ``PrefixState``.
-    2. Scores every rollout with ``compute_omr_rlvr_reward`` (or custom ``reward_fn``).
+    2. Scores labeled pages (``ref_bekerns[b] is not None``) with
+       ``compute_omr_rlvr_reward`` (or ``reward_fn``), and unlabeled pages
+       (``ref_bekerns[b] is None``) with ``compute_unlabeled_structural_reward``
+       (or ``unlabeled_reward_fn``).
     3. Computes group-normalized advantages ``A_i = (R_i - mean(R)) / (std(R) + 1e-6)``.
     4. Computes current-policy and frozen-reference-policy log-probs.
     5. Returns ``(total_loss, stats)`` ready for ``loss.backward()``.
@@ -781,7 +1059,7 @@ def grpo_step(
     B = int(images.shape[0])
     if len(ref_bekerns) != B:
         raise ValueError(
-            f"Expected {B} reference bekern sequences to match images batch, got {len(ref_bekerns)}"
+            f"Expected {B} reference bekern entries to match images batch, got {len(ref_bekerns)}"
         )
 
     rollouts = sample_rollouts(
@@ -802,19 +1080,46 @@ def grpo_step(
         "r_parse": 0.0,
         "r_sys": 0.0,
         "r_meter": 0.0,
+        "r_rhythm": 0.0,
+        "r_completeness": 0.0,
         "r_noloop": 0.0,
         "r_note": 0.0,
     }
+    n_labeled = 0
+    n_unlabeled = 0
+    eff_vocab = unlabeled_vocab if unlabeled_vocab is not None else uni_omr.UNI_TOKEN_TO_ID
+
     for b in range(B):
         ref_b = ref_bekerns[b]
+        is_unlabeled = ref_b is None
+        if is_unlabeled:
+            n_unlabeled += 1
+        else:
+            n_labeled += 1
         for g in range(G):
             pred_toks = rollouts.decoded_tokens[b][g]
-            if reward_fn is not None:
-                res = reward_fn(pred_toks, ref_b)
+            if is_unlabeled:
+                if unlabeled_reward_fn is not None:
+                    res = unlabeled_reward_fn(pred_toks)
+                else:
+                    eos_flag = (
+                        bool(rollouts.terminated_eos[b, g].item())
+                        if rollouts.terminated_eos is not None
+                        else None
+                    )
+                    res = compute_unlabeled_structural_reward(
+                        pred_toks,
+                        vocab=eff_vocab,
+                        terminated_eos=eos_flag,
+                        check_decode_fn=check_decode_fn,
+                    )
             else:
-                res = compute_omr_rlvr_reward(
-                    pred_toks, ref_b, check_decode_fn=check_decode_fn
-                )
+                if reward_fn is not None:
+                    res = reward_fn(pred_toks, ref_b)
+                else:
+                    res = compute_omr_rlvr_reward(
+                        pred_toks, ref_b, check_decode_fn=check_decode_fn
+                    )
             rewards[b, g] = float(res["reward"])
             for k in comp_sums:
                 comp_sums[k] += float(res.get(k, 0.0))
@@ -863,8 +1168,12 @@ def grpo_step(
         "mean_r_parse": comp_sums["r_parse"] / total_n,
         "mean_r_sys": comp_sums["r_sys"] / total_n,
         "mean_r_meter": comp_sums["r_meter"] / total_n,
+        "mean_r_rhythm": comp_sums["r_rhythm"] / total_n,
+        "mean_r_completeness": comp_sums["r_completeness"] / total_n,
         "mean_r_noloop": comp_sums["r_noloop"] / total_n,
         "mean_r_note": comp_sums["r_note"] / total_n,
+        "n_labeled": int(n_labeled),
+        "n_unlabeled": int(n_unlabeled),
         "rewards": rewards.detach(),
         "advantages": advantages.detach(),
         "seq_len": int(rollouts.seq_ids.shape[-1]),
@@ -885,6 +1194,18 @@ def build_arg_parser() -> argparse.ArgumentParser:
     ap.add_argument("--kl-beta", type=float, default=0.02, help="KL-to-reference-policy penalty weight.")
     ap.add_argument("--no-grammar", action="store_true", help="Disable PrefixState rollout constraints.")
     ap.add_argument("--strict-grammar", action="store_true", help="Use PrefixState(strict=True) during rollouts.")
+    ap.add_argument(
+        "--unlabeled-dir",
+        type=str,
+        default=None,
+        help="Optional path to unlabeled real HW pages (e.g. D:\\tmp\\unlabeled-10k-real\\rism_hw).",
+    )
+    ap.add_argument(
+        "--unlabeled-frac",
+        type=float,
+        default=0.30,
+        help="Fraction of GRPO pages drawn from --unlabeled-dir using structural-validity RLVR (default: 0.30).",
+    )
     return ap
 
 
@@ -894,12 +1215,18 @@ __all__ = [
     "W_METER",
     "W_NOLOOP",
     "W_NOTE",
+    "W_UNLABELED_PARSE",
+    "W_UNLABELED_RHYTHM",
+    "W_UNLABELED_COMPLETENESS",
     "GRPOConfig",
     "RolloutBatch",
     "has_repetition_loop",
     "extract_pitch_dur_notes",
     "compute_sequence_f1",
     "compute_omr_rlvr_reward",
+    "compute_unlabeled_structural_reward",
+    "collect_unlabeled_image_paths",
+    "mix_labeled_unlabeled_flags",
     "sample_top_p",
     "sample_rollouts",
     "compute_sequence_logprobs",

@@ -19,7 +19,7 @@ if str(_THIS_DIR) not in sys.path:
     sys.path.insert(0, str(_THIS_DIR))
 
 import rlvr_grpo  # noqa: E402
-from uni_omr import UniOMRConfig, UniOMRNet  # noqa: E402
+from uni_omr import UNI_TOKEN_TO_ID, UniOMRConfig, UniOMRNet  # noqa: E402
 from uni_omr_v2 import UniOMRv2Config, UniOMRv2Net  # noqa: E402
 
 
@@ -313,6 +313,142 @@ class TestGRPOEndToEndCPU(unittest.TestCase):
         args = rlvr_grpo.build_arg_parser().parse_args([])
         self.assertEqual(args.group_size, 4)
         self.assertAlmostEqual(args.kl_beta, 0.02, places=6)
+        self.assertIsNone(args.unlabeled_dir)
+        self.assertAlmostEqual(args.unlabeled_frac, 0.30, places=6)
+
+
+class TestUnlabeledStructuralRLVR(unittest.TestCase):
+    def test_unlabeled_structural_reward_good_vs_bad(self) -> None:
+        """Verify high reward (> 0.75) for valid multi-measure bekern and low (< 0.35) for bad ones."""
+        # 1. Valid multi-measure, multi-system bekern -> > 0.75 (should be ~1.0)
+        res_valid = rlvr_grpo.compute_unlabeled_structural_reward(
+            REF_BEKERN, UNI_TOKEN_TO_ID
+        )
+        self.assertGreater(res_valid["reward"], 0.75)
+        self.assertEqual(res_valid["r_parse"], 1.0)
+        self.assertEqual(res_valid["r_rhythm"], 1.0)
+        self.assertEqual(res_valid["r_completeness"], 1.0)
+
+        # 2. Valid multi-measure bekern with explicit <eos>
+        res_valid_eos = rlvr_grpo.compute_unlabeled_structural_reward(
+            REF_BEKERN.split() + ["<eos>"], UNI_TOKEN_TO_ID
+        )
+        self.assertGreater(res_valid_eos["reward"], 0.95)
+        self.assertTrue(res_valid_eos["has_eos"])
+
+        # 3. Empty sequence -> < 0.35 (0.0)
+        res_empty = rlvr_grpo.compute_unlabeled_structural_reward("", UNI_TOKEN_TO_ID)
+        self.assertLess(res_empty["reward"], 0.35)
+        self.assertEqual(res_empty["reward"], 0.0)
+
+        # 4. Malformed / unparseable sequence -> < 0.35 (0.0)
+        malformed = "quarter quarter C C ??? invalid-tok bar-light-heavy"
+        res_malformed = rlvr_grpo.compute_unlabeled_structural_reward(
+            malformed, UNI_TOKEN_TO_ID
+        )
+        self.assertLess(res_malformed["reward"], 0.35)
+        self.assertEqual(res_malformed["r_parse"], 0.0)
+
+        # 5. Runaway repetition loop (valid bars repeated 5x) -> < 0.35
+        loop_unit = [
+            "quarter", "C", "4", "quarter", "D", "4",
+            "quarter", "E", "4", "quarter", "F", "4", "bar",
+        ]
+        loop_seq = ["clef-G-2", "key+0", "time-4-4"] + loop_unit * 5
+        res_loop = rlvr_grpo.compute_unlabeled_structural_reward(
+            loop_seq, UNI_TOKEN_TO_ID
+        )
+        self.assertTrue(res_loop["has_loop"])
+        self.assertLess(res_loop["reward"], 0.35)
+
+        # 6. Rhythm-broken sequence (all interior bars violate 4/4 meter) -> < 0.35
+        rhythm_broken = " ".join([
+            "clef-G-2", "key+0", "time-4-4",
+            "quarter", "C", "4", "quarter", "D", "4", "quarter", "E", "4", "quarter", "F", "4", "bar",
+            "quarter", "G", "4", "bar",                     # 1 != 4
+            "quarter", "A", "4", "quarter", "B", "4", "bar",  # 2 != 4
+            "<sys>",
+            "clef-G-2", "key+0", "time-4-4",
+            "half", "C", "4", "bar",                        # 2 != 4
+            "quarter", "D", "4", "quarter", "E", "4", "bar",  # 2 != 4
+            "whole", "C", "4", "bar-light-heavy",
+        ])
+        res_rhythm = rlvr_grpo.compute_unlabeled_structural_reward(
+            rhythm_broken, UNI_TOKEN_TO_ID
+        )
+        self.assertEqual(res_rhythm["r_parse"], 1.0)
+        self.assertEqual(res_rhythm["r_rhythm"], 0.0)
+        self.assertLess(res_rhythm["reward"], 0.35)
+
+    def test_mixed_labeled_and_unlabeled_grpo_step_cpu(self) -> None:
+        """Verify mixed labeled + unlabeled GRPO step runs cleanly on CPU with finite grads."""
+        torch.manual_seed(123)
+        model = _tiny_v2()
+        ref_model = copy.deepcopy(model).eval()
+        for p in ref_model.parameters():
+            p.requires_grad_(False)
+
+        opt = torch.optim.AdamW(model.parameters(), lr=1e-3)
+        # Batch of 2 pages: index 0 is labeled (REF_BEKERN), index 1 is unlabeled (None)
+        images = torch.rand(2, 3, 64, 128)
+        ref_bekerns = [REF_BEKERN, None]
+        cfg = rlvr_grpo.GRPOConfig(
+            group_size=4,
+            max_len=10,
+            temperature=1.0,
+            top_p=0.95,
+            clip_eps=0.2,
+            kl_beta=0.02,
+            use_grammar=True,
+            unlabeled_frac=0.30,
+        )
+
+        # Deterministic tie-break wrappers ensuring non-zero group variance on random init
+        lab_idx = [0]
+        unlab_idx = [0]
+
+        def _labeled_reward(pred_toks, ref_b):
+            res = rlvr_grpo.compute_omr_rlvr_reward(pred_toks, ref_b)
+            res["reward"] = float(res["reward"]) + 1e-2 * float(lab_idx[0] % 4)
+            lab_idx[0] += 1
+            return res
+
+        def _unlabeled_reward(pred_toks):
+            res = rlvr_grpo.compute_unlabeled_structural_reward(pred_toks, UNI_TOKEN_TO_ID)
+            res["reward"] = float(res["reward"]) + 1e-2 * float(unlab_idx[0] % 4)
+            unlab_idx[0] += 1
+            return res
+
+        opt.zero_grad(set_to_none=True)
+        loss, stats = rlvr_grpo.grpo_step(
+            model,
+            ref_model,
+            images,
+            ref_bekerns,
+            cfg=cfg,
+            reward_fn=_labeled_reward,
+            unlabeled_reward_fn=_unlabeled_reward,
+        )
+
+        self.assertTrue(torch.isfinite(loss), f"Non-finite mixed GRPO loss: {loss}")
+        self.assertEqual(stats["n_labeled"], 1)
+        self.assertEqual(stats["n_unlabeled"], 1)
+        self.assertEqual(stats["rewards"].shape, (2, 4))
+        self.assertEqual(lab_idx[0], 4)
+        self.assertEqual(unlab_idx[0], 4)
+
+        loss.backward()
+        grad_norms = []
+        for name, p in model.named_parameters():
+            if p.grad is not None:
+                self.assertTrue(torch.isfinite(p.grad).all(), f"Non-finite grad in {name}")
+                grad_norms.append(float(p.grad.norm().item()))
+        self.assertGreater(len(grad_norms), 0)
+        self.assertGreater(max(grad_norms), 0.0)
+
+        opt.step()
+        for name, p in model.named_parameters():
+            self.assertTrue(torch.isfinite(p).all(), f"Non-finite param after mixed step: {name}")
 
 
 if __name__ == "__main__":

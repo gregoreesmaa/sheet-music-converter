@@ -17,6 +17,7 @@ if str(_THIS_DIR) not in sys.path:
 
 from uni_omr_v2 import (  # noqa: E402
     AnisotropicMusicBlock,
+    AspectNormalizedRoPE1D,
     AspectNormalizedRoPE2D,
     BOS_ID,
     EOS_ID,
@@ -24,9 +25,12 @@ from uni_omr_v2 import (  # noqa: E402
     InkTokenRouterV2,
     PAD_ID,
     SYS_ID,
+    StrokeHogHead,
     VOCAB_SIZE,
     UniOMRv2Config,
     UniOMRv2Net,
+    compute_stroke_hog_loss,
+    compute_stroke_hog_target,
     compute_sys_count_loss,
     compute_sys_y_loss,
 )
@@ -420,6 +424,141 @@ def test_iter11_optimizations() -> None:
     assert 10 <= info_ev["k_kept"] <= 48
 
 
+def test_frontier_2025_2026_upgrades() -> None:
+    """Verify iRoPE, RoPE-exempt register tokens, V2PE RoPE box jitter, and Sobel-HOG aux head."""
+    torch.manual_seed(2026)
+
+    # 1. Llama 4 iRoPE: layers where (i + 1) % irope_nope_every == 0 skip RoPE while keeping QK-Norm active.
+    cfg_irope = _tiny_cfg(n_dec_layers=8, irope_nope_every=4)
+    m_irope = UniOMRv2Net(cfg_irope).eval()
+    expected_use_rope = [True, True, True, False, True, True, True, False]
+    actual_use_rope = [layer.use_rope for layer in m_irope.dec_layers]
+    assert actual_use_rope == expected_use_rope, f"iRoPE flags mismatch: {actual_use_rope}"
+    assert [layer.self_attn.use_rope for layer in m_irope.dec_layers] == expected_use_rope
+
+    # Verify NoPE layer (layer 3) ignores rope_cos/rope_sin while RoPE layer (layer 0) uses them.
+    x_dec = torch.randn(1, 8, cfg_irope.d_model)
+    mem_dec = torch.randn(1, 12, cfg_irope.d_model)
+    cos_a, sin_a = m_irope.rope1d(8, device=x_dec.device, dtype=x_dec.dtype)
+    cos_b = torch.ones_like(cos_a)
+    sin_b = torch.zeros_like(sin_a)
+    with torch.no_grad():
+        nope_a = m_irope.dec_layers[3](x_dec, mem_dec, cos_a, sin_a)
+        nope_b = m_irope.dec_layers[3](x_dec, mem_dec, cos_b, sin_b)
+        rope_a = m_irope.dec_layers[0](x_dec, mem_dec, cos_a, sin_a)
+        rope_b = m_irope.dec_layers[0](x_dec, mem_dec, cos_b, sin_b)
+    assert float((nope_a - nope_b).abs().max().item()) == 0.0, "NoPE layer must be invariant to RoPE cos/sin"
+    assert float((rope_a - rope_b).abs().max().item()) > 1e-4, "RoPE layer must depend on RoPE cos/sin"
+    assert m_irope.dec_layers[3].self_attn.q_norm is not None
+    assert m_irope.dec_layers[3].self_attn.k_norm is not None
+
+    # irope_nope_every=0 disables NoPE (all layers use RoPE).
+    m_all_rope = UniOMRv2Net(_tiny_cfg(n_dec_layers=4, irope_nope_every=0))
+    assert all(layer.use_rope for layer in m_all_rope.dec_layers)
+
+    # 2. ViT-5 / DINOv3 RoPE-exempt register tokens: prepended before global_layers, sliced cleanly after.
+    cfg_reg = _tiny_cfg(n_register_tokens=4, n_global_layers=2, dropout=0.0)
+    m_reg = UniOMRv2Net(cfg_reg).train()
+    assert m_reg.encoder.register_tokens is not None
+    assert m_reg.encoder.register_tokens.shape == (1, 4, cfg_reg.d_model)
+
+    captured_rope = {}
+    orig_g0 = m_reg.encoder.global_layers[0].forward
+
+    def _capture_g0(x_in, rope_cos, rope_sin):
+        captured_rope["seq_len"] = x_in.shape[1]
+        captured_rope["reg_cos"] = rope_cos[:, :, :4, :].detach().clone()
+        captured_rope["reg_sin"] = rope_sin[:, :, :4, :].detach().clone()
+        return orig_g0(x_in, rope_cos, rope_sin)
+
+    m_reg.encoder.global_layers[0].forward = _capture_g0  # type: ignore[method-assign]
+    imgs = torch.rand(2, 3, 96, 96)
+    mem_levels, aux_enc, rinfo = m_reg.encode_image(imgs, return_aux=True)
+    n_out = rinfo["n_out"]
+    assert captured_rope["seq_len"] == n_out + 4, "Register tokens must be prepended before global_layers"
+    assert float((captured_rope["reg_cos"] - 1.0).abs().max().item()) == 0.0, "Register tokens must be RoPE-exempt (cos=1)"
+    assert float(captured_rope["reg_sin"].abs().max().item()) == 0.0, "Register tokens must be RoPE-exempt (sin=0)"
+    for lvl in mem_levels:
+        assert lvl.shape == (2, n_out, cfg_reg.d_model), f"Register tokens must be stripped: got {lvl.shape}"
+
+    # Verify gradients flow to register_tokens.
+    m_reg.zero_grad(set_to_none=True)
+    mem_levels[-1].sum().backward()
+    assert m_reg.encoder.register_tokens.grad is not None
+    assert float(m_reg.encoder.register_tokens.grad.abs().max().item()) > 0.0
+
+    # n_register_tokens=0 disables register tokens cleanly.
+    m_noreg = UniOMRv2Net(_tiny_cfg(n_register_tokens=0)).eval()
+    assert m_noreg.encoder.register_tokens is None
+
+    # 3. DINOv3 / InternVL 3 V2PE RoPE Box Jitter (train-only, deterministic in eval).
+    rope1d_j = AspectNormalizedRoPE1D(head_dim=16, rope_jitter=0.08)
+    rope1d_0 = AspectNormalizedRoPE1D(head_dim=16, rope_jitter=0.0)
+    rope1d_j.eval()
+    rope1d_0.eval()
+    c_e1, s_e1 = rope1d_j(20, device=torch.device("cpu"), dtype=torch.float32)
+    c_e2, s_e2 = rope1d_j(20, device=torch.device("cpu"), dtype=torch.float32)
+    c_0, s_0 = rope1d_0(20, device=torch.device("cpu"), dtype=torch.float32)
+    assert float((c_e1 - c_e2).abs().max().item()) == 0.0
+    assert float((c_e1 - c_0).abs().max().item()) < 1e-6
+    assert float((s_e1 - s_0).abs().max().item()) < 1e-6
+
+    rope1d_j.train()
+    c_t1, _ = rope1d_j(20, device=torch.device("cpu"), dtype=torch.float32)
+    c_t2, _ = rope1d_j(20, device=torch.device("cpu"), dtype=torch.float32)
+    assert float((c_t1 - c_0).abs().max().item()) > 1e-4, "RoPE1D jitter must perturb train() coordinates"
+    assert float((c_t1 - c_t2).abs().max().item()) > 1e-4, "RoPE1D jitter must vary across train() batches"
+
+    rope2d_j = AspectNormalizedRoPE2D(head_dim=16, rope_jitter=0.08)
+    rope2d_0 = AspectNormalizedRoPE2D(head_dim=16, rope_jitter=0.0)
+    coords = torch.tensor([[[1.0, 2.0], [5.0, 6.0], [9.0, 7.0]]], dtype=torch.float32)
+    rope2d_j.eval()
+    rope2d_0.eval()
+    c2_e1, s2_e1 = rope2d_j(coords, (10, 10), dtype=torch.float32)
+    c2_e2, s2_e2 = rope2d_j(coords, (10, 10), dtype=torch.float32)
+    c2_0, s2_0 = rope2d_0(coords, (10, 10), dtype=torch.float32)
+    assert float((c2_e1 - c2_e2).abs().max().item()) == 0.0
+    assert float((c2_e1 - c2_0).abs().max().item()) < 1e-6
+    assert float((s2_e1 - s2_0).abs().max().item()) < 1e-6
+
+    rope2d_j.train()
+    c2_t1, _ = rope2d_j(coords, (10, 10), dtype=torch.float32)
+    c2_t2, _ = rope2d_j(coords, (10, 10), dtype=torch.float32)
+    assert float((c2_t1 - c2_0).abs().max().item()) > 1e-4, "RoPE2D jitter must perturb train() coordinates"
+    assert float((c2_t1 - c2_t2).abs().max().item()) > 1e-4, "RoPE2D jitter must vary across train() batches"
+
+    # 4. MonkeyOCRv2 / MaskFeat Training-Only Sobel-HOG Stroke-Gradient Aux Head.
+    m_hog = UniOMRv2Net(_tiny_cfg(use_stroke_hog_head=True)).train()
+    assert isinstance(m_hog.stroke_hog_head, StrokeHogHead)
+    tgt_ids = torch.tensor([[BOS_ID, 5, 6, 7], [BOS_ID, 8, 9, 10]])
+    targets = torch.tensor([[5, 6, 7, EOS_ID], [8, 9, 10, EOS_ID]])
+    out = m_hog(imgs, tgt_ids)
+    assert out["stroke_hog_pred"] is not None
+    assert out["stroke_hog_pred"].shape == (2, 8, 24, 24)
+
+    hog_tgt = compute_stroke_hog_target(imgs, target_hw=(24, 24), n_bins=8)
+    assert hog_tgt.shape == (2, 8, 24, 24)
+    assert torch.isfinite(hog_tgt).all()
+
+    hog_loss = compute_stroke_hog_loss(out["stroke_hog_pred"], imgs)
+    assert torch.isfinite(hog_loss) and float(hog_loss.item()) > 0.0
+
+    losses = m_hog.compute_loss(out, targets, images=imgs)
+    assert torch.isfinite(losses["stroke_hog_loss"]) and float(losses["stroke_hog_loss"].item()) > 0.0
+    m_hog.zero_grad(set_to_none=True)
+    losses["loss"].backward()
+    assert m_hog.stroke_hog_head.net[0].weight.grad is not None
+
+    # strip_aux_heads() removes stroke_hog_head completely (0% inference cost).
+    m_hog.strip_aux_heads()
+    assert m_hog.stroke_hog_head is None
+    assert m_hog.param_summary()["aux_params"] == 0
+    m_hog.eval()
+    with torch.no_grad():
+        out_ev = m_hog(imgs, tgt_ids)
+    assert out_ev["stroke_hog_pred"] is None
+
+
 def main() -> None:
     summaries = _check_presets_param_counts_and_byte_budgets()
     test_aspect_normalized_rope2d_resolution_invariance()
@@ -427,6 +566,7 @@ def main() -> None:
     max_diff = _check_gqa_kv_cache_decode_parity_and_4x_shrink()
     n_qat = _check_qat_int4_controller_v2_and_zero_schema_change()
     test_iter11_optimizations()
+    test_frontier_2025_2026_upgrades()
 
     print("=== UniOMR v2 CPU Unit Tests PASSED ===")
     for name, s in summaries.items():

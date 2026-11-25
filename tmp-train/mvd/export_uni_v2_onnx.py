@@ -215,6 +215,8 @@ class UniOMRv2EncoderONNX(nn.Module):
         self.patch_merger = enc.patch_merger
         self.router = enc.router
         self.pos2d_proj = enc.pos2d_proj
+        self.n_register_tokens = int(model.cfg.n_register_tokens) if enc.register_tokens is not None else 0
+        self.register_tokens = enc.register_tokens
         self.global_layers = enc.global_layers
         self.enc_norm = enc.enc_norm
 
@@ -229,6 +231,7 @@ class UniOMRv2EncoderONNX(nn.Module):
         self.n_kv_heads = int(model.cfg.n_kv_heads)
         self.head_dim = self.d_model // self.n_heads
         self.n_dec_layers = int(model.cfg.n_dec_layers)
+        self.irope_nope_every = int(model.cfg.irope_nope_every)
         self.rope_coord_scale = float(model.cfg.rope_coord_scale)
 
         # RoPE / sinusoidal frequency buffers
@@ -584,14 +587,25 @@ class UniOMRv2EncoderONNX(nn.Module):
         cos2d, sin2d = self._rope2d_onnx(routed_coords, y_denom, x_denom)
         mem = routed_tokens + pos2d
 
+        n_reg = self.n_register_tokens
+        if n_reg > 0 and self.register_tokens is not None:
+            reg = self.register_tokens.to(mem.dtype)
+            mem = torch.cat([reg, mem], dim=1)
+            ones_c = torch.ones((1, 1, n_reg, self.head_dim), dtype=cos2d.dtype)
+            zeros_s = torch.zeros((1, 1, n_reg, self.head_dim), dtype=sin2d.dtype)
+            cos2d = torch.cat([ones_c, cos2d], dim=2)
+            sin2d = torch.cat([zeros_s, sin2d], dim=2)
+
         n_global = len(self.global_layers)
         mid_idx = max(0, (n_global // 2) - 1)
         mem_global_mid = mem_post_merger
         for i, layer in enumerate(self.global_layers):
             mem = self._global_layer_onnx(layer, mem, cos2d, sin2d)
             if i == mid_idx:
-                mem_global_mid = mem
+                mem_global_mid = mem[:, n_reg:, :] if n_reg > 0 else mem
 
+        if n_reg > 0:
+            mem = mem[:, n_reg:, :]
         mem_final = _rms_norm_onnx(mem, self.enc_norm.weight, self.enc_norm.eps) + pos2d
 
         # Encoder-side DeepStackFusion + pre-projected Cross-K/V (compact n_kv_heads).
@@ -643,6 +657,7 @@ class UniOMRv2DecoderDynamicONNX(nn.Module):
         self.n_rep = self.n_heads // self.n_kv_heads
         self.head_dim = self.d_model // self.n_heads
         self.n_dec_layers = int(model.cfg.n_dec_layers)
+        self.irope_nope_every = int(model.cfg.irope_nope_every)
 
         self.tok_emb = model.tok_emb
         self.dec_layers = model.dec_layers
@@ -705,7 +720,13 @@ class UniOMRv2DecoderDynamicONNX(nn.Module):
                 sa.k_norm.eps,
             ).transpose(1, 2)
             v = sa.v_proj(h).reshape(1, t_len, self.n_kv_heads, self.head_dim).transpose(1, 2)
-            q, k = _apply_rope(q, k, cos1d, sin1d)
+            use_rope = getattr(
+                layer,
+                "use_rope",
+                (self.irope_nope_every <= 0) or (((idx + 1) % self.irope_nope_every) != 0),
+            )
+            if use_rope:
+                q, k = _apply_rope(q, k, cos1d, sin1d)
 
             pk = past_ks[idx][:, :, :pos0, :]
             pv = past_vs[idx][:, :, :pos0, :]
@@ -788,6 +809,7 @@ class UniOMRv2DecoderNPUONNX(nn.Module):
         self.n_rep = self.n_heads // self.n_kv_heads
         self.head_dim = self.d_model // self.n_heads
         self.n_dec_layers = int(model.cfg.n_dec_layers)
+        self.irope_nope_every = int(model.cfg.irope_nope_every)
         self.kv_max_len = int(kv_max_len)
         self.static_t = int(static_t)
 
@@ -866,7 +888,13 @@ class UniOMRv2DecoderNPUONNX(nn.Module):
                 sa.k_norm.eps,
             ).transpose(1, 2)
             v = sa.v_proj(h).reshape(1, T, self.n_kv_heads, self.head_dim).transpose(1, 2)
-            q, k = _apply_rope(q, k, cos1d, sin1d)
+            use_rope = getattr(
+                layer,
+                "use_rope",
+                (self.irope_nope_every <= 0) or (((idx + 1) % self.irope_nope_every) != 0),
+            )
+            if use_rope:
+                q, k = _apply_rope(q, k, cos1d, sin1d)
 
             k_buf = past_ks[idx].scatter(2, write_idx, k)
             v_buf = past_vs[idx].scatter(2, write_idx, v)
@@ -1117,9 +1145,12 @@ def build_tiny_test_model(seed: int = 42) -> Tuple[uni_omr_v2.UniOMRv2Net, uni_o
         max_mem_tokens=64,
         n_bg_summary=4,
         mtp_k=2,
+        irope_nope_every=2,
+        n_register_tokens=2,
         use_sys_y_aux=False,
         use_sys_count_aux=False,
         use_staff_seg_aux=False,
+        use_stroke_hog_head=False,
     )
     model = uni_omr_v2.UniOMRv2Net(cfg).eval()
     return model, cfg
