@@ -71,6 +71,12 @@ const CLS_ALTER = 1 << 17;
 const CLS_DOT = 1 << 18;
 const CLS_MOD = 1 << 19;
 const CLS_TIE = 1 << 20;
+// bekern v2 compositional grammar classes (bits 21..25, staying within 0..30)
+const CLS_TIME_KW = 1 << 21; // 'time'
+const CLS_TUPLET_KW = 1 << 22; // 'tuplet-start'
+const CLS_SLASH = 1 << 23; // '/'
+const CLS_DIGIT = 1 << 24; // '0'..'9'
+const CLS_MULTIREST = 1 << 25; // 'multi-rest'
 
 const FSA_HEADER = 0;
 const FSA_BODY = 1;
@@ -80,6 +86,14 @@ const FSA_NEED_STEP = 4; // after pitched duration
 const FSA_NEED_OCT = 5; // after pitch step A..G
 const FSA_PITCH_TAIL = 6; // after octave
 const FSA_REST_TAIL = 7; // after rest + duration
+const FSA_COMP = 8; // v2 compositional sub-state (dispatched via compState)
+
+const COMP_NONE = 0;
+const COMP_TIME_NUM = 1; // after 'time', reading numerator digits -> '/'
+const COMP_TIME_DEN = 2; // after 'time <N> /', reading denominator digits
+const COMP_TUPLET_A = 3; // after 'tuplet-start', reading actual digits -> '/'
+const COMP_TUPLET_N = 4; // after 'tuplet-start <A> /', reading normal digits
+const COMP_MULTIREST = 5; // after 'multi-rest', reading bar-count digits -> bar
 
 const MAX_CHORDS_PER_ONSET = 8;
 const MAX_CONSECUTIVE_GRACE = 8;
@@ -88,6 +102,8 @@ const MAX_DOTS_PER_EVENT = 3;
 const DUR_SET = new Set(['breve', 'whole', 'half', 'quarter', 'eighth', '16th', '32nd', '64th', '128th']);
 const STEP_SET = new Set(['A', 'B', 'C', 'D', 'E', 'F', 'G']);
 const OCT_SET = new Set(['-1', '0', '1', '2', '3', '4', '5', '6', '7', '8', '9']);
+const DIGIT_SET = new Set(['0', '1', '2', '3', '4', '5', '6', '7', '8', '9']);
+const TIME_DEN_DIGIT_SET = new Set(['1', '2', '3', '4', '6', '8']);
 const ALTER_SET = new Set(['a-2', 'a-1', 'a1', 'a2']);
 const MOD_SET = new Set(['slur-start', 'slur-stop', 'stacc', 'accent', 'tenuto', 'fermata']);
 const TIE_SET = new Set(['tie-start', 'tie-stop']);
@@ -130,11 +146,15 @@ function classifyBekernToken(tok) {
   if (tok === '<eos>') return CLS_EOS;
   if (tok === '<sys>') return CLS_SYS;
   if (isValidClef(tok) || isValidKey(tok) || isValidTime(tok)) return CLS_HEADER;
+  if (tok === 'time') return CLS_TIME_KW;
   if (BAR_CLOSE_SET.has(tok)) return CLS_BAR_CLOSE;
   if (tok === 'bar-repeat-left') return CLS_BAR_LEFT;
   if (parseVoiceNum(tok) > 0) return CLS_VOICE;
   if (isValidTupletStart(tok)) return CLS_TUPLET_START;
+  if (tok === 'tuplet-start') return CLS_TUPLET_KW;
   if (tok === 'tuplet-stop') return CLS_TUPLET_STOP;
+  if (tok === '/') return CLS_SLASH;
+  if (tok === 'multi-rest') return CLS_MULTIREST;
   if (DYN_SET.has(tok) || HAIRPIN_SET.has(tok)) return CLS_DYN_HAIR;
   if (tok === 'grace') return CLS_GRACE;
   if (tok === 'chord') return CLS_CHORD;
@@ -142,7 +162,7 @@ function classifyBekernToken(tok) {
   if (tok === 'rest') return CLS_REST;
   if (tok === 'bar-rest') return CLS_BAR_REST;
   if (STEP_SET.has(tok)) return CLS_STEP;
-  if (OCT_SET.has(tok)) return CLS_OCT;
+  if (OCT_SET.has(tok)) return DIGIT_SET.has(tok) ? (CLS_OCT | CLS_DIGIT) : CLS_OCT;
   if (ALTER_SET.has(tok)) return CLS_ALTER;
   if (tok === 'dot') return CLS_DOT;
   if (MOD_SET.has(tok)) return CLS_MOD;
@@ -155,13 +175,64 @@ export class BekernFsa {
     this.vocabSize = idToToken.length;
     this.tokenClass = new Uint32Array(this.vocabSize);
     this.voiceNum = new Uint16Array(this.vocabSize);
+    this.digitVal = new Int8Array(this.vocabSize).fill(-1);
+    this.digitId = new Int32Array(10).fill(-1);
+
+    const stepIds = [];
+    const octIds = [];
+    const durIds = [];
+    const digitIds = [];
+    const nonZeroDigitIds = [];
+    const timeDenDigitIds = [];
+    const slashIds = [];
+    const digitSlashIds = [];
+    const digitBarIds = [];
+    const barCloseIds = [];
+
     for (let i = 0; i < this.vocabSize; i++) {
       const tok = idToToken[i] ?? '';
-      this.tokenClass[i] = classifyBekernToken(tok);
-      if ((this.tokenClass[i] & CLS_VOICE) !== 0) {
+      const c = classifyBekernToken(tok);
+      this.tokenClass[i] = c;
+      if ((c & CLS_VOICE) !== 0) {
         this.voiceNum[i] = parseVoiceNum(tok);
       }
+      if ((c & CLS_STEP) !== 0) stepIds.push(i);
+      if ((c & CLS_OCT) !== 0) octIds.push(i);
+      if ((c & CLS_DUR) !== 0) durIds.push(i);
+      if ((c & CLS_DIGIT) !== 0) {
+        const d = tok.charCodeAt(0) - 48;
+        this.digitVal[i] = d;
+        if (d >= 0 && d <= 9) this.digitId[d] = i;
+        digitIds.push(i);
+        digitSlashIds.push(i);
+        digitBarIds.push(i);
+        if (d > 0) nonZeroDigitIds.push(i);
+        if (TIME_DEN_DIGIT_SET.has(tok)) timeDenDigitIds.push(i);
+      }
+      if ((c & CLS_SLASH) !== 0) {
+        slashIds.push(i);
+        digitSlashIds.push(i);
+      }
+      if ((c & CLS_BAR_CLOSE) !== 0) {
+        barCloseIds.push(i);
+        digitBarIds.push(i);
+      }
     }
+
+    // Compact Uint16Array allowed-index LUTs for narrow states (shared by ref across clone())
+    this.lutStep = Uint16Array.from(stepIds);
+    this.lutOct = Uint16Array.from(octIds);
+    this.lutDur = Uint16Array.from(durIds);
+    this.lutDigit = Uint16Array.from(digitIds);
+    this.lutNonZeroDigit = Uint16Array.from(nonZeroDigitIds);
+    this.lutTimeDenDigit = Uint16Array.from(timeDenDigitIds);
+    this.lutSlash = Uint16Array.from(slashIds);
+    this.lutDigitSlash = Uint16Array.from(digitSlashIds);
+    this.lutDigitBar = Uint16Array.from(digitBarIds);
+    this.lutBarClose = Uint16Array.from(barCloseIds);
+    this.lutDigit2 = this.digitId[2] >= 0 ? Uint16Array.of(this.digitId[2]) : new Uint16Array(0);
+    this.lutDigit4 = this.digitId[4] >= 0 ? Uint16Array.of(this.digitId[4]) : new Uint16Array(0);
+
     this.reset();
   }
 
@@ -177,6 +248,11 @@ export class BekernFsa {
     this.dotCount = 0;
     this.modOrTieSeen = false;
     this.lastTokenId = -1;
+    // Flat scalar ints for bekern v2 compositional sub-states (zero-alloc clone)
+    this.compState = COMP_NONE;
+    this.compDigits = 0;
+    this.compVal = 0;
+    this.compReturnMode = FSA_BODY;
   }
 
   clone() {
@@ -184,6 +260,20 @@ export class BekernFsa {
     copy.vocabSize = this.vocabSize;
     copy.tokenClass = this.tokenClass;
     copy.voiceNum = this.voiceNum;
+    copy.digitVal = this.digitVal;
+    copy.digitId = this.digitId;
+    copy.lutStep = this.lutStep;
+    copy.lutOct = this.lutOct;
+    copy.lutDur = this.lutDur;
+    copy.lutDigit = this.lutDigit;
+    copy.lutNonZeroDigit = this.lutNonZeroDigit;
+    copy.lutTimeDenDigit = this.lutTimeDenDigit;
+    copy.lutSlash = this.lutSlash;
+    copy.lutDigitSlash = this.lutDigitSlash;
+    copy.lutDigitBar = this.lutDigitBar;
+    copy.lutBarClose = this.lutBarClose;
+    copy.lutDigit2 = this.lutDigit2;
+    copy.lutDigit4 = this.lutDigit4;
     copy.mode = this.mode;
     copy.seg = this.seg;
     copy.segLast = this.segLast.slice();
@@ -195,6 +285,10 @@ export class BekernFsa {
     copy.dotCount = this.dotCount;
     copy.modOrTieSeen = this.modOrTieSeen;
     copy.lastTokenId = this.lastTokenId;
+    copy.compState = this.compState;
+    copy.compDigits = this.compDigits;
+    copy.compVal = this.compVal;
+    copy.compReturnMode = this.compReturnMode;
     return copy;
   }
 
@@ -215,14 +309,17 @@ export class BekernFsa {
   _boundaryMask(placedOverride) {
     let mask =
       CLS_HEADER |
+      CLS_TIME_KW |
       CLS_BAR_CLOSE |
       CLS_BAR_LEFT |
       CLS_VOICE |
       CLS_TUPLET_START |
+      CLS_TUPLET_KW |
       CLS_DYN_HAIR |
       CLS_DUR |
       CLS_REST |
       CLS_BAR_REST |
+      CLS_MULTIREST |
       CLS_EOS |
       CLS_SYS;
     const placed = placedOverride !== null ? placedOverride : this.segLast[this.seg];
@@ -236,6 +333,42 @@ export class BekernFsa {
       mask |= CLS_TUPLET_STOP;
     }
     return mask;
+  }
+
+  _getNarrowLut() {
+    switch (this.mode) {
+      case FSA_NEED_DUR_NOTE:
+      case FSA_NEED_DUR_REST:
+        return this.lutDur;
+      case FSA_NEED_STEP:
+        return this.lutStep;
+      case FSA_NEED_OCT:
+        return this.lutOct;
+      case FSA_COMP:
+        switch (this.compState) {
+          case COMP_TIME_NUM:
+          case COMP_TUPLET_A:
+            if (this.compDigits === 0) return this.lutNonZeroDigit;
+            if (this.compDigits === 1) return this.lutDigitSlash;
+            return this.lutSlash;
+          case COMP_TIME_DEN:
+            if (this.compDigits === 0) return this.lutTimeDenDigit;
+            if (this.compVal === 3) return this.lutDigit2;
+            if (this.compVal === 6) return this.lutDigit4;
+            return null; // compVal === 1: allows '6' or any boundary token
+          case COMP_TUPLET_N:
+            if (this.compDigits === 0) return this.lutNonZeroDigit;
+            return null; // compDigits === 1: allows 2nd digit or any boundary token
+          case COMP_MULTIREST:
+            if (this.compDigits === 0) return this.lutNonZeroDigit;
+            if (this.compDigits < 3) return this.lutDigitBar;
+            return this.lutBarClose;
+          default:
+            return null;
+        }
+      default:
+        return null;
+    }
   }
 
   getAllowedMask() {
@@ -267,6 +400,28 @@ export class BekernFsa {
         }
         return mask;
       }
+      case FSA_COMP:
+        switch (this.compState) {
+          case COMP_TIME_NUM:
+          case COMP_TUPLET_A:
+            if (this.compDigits === 0) return CLS_DIGIT;
+            if (this.compDigits === 1) return CLS_DIGIT | CLS_SLASH;
+            return CLS_SLASH;
+          case COMP_TIME_DEN:
+            if (this.compDigits === 0 || this.compVal === 3 || this.compVal === 6) {
+              return CLS_DIGIT;
+            }
+            return this._boundaryMask(null) | CLS_DIGIT;
+          case COMP_TUPLET_N:
+            if (this.compDigits === 0) return CLS_DIGIT;
+            return this._boundaryMask(null) | CLS_DIGIT;
+          case COMP_MULTIREST:
+            if (this.compDigits === 0) return CLS_DIGIT;
+            if (this.compDigits < 3) return CLS_DIGIT | CLS_BAR_CLOSE;
+            return CLS_BAR_CLOSE;
+          default:
+            return this._boundaryMask(null);
+        }
       default:
         return this._boundaryMask(null);
     }
@@ -275,17 +430,41 @@ export class BekernFsa {
   selectNextToken(logitsData, vocabSize, offset = null) {
     const n = Math.min(vocabSize, this.vocabSize);
     const base = offset !== null ? offset : Math.max(0, logitsData.length - vocabSize);
+
+    // Fast path: compact Uint16Array LUT scan for narrow sub-states
+    const lut = this._getNarrowLut();
+    if (lut !== null) {
+      let bestIdx = -1;
+      let bestVal = -Infinity;
+      for (let k = 0, len = lut.length; k < len; k++) {
+        const i = lut[k];
+        if (i >= n) break;
+        const v = logitsData[base + i];
+        if (v > bestVal) {
+          bestVal = v;
+          bestIdx = i;
+        }
+      }
+      if (bestIdx >= 0) return bestIdx;
+    }
+
     const allowMask = this.getAllowedMask();
     const forbidVoiceId =
       this.lastTokenId >= 0 && (this.tokenClass[this.lastTokenId] & CLS_VOICE) !== 0
         ? this.lastTokenId
         : -1;
+    // In COMP_TIME_DEN with compVal===1, only digit '6' (for 16) is allowed among digits
+    const restrictTimeDen1 =
+      this.mode === FSA_COMP && this.compState === COMP_TIME_DEN && this.compVal === 1;
+    const digit6Id = this.digitId[6];
     const cls = this.tokenClass;
 
     let bestIdx = -1;
     let bestVal = -Infinity;
     for (let i = 0; i < n; i++) {
-      if ((cls[i] & allowMask) === 0 || i === forbidVoiceId) continue;
+      const ci = cls[i];
+      if ((ci & allowMask) === 0 || i === forbidVoiceId) continue;
+      if (restrictTimeDen1 && (ci & CLS_DIGIT) !== 0 && i !== digit6Id) continue;
       const v = logitsData[base + i];
       if (v > bestVal) {
         bestVal = v;
@@ -320,6 +499,14 @@ export class BekernFsa {
       this.mode = this.mode === FSA_HEADER ? FSA_HEADER : FSA_BODY;
       return;
     }
+    if ((c & CLS_TIME_KW) !== 0) {
+      this.compReturnMode = this.mode === FSA_HEADER ? FSA_HEADER : FSA_BODY;
+      this.compState = COMP_TIME_NUM;
+      this.compDigits = 0;
+      this.compVal = 0;
+      this.mode = FSA_COMP;
+      return;
+    }
     if ((c & CLS_BAR_CLOSE) !== 0) {
       this.seg = 0;
       this.segLast = [false];
@@ -341,6 +528,14 @@ export class BekernFsa {
     if ((c & CLS_TUPLET_START) !== 0) {
       this.pendingTuplets += 1;
       this.mode = FSA_BODY;
+      return;
+    }
+    if ((c & CLS_TUPLET_KW) !== 0) {
+      this.compReturnMode = FSA_BODY;
+      this.compState = COMP_TUPLET_A;
+      this.compDigits = 0;
+      this.compVal = 0;
+      this.mode = FSA_COMP;
       return;
     }
     if ((c & CLS_TUPLET_STOP) !== 0) {
@@ -388,6 +583,104 @@ export class BekernFsa {
       this.chordCount = 0;
       this.graceCount = 0;
       this.mode = FSA_BODY;
+      return;
+    }
+    if ((c & CLS_MULTIREST) !== 0) {
+      this._drainTuplets();
+      this.segLast[this.seg] = false;
+      this.chordCount = 0;
+      this.graceCount = 0;
+      this.compReturnMode = FSA_BODY;
+      this.compState = COMP_MULTIREST;
+      this.compDigits = 0;
+      this.compVal = 0;
+      this.mode = FSA_COMP;
+    }
+  }
+
+  _stepComp(id, c) {
+    switch (this.compState) {
+      case COMP_TIME_NUM:
+        if ((c & CLS_DIGIT) !== 0) {
+          this.compVal = this.compVal * 10 + this.digitVal[id];
+          this.compDigits += 1;
+        } else if ((c & CLS_SLASH) !== 0) {
+          this.compState = COMP_TIME_DEN;
+          this.compDigits = 0;
+          this.compVal = 0;
+        }
+        break;
+      case COMP_TIME_DEN:
+        if ((c & CLS_DIGIT) !== 0) {
+          const d = this.digitVal[id];
+          this.compVal = this.compVal * 10 + d;
+          this.compDigits += 1;
+          // 1-digit power-of-2 (2, 4, 8) or any 2-digit denominator (16, 32, 64) finishes immediately
+          if (this.compDigits >= 2 || this.compVal === 2 || this.compVal === 4 || this.compVal === 8) {
+            this.mode = this.compReturnMode;
+            this.compState = COMP_NONE;
+            this.compDigits = 0;
+            this.compVal = 0;
+          }
+        } else {
+          // Finished 1-digit denominator '1' -> dispatch boundary token
+          this.mode = this.compReturnMode;
+          this.compState = COMP_NONE;
+          this.compDigits = 0;
+          this.compVal = 0;
+          this._stepBoundary(id, c);
+        }
+        break;
+      case COMP_TUPLET_A:
+        if ((c & CLS_DIGIT) !== 0) {
+          this.compVal = this.compVal * 10 + this.digitVal[id];
+          this.compDigits += 1;
+        } else if ((c & CLS_SLASH) !== 0) {
+          this.compState = COMP_TUPLET_N;
+          this.compDigits = 0;
+          this.compVal = 0;
+        }
+        break;
+      case COMP_TUPLET_N:
+        if ((c & CLS_DIGIT) !== 0) {
+          this.compVal = this.compVal * 10 + this.digitVal[id];
+          this.compDigits += 1;
+          if (this.compDigits >= 2) {
+            this.pendingTuplets += 1;
+            this.mode = FSA_BODY;
+            this.compState = COMP_NONE;
+            this.compDigits = 0;
+            this.compVal = 0;
+          }
+        } else {
+          // 1-digit normal count finished -> commit tuplet and dispatch boundary token
+          this.pendingTuplets += 1;
+          this.mode = FSA_BODY;
+          this.compState = COMP_NONE;
+          this.compDigits = 0;
+          this.compVal = 0;
+          this._stepBoundary(id, c);
+        }
+        break;
+      case COMP_MULTIREST:
+        if ((c & CLS_DIGIT) !== 0) {
+          this.compVal = this.compVal * 10 + this.digitVal[id];
+          this.compDigits += 1;
+        } else if ((c & CLS_BAR_CLOSE) !== 0) {
+          this.compState = COMP_NONE;
+          this.compDigits = 0;
+          this.compVal = 0;
+          this.mode = FSA_BODY;
+          this._stepBoundary(id, c);
+        }
+        break;
+      default:
+        this.compState = COMP_NONE;
+        this.compDigits = 0;
+        this.compVal = 0;
+        this.mode = FSA_BODY;
+        this._stepBoundary(id, c);
+        break;
     }
   }
 
@@ -456,6 +749,9 @@ export class BekernFsa {
           this.mode = FSA_BODY;
           this._stepBoundary(id, c);
         }
+        break;
+      case FSA_COMP:
+        this._stepComp(id, c);
         break;
       default:
         break;

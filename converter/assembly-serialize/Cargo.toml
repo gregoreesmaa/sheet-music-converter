@@ -15,5 +15,5 @@ path = "src/main.rs"
 
 [dependencies]
 clap = { version = "4", features = ["derive"] }
-mscz = { version = "0.1", default-features = false, features = ["bekern", "lattice"] }
+mscz = { path = "../../../mscz-rs", default-features = false, features = ["bekern", "lattice"] }
 serde_json = "1"

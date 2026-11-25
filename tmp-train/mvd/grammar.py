@@ -51,6 +51,16 @@ BAR_LEFT = frozenset(['bar-repeat-left'])
 BAR_RIGHT = frozenset(['bar-light-heavy', 'bar-repeat-right', 'bar-double'])
 BAR_LIKES = frozenset([BAR]) | BAR_RIGHT
 
+# bekern v2 optional hybrid compositional grammar tokens (present in v2 vocabs;
+# absent from legacy v1 vocabs, where vocab_map checks keep 100% compatibility).
+TIME_KW = 'time'
+TUPLET_KW = 'tuplet-start'
+MULTIREST_KW = 'multi-rest'
+SLASH = '/'
+DIGITS = frozenset(str(d) for d in range(10))
+NONZERO_DIGITS = frozenset(str(d) for d in range(1, 10))
+TIME_DEN_DIGITS = frozenset(['1', '2', '3', '4', '6', '8'])
+
 # Opt-in Gate-D percussion/tab token families (gated behind
 # ``PrefixState(allow_percussion_tab=True)``; never active in Gate A-C).
 TAB_CLEFS = frozenset(['clef-TAB-5', 'clef-TAB-4', 'clef-TAB-6'])
@@ -136,6 +146,7 @@ class PrefixState:
                  'ev_base', 'ev_dots', 'ev_chord', 'ev_grace',
                  'chords_on_onset', 'grace_run',
                  'consec_bar_rest_bars', 'bar_has_pitched', 'bar_has_bar_rest',
+                 'comp_num', 'comp_digits', 'comp_val',
                  'allow_percussion_tab', 'vocab_map')
 
     def __init__(self, strict=False, allow_percussion_tab=False, vocab_map=None):
@@ -177,6 +188,10 @@ class PrefixState:
         self.consec_bar_rest_bars = 0
         self.bar_has_pitched = False
         self.bar_has_bar_rest = False
+        # bekern v2 compositional sub-state counters (flat ints for cheap copy())
+        self.comp_num = 0
+        self.comp_digits = 0
+        self.comp_val = 0
         # Gate-D opt-in: percussion/tab grammar transitions (OFF by default).
         self.allow_percussion_tab = bool(allow_percussion_tab)
         if vocab_map is not None:
@@ -217,6 +232,9 @@ class PrefixState:
         c.consec_bar_rest_bars = self.consec_bar_rest_bars
         c.bar_has_pitched = self.bar_has_pitched
         c.bar_has_bar_rest = self.bar_has_bar_rest
+        c.comp_num = self.comp_num
+        c.comp_digits = self.comp_digits
+        c.comp_val = self.comp_val
         c.allow_percussion_tab = self.allow_percussion_tab
         c.vocab_map = self.vocab_map
         return c
@@ -344,7 +362,21 @@ class PrefixState:
         self.depth[self.seg] += self.pending
         self.pending = 0
 
+    def _apply_tsig(self, beats):
+        if all(v == 0.0 for v in self.vcurs):
+            self.tsig = beats
+            self.pending_tsig = None
+        else:
+            self.pending_tsig = beats
+
     def _bound(self, t):
+        if t == TIME_KW:
+            if not self._header_attr_ok():
+                raise ValueError('spurious mid-bar header %r' % t)
+            self.comp_num = 0
+            self.comp_digits = 0
+            self.comp_val = 0
+            return 'time-num'
         if t in CLEFS or t in KEYS or t in TIMES or (
                 self.allow_percussion_tab and t in TAB_CLEFS):
             # Mid-stream attribute changes (bekern+): clef/key/time
@@ -360,11 +392,7 @@ class PrefixState:
                 if not self._short_pickup_time_ok(prev_tok):
                     raise ValueError('spurious mid-bar pickup time %r' % t)
             if t in TIMES:
-                if all(v == 0.0 for v in self.vcurs):
-                    self.tsig = _beats_of(t)
-                    self.pending_tsig = None
-                else:
-                    self.pending_tsig = _beats_of(t)
+                self._apply_tsig(_beats_of(t))
             return 'bound'
         self.header_open = False
         if t == BAR or t in BAR_RIGHT:
@@ -421,6 +449,26 @@ class PrefixState:
             _, _, a, n = t.split('-')
             self.pend_spans.append((int(a), int(n)))
             return 'bound'
+        if t == TUPLET_KW:
+            if self.strict and (self.depth[self.seg] + self.pending >= 1
+                    or self._bar_is_full()):
+                raise ValueError('tuplet-start blocked (chained/full bar): %r' % t)
+            self.comp_num = 0
+            self.comp_digits = 0
+            self.comp_val = 0
+            return 'tuplet-a'
+        if t == MULTIREST_KW:
+            self._drain()
+            self._drained_scale()
+            self.ev_base = None
+            self.ev_dots = 0
+            self.seg_last[self.seg] = False
+            self.chords_on_onset = 0
+            self.grace_run = 0
+            self.comp_num = 0
+            self.comp_digits = 0
+            self.comp_val = 0
+            return 'multi-rest'
         if t == TUPLET_STOP:
             if self.depth[self.seg] <= 0:
                 raise ValueError('unmatched tuplet-stop')
@@ -621,6 +669,114 @@ class PrefixState:
                 return
             self._close_event(False)
             self.mode = self._bound(t)
+        elif self.mode == 'time-num':
+            if t == SLASH:
+                if self.comp_digits == 0 or self.comp_val <= 0:
+                    raise ValueError('time slash without numerator')
+                self.comp_num = self.comp_val
+                self.comp_digits = 0
+                self.comp_val = 0
+                self.mode = 'time-den'
+            elif t in DIGITS:
+                if self.comp_digits == 0 and t == '0':
+                    raise ValueError('leading zero in time numerator')
+                if self.comp_digits >= 2:
+                    raise ValueError('time numerator too many digits')
+                self.comp_val = self.comp_val * 10 + int(t)
+                self.comp_digits += 1
+            else:
+                raise ValueError('bad time numerator token %r' % t)
+        elif self.mode == 'time-den':
+            if t in DIGITS:
+                if self.comp_digits == 0:
+                    if t not in TIME_DEN_DIGITS:
+                        raise ValueError('bad time denominator digit %r' % t)
+                    self.comp_val = int(t)
+                    self.comp_digits = 1
+                    if self.comp_val in (2, 4, 8):
+                        self._apply_tsig(self.comp_num * 4.0 / self.comp_val)
+                        self.comp_num = 0
+                        self.comp_digits = 0
+                        self.comp_val = 0
+                        self.mode = 'bound'
+                elif self.comp_digits == 1:
+                    den = self.comp_val * 10 + int(t)
+                    if den not in (16, 32, 64):
+                        raise ValueError('bad time denominator %d' % den)
+                    self._apply_tsig(self.comp_num * 4.0 / den)
+                    self.comp_num = 0
+                    self.comp_digits = 0
+                    self.comp_val = 0
+                    self.mode = 'bound'
+                else:
+                    raise ValueError('time denominator too many digits')
+            else:
+                if self.comp_digits == 1 and self.comp_val == 1:
+                    self._apply_tsig(self.comp_num * 4.0)
+                    self.comp_num = 0
+                    self.comp_digits = 0
+                    self.comp_val = 0
+                    self.mode = self._bound(t)
+                else:
+                    raise ValueError('incomplete time denominator before %r' % t)
+        elif self.mode == 'tuplet-a':
+            if t == SLASH:
+                if self.comp_digits == 0 or self.comp_val <= 0:
+                    raise ValueError('tuplet slash without actual count')
+                self.comp_num = self.comp_val
+                self.comp_digits = 0
+                self.comp_val = 0
+                self.mode = 'tuplet-n'
+            elif t in DIGITS:
+                if self.comp_digits == 0 and t == '0':
+                    raise ValueError('leading zero in tuplet actual')
+                if self.comp_digits >= 2:
+                    raise ValueError('tuplet actual too many digits')
+                self.comp_val = self.comp_val * 10 + int(t)
+                self.comp_digits += 1
+            else:
+                raise ValueError('bad tuplet actual token %r' % t)
+        elif self.mode == 'tuplet-n':
+            if t in DIGITS:
+                if self.comp_digits == 0 and t == '0':
+                    raise ValueError('leading zero in tuplet normal')
+                if self.comp_digits >= 2:
+                    raise ValueError('tuplet normal too many digits')
+                self.comp_val = self.comp_val * 10 + int(t)
+                self.comp_digits += 1
+                if self.comp_digits == 2:
+                    self.pending += 1
+                    self.pend_spans.append((self.comp_num, self.comp_val))
+                    self.comp_num = 0
+                    self.comp_digits = 0
+                    self.comp_val = 0
+                    self.mode = 'bound'
+            else:
+                if self.comp_digits == 0:
+                    raise ValueError('tuplet normal missing before %r' % t)
+                self.pending += 1
+                self.pend_spans.append((self.comp_num, self.comp_val))
+                self.comp_num = 0
+                self.comp_digits = 0
+                self.comp_val = 0
+                self.mode = self._bound(t)
+        elif self.mode == 'multi-rest':
+            if t in DIGITS:
+                if self.comp_digits == 0 and t == '0':
+                    raise ValueError('leading zero in multi-rest count')
+                if self.comp_digits >= 3:
+                    raise ValueError('multi-rest count too many digits')
+                self.comp_val = self.comp_val * 10 + int(t)
+                self.comp_digits += 1
+            elif t in BAR_LIKES:
+                if self.comp_digits == 0:
+                    raise ValueError('multi-rest bar without count')
+                self.comp_num = 0
+                self.comp_digits = 0
+                self.comp_val = 0
+                self.mode = self._bound(t)
+            else:
+                raise ValueError('bad multi-rest token %r' % t)
         else:
             raise ValueError('bad mode')
 
@@ -751,6 +907,8 @@ class PrefixState:
             if not (self.strict and (self.depth[self.seg] + self.pending >= 1
                     or self._bar_is_full())):
                 allow.update(vm[t] for t in TUPLET_STARTS if t in vm)
+                if TUPLET_KW in vm:
+                    allow.add(vm[TUPLET_KW])
             for t in DURATIONS:
                 if t in vm and not self._blocks_duration(_WRITTEN[t]):
                     allow.add(vm[t])
@@ -771,6 +929,8 @@ class PrefixState:
                 self.strict and (self._bar_is_full() or cur_used > _BAR_EPS)
             ):
                 allow.add(vm[BAR_REST])
+                if MULTIREST_KW in vm:
+                    allow.add(vm[MULTIREST_KW])
             if self.depth[self.seg] > 0:
                 allow.add(vm[TUPLET_STOP])
             if (placed if placed is not None else self.seg_last[self.seg]) \
@@ -785,6 +945,8 @@ class PrefixState:
                 for t in TIMES:
                     if t in vm and (short_ok or t not in SHORT_PICKUP_TIMES):
                         allow.add(vm[t])
+                if TIME_KW in vm:
+                    allow.add(vm[TIME_KW])
             if self.grace_run < MAX_CONSECUTIVE_GRACE:
                 allow.add(vm[GRACE])
             allow.update(vm[t] for t in DYNS | HAIRS | BAR_LEFT if t in vm)
@@ -856,6 +1018,62 @@ class PrefixState:
             allow.update(vm[t] for t in MODS)
             add_boundary()
             return allow, True
+        if self.mode == 'time-num':
+            if self.comp_digits == 0:
+                allow.update(vm[t] for t in NONZERO_DIGITS if t in vm)
+            elif self.comp_digits == 1:
+                allow.update(vm[t] for t in DIGITS if t in vm)
+                if SLASH in vm:
+                    allow.add(vm[SLASH])
+            else:
+                if SLASH in vm:
+                    allow.add(vm[SLASH])
+            return allow, False
+        if self.mode == 'time-den':
+            if self.comp_digits == 0:
+                allow.update(vm[t] for t in TIME_DEN_DIGITS if t in vm)
+                return allow, False
+            if self.comp_val == 3:
+                if '2' in vm:
+                    allow.add(vm['2'])
+                return allow, False
+            if self.comp_val == 6:
+                if '4' in vm:
+                    allow.add(vm['4'])
+                return allow, False
+            # comp_val == 1: either '6' (for 16) or a boundary token (for N/1)
+            if '6' in vm:
+                allow.add(vm['6'])
+            add_boundary()
+            return allow, True
+        if self.mode == 'tuplet-a':
+            if self.comp_digits == 0:
+                allow.update(vm[t] for t in NONZERO_DIGITS if t in vm)
+            elif self.comp_digits == 1:
+                allow.update(vm[t] for t in DIGITS if t in vm)
+                if SLASH in vm:
+                    allow.add(vm[SLASH])
+            else:
+                if SLASH in vm:
+                    allow.add(vm[SLASH])
+            return allow, False
+        if self.mode == 'tuplet-n':
+            if self.comp_digits == 0:
+                allow.update(vm[t] for t in NONZERO_DIGITS if t in vm)
+                return allow, False
+            allow.update(vm[t] for t in DIGITS if t in vm)
+            add_boundary()
+            return allow, True
+        if self.mode == 'multi-rest':
+            if self.comp_digits == 0:
+                allow.update(vm[t] for t in NONZERO_DIGITS if t in vm)
+            else:
+                if self.comp_digits < 3:
+                    allow.update(vm[t] for t in DIGITS if t in vm)
+                if BAR in vm:
+                    allow.add(vm[BAR])
+                allow.update(vm[t] for t in BAR_RIGHT if t in vm)
+            return allow, False
         return _fail_open()
 
 

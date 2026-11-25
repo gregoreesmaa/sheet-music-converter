@@ -525,4 +525,181 @@ WebAssembly.instantiateStreaming = origInstantiateStreaming;
   console.log('[PASS] (g) Multi-page tail state extraction, cross-page header carryover & 1-shot KV prefill');
 }
 
+// ---------------------------------------------------------------------------
+// 5. bekern v2 Hybrid Compositional Grammar + Uint16Array LUT Speed Benchmark
+// ---------------------------------------------------------------------------
+{
+  // Build a v2 vocab by extending the existing v1 vocab.json with v2 compositional tokens
+  const v2Extra = ['time', 'tuplet-start', '/', 'multi-rest', '9'];
+  const v2IdToToken = [...idToToken];
+  for (const tok of v2Extra) {
+    if (!v2IdToToken.includes(tok)) v2IdToToken.push(tok);
+  }
+  const v2TokenToId = Object.fromEntries(v2IdToToken.map((t, i) => [t, i]));
+  const v2VocabSize = v2IdToToken.length;
+
+  function makeV2Logits(overrides) {
+    const arr = new Float32Array(v2VocabSize).fill(-10.0);
+    for (const [tok, val] of Object.entries(overrides)) {
+      const id = v2TokenToId[tok];
+      assert.notEqual(id, undefined, `Unknown v2 vocab token: ${tok}`);
+      arr[id] = val;
+    }
+    return arr;
+  }
+
+  // Verify v1 backward compatibility: v1 vocab has empty v2 LUTs (lutSlash empty)
+  const fsaV1 = new BekernFsa(idToToken);
+  assert.equal(fsaV1.lutSlash.length, 0, 'v1 vocab without "/" should have empty lutSlash');
+  assert.ok(fsaV1.lutStep.length === 7, 'lutStep should have 7 pitch steps');
+  assert.ok(fsaV1.lutDur.length === 9, 'lutDur should have 9 durations');
+  assert.ok(fsaV1.lutOct.length >= 9, 'lutOct should have octave tokens');
+
+  // Verify v2 LUT construction
+  const fsaV2 = new BekernFsa(v2IdToToken);
+  assert.equal(fsaV2.lutSlash.length, 1, 'v2 vocab should have 1 slash token in lutSlash');
+  assert.equal(fsaV2.lutDigit.length, 10, 'v2 vocab should have 10 digits 0..9 in lutDigit');
+  assert.equal(fsaV2.lutTimeDenDigit.length, 6, 'v2 vocab should have 6 time-denom digits {1,2,3,4,6,8}');
+
+  // (a) Compositional time signature: `time 7 / 8` + hybrid fast-path `time-4-4`
+  fsaV2.step(v2TokenToId['clef-G-2']);
+  fsaV2.step(v2TokenToId['key+0']);
+  fsaV2.step(v2TokenToId['time']);
+  // After 'time': only non-zero digits allowed (not '/', not '0', not 'quarter', not 'C')
+  const tNum = fsaV2.selectNextToken(
+    makeV2Logits({ '/': 100, '0': 99, quarter: 98, C: 97, '7': 5 }),
+    v2VocabSize,
+  );
+  assert.equal(v2IdToToken[tNum], '7');
+  fsaV2.step(tNum);
+  // After 'time 7': digits or '/' allowed (not 'quarter', not 'C')
+  const tSlash = fsaV2.selectNextToken(
+    makeV2Logits({ quarter: 100, C: 99, bar: 98, '/': 5 }),
+    v2VocabSize,
+  );
+  assert.equal(v2IdToToken[tSlash], '/');
+  fsaV2.step(tSlash);
+  // After 'time 7 /': only time-denom digits {1,2,3,4,6,8} allowed (not '5', '7', '9', '0', '/')
+  const tDen = fsaV2.selectNextToken(
+    makeV2Logits({ '5': 100, '7': 99, '9': 98, '0': 97, '/': 96, quarter: 95, '8': 5 }),
+    v2VocabSize,
+  );
+  assert.equal(v2IdToToken[tDen], '8');
+  fsaV2.step(tDen);
+  // After 'time 7 / 8': back to boundary, 'quarter' allowed (and bare '4' forbidden)
+  const afterTime = fsaV2.selectNextToken(
+    makeV2Logits({ '4': 100, '/': 99, quarter: 5 }),
+    v2VocabSize,
+  );
+  assert.equal(v2IdToToken[afterTime], 'quarter');
+
+  // (b) Compositional tuplet: `tuplet-start 5 / 4` -> note -> `tuplet-stop`
+  fsaV2.step(v2TokenToId['tuplet-start']);
+  const tupA = fsaV2.selectNextToken(
+    makeV2Logits({ '/': 100, '0': 99, quarter: 98, '5': 5 }),
+    v2VocabSize,
+  );
+  assert.equal(v2IdToToken[tupA], '5');
+  fsaV2.step(tupA);
+  const tupSlash = fsaV2.selectNextToken(
+    makeV2Logits({ quarter: 100, bar: 99, '/': 5 }),
+    v2VocabSize,
+  );
+  assert.equal(v2IdToToken[tupSlash], '/');
+  fsaV2.step(tupSlash);
+
+  // Test clone() fidelity mid-compositional state!
+  const clonedMidTup = fsaV2.clone();
+  assert.equal(clonedMidTup.compState, fsaV2.compState);
+  assert.equal(clonedMidTup.compDigits, fsaV2.compDigits);
+  assert.equal(clonedMidTup.compVal, fsaV2.compVal);
+  // Mutate clone: finish tuplet-start 5 / 4 and emit a note
+  clonedMidTup.step(v2TokenToId['4']);
+  clonedMidTup.step(v2TokenToId['eighth']);
+  clonedMidTup.step(v2TokenToId['C']);
+  clonedMidTup.step(v2TokenToId['4']);
+  assert.equal(clonedMidTup.tupletDepth[0], 1, 'Clone should have drained compositional tuplet into depth=1');
+  // Parent must still be right after `tuplet-start 5 /` expecting a non-zero digit!
+  assert.equal(fsaV2.tupletDepth[0], 0, 'Parent tupletDepth must remain 0 after clone mutation');
+  const tupN = fsaV2.selectNextToken(
+    makeV2Logits({ quarter: 100, '/': 99, '0': 98, '4': 5 }),
+    v2VocabSize,
+  );
+  assert.equal(v2IdToToken[tupN], '4');
+  fsaV2.step(tupN);
+  // After `tuplet-start 5 / 4`, boundary token 'eighth' commits tuplet and drains into tupletDepth
+  const tupNoteDur = fsaV2.selectNextToken(
+    makeV2Logits({ '/': 100, C: 99, eighth: 5 }),
+    v2VocabSize,
+  );
+  assert.equal(v2IdToToken[tupNoteDur], 'eighth');
+  fsaV2.step(tupNoteDur);
+  fsaV2.step(v2TokenToId['C']);
+  fsaV2.step(v2TokenToId['4']);
+  // tuplet-stop must now be allowed!
+  const tupStop = fsaV2.selectNextToken(
+    makeV2Logits({ '/': 100, 'tuplet-stop': 5 }),
+    v2VocabSize,
+  );
+  assert.equal(v2IdToToken[tupStop], 'tuplet-stop');
+  fsaV2.step(tupStop);
+  fsaV2.step(v2TokenToId['bar']);
+
+  // (c) Compositional multi-rest: `multi-rest 1 6 bar`
+  fsaV2.step(v2TokenToId['multi-rest']);
+  const mr1 = fsaV2.selectNextToken(
+    makeV2Logits({ bar: 100, '0': 99, quarter: 98, '1': 5 }),
+    v2VocabSize,
+  );
+  assert.equal(v2IdToToken[mr1], '1');
+  fsaV2.step(mr1);
+  const mr2 = fsaV2.selectNextToken(
+    makeV2Logits({ quarter: 100, '/': 99, '6': 5 }),
+    v2VocabSize,
+  );
+  assert.equal(v2IdToToken[mr2], '6');
+  fsaV2.step(mr2);
+  const mrBar = fsaV2.selectNextToken(
+    makeV2Logits({ quarter: 100, '/': 99, bar: 5 }),
+    v2VocabSize,
+  );
+  assert.equal(v2IdToToken[mrBar], 'bar');
+  fsaV2.step(mrBar);
+  // After `multi-rest 1 6 bar`: back to boundary, 'quarter' allowed and bare '4' forbidden
+  const afterMr = fsaV2.selectNextToken(
+    makeV2Logits({ '4': 100, '/': 99, quarter: 5 }),
+    v2VocabSize,
+  );
+  assert.equal(v2IdToToken[afterMr], 'quarter');
+
+  // (d) V8 throughput micro-benchmark: 3,000 realistic decode steps (mixed narrow + broad states)
+  const benchFsa = new BekernFsa(v2IdToToken);
+  const benchLogits = new Float32Array(v2VocabSize);
+  for (let i = 0; i < v2VocabSize; i++) benchLogits[i] = Math.sin(i * 1.3);
+  // Bias note sequence tokens slightly so the stream exercises boundary -> dur -> step -> oct -> tail
+  benchLogits[v2TokenToId['quarter']] = 2.0;
+  benchLogits[v2TokenToId['C']] = 2.0;
+  benchLogits[v2TokenToId['4']] = 2.0;
+
+  // Warmup V8 JIT (500 steps)
+  for (let s = 0; s < 500; s++) {
+    const id = benchFsa.selectNextToken(benchLogits, v2VocabSize, 0);
+    benchFsa.step(id);
+  }
+  benchFsa.reset();
+
+  const N_STEPS = 3000;
+  const t0 = performance.now();
+  for (let s = 0; s < N_STEPS; s++) {
+    const id = benchFsa.selectNextToken(benchLogits, v2VocabSize, 0);
+    benchFsa.step(id);
+  }
+  const elapsedMs = performance.now() - t0;
+  const msPerStep = elapsedMs / N_STEPS;
+  assert.ok(msPerStep < 0.05, `BekernFsa v2 LUT throughput too slow: ${msPerStep.toFixed(6)} ms/step`);
+  console.log(
+    `[PASS] (h) bekern v2 compositional grammar (time 7 / 8, tuplet-start 5 / 4, multi-rest 1 6 bar, clone()) + V8 LUT bench: ${msPerStep.toFixed(6)} ms/step (${elapsedMs.toFixed(3)} ms / ${N_STEPS} steps)`,
+  );
+}
+
 console.log('ALL TESTS PASSED');
