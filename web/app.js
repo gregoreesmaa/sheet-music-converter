@@ -107,6 +107,7 @@ const state = {
   modelsReady: false,
   backend: 'wasm',
   numThreads: 1,
+  useMtp: false,
   maxDim: 1280,
   maxTokens: 3072,
   inputKind: null, // 'image' | 'pdf'
@@ -129,6 +130,7 @@ window.__smcGetResult = () => ({
   modelsReady: state.modelsReady,
   backend: state.backend,
   numThreads: state.numThreads,
+  useMtp: state.useMtp,
   inputKind: state.inputKind,
   pdfPageCount: state.pdfPageCount,
   msczLength: state.lastMsczBytes ? state.lastMsczBytes.length : 0,
@@ -238,13 +240,14 @@ function initWorker() {
       case 'models-ready':
         state.backend = msg.backend;
         state.numThreads = msg.numThreads;
+        state.useMtp = Boolean(msg.useMtp);
         state.maxDim = msg.maxDim || 1280;
         state.maxTokens = msg.maxTokens || 3072;
         state.modelsReady = true;
         setBadge(
           els.badgeBackend,
           state.backend === 'webgpu'
-            ? 'ORT: WebGPU (Worker)'
+            ? (state.useMtp ? `ORT: WebGPU (MTP-${msg.mtpK || 4})` : 'ORT: WebGPU (Worker)')
             : `ORT: WASM SIMD (${state.numThreads}T)`,
           'ok',
         );
@@ -304,7 +307,8 @@ function initWorker() {
     }
   };
 
-  worker.postMessage({ type: 'init' });
+  const forceBackend = new URLSearchParams(location.search).get('backend') || undefined;
+  worker.postMessage({ type: 'init', forceBackend });
 }
 
 function workerRecognizePage(nchwFloat32, width, height, pageIndex, pageCount, onProgress) {

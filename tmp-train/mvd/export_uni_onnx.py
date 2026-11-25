@@ -90,6 +90,28 @@ def _manual_sdpa(
     return torch.matmul(attn, v)
 
 
+def _causal_sdpa(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    causal_mask: torch.Tensor,
+) -> torch.Tensor:
+    """Explicit causal SDPA for variable-length decode (T=1 or T=4 MTP verify).
+
+    ``causal_mask`` is a bool tensor broadcastable to ``(1, 1, T, P+T)`` where
+    ``True`` marks future positions to mask out with ``-1e9``.
+    """
+    scale = 1.0 / math.sqrt(q.shape[-1])
+    scores = torch.matmul(q, k.transpose(-2, -1)) * scale
+    scores = torch.where(
+        causal_mask,
+        torch.full_like(scores, -1e9),
+        scores,
+    )
+    attn = F.softmax(scores, dim=-1)
+    return torch.matmul(attn, v)
+
+
 @torch.jit.script
 def _chunked_sdpa(
     q: torch.Tensor,
@@ -484,6 +506,129 @@ class UniOMRDecoderStepONNX(nn.Module):
 
 
 # ---------------------------------------------------------------------------
+# 2b. ONNX Variable-Length MTP-4 KV-Cached Decoder Wrapper (WebGPU-native)
+# ---------------------------------------------------------------------------
+
+class UniOMRDecoderMTPWebGPUONNX(nn.Module):
+    """Variable-T (T=1 or T=4) causal KV-cached decoder with MTP-4 draft heads.
+
+    Inputs:
+      - ``token_ids``: int64 ``(1, T)``
+      - ``step_pos``: int64 ``(1,)`` (starting position == past_len)
+      - ``past_k_0..L-1``, ``past_v_0..L-1``: float32 ``(1, n_heads, past_len, head_dim)``
+      - ``cross_k_0..L-1``, ``cross_v_0..L-1``: float32 ``(1, n_heads, N_mem, head_dim)``
+    Outputs:
+      - ``logits``: float32 ``(1, T, vocab_size)``
+      - ``mtp_logits_0..K-2``: float32 ``(1, vocab_size)`` (from last token's hidden state)
+      - ``present_k_0..L-1``, ``present_v_0..L-1``: float32 ``(1, n_heads, past_len + T, head_dim)``
+    """
+
+    def __init__(self, model: uni_omr.UniOMRNet) -> None:
+        super().__init__()
+        self.d_model = int(model.cfg.d_model)
+        self.n_heads = int(model.cfg.n_heads)
+        self.head_dim = self.d_model // self.n_heads
+        self.n_dec_layers = int(model.cfg.n_dec_layers)
+
+        self.tok_emb = model.tok_emb
+        self.dec_layers = model.dec_layers
+        self.dec_norm = model.dec_norm
+        self.lm_head = model.lm_head
+        self.mtp_heads = model.mtp_heads
+        self.register_buffer(
+            "rope1d_inv_freq",
+            model.rope1d.inv_freq.detach().clone().to(torch.float32),
+            persistent=False,
+        )
+
+    def forward(
+        self,
+        token_ids: torch.Tensor,
+        step_pos: torch.Tensor,
+        *kv_tensors: torch.Tensor,
+    ) -> Tuple[torch.Tensor, ...]:
+        L = self.n_dec_layers
+        past_ks = kv_tensors[0:L]
+        past_vs = kv_tensors[L : 2 * L]
+        cross_ks = kv_tensors[2 * L : 3 * L]
+        cross_vs = kv_tensors[3 * L : 4 * L]
+
+        x = self.tok_emb(token_ids)  # (1, T, D)
+        t_len = token_ids.shape[1]
+        past_len = past_ks[0].shape[2]
+        total_len = past_len + t_len
+
+        # 1D RoPE for positions [step_pos, step_pos + 1, ..., step_pos + T - 1].
+        t_arange = torch.arange(t_len, device=token_ids.device, dtype=torch.float32)
+        pos = step_pos.to(torch.float32).view(1, 1) + t_arange.view(1, -1)  # (1, T)
+        freqs = pos.unsqueeze(-1) * self.rope1d_inv_freq.view(1, 1, -1)     # (1, T, head_dim // 2)
+        emb = torch.cat([freqs, freqs], dim=-1)                             # (1, T, head_dim)
+        cos1d = emb.cos().unsqueeze(1)                                      # (1, 1, T, head_dim)
+        sin1d = emb.sin().unsqueeze(1)                                      # (1, 1, T, head_dim)
+
+        # Causal mask: key position j > query position (past_len + i) is masked out.
+        q_pos = past_len + torch.arange(t_len, device=token_ids.device, dtype=torch.long)
+        k_pos = torch.arange(total_len, device=token_ids.device, dtype=torch.long)
+        causal_mask = (k_pos.unsqueeze(0) > q_pos.unsqueeze(1)).unsqueeze(0).unsqueeze(0)
+
+        present_ks: List[torch.Tensor] = []
+        present_vs: List[torch.Tensor] = []
+
+        for idx, layer in enumerate(self.dec_layers):
+            # 1. Causal self-attention with KV cache.
+            h = _rms_norm_onnx(x, layer.norm1.weight, layer.norm1.eps)
+            sa = layer.self_attn
+            q = sa.q_proj(h).view(1, -1, self.n_heads, self.head_dim).transpose(1, 2)
+            k = sa.k_proj(h).view(1, -1, self.n_heads, self.head_dim).transpose(1, 2)
+            v = sa.v_proj(h).view(1, -1, self.n_heads, self.head_dim).transpose(1, 2)
+            q, k = _apply_rope(q, k, cos1d, sin1d)
+
+            k_cat = torch.cat([past_ks[idx], k], dim=2)
+            v_cat = torch.cat([past_vs[idx], v], dim=2)
+            present_ks.append(k_cat)
+            present_vs.append(v_cat)
+
+            sa_out = (
+                _causal_sdpa(q, k_cat, v_cat, causal_mask)
+                .transpose(1, 2)
+                .contiguous()
+                .view(1, -1, self.d_model)
+            )
+            x = x + sa.o_proj(sa_out)
+
+            # 2. Cross-attention using pre-projected K/V from encoder.
+            h2 = _rms_norm_onnx(x, layer.norm2.weight, layer.norm2.eps)
+            ca = layer.cross_attn
+            cq = ca.q_proj(h2).view(1, -1, self.n_heads, self.head_dim).transpose(1, 2)
+            ca_out = (
+                _manual_sdpa(cq, cross_ks[idx], cross_vs[idx])
+                .transpose(1, 2)
+                .contiguous()
+                .view(1, -1, self.d_model)
+            )
+            x = x + ca.o_proj(ca_out)
+
+            # 3. SwiGLU FFN.
+            h3 = _rms_norm_onnx(x, layer.norm3.weight, layer.norm3.eps)
+            gate, up = layer.ffn.w_gate_up(h3).chunk(2, dim=-1)
+            x = x + layer.ffn.w_down(F.silu(gate) * up)
+
+        h_out = _rms_norm_onnx(x, self.dec_norm.weight, self.dec_norm.eps)  # (1, T, D)
+        logits = self.lm_head(h_out)  # (1, T, vocab_size)
+
+        # MTP draft heads evaluated on the last token's hidden state h_out[:, -1, :].
+        h_last = h_out[:, -1, :]  # (1, D)
+        mtp_logits: List[torch.Tensor] = []
+        for head in self.mtp_heads:
+            h_mtp = h_last + F.silu(
+                head.proj(_rms_norm_onnx(h_last, head.norm.weight, head.norm.eps))
+            )
+            mtp_logits.append(self.lm_head(h_mtp))  # (1, vocab_size)
+
+        return (logits, *mtp_logits, *present_ks, *present_vs)
+
+
+# ---------------------------------------------------------------------------
 # Checkpoint Loading, Export, Quantization, and Parity Verification
 # ---------------------------------------------------------------------------
 
@@ -675,6 +820,456 @@ def export_models(
     }
 
 
+def _compress_conv_weights_int8(model_proto: Any, min_elems: int = 4096) -> int:
+    """Compress large FP32 Conv weight initializers to per-channel INT8 + DequantizeLinear.
+
+    Shrinks Conv backbone weights 4x (FP32 -> INT8) while keeping Conv execution
+    in native FP32 on WebGPU (avoiding ConvInteger CPU fallbacks).
+    """
+    import onnx
+    from onnx import helper, numpy_helper
+
+    init_map = {init.name: idx for idx, init in enumerate(model_proto.graph.initializer)}
+    compressed = 0
+    new_inits: List[Any] = []
+    new_nodes: List[Any] = []
+    replaced_init_names: set[str] = set()
+
+    for node in model_proto.graph.node:
+        if node.op_type == "Conv" and len(node.input) >= 2:
+            w_name = node.input[1]
+            if w_name in init_map and w_name not in replaced_init_names:
+                init = model_proto.graph.initializer[init_map[w_name]]
+                if init.data_type == onnx.TensorProto.FLOAT:
+                    w = numpy_helper.to_array(init)
+                    if w.ndim == 4 and w.size >= min_elems:
+                        max_abs = np.max(np.abs(w), axis=(1, 2, 3))
+                        scale = np.maximum(max_abs / 127.0, 1e-8).astype(np.float32)
+                        w_q = np.clip(
+                            np.round(w / scale[:, None, None, None]), -127, 127
+                        ).astype(np.int8)
+                        zp = np.zeros(w.shape[0], dtype=np.int8)
+
+                        q_name = f"{w_name}_i8"
+                        s_name = f"{w_name}_scale"
+                        z_name = f"{w_name}_zp"
+                        dq_out = f"{w_name}_dequant"
+
+                        new_inits.append(numpy_helper.from_array(w_q, name=q_name))
+                        new_inits.append(numpy_helper.from_array(scale, name=s_name))
+                        new_inits.append(numpy_helper.from_array(zp, name=z_name))
+                        dq_node = helper.make_node(
+                            "DequantizeLinear",
+                            inputs=[q_name, s_name, z_name],
+                            outputs=[dq_out],
+                            name=f"Dequant_{w_name}",
+                            axis=0,
+                        )
+                        new_nodes.append(dq_node)
+                        node.input[1] = dq_out
+                        replaced_init_names.add(w_name)
+                        compressed += 1
+        new_nodes.append(node)
+
+    if compressed > 0:
+        kept_inits = [
+            init for init in model_proto.graph.initializer if init.name not in replaced_init_names
+        ]
+        del model_proto.graph.initializer[:]
+        model_proto.graph.initializer.extend(kept_inits)
+        model_proto.graph.initializer.extend(new_inits)
+        del model_proto.graph.node[:]
+        model_proto.graph.node.extend(new_nodes)
+
+    return compressed
+
+
+def quantize_matmul_nbits(
+    fp32_path: Path,
+    out_path: Path,
+    bits: int = 4,
+    block_size: int = 32,
+    is_symmetric: bool = False,
+    compress_conv_int8: bool = False,
+) -> None:
+    """Quantize FP32 Linear MatMuls to ``com.microsoft::MatMulNBits`` (INT4).
+
+    Optionally compresses large FP32 Conv weights to per-channel INT8 with
+    ``DequantizeLinear`` so the encoder stays < 22 MB while executing Conv in
+    native FP32 on WebGPU.
+    """
+    from onnxruntime.quantization.matmul_nbits_quantizer import MatMulNBitsQuantizer
+
+    quantizer = MatMulNBitsQuantizer(
+        model=str(fp32_path),
+        bits=bits,
+        block_size=block_size,
+        is_symmetric=is_symmetric,
+        accuracy_level=4,
+    )
+    quantizer.process()
+    if compress_conv_int8:
+        n_conv = _compress_conv_weights_int8(quantizer.model.model)
+        print(f"[export-webgpu] Compressed {n_conv} Conv weights to per-channel INT8 (DequantizeLinear)", flush=True)
+    quantizer.model.save_model_to_file(str(out_path))
+
+
+def export_webgpu_models(
+    model: uni_omr.UniOMRNet,
+    cfg: uni_omr.UniOMRConfig,
+    out_dir: Path,
+    opset: int = 17,
+    attn_chunk_q: int = 256,
+    block_size: int = 32,
+    is_symmetric: bool = False,
+) -> Dict[str, Any]:
+    """Export WebGPU-native INT4 MatMulNBits encoder + MTP-4 speculative decoder.
+
+    Writes ``uni_omr_encoder_webgpu.onnx`` and ``uni_omr_decoder_webgpu.onnx``
+    alongside the existing WASM SIMD 8T models without touching them.
+    """
+    out_dir.mkdir(parents=True, exist_ok=True)
+    n_dec = int(cfg.n_dec_layers)
+    n_heads = int(cfg.n_heads)
+    head_dim = int(cfg.d_model) // n_heads
+    n_mtp_heads = len(model.mtp_heads)
+    mtp_k = n_mtp_heads + 1
+
+    enc_wrapper = UniOMREncoderONNX(model, attn_chunk_q=attn_chunk_q).eval()
+    dec_wrapper = UniOMRDecoderMTPWebGPUONNX(model).eval()
+
+    enc_fp32_path = out_dir / "uni_omr_encoder_webgpu_fp32.onnx"
+    dec_fp32_path = out_dir / "uni_omr_decoder_webgpu_fp32.onnx"
+    enc_final_path = out_dir / "uni_omr_encoder_webgpu.onnx"
+    dec_final_path = out_dir / "uni_omr_decoder_webgpu.onnx"
+
+    # --- 1. Export WebGPU Encoder (FP32 -> INT4 MatMulNBits) ---
+    dummy_img = torch.rand(1, 3, 256, 512, dtype=torch.float32)
+    enc_out_names = (
+        [f"cross_k_{i}" for i in range(n_dec)]
+        + [f"cross_v_{i}" for i in range(n_dec)]
+    )
+    enc_dyn_axes: Dict[str, Dict[int, str]] = {"image": {2: "height", 3: "width"}}
+    for name in enc_out_names:
+        enc_dyn_axes[name] = {2: "n_mem"}
+
+    print(
+        f"[export-webgpu] Exporting tiled encoder (opset={opset}, chunk_q={attn_chunk_q}) -> {enc_fp32_path}",
+        flush=True,
+    )
+    t0 = time.perf_counter()
+    with torch.no_grad():
+        torch.onnx.export(
+            enc_wrapper,
+            (dummy_img,),
+            str(enc_fp32_path),
+            input_names=["image"],
+            output_names=enc_out_names,
+            dynamic_axes=enc_dyn_axes,
+            opset_version=opset,
+            do_constant_folding=True,
+            dynamo=False,
+        )
+    print(
+        f"[export-webgpu] Encoder FP32 exported in {time.perf_counter() - t0:.1f}s "
+        f"({enc_fp32_path.stat().st_size / (1024 * 1024):.2f} MB)",
+        flush=True,
+    )
+
+    # --- 2. Export WebGPU MTP-4 Variable-T Decoder (FP32 -> INT4 MatMulNBits) ---
+    # Trace with T=4 so seq_len stays genuinely dynamic for both T=1 and T=4!
+    bos_id = int(cfg.vocab_size) - 3
+    dummy_toks = torch.full((1, 4), bos_id, dtype=torch.long)
+    dummy_pos = torch.tensor([2], dtype=torch.long)
+    dummy_past_ks = [torch.zeros(1, n_heads, 2, head_dim, dtype=torch.float32) for _ in range(n_dec)]
+    dummy_past_vs = [torch.zeros(1, n_heads, 2, head_dim, dtype=torch.float32) for _ in range(n_dec)]
+    dummy_cross_ks = [torch.zeros(1, n_heads, 64, head_dim, dtype=torch.float32) for _ in range(n_dec)]
+    dummy_cross_vs = [torch.zeros(1, n_heads, 64, head_dim, dtype=torch.float32) for _ in range(n_dec)]
+
+    dec_in_names = (
+        ["token_ids", "step_pos"]
+        + [f"past_k_{i}" for i in range(n_dec)]
+        + [f"past_v_{i}" for i in range(n_dec)]
+        + [f"cross_k_{i}" for i in range(n_dec)]
+        + [f"cross_v_{i}" for i in range(n_dec)]
+    )
+    mtp_out_names = [f"mtp_logits_{i}" for i in range(n_mtp_heads)]
+    dec_out_names = (
+        ["logits"]
+        + mtp_out_names
+        + [f"present_k_{i}" for i in range(n_dec)]
+        + [f"present_v_{i}" for i in range(n_dec)]
+    )
+    dec_dyn_axes: Dict[str, Dict[int, str]] = {
+        "token_ids": {1: "seq_len"},
+        "logits": {1: "seq_len"},
+    }
+    for i in range(n_dec):
+        dec_dyn_axes[f"past_k_{i}"] = {2: "past_len"}
+        dec_dyn_axes[f"past_v_{i}"] = {2: "past_len"}
+        dec_dyn_axes[f"cross_k_{i}"] = {2: "n_mem"}
+        dec_dyn_axes[f"cross_v_{i}"] = {2: "n_mem"}
+        dec_dyn_axes[f"present_k_{i}"] = {2: "total_len"}
+        dec_dyn_axes[f"present_v_{i}"] = {2: "total_len"}
+
+    print(
+        f"[export-webgpu] Exporting MTP-{mtp_k} decoder (opset={opset}, {n_mtp_heads} MTP heads) -> {dec_fp32_path}",
+        flush=True,
+    )
+    t0 = time.perf_counter()
+    with torch.no_grad():
+        torch.onnx.export(
+            dec_wrapper,
+            (dummy_toks, dummy_pos, *dummy_past_ks, *dummy_past_vs, *dummy_cross_ks, *dummy_cross_vs),
+            str(dec_fp32_path),
+            input_names=dec_in_names,
+            output_names=dec_out_names,
+            dynamic_axes=dec_dyn_axes,
+            opset_version=opset,
+            do_constant_folding=True,
+            dynamo=False,
+        )
+    print(
+        f"[export-webgpu] Decoder FP32 exported in {time.perf_counter() - t0:.1f}s "
+        f"({dec_fp32_path.stat().st_size / (1024 * 1024):.2f} MB)",
+        flush=True,
+    )
+
+    # --- 3. Quantize Linear MatMuls to INT4 MatMulNBits (block_size=32) ---
+    print(
+        f"[export-webgpu] Quantizing Linear MatMuls -> INT4 MatMulNBits (block_size={block_size}, sym={is_symmetric})...",
+        flush=True,
+    )
+    t0 = time.perf_counter()
+    quantize_matmul_nbits(
+        enc_fp32_path,
+        enc_final_path,
+        bits=4,
+        block_size=block_size,
+        is_symmetric=is_symmetric,
+        compress_conv_int8=True,
+    )
+    quantize_matmul_nbits(
+        dec_fp32_path, dec_final_path, bits=4, block_size=block_size, is_symmetric=is_symmetric
+    )
+    print(f"[export-webgpu] MatMulNBits quantization done in {time.perf_counter() - t0:.1f}s", flush=True)
+
+    enc_fp32_path.unlink(missing_ok=True)
+    dec_fp32_path.unlink(missing_ok=True)
+
+    return {
+        "encoder_path": enc_final_path,
+        "decoder_path": dec_final_path,
+        "mtp_k": mtp_k,
+        "n_mtp_heads": n_mtp_heads,
+        "block_size": block_size,
+        "is_symmetric": is_symmetric,
+    }
+
+
+def verify_webgpu_parity(
+    model: uni_omr.UniOMRNet,
+    cfg: uni_omr.UniOMRConfig,
+    enc_path: Path,
+    dec_path: Path,
+    image_path: Path,
+    max_dim: int = 1280,
+    n_tokens: int = 30,
+) -> Dict[str, Any]:
+    """Verify exact greedy parity of WebGPU MatMulNBits encoder + MTP-4 decoder on CPU.
+
+    Tests BOTH:
+      1. Single-step ``T=1`` decoding
+      2. MTP-4 speculative decoding (``T=1`` bootstrap + ``T=4`` parallel verify + KV slice)
+    """
+    import onnxruntime as ort
+
+    with Image.open(image_path) as raw_im:
+        pil_im = uni_omr._resize_fullpage_pil(raw_im.convert("RGB"), max_dim)
+    img_t = uni_omr._pil_to_chw_tensor(pil_im).unsqueeze(0)
+    _, _, H, W = img_t.shape
+    print(f"[webgpu-parity] Image: {image_path.name} -> resized ({H}x{W})", flush=True)
+
+    vocab_size = int(cfg.vocab_size)
+    bos_id = vocab_size - 3
+    eos_id = vocab_size - 2
+    n_dec = int(cfg.n_dec_layers)
+    n_heads = int(cfg.n_heads)
+    head_dim = int(cfg.d_model) // n_heads
+    n_mtp_heads = len(model.mtp_heads)
+
+    # 1. PyTorch greedy reference
+    with torch.no_grad():
+        pt_mem, _, pt_rinfo = model.encode_image(img_t, return_aux=False)
+        pt_tokens: List[int] = []
+        pt_past = None
+        cur_id = torch.tensor([[bos_id]], dtype=torch.long)
+        for _ in range(n_tokens):
+            logits, _, pt_past = model.decode_tokens(
+                cur_id,
+                memory=pt_mem if pt_past is None else None,
+                return_mtp=False,
+                past_kvs=pt_past,
+                use_cache=True,
+            )
+            nxt = int(logits[0, -1].argmax().item())
+            pt_tokens.append(nxt)
+            if nxt == eos_id:
+                break
+            cur_id = torch.tensor([[nxt]], dtype=torch.long)
+
+    # 2. ORT CPU sessions on the WebGPU INT4 MatMulNBits models
+    sess_opts = ort.SessionOptions()
+    sess_opts.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+    enc_sess = ort.InferenceSession(str(enc_path), sess_options=sess_opts, providers=["CPUExecutionProvider"])
+    dec_sess = ort.InferenceSession(str(dec_path), sess_options=sess_opts, providers=["CPUExecutionProvider"])
+
+    t0 = time.perf_counter()
+    enc_outs = enc_sess.run(None, {"image": img_t.numpy()})
+    ort_enc_ms = (time.perf_counter() - t0) * 1000.0
+    cross_ks = enc_outs[:n_dec]
+    cross_vs = enc_outs[n_dec : 2 * n_dec]
+    n_mem = int(cross_ks[0].shape[2])
+
+    def _run_dec(
+        tok_ids: List[int],
+        step_pos: int,
+        past_ks: List[np.ndarray],
+        past_vs: List[np.ndarray],
+    ) -> Tuple[np.ndarray, List[np.ndarray], List[np.ndarray], List[np.ndarray]]:
+        feed: Dict[str, np.ndarray] = {
+            "token_ids": np.array([tok_ids], dtype=np.int64),
+            "step_pos": np.array([step_pos], dtype=np.int64),
+        }
+        for i in range(n_dec):
+            feed[f"past_k_{i}"] = past_ks[i]
+            feed[f"past_v_{i}"] = past_vs[i]
+            feed[f"cross_k_{i}"] = cross_ks[i]
+            feed[f"cross_v_{i}"] = cross_vs[i]
+        outs = dec_sess.run(None, feed)
+        logits = outs[0]  # (1, T, V)
+        mtp = outs[1 : 1 + n_mtp_heads]
+        pk = outs[1 + n_mtp_heads : 1 + n_mtp_heads + n_dec]
+        pv = outs[1 + n_mtp_heads + n_dec : 1 + n_mtp_heads + 2 * n_dec]
+        return logits, mtp, pk, pv
+
+    # 2a. T=1 step-by-step verification
+    past_ks = [np.zeros((1, n_heads, 0, head_dim), dtype=np.float32) for _ in range(n_dec)]
+    past_vs = [np.zeros((1, n_heads, 0, head_dim), dtype=np.float32) for _ in range(n_dec)]
+    t1_tokens: List[int] = []
+    cur_tok = bos_id
+    t_dec1 = time.perf_counter()
+    for step in range(n_tokens):
+        logits, _, past_ks, past_vs = _run_dec([cur_tok], step, past_ks, past_vs)
+        nxt = int(np.argmax(logits[0, -1]))
+        t1_tokens.append(nxt)
+        if nxt == eos_id:
+            break
+        cur_tok = nxt
+    t1_dec_ms = (time.perf_counter() - t_dec1) * 1000.0
+
+    # 2b. MTP-4 speculative decoding verification (T=1 bootstrap + T=4 verify)
+    past_ks = [np.zeros((1, n_heads, 0, head_dim), dtype=np.float32) for _ in range(n_dec)]
+    past_vs = [np.zeros((1, n_heads, 0, head_dim), dtype=np.float32) for _ in range(n_dec)]
+    mtp_tokens: List[int] = []
+    mtp_calls = 0
+    mtp_t4_calls = 0
+    mtp_t4_accepted_total = 0
+    cur_tok = bos_id
+    pending_drafts: Optional[List[int]] = None
+    t_dec4 = time.perf_counter()
+
+    while len(mtp_tokens) < n_tokens:
+        past_len = int(past_ks[0].shape[2])
+        if pending_drafts is not None and len(pending_drafts) == 3 and (n_tokens - len(mtp_tokens)) >= 4:
+            # Speculative T=4 verify: [cur_tok, d1, d2, d3]
+            batch = [cur_tok] + pending_drafts
+            logits, mtp_outs, pres_ks, pres_vs = _run_dec(batch, past_len, past_ks, past_vs)
+            mtp_calls += 1
+            mtp_t4_calls += 1
+
+            accepted = 0
+            all_matched = True
+            next_tok = eos_id
+            for j in range(4):
+                v_tok = int(np.argmax(logits[0, j]))
+                mtp_tokens.append(v_tok)
+                accepted += 1
+                next_tok = v_tok
+                if v_tok == eos_id or len(mtp_tokens) >= n_tokens:
+                    all_matched = (j == 3)
+                    break
+                if j < 3 and v_tok != pending_drafts[j]:
+                    all_matched = False
+                    break
+
+            mtp_t4_accepted_total += accepted
+            if next_tok == eos_id or len(mtp_tokens) >= n_tokens:
+                break
+
+            if all_matched:
+                # All 4 positions valid in KV cache; reuse mtp_outs from last token!
+                past_ks, past_vs = pres_ks, pres_vs
+                cur_tok = next_tok
+                pending_drafts = [int(np.argmax(m[0])) for m in mtp_outs]
+            else:
+                # Keep only the verified prefix (past_len + accepted) in KV cache.
+                keep_len = past_len + accepted
+                past_ks = [np.ascontiguousarray(k[:, :, :keep_len, :]) for k in pres_ks]
+                past_vs = [np.ascontiguousarray(v[:, :, :keep_len, :]) for v in pres_vs]
+                cur_tok = next_tok
+                pending_drafts = None
+        else:
+            # Single-step T=1 (initial BOS or post-mismatch refresh)
+            logits, mtp_outs, past_ks, past_vs = _run_dec([cur_tok], past_len, past_ks, past_vs)
+            mtp_calls += 1
+            nxt = int(np.argmax(logits[0, 0]))
+            mtp_tokens.append(nxt)
+            if nxt == eos_id or len(mtp_tokens) >= n_tokens:
+                break
+            cur_tok = nxt
+            pending_drafts = [int(np.argmax(m[0])) for m in mtp_outs] if len(mtp_outs) == 3 else None
+
+    t4_dec_ms = (time.perf_counter() - t_dec4) * 1000.0
+
+    n_cmp = min(len(pt_tokens), len(t1_tokens), len(mtp_tokens))
+    t1_match = sum(1 for a, b in zip(pt_tokens[:n_cmp], t1_tokens[:n_cmp]) if a == b)
+    mtp_match = sum(1 for a, b in zip(pt_tokens[:n_cmp], mtp_tokens[:n_cmp]) if a == b)
+    t1_vs_mtp_exact = (t1_tokens == mtp_tokens)
+    mean_acc = mtp_t4_accepted_total / max(1, mtp_t4_calls)
+
+    print(
+        f"[webgpu-parity] N_mem: PT={pt_rinfo['n_out']} vs ORT={n_mem} | "
+        f"T=1 match={t1_match}/{n_cmp} | MTP-4 match={mtp_match}/{n_cmp} | "
+        f"T1==MTP4: {t1_vs_mtp_exact}",
+        flush=True,
+    )
+    print(
+        f"[webgpu-parity] CPU timing: enc={ort_enc_ms:.0f}ms | "
+        f"T=1({len(t1_tokens)} toks)={t1_dec_ms:.0f}ms ({t1_dec_ms / max(1, len(t1_tokens)):.1f} ms/tok) | "
+        f"MTP-4({len(mtp_tokens)} toks, {mtp_calls} calls, mean_acc={mean_acc:.2f}/4)={t4_dec_ms:.0f}ms "
+        f"({t4_dec_ms / max(1, len(mtp_tokens)):.1f} ms/tok)",
+        flush=True,
+    )
+    return {
+        "image": str(image_path),
+        "shape_hw": [H, W],
+        "pt_n_mem": int(pt_rinfo["n_out"]),
+        "ort_n_mem": n_mem,
+        "n_compared": n_cmp,
+        "t1_matched": t1_match,
+        "mtp4_matched": mtp_match,
+        "t1_exact_vs_pt": (pt_tokens == t1_tokens),
+        "mtp4_exact_vs_pt": (pt_tokens == mtp_tokens),
+        "t1_exact_vs_mtp4": t1_vs_mtp_exact,
+        "mtp4_calls": mtp_calls,
+        "mtp4_mean_accepted": round(mean_acc, 2),
+        "ort_enc_ms": round(ort_enc_ms, 1),
+        "t1_ms_per_tok": round(t1_dec_ms / max(1, len(t1_tokens)), 2),
+        "mtp4_ms_per_tok": round(t4_dec_ms / max(1, len(mtp_tokens)), 2),
+    }
+
+
 def verify_parity(
     model: uni_omr.UniOMRNet,
     cfg: uni_omr.UniOMRConfig,
@@ -802,6 +1397,10 @@ def main() -> None:
     parser.add_argument("--opset", type=int, default=17)
     parser.add_argument("--attn-chunk-q", type=int, default=256)
     parser.add_argument("--no-quantize", action="store_true")
+    parser.add_argument("--export-webgpu", action="store_true", help="Export WebGPU INT4 MatMulNBits encoder + MTP-4 decoder.")
+    parser.add_argument("--skip-wasm", action="store_true", help="Skip re-exporting WASM INT8 models (use with --export-webgpu).")
+    parser.add_argument("--nbits-block-size", type=int, default=32, help="Block size for INT4 MatMulNBits quantization.")
+    parser.add_argument("--nbits-symmetric", action="store_true", help="Use symmetric INT4 MatMulNBits quantization.")
     parser.add_argument("--test-image", type=Path, default=DEFAULT_TEST_IMAGE)
     parser.add_argument("--parity-tokens", type=int, default=30)
     args = parser.parse_args()
@@ -812,46 +1411,85 @@ def main() -> None:
         f"[load] step={meta['step']} val_ser={meta['val_ser']} "
         f"d_model={cfg.d_model} enc={cfg.n_enc_layers} dec={cfg.n_dec_layers} "
         f"stride={cfg.backbone_stride} dynamic_routing={cfg.dynamic_routing} "
-        f"vocab={cfg.vocab_size}",
+        f"mtp_k={cfg.mtp_k} vocab={cfg.vocab_size}",
         flush=True,
     )
 
-    info = export_models(
-        model,
-        cfg,
-        args.out_dir,
-        opset=args.opset,
-        quantize=(not args.no_quantize),
-        attn_chunk_q=args.attn_chunk_q,
-    )
-
-    vocab_meta = build_vocab_json(cfg, meta.get("vocab"))
     vocab_path = args.out_dir / "vocab.json"
-    vocab_path.write_text(json.dumps(vocab_meta, indent=2) + "\n", encoding="utf-8")
-    print(f"[vocab] Wrote {vocab_path} ({vocab_meta['vocab_size']} tokens)", flush=True)
+    if args.skip_wasm and vocab_path.exists():
+        vocab_meta = json.loads(vocab_path.read_text(encoding="utf-8"))
+    else:
+        vocab_meta = build_vocab_json(cfg, meta.get("vocab"))
 
-    enc_mb = info["encoder_path"].stat().st_size / (1024 * 1024)
-    dec_mb = info["decoder_path"].stat().st_size / (1024 * 1024)
-    print(
-        f"[sizes] {info['encoder_path'].name}: {enc_mb:.2f} MB | "
-        f"{info['decoder_path'].name}: {dec_mb:.2f} MB | "
-        f"TOTAL: {enc_mb + dec_mb:.2f} MB (quantized={info['quantized']})",
-        flush=True,
-    )
-
-    if args.test_image.exists():
-        parity = verify_parity(
+    if not args.skip_wasm:
+        info = export_models(
             model,
             cfg,
-            info["encoder_path"],
-            info["decoder_path"],
-            args.test_image,
-            max_dim=vocab_meta["max_dim"],
-            n_tokens=args.parity_tokens,
+            args.out_dir,
+            opset=args.opset,
+            quantize=(not args.no_quantize),
+            attn_chunk_q=args.attn_chunk_q,
         )
-        print("[parity] Result:", json.dumps({k: v for k, v in parity.items() if k not in ("pt_tokens", "ort_tokens")}), flush=True)
-    else:
-        print(f"[parity] Skipping: test image not found at {args.test_image}", flush=True)
+        enc_mb = info["encoder_path"].stat().st_size / (1024 * 1024)
+        dec_mb = info["decoder_path"].stat().st_size / (1024 * 1024)
+        print(
+            f"[sizes] {info['encoder_path'].name}: {enc_mb:.2f} MB | "
+            f"{info['decoder_path'].name}: {dec_mb:.2f} MB | "
+            f"TOTAL: {enc_mb + dec_mb:.2f} MB (quantized={info['quantized']})",
+            flush=True,
+        )
+        if args.test_image.exists():
+            parity = verify_parity(
+                model,
+                cfg,
+                info["encoder_path"],
+                info["decoder_path"],
+                args.test_image,
+                max_dim=vocab_meta["max_dim"],
+                n_tokens=args.parity_tokens,
+            )
+            print("[parity] Result:", json.dumps({k: v for k, v in parity.items() if k not in ("pt_tokens", "ort_tokens")}), flush=True)
+        else:
+            print(f"[parity] Skipping: test image not found at {args.test_image}", flush=True)
+
+    if args.export_webgpu:
+        wg_info = export_webgpu_models(
+            model,
+            cfg,
+            args.out_dir,
+            opset=args.opset,
+            attn_chunk_q=args.attn_chunk_q,
+            block_size=args.nbits_block_size,
+            is_symmetric=args.nbits_symmetric,
+        )
+        vocab_meta["webgpu_encoder_file"] = wg_info["encoder_path"].name
+        vocab_meta["webgpu_decoder_file"] = wg_info["decoder_path"].name
+        vocab_meta["webgpu_mtp_k"] = wg_info["mtp_k"]
+
+        wg_enc_mb = wg_info["encoder_path"].stat().st_size / (1024 * 1024)
+        wg_dec_mb = wg_info["decoder_path"].stat().st_size / (1024 * 1024)
+        print(
+            f"[webgpu-sizes] {wg_info['encoder_path'].name}: {wg_enc_mb:.2f} MB | "
+            f"{wg_info['decoder_path'].name}: {wg_dec_mb:.2f} MB | "
+            f"TOTAL: {wg_enc_mb + wg_dec_mb:.2f} MB (INT4 MatMulNBits block_size={wg_info['block_size']}, mtp_k={wg_info['mtp_k']})",
+            flush=True,
+        )
+        if args.test_image.exists():
+            wg_parity = verify_webgpu_parity(
+                model,
+                cfg,
+                wg_info["encoder_path"],
+                wg_info["decoder_path"],
+                args.test_image,
+                max_dim=vocab_meta["max_dim"],
+                n_tokens=args.parity_tokens,
+            )
+            print("[webgpu-parity] Result:", json.dumps(wg_parity), flush=True)
+        else:
+            print(f"[webgpu-parity] Skipping: test image not found at {args.test_image}", flush=True)
+
+    vocab_path.write_text(json.dumps(vocab_meta, indent=2) + "\n", encoding="utf-8")
+    print(f"[vocab] Wrote {vocab_path} ({vocab_meta['vocab_size']} tokens)", flush=True)
 
 
 if __name__ == "__main__":

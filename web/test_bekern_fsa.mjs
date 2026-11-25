@@ -30,6 +30,8 @@ import {
 } from './wasm/mscz_wasm.js';
 import {
   BekernFsa,
+  draftMtpTokens,
+  verifyMtpBatch,
   sanitizeBekernForMscz,
   compileBekernWithFallback,
   formatOrtError,
@@ -262,6 +264,122 @@ WebAssembly.instantiateStreaming = origInstantiateStreaming;
   const msg3 = formatOrtError(new Error('invalid tensor shape'), { stage: 'encoding', width: 512, height: 256 });
   assert.ok(msg3.includes('invalid tensor shape') && msg3.includes('stage=encoding'), msg3);
   console.log('[PASS] (e) formatOrtError handles numeric WASM exception pointers and normal errors');
+}
+
+// ---------------------------------------------------------------------------
+// 3. BekernFsa.clone() & MTP-4 speculative drafting / verification tests
+// ---------------------------------------------------------------------------
+{
+  const eosId = vocabJson.eos_id;
+
+  // (a) BekernFsa.clone() deep-copies mutable state without mutating the parent
+  const fsa = new BekernFsa(idToToken);
+  fsa.step(tokenToId['clef-G-2']);
+  fsa.step(tokenToId['key+0']);
+  fsa.step(tokenToId['time-4-4']);
+  fsa.step(tokenToId['quarter']); // now in FSA_NEED_STEP
+
+  const cloned = fsa.clone();
+  cloned.step(tokenToId['C']);
+  cloned.step(tokenToId['4']);
+  cloned.step(tokenToId['chord']);
+  cloned.step(tokenToId['quarter']);
+  cloned.step(tokenToId['E']);
+  cloned.step(tokenToId['4']);
+
+  // Parent must still require a pitch step (A..G), not octave/chord
+  const parentNext = fsa.selectNextToken(makeLogits({ '4': 100, bar: 99, G: 2 }), vocabSize);
+  assert.equal(idToToken[parentNext], 'G', 'clone() must not mutate parent FSA state');
+
+  // (b) draftMtpTokens drafts 3 FSA-valid tokens without mutating committed FSA
+  const drafts = draftMtpTokens(
+    fsa,
+    [
+      makeLogits({ '4': 100, C: 5 }), // FSA_NEED_STEP -> must pick 'C', not '4'
+      makeLogits({ C: 100, '4': 5 }), // FSA_NEED_OCT -> must pick '4', not 'C'
+      makeLogits({ F: 100, quarter: 5 }), // FSA_PITCH_TAIL -> must pick 'quarter', not bare 'F'
+    ],
+    vocabSize,
+  );
+  assert.deepEqual(
+    drafts.map((id) => idToToken[id]),
+    ['C', '4', 'quarter'],
+    'draftMtpTokens must enforce FSA grammar across all 3 draft heads',
+  );
+  // Committed FSA must still be untouched (still in FSA_NEED_STEP)
+  const stillStep = fsa.selectNextToken(makeLogits({ '4': 100, D: 2 }), vocabSize);
+  assert.equal(idToToken[stillStep], 'D');
+
+  // Helper to concat 4 logit slices into [1, 4, vocabSize]
+  const concat4 = (a, b, c, d) => {
+    const out = new Float32Array(4 * vocabSize);
+    out.set(a, 0);
+    out.set(b, vocabSize);
+    out.set(c, 2 * vocabSize);
+    out.set(d, 3 * vocabSize);
+    return out;
+  };
+
+  // (c) All-4 accept case: drafts [C, 4, quarter] all match, bonus token 'D' emitted!
+  const fsaAll = fsa.clone();
+  const verAll = verifyMtpBatch(
+    fsaAll,
+    concat4(
+      makeLogits({ '4': 100, C: 5 }), // j=0 -> 'C' (matches d1)
+      makeLogits({ C: 100, '4': 5 }), // j=1 -> '4' (matches d2)
+      makeLogits({ F: 100, quarter: 5 }), // j=2 -> 'quarter' (matches d3)
+      makeLogits({ '4': 100, D: 5 }), // j=3 -> 'D' (bonus token after 'quarter')
+    ),
+    vocabSize,
+    drafts,
+    eosId,
+  );
+  assert.equal(verAll.allMatched, true);
+  assert.equal(verAll.hitEos, false);
+  assert.equal(verAll.acceptedCount, 4);
+  assert.deepEqual(verAll.acceptedIds.map((id) => idToToken[id]), ['C', '4', 'quarter', 'D']);
+  // FSA should now expect an octave for 'D'
+  assert.equal(idToToken[fsaAll.selectNextToken(makeLogits({ bar: 100, '5': 1 }), vocabSize)], '5');
+
+  // (d) Partial accept (2/4): d1='C' matches, d2='4' mismatches -> corrected to '5', stops at 2!
+  const fsaPart = fsa.clone();
+  const verPart = verifyMtpBatch(
+    fsaPart,
+    concat4(
+      makeLogits({ C: 5 }), // j=0 -> 'C' (matches d1)
+      makeLogits({ '5': 5 }), // j=1 -> '5' (mismatches d2='4'!)
+      makeLogits({ quarter: 5 }), // j=2 (ignored)
+      makeLogits({ D: 5 }), // j=3 (ignored)
+    ),
+    vocabSize,
+    drafts,
+    eosId,
+  );
+  assert.equal(verPart.allMatched, false);
+  assert.equal(verPart.hitEos, false);
+  assert.equal(verPart.acceptedCount, 2);
+  assert.deepEqual(verPart.acceptedIds.map((id) => idToToken[id]), ['C', '5']);
+
+  // (e) Mid-batch EOS: accepts up to and including EOS and sets hitEos=true
+  const fsaEos = fsa.clone();
+  const verEos = verifyMtpBatch(
+    fsaEos,
+    concat4(
+      makeLogits({ C: 5 }), // j=0 -> 'C' (matches d1)
+      makeLogits({ '4': 5 }), // j=1 -> '4' (matches d2)
+      makeLogits({ '<eos>': 10 }), // j=2 -> '<eos>' (allowed in PITCH_TAIL!)
+      makeLogits({ D: 5 }), // j=3 (ignored)
+    ),
+    vocabSize,
+    drafts,
+    eosId,
+  );
+  assert.equal(verEos.hitEos, true);
+  assert.equal(verEos.allMatched, false);
+  assert.equal(verEos.acceptedCount, 3);
+  assert.deepEqual(verEos.acceptedIds.map((id) => idToToken[id]), ['C', '4', '<eos>']);
+
+  console.log('[PASS] (f) BekernFsa.clone() + MTP-4 speculative drafting & verification (4/4, partial, EOS)');
 }
 
 console.log('ALL TESTS PASSED');

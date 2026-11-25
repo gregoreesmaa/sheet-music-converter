@@ -14,7 +14,7 @@ import {
   bekernToMusicXml,
 } from './wasm/mscz_wasm.js';
 
-const ORT_CDN_BASE = 'https://cdn.jsdelivr.net/npm/onnxruntime-web@1.20.1/dist/';
+const ORT_CDN_BASE = 'https://cdn.jsdelivr.net/npm/onnxruntime-web@1.21.0/dist/';
 const ORT_ESM_URL = `${ORT_CDN_BASE}ort.webgpu.min.mjs`;
 
 // --- Crude Rollbar-like worker error & console forwarder (POST /__log) ---
@@ -177,6 +177,25 @@ export class BekernFsa {
     this.lastTokenId = -1;
   }
 
+  clone() {
+    const copy = Object.create(BekernFsa.prototype);
+    copy.vocabSize = this.vocabSize;
+    copy.tokenClass = this.tokenClass;
+    copy.voiceNum = this.voiceNum;
+    copy.mode = this.mode;
+    copy.seg = this.seg;
+    copy.segLast = this.segLast.slice();
+    copy.tupletDepth = this.tupletDepth.slice();
+    copy.pendingTuplets = this.pendingTuplets;
+    copy.chordCount = this.chordCount;
+    copy.graceCount = this.graceCount;
+    copy.alterSeen = this.alterSeen;
+    copy.dotCount = this.dotCount;
+    copy.modOrTieSeen = this.modOrTieSeen;
+    copy.lastTokenId = this.lastTokenId;
+    return copy;
+  }
+
   _growSeg(n) {
     while (this.segLast.length < n) {
       this.segLast.push(false);
@@ -251,9 +270,9 @@ export class BekernFsa {
     }
   }
 
-  selectNextToken(logitsData, vocabSize) {
+  selectNextToken(logitsData, vocabSize, offset = null) {
     const n = Math.min(vocabSize, this.vocabSize);
-    const offset = Math.max(0, logitsData.length - vocabSize);
+    const base = offset !== null ? offset : Math.max(0, logitsData.length - vocabSize);
     const allowMask = this.getAllowedMask();
     const forbidVoiceId =
       this.lastTokenId >= 0 && (this.tokenClass[this.lastTokenId] & CLS_VOICE) !== 0
@@ -265,7 +284,7 @@ export class BekernFsa {
     let bestVal = -Infinity;
     for (let i = 0; i < n; i++) {
       if ((cls[i] & allowMask) === 0 || i === forbidVoiceId) continue;
-      const v = logitsData[offset + i];
+      const v = logitsData[base + i];
       if (v > bestVal) {
         bestVal = v;
         bestIdx = i;
@@ -277,7 +296,7 @@ export class BekernFsa {
     let fbIdx = 0;
     let fbVal = -Infinity;
     for (let i = 0; i < vocabSize; i++) {
-      const v = logitsData[offset + i];
+      const v = logitsData[base + i];
       if (v > fbVal) {
         fbVal = v;
         fbIdx = i;
@@ -707,12 +726,91 @@ export function compileBekernWithFallback(rawBekern, title, { toMscz = bekernToM
   }
 }
 
+// ---------------------------------------------------------------------------
+// MTP-4 FSA-Verified Speculative Decoding Helpers
+// ---------------------------------------------------------------------------
+
+/**
+ * Draft K-1 (typically 3) future tokens from MTP head logits using a cloned
+ * BekernFsa so the committed FSA state is never mutated.
+ */
+export function draftMtpTokens(fsa, mtpLogitsList, vocabSize) {
+  const draftFsa = fsa.clone();
+  const drafts = new Array(mtpLogitsList.length);
+  for (let i = 0; i < mtpLogitsList.length; i++) {
+    const tok = draftFsa.selectNextToken(mtpLogitsList[i], vocabSize, 0);
+    draftFsa.step(tok);
+    drafts[i] = tok;
+  }
+  return drafts;
+}
+
+/**
+ * Verify a speculative MTP-K batch [curTok, d1, ..., d_{K-1}] against the true
+ * decoder logits [1, K, vocabSize], advancing `fsa` for every accepted token.
+ *
+ * Returns:
+ *   - acceptedIds: 1..K verified token IDs (including the correction/bonus token)
+ *   - acceptedCount: acceptedIds.length (KV cache should be sliced to pastLen + acceptedCount)
+ *   - allMatched: true iff all K-1 drafts matched (all K KV entries valid; can reuse mtp_logits)
+ *   - hitEos: true iff eosId was produced
+ */
+export function verifyMtpBatch(fsa, batchLogitsData, vocabSize, draftedTokens, eosId, maxRemaining = Infinity) {
+  const K = draftedTokens.length + 1;
+  const acceptedIds = [];
+  let allMatched = true;
+  let hitEos = false;
+
+  for (let j = 0; j < K; j++) {
+    if (acceptedIds.length >= maxRemaining) {
+      allMatched = false;
+      break;
+    }
+    const vTok = fsa.selectNextToken(batchLogitsData, vocabSize, j * vocabSize);
+    fsa.step(vTok);
+    acceptedIds.push(vTok);
+    if (vTok === eosId) {
+      hitEos = true;
+      allMatched = j === K - 1;
+      break;
+    }
+    if (j < draftedTokens.length && vTok !== draftedTokens[j]) {
+      allMatched = false;
+      break;
+    }
+  }
+
+  return {
+    acceptedIds,
+    acceptedCount: acceptedIds.length,
+    allMatched,
+    hitEos,
+  };
+}
+
+async function sliceKvTensor(ort, tensor, nHeads, keepLen, headDim) {
+  const totalLen = tensor.dims[2];
+  if (keepLen === totalLen) return tensor;
+  const src = typeof tensor.getData === 'function' ? await tensor.getData() : tensor.data;
+  const dst = new Float32Array(nHeads * keepLen * headDim);
+  const copyPerHead = keepLen * headDim;
+  const strideSrc = totalLen * headDim;
+  for (let h = 0; h < nHeads; h++) {
+    const srcOff = h * strideSrc;
+    dst.set(src.subarray(srcOff, srcOff + copyPerHead), h * copyPerHead);
+  }
+  if (typeof tensor.dispose === 'function') tensor.dispose();
+  return new ort.Tensor('float32', dst, [1, nHeads, keepLen, headDim]);
+}
+
 const state = {
   ort: null,
   wasmReady: false,
   modelsReady: false,
   backend: 'wasm',
   numThreads: 1,
+  useMtp: false,
+  mtpK: 1,
   vocab: null,
   fsa: null,
   modelIo: null,
@@ -784,24 +882,81 @@ async function detectWebGpu() {
   }
 }
 
-async function createOrtSession(ort, url, preferWebGpu) {
-  const providers = preferWebGpu ? ['webgpu', 'wasm'] : ['wasm'];
+async function createOrtSession(ort, url, provider, extraOpts = {}) {
+  return await ort.InferenceSession.create(url, {
+    executionProviders: [provider],
+    graphOptimizationLevel: 'all',
+    logSeverityLevel: 3,
+    ...extraOpts,
+  });
+}
+
+async function warmupWebGpuSessions(ort, encSession, decSession, vocab) {
+  const nLayers = vocab.nDecLayers || 6;
+  const nHeads = vocab.nHeads || 6;
+  const headDim = vocab.headDim || 64;
+  const bosId = vocab.bosId;
+
+  let imgT = null;
+  let encOut = null;
+  let tokT1 = null;
+  let posT1 = null;
+  let tokT4 = null;
+  let posT4 = null;
+  let decOut1 = null;
+  let decOut4 = null;
+  const emptyK = [];
+  const emptyV = [];
+
   try {
-    const session = await ort.InferenceSession.create(url, {
-      executionProviders: providers,
-      graphOptimizationLevel: 'all',
-      logSeverityLevel: 3,
-    });
-    return { session, usedWebGpu: preferWebGpu };
-  } catch (err) {
-    if (!preferWebGpu) throw err;
-    console.warn(`WebGPU session creation failed for ${url}, falling back to WASM:`, err);
-    const session = await ort.InferenceSession.create(url, {
-      executionProviders: ['wasm'],
-      graphOptimizationLevel: 'all',
-      logSeverityLevel: 3,
-    });
-    return { session, usedWebGpu: false };
+    // 1. Minimal encoder run (32x32)
+    imgT = new ort.Tensor('float32', new Float32Array(1 * 3 * 32 * 32), [1, 3, 32, 32]);
+    encOut = await encSession.run({ image: imgT });
+
+    // 2. Minimal T=1 decoder run
+    for (let i = 0; i < nLayers; i++) {
+      emptyK.push(new ort.Tensor('float32', new Float32Array(0), [1, nHeads, 0, headDim]));
+      emptyV.push(new ort.Tensor('float32', new Float32Array(0), [1, nHeads, 0, headDim]));
+    }
+    tokT1 = new ort.Tensor('int64', BigInt64Array.from([BigInt(bosId)]), [1, 1]);
+    posT1 = new ort.Tensor('int64', BigInt64Array.from([0n]), [1]);
+    const feed1 = { token_ids: tokT1, step_pos: posT1 };
+    for (let i = 0; i < nLayers; i++) {
+      feed1[`past_k_${i}`] = emptyK[i];
+      feed1[`past_v_${i}`] = emptyV[i];
+      feed1[`cross_k_${i}`] = encOut[`cross_k_${i}`];
+      feed1[`cross_v_${i}`] = encOut[`cross_v_${i}`];
+    }
+    decOut1 = await decSession.run(feed1);
+
+    // 3. Minimal T=4 MTP-4 decoder run (verifies dynamic seq_len & causal mask on WebGPU)
+    tokT4 = new ort.Tensor(
+      'int64',
+      BigInt64Array.from([BigInt(bosId), BigInt(bosId), BigInt(bosId), BigInt(bosId)]),
+      [1, 4],
+    );
+    posT4 = new ort.Tensor('int64', BigInt64Array.from([1n]), [1]);
+    const feed4 = { token_ids: tokT4, step_pos: posT4 };
+    for (let i = 0; i < nLayers; i++) {
+      feed4[`past_k_${i}`] = decOut1[`present_k_${i}`];
+      feed4[`past_v_${i}`] = decOut1[`present_v_${i}`];
+      feed4[`cross_k_${i}`] = encOut[`cross_k_${i}`];
+      feed4[`cross_v_${i}`] = encOut[`cross_v_${i}`];
+    }
+    decOut4 = await decSession.run(feed4);
+  } finally {
+    if (imgT?.dispose) imgT.dispose();
+    if (tokT1?.dispose) tokT1.dispose();
+    if (posT1?.dispose) posT1.dispose();
+    if (tokT4?.dispose) tokT4.dispose();
+    if (posT4?.dispose) posT4.dispose();
+    for (const t of emptyK) if (t?.dispose) t.dispose();
+    for (const t of emptyV) if (t?.dispose) t.dispose();
+    for (const bag of [encOut, decOut1, decOut4]) {
+      if (bag) {
+        for (const t of Object.values(bag)) if (t?.dispose) t.dispose();
+      }
+    }
   }
 }
 
@@ -853,7 +1008,7 @@ function argmaxLastSlice(logitsData, vocabSize) {
   return bestIdx;
 }
 
-async function handleInit() {
+async function handleInit(msg = {}) {
   // 1. Initialize mscz-rs WASM
   try {
     await initMsczWasm();
@@ -882,10 +1037,8 @@ async function handleInit() {
     ort.env.wasm.numThreads = threads;
     state.numThreads = threads;
 
-    // INT8 QUInt8 (DynamicQuantizeLinear/MatMulInteger) models run 5-7x faster
-    // on multi-threaded WASM SIMD than WebGPU (which ping-pongs CPU<->GPU on
-    // quantized ops). Default directly to WASM SIMD unless explicitly overridden.
-    state.backend = 'wasm';
+    const hasWebGpu = msg?.forceBackend === 'wasm' ? false : await detectWebGpu();
+    state.backend = hasWebGpu ? 'webgpu' : 'wasm';
     self.postMessage({
       type: 'ort-ready',
       backend: state.backend,
@@ -896,7 +1049,7 @@ async function handleInit() {
     return;
   }
 
-  // 3. Load vocab.json + ONNX encoder/decoder
+  // 3. Load vocab.json + ONNX encoder/decoder (prefer WebGPU INT4 + MTP-4, fallback to WASM SIMD 8T)
   try {
     const vocabRaw = await fetchJsonOptional('./models/vocab.json');
     if (!vocabRaw) {
@@ -909,26 +1062,70 @@ async function handleInit() {
       ? (await fetchJsonOptional(`./models/${vocabRaw.model_io_file}`)) || {}
       : vocabRaw;
 
-    const encoderUrl = state.modelIo.encoder_file
-      ? `./models/${state.modelIo.encoder_file}`
-      : './models/uni_omr_encoder.onnx';
-    const decoderUrl = state.modelIo.decoder_file
-      ? `./models/${state.modelIo.decoder_file}`
-      : './models/uni_omr_decoder_step.onnx';
+    const webgpuEncFile = state.modelIo.webgpu_encoder_file || vocabRaw.webgpu_encoder_file || null;
+    const webgpuDecFile = state.modelIo.webgpu_decoder_file || vocabRaw.webgpu_decoder_file || null;
+    const webgpuMtpK = Number(state.modelIo.webgpu_mtp_k || vocabRaw.webgpu_mtp_k || 1);
 
-    const preferWebGpu = false;
-    const encRes = await createOrtSession(ort, encoderUrl, preferWebGpu);
-    const decRes = await createOrtSession(ort, decoderUrl, encRes.usedWebGpu);
+    let loadedWebGpu = false;
+    if (state.backend === 'webgpu' && webgpuEncFile && webgpuDecFile) {
+      let wgEnc = null;
+      let wgDec = null;
+      try {
+        // Keep cross_k/v and present_k/v resident in WebGPU buffers across
+        // decode steps to eliminate ~80 MB/step CPU<->GPU copies!
+        const nLayers = state.vocab.nDecLayers || 6;
+        const decOutLoc = {
+          logits: 'cpu',
+          mtp_logits_0: 'cpu',
+          mtp_logits_1: 'cpu',
+          mtp_logits_2: 'cpu',
+        };
+        for (let i = 0; i < nLayers; i++) {
+          decOutLoc[`present_k_${i}`] = 'gpu-buffer';
+          decOutLoc[`present_v_${i}`] = 'gpu-buffer';
+        }
+        wgEnc = await createOrtSession(ort, `./models/${webgpuEncFile}`, 'webgpu', {
+          preferredOutputLocation: 'gpu-buffer',
+        });
+        wgDec = await createOrtSession(ort, `./models/${webgpuDecFile}`, 'webgpu', {
+          preferredOutputLocation: decOutLoc,
+        });
+        await warmupWebGpuSessions(ort, wgEnc, wgDec, state.vocab);
+        state.encoderSession = wgEnc;
+        state.decoderSession = wgDec;
+        state.backend = 'webgpu';
+        state.useMtp = webgpuMtpK >= 4;
+        state.mtpK = state.useMtp ? webgpuMtpK : 1;
+        loadedWebGpu = true;
+      } catch (wgErr) {
+        console.warn('WebGPU session/warmup failed, falling back to WASM SIMD 8T:', wgErr);
+        try { if (wgEnc?.release) await wgEnc.release(); } catch (_) {}
+        try { if (wgDec?.release) await wgDec.release(); } catch (_) {}
+      }
+    }
 
-    state.encoderSession = encRes.session;
-    state.decoderSession = decRes.session;
-    state.backend = encRes.usedWebGpu && decRes.usedWebGpu ? 'webgpu' : 'wasm';
+    if (!loadedWebGpu) {
+      const encoderUrl = state.modelIo.encoder_file
+        ? `./models/${state.modelIo.encoder_file}`
+        : './models/uni_omr_encoder.onnx';
+      const decoderUrl = state.modelIo.decoder_file
+        ? `./models/${state.modelIo.decoder_file}`
+        : './models/uni_omr_decoder_step.onnx';
+      state.encoderSession = await createOrtSession(ort, encoderUrl, 'wasm');
+      state.decoderSession = await createOrtSession(ort, decoderUrl, 'wasm');
+      state.backend = 'wasm';
+      state.useMtp = false;
+      state.mtpK = 1;
+    }
+
     state.modelsReady = true;
 
     self.postMessage({
       type: 'models-ready',
       backend: state.backend,
       numThreads: state.numThreads,
+      useMtp: state.useMtp,
+      mtpK: state.mtpK,
       maxDim: state.vocab.maxDim || state.modelIo.max_dim || 1280,
       maxTokens: state.modelIo.max_tokens || DEFAULT_MAX_TOKENS,
     });
@@ -1037,87 +1234,226 @@ async function handleRecognizePage(msg) {
       pageCount,
     });
 
-    for (let step = 0; step < maxTokens; step++) {
-      currentStep = step;
-      if (state.cancelRequested) {
-        self.postMessage({ type: 'cancelled', requestId });
-        return;
-      }
-
-      const tokenIdTensor = new ort.Tensor('int64', BigInt64Array.from([BigInt(curId)]), [1, 1]);
-      const stepPosTensor = new ort.Tensor('int64', BigInt64Array.from([BigInt(step)]), [1]);
-      const feeds = {
-        token_id: tokenIdTensor,
-        step_pos: stepPosTensor,
-      };
-      for (let i = 0; i < nLayers; i++) {
-        feeds[`past_k_${i}`] = pastK[i];
-        feeds[`past_v_${i}`] = pastV[i];
-        feeds[`cross_k_${i}`] = encOutputs[`cross_k_${i}`];
-        feeds[`cross_v_${i}`] = encOutputs[`cross_v_${i}`];
-      }
-
-      let out;
-      try {
-        out = await state.decoderSession.run(feeds);
-      } finally {
-        if (typeof tokenIdTensor.dispose === 'function') tokenIdTensor.dispose();
-        if (typeof stepPosTensor.dispose === 'function') stepPosTensor.dispose();
-      }
-      const logitsTensor = out.logits;
-      const nextId = fsa.selectNextToken(logitsTensor.data, vocabSize);
-      fsa.step(nextId);
-
-      const nextPastK = [];
-      const nextPastV = [];
-      for (let i = 0; i < nLayers; i++) {
-        nextPastK.push(out[`present_k_${i}`]);
-        nextPastV.push(out[`present_v_${i}`]);
-      }
-      for (const t of pastK) if (t && typeof t.dispose === 'function') t.dispose();
-      for (const t of pastV) if (t && typeof t.dispose === 'function') t.dispose();
-      if (typeof logitsTensor.dispose === 'function') logitsTensor.dispose();
-      pastK = nextPastK;
-      pastV = nextPastV;
-
-      if (nextId === eosId) {
-        break;
-      }
-
-      curId = nextId;
-      if (nextId !== padId && nextId !== bosId) {
-        generatedIds.push(nextId);
-        const tok = idToToken[nextId] ?? '';
+    const emitToken = (tokId) => {
+      if (tokId !== padId && tokId !== bosId && tokId !== eosId) {
+        generatedIds.push(tokId);
+        const tok = idToToken[tokId] ?? '';
         if (tok) generatedTokens.push(tok);
-        if (nextId === sysId || tok === '<sys>') {
+        if (tokId === sysId || tok === '<sys>') {
           systemCount++;
         }
       }
+    };
 
-      const loopCheck = detectRepetitionLoop(generatedIds);
-      if (loopCheck.detected) {
-        stoppedByLoop = true;
-        generatedTokens.length = Math.max(0, loopCheck.cutAt);
-        break;
+    const postDecodeProgress = (stepCount) => {
+      const now = performance.now();
+      const decS = Math.max(0.001, (now - decodeStart) / 1000);
+      const tokPerSec = Math.max(1, stepCount) / decS;
+      const pct = 22 + Math.min(70, (stepCount / Math.min(maxTokens, 1024)) * 70);
+      self.postMessage({
+        type: 'progress',
+        requestId,
+        stage: 'decoding',
+        tokens: generatedTokens.length,
+        systems: systemCount,
+        tokPerSec,
+        elapsedMs: now - t0,
+        pct,
+        pageIndex,
+        pageCount,
+      });
+    };
+
+    if (state.useMtp) {
+      // 4-token FSA-verified MTP-4 speculative decoding (WebGPU native)
+      let pendingDrafts = null;
+      let totalGenerated = 0;
+      let lastProgressAt = 0;
+
+      while (totalGenerated < maxTokens) {
+        currentStep = totalGenerated;
+        if (state.cancelRequested) {
+          self.postMessage({ type: 'cancelled', requestId });
+          return;
+        }
+
+        const pastLen = pastK[0].dims[2];
+        const canSpeculate =
+          pendingDrafts !== null &&
+          pendingDrafts.length === 3 &&
+          maxTokens - totalGenerated >= 4;
+
+        const batchIds = canSpeculate
+          ? [curId, pendingDrafts[0], pendingDrafts[1], pendingDrafts[2]]
+          : [curId];
+        const tokenIdsTensor = new ort.Tensor(
+          'int64',
+          BigInt64Array.from(batchIds.map((id) => BigInt(id))),
+          [1, batchIds.length],
+        );
+        const stepPosTensor = new ort.Tensor('int64', BigInt64Array.from([BigInt(pastLen)]), [1]);
+        const feeds = {
+          token_ids: tokenIdsTensor,
+          step_pos: stepPosTensor,
+        };
+        for (let i = 0; i < nLayers; i++) {
+          feeds[`past_k_${i}`] = pastK[i];
+          feeds[`past_v_${i}`] = pastV[i];
+          feeds[`cross_k_${i}`] = encOutputs[`cross_k_${i}`];
+          feeds[`cross_v_${i}`] = encOutputs[`cross_v_${i}`];
+        }
+
+        let out;
+        try {
+          out = await state.decoderSession.run(feeds);
+        } finally {
+          if (typeof tokenIdsTensor.dispose === 'function') tokenIdsTensor.dispose();
+          if (typeof stepPosTensor.dispose === 'function') stepPosTensor.dispose();
+        }
+
+        const logitsTensor = out.logits;
+        const mtpTensors = [out.mtp_logits_0, out.mtp_logits_1, out.mtp_logits_2];
+
+        let keepLen;
+        let done = false;
+        let nextDrafts = null;
+
+        if (canSpeculate) {
+          const ver = verifyMtpBatch(
+            fsa,
+            logitsTensor.data,
+            vocabSize,
+            pendingDrafts,
+            eosId,
+            maxTokens - totalGenerated,
+          );
+          for (const tokId of ver.acceptedIds) {
+            totalGenerated++;
+            if (tokId === eosId) {
+              done = true;
+              break;
+            }
+            emitToken(tokId);
+            curId = tokId;
+          }
+          keepLen = pastLen + ver.acceptedCount;
+          if (!done && ver.allMatched && mtpTensors[0] && mtpTensors[1] && mtpTensors[2]) {
+            nextDrafts = draftMtpTokens(
+              fsa,
+              [mtpTensors[0].data, mtpTensors[1].data, mtpTensors[2].data],
+              vocabSize,
+            );
+          }
+        } else {
+          const nextId = fsa.selectNextToken(logitsTensor.data, vocabSize, 0);
+          fsa.step(nextId);
+          totalGenerated++;
+          keepLen = pastLen + 1;
+          if (nextId === eosId) {
+            done = true;
+          } else {
+            emitToken(nextId);
+            curId = nextId;
+            if (mtpTensors[0] && mtpTensors[1] && mtpTensors[2]) {
+              nextDrafts = draftMtpTokens(
+                fsa,
+                [mtpTensors[0].data, mtpTensors[1].data, mtpTensors[2].data],
+                vocabSize,
+              );
+            }
+          }
+        }
+
+        const nextPastK = [];
+        const nextPastV = [];
+        for (let i = 0; i < nLayers; i++) {
+          nextPastK.push(await sliceKvTensor(ort, out[`present_k_${i}`], nHeads, keepLen, headDim));
+          nextPastV.push(await sliceKvTensor(ort, out[`present_v_${i}`], nHeads, keepLen, headDim));
+        }
+        for (const t of pastK) if (t && typeof t.dispose === 'function') t.dispose();
+        for (const t of pastV) if (t && typeof t.dispose === 'function') t.dispose();
+        if (logitsTensor?.dispose) logitsTensor.dispose();
+        for (const mt of mtpTensors) if (mt?.dispose) mt.dispose();
+        pastK = nextPastK;
+        pastV = nextPastV;
+        pendingDrafts = nextDrafts;
+
+        if (done) break;
+
+        const loopCheck = detectRepetitionLoop(generatedIds);
+        if (loopCheck.detected) {
+          stoppedByLoop = true;
+          generatedTokens.length = Math.max(0, loopCheck.cutAt);
+          break;
+        }
+
+        if (totalGenerated - lastProgressAt >= 4) {
+          lastProgressAt = totalGenerated;
+          postDecodeProgress(totalGenerated);
+        }
       }
+    } else {
+      // Standard single-step autoregressive decoding (WASM SIMD 8T fallback)
+      for (let step = 0; step < maxTokens; step++) {
+        currentStep = step;
+        if (state.cancelRequested) {
+          self.postMessage({ type: 'cancelled', requestId });
+          return;
+        }
 
-      if (step % 4 === 0) {
-        const now = performance.now();
-        const decS = Math.max(0.001, (now - decodeStart) / 1000);
-        const tokPerSec = (step + 1) / decS;
-        const pct = 22 + Math.min(70, (step / Math.min(maxTokens, 1024)) * 70);
-        self.postMessage({
-          type: 'progress',
-          requestId,
-          stage: 'decoding',
-          tokens: generatedTokens.length,
-          systems: systemCount,
-          tokPerSec,
-          elapsedMs: now - t0,
-          pct,
-          pageIndex,
-          pageCount,
-        });
+        const tokenIdTensor = new ort.Tensor('int64', BigInt64Array.from([BigInt(curId)]), [1, 1]);
+        const stepPosTensor = new ort.Tensor('int64', BigInt64Array.from([BigInt(step)]), [1]);
+        const feeds = {
+          token_id: tokenIdTensor,
+          step_pos: stepPosTensor,
+        };
+        for (let i = 0; i < nLayers; i++) {
+          feeds[`past_k_${i}`] = pastK[i];
+          feeds[`past_v_${i}`] = pastV[i];
+          feeds[`cross_k_${i}`] = encOutputs[`cross_k_${i}`];
+          feeds[`cross_v_${i}`] = encOutputs[`cross_v_${i}`];
+        }
+
+        let out;
+        try {
+          out = await state.decoderSession.run(feeds);
+        } finally {
+          if (typeof tokenIdTensor.dispose === 'function') tokenIdTensor.dispose();
+          if (typeof stepPosTensor.dispose === 'function') stepPosTensor.dispose();
+        }
+        const logitsTensor = out.logits;
+        const nextId = fsa.selectNextToken(logitsTensor.data, vocabSize);
+        fsa.step(nextId);
+
+        const nextPastK = [];
+        const nextPastV = [];
+        for (let i = 0; i < nLayers; i++) {
+          nextPastK.push(out[`present_k_${i}`]);
+          nextPastV.push(out[`present_v_${i}`]);
+        }
+        for (const t of pastK) if (t && typeof t.dispose === 'function') t.dispose();
+        for (const t of pastV) if (t && typeof t.dispose === 'function') t.dispose();
+        if (typeof logitsTensor.dispose === 'function') logitsTensor.dispose();
+        pastK = nextPastK;
+        pastV = nextPastV;
+
+        if (nextId === eosId) {
+          break;
+        }
+
+        curId = nextId;
+        emitToken(nextId);
+
+        const loopCheck = detectRepetitionLoop(generatedIds);
+        if (loopCheck.detected) {
+          stoppedByLoop = true;
+          generatedTokens.length = Math.max(0, loopCheck.cutAt);
+          break;
+        }
+
+        if (step % 4 === 0) {
+          postDecodeProgress(step + 1);
+        }
       }
     }
 
@@ -1218,7 +1554,7 @@ if (typeof self !== 'undefined') {
     if (!msg || typeof msg.type !== 'string') return;
     switch (msg.type) {
       case 'init':
-        await handleInit();
+        await handleInit(msg);
         break;
       case 'recognize-page':
         await handleRecognizePage(msg);
