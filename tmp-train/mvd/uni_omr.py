@@ -4037,6 +4037,10 @@ class GPUEmaShadow:
                 tgt.copy_(src)
         return True
 
+    def cpu_state_dict(self, model: Optional[nn.Module] = None) -> Dict[str, torch.Tensor]:
+        """Return a detached CPU copy of the EMA shadow state_dict."""
+        return {k: v.detach().cpu() for k, v in self.shadow.items()}
+
     @contextlib.contextmanager
     def swap_into(self, model: nn.Module, qat_ctrl: Optional[QATInt4Controller] = None) -> Iterator[None]:
         """Temporarily swap EMA weights into ``model`` for evaluation (0 extra GPU VRAM)."""
