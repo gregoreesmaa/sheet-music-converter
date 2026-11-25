@@ -108,7 +108,7 @@ const state = {
   backend: 'wasm',
   numThreads: 1,
   maxDim: 1280,
-  maxTokens: 2048,
+  maxTokens: 3072,
   inputKind: null, // 'image' | 'pdf'
   loadedImage: null,
   pdfDoc: null,
@@ -215,8 +215,8 @@ function initWorker() {
           els.badgeBackend,
           msg.backend === 'webgpu'
             ? 'ORT: WebGPU (Worker)'
-            : `ORT: WASM (${msg.numThreads}T Worker)`,
-          msg.backend === 'webgpu' ? 'ok' : 'warn',
+            : `ORT: WASM SIMD (${msg.numThreads}T)`,
+          'ok',
         );
         setBadge(els.badgeModels, 'Models: Loading…', 'muted');
         setProgress(0, 'Loading UniOMR encoder & decoder ONNX models in worker…', 'Loading');
@@ -239,14 +239,14 @@ function initWorker() {
         state.backend = msg.backend;
         state.numThreads = msg.numThreads;
         state.maxDim = msg.maxDim || 1280;
-        state.maxTokens = msg.maxTokens || 2048;
+        state.maxTokens = msg.maxTokens || 3072;
         state.modelsReady = true;
         setBadge(
           els.badgeBackend,
           state.backend === 'webgpu'
             ? 'ORT: WebGPU (Worker)'
-            : `ORT: WASM (${state.numThreads}T Worker)`,
-          state.backend === 'webgpu' ? 'ok' : 'warn',
+            : `ORT: WASM SIMD (${state.numThreads}T)`,
+          'ok',
         );
         setBadge(els.badgeModels, 'Models: Ready', 'ok');
         setProgress(0, 'Ready. Drop a sheet music image or PDF.', 'Ready');
