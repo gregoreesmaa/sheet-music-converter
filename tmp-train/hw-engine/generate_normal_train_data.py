@@ -704,6 +704,10 @@ def _worker_render_one(job: Dict[str, Any]) -> Dict[str, Any]:
     is_landscape = bool(page_w > page_h)
     clean_paper = bool(job.get("clean_paper", False))
     dense_hw_mode = bool(job.get("dense_hw_mode", False))
+    historical_clean = bool(job.get("historical_clean", False))
+    omit_cont_header_prob = job.get("omit_cont_header_prob", None)
+    max_page_tokens = int(job.get("max_page_tokens", 0))
+    strict_fullpage = bool(job.get("strict_fullpage", False))
     max_parts = int(job.get("max_parts", 6))
     pages_dir = Path(job["pages_dir"])
     strips_dir = Path(job["strips_dir"])
@@ -822,6 +826,8 @@ def _worker_render_one(job: Dict[str, Any]) -> Dict[str, Any]:
             export_train_dir=work_strip_dir,
             clean_paper=clean_paper,
             max_parts=max_parts,
+            historical_clean=historical_clean,
+            omit_cont_header_prob=omit_cont_header_prob,
         )
     except Exception as exc:
         if work_strip_dir.exists():
@@ -897,6 +903,23 @@ def _worker_render_one(job: Dict[str, Any]) -> Dict[str, Any]:
         shutil.rmtree(work_strip_dir, ignore_errors=True)
 
     fullpage_ok = (len(ordered_valid_beks) == len(nonblank_sys)) and (len(nonblank_sys) > 0)
+    if max_page_tokens > 0 and n_tokens_page > max_page_tokens:
+        fullpage_ok = False
+    if strict_fullpage and not fullpage_ok:
+        for p in (page_png, page_json):
+            if p.exists():
+                p.unlink(missing_ok=True)
+        for bp in ordered_valid_beks:
+            bp_p = Path(bp)
+            bp_p.unlink(missing_ok=True)
+            sp_p = bp_p.with_name(bp_p.name.replace("-bekern.txt", ".png"))
+            sp_p.unlink(missing_ok=True)
+        err_msg = (
+            f"too_many_tokens:{n_tokens_page}>{max_page_tokens}"
+            if (max_page_tokens > 0 and n_tokens_page > max_page_tokens)
+            else f"incomplete_systems:{len(ordered_valid_beks)}/{len(nonblank_sys)}"
+        )
+        return {"ok": False, "idx": idx, "stem": stem, "error": err_msg}
     fullpage_row = (
         {
             "image": str(page_png.resolve()),
@@ -904,6 +927,8 @@ def _worker_render_one(job: Dict[str, Any]) -> Dict[str, Any]:
             "domain": "hw",
             "n_systems": len(nonblank_sys),
             "n_staves": len(s1_row["staves"]),
+            "n_tokens": n_tokens_page,
+            "omit_cont_header": bool(gt_payload.get("omit_cont_header", False)),
         }
         if fullpage_ok
         else None
@@ -1097,6 +1122,33 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         "--clean-paper",
         action="store_true",
         help="Force clean_paper=True on 100%% of pages (overrides --clean-paper-frac)",
+    )
+    parser.add_argument(
+        "--historical-clean",
+        action="store_true",
+        help="Enable hw-score-sim curated historical_clean archival manuscript mode",
+    )
+    parser.add_argument(
+        "--omit-cont-header-prob",
+        type=float,
+        default=None,
+        help="Override omit_cont_header_prob (default: 0.35 when --historical-clean, else 0.0)",
+    )
+    parser.add_argument(
+        "--max-page-tokens",
+        type=int,
+        default=0,
+        help="Reject & backfill pages exceeding this total bekern token count (0 = unlimited)",
+    )
+    parser.add_argument(
+        "--strict-fullpage",
+        action="store_true",
+        help="Reject & backfill any page that fails fullpage_ok (barline/OOV/token cap)",
+    )
+    parser.add_argument(
+        "--no-merge-stage1",
+        action="store_true",
+        help="Do not touch/overwrite --merged-stage1-manifest",
     )
     parser.add_argument("--verify-only", action="store_true", help="Skip generation and only run verification")
     args = parser.parse_args(argv)
@@ -1299,6 +1351,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 "page_h": ph,
                 "max_parts": max_parts,
                 "dense_hw_mode": dense_hw_mode,
+                "historical_clean": bool(args.historical_clean),
+                "omit_cont_header_prob": args.omit_cont_header_prob,
+                "max_page_tokens": int(args.max_page_tokens),
+                "strict_fullpage": bool(args.strict_fullpage),
                 "pages_dir": str(pages_dir),
                 "strips_dir": str(strips_dir),
                 "tmp_export_dir": str(tmp_export_dir),
@@ -1355,21 +1411,27 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         with open(fullpage_manifest, "w", encoding="utf-8") as fh:
             for row in fullpage_rows:
                 fh.write(json.dumps(row, ensure_ascii=False) + "\n")
+        with open(out_root / "manifest.jsonl", "w", encoding="utf-8") as fh:
+            for row in fullpage_rows:
+                fh.write(json.dumps(row, ensure_ascii=False) + "\n")
 
         # Write non-destructive merged Stage-1 manifest
-        base_manifest = Path(args.base_stage1_manifest)
         merged_manifest = Path(args.merged_stage1_manifest)
-        merged_manifest.parent.mkdir(parents=True, exist_ok=True)
-        base_rows = 0
-        with open(merged_manifest, "w", encoding="utf-8") as out_f:
-            if base_manifest.exists():
-                with open(base_manifest, "r", encoding="utf-8") as in_f:
-                    for line in in_f:
-                        if line.strip():
-                            out_f.write(line if line.endswith("\n") else line + "\n")
-                            base_rows += 1
-            for r in ordered:
-                out_f.write(json.dumps(r["stage1_row"], ensure_ascii=False) + "\n")
+        if not args.no_merge_stage1:
+            base_manifest = Path(args.base_stage1_manifest)
+            merged_manifest.parent.mkdir(parents=True, exist_ok=True)
+            base_rows = 0
+            with open(merged_manifest, "w", encoding="utf-8") as out_f:
+                if base_manifest.exists():
+                    with open(base_manifest, "r", encoding="utf-8") as in_f:
+                        for line in in_f:
+                            if line.strip():
+                                out_f.write(line if line.endswith("\n") else line + "\n")
+                                base_rows += 1
+                for r in ordered:
+                    out_f.write(json.dumps(r["stage1_row"], ensure_ascii=False) + "\n")
+        else:
+            base_rows = 0
 
         selected_sources = [Path(r["score_path"]) for r in ordered]
         named_used = sorted({r["style"] for r in ordered if r["mode"] == "named"})
