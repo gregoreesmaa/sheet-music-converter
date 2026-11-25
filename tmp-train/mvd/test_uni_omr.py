@@ -1335,6 +1335,150 @@ class TestUniOMR(unittest.TestCase):
         ms_per_img = (_time.perf_counter() - t0) * 1000.0 / n_runs
         self.assertLess(ms_per_img, 20.0, f"_apply_performer_pencil_markup too slow: {ms_per_img:.2f} ms/img")
 
+    def test_w_struct_tok_weight_loss_and_cli(self) -> None:
+        """(w) P0: struct_tok_weight upweights header/structural tokens in CE loss, caches weights, and parses CLI."""
+        model = uni_omr.UniOMRNet(_small_cfg(d_model=64, n_enc_layers=1, n_dec_layers=1, n_heads=4, mtp_k=1))
+        model.eval()
+
+        # Verify weight tensor contents and caching
+        w3 = model._get_struct_token_weights(uni_omr.VOCAB_SIZE, 3.0, torch.device("cpu"), torch.float32)
+        w3_cached = model._get_struct_token_weights(uni_omr.VOCAB_SIZE, 3.0, torch.device("cpu"), torch.float32)
+        self.assertIs(w3, w3_cached)
+        self.assertEqual(w3.shape, (uni_omr.VOCAB_SIZE,))
+        for tok in ("clef-G-2", "key+0", "time-4-4", "<sys>", "grace", "bar", "bar-light-heavy"):
+            self.assertAlmostEqual(float(w3[uni_omr.UNI_TOKEN_TO_ID[tok]].item()), 3.0, places=5)
+        for tok in ("quarter", "C", "4", "dot", "rest"):
+            self.assertAlmostEqual(float(w3[uni_omr.UNI_TOKEN_TO_ID[tok]].item()), 1.0, places=5)
+
+        # Verify weighted CE shifts loss toward higher-error structural tokens vs unweighted
+        V = uni_omr.VOCAB_SIZE
+        clef_id = uni_omr.UNI_TOKEN_TO_ID["clef-G-2"]
+        note_id = uni_omr.UNI_TOKEN_TO_ID["quarter"]
+        logits = torch.zeros(1, 2, V, dtype=torch.float32)
+        # High error on clef_id (pos 0), low error on note_id (pos 1)
+        logits[0, 0, clef_id] = -2.0
+        logits[0, 1, note_id] = 4.0
+        targets = torch.tensor([[clef_id, note_id]], dtype=torch.long)
+        out = {"logits": logits, "mtp_logits": [], "uv_pred": None, "router_info": {}}
+
+        l1 = model.compute_loss(out, targets, struct_tok_weight=1.0)
+        l3 = model.compute_loss(out, targets, struct_tok_weight=3.0)
+        ref_ce = torch.nn.functional.cross_entropy(logits.reshape(-1, V), targets.reshape(-1), ignore_index=uni_omr.PAD_ID)
+        self.assertAlmostEqual(float(l1["ce_loss"].item()), float(ref_ce.item()), places=5)
+        self.assertGreater(float(l3["ce_loss"].item()), float(l1["ce_loss"].item()))
+
+        # CLI parsing default=1.0 and custom value
+        ap = uni_omr.build_arg_parser()
+        self.assertAlmostEqual(ap.parse_args([]).struct_tok_weight, 1.0)
+        self.assertAlmostEqual(ap.parse_args(["--struct-tok-weight", "2.5"]).struct_tok_weight, 2.5)
+
+    def test_x_router_dark_border_paper_gate_and_bce_target(self) -> None:
+        """(x) P4a: paper_gate suppresses high-firing saliency_net on dark borders & ink_target=0 trains it down."""
+        cfg = _small_cfg(
+            keep_ratio=0.40,
+            dynamic_routing=True,
+            min_keep_ratio=0.15,
+            max_keep_ratio=0.45,
+            saliency_thr=0.05,
+            n_bg_summary=4,
+            use_ink_prior=True,
+            backbone_stride=16,
+        )
+        model = uni_omr.UniOMRNet(cfg)
+        model.eval()
+
+        H, W = 384, 384
+        border = int(round(H * 0.15))  # 58px dark scanner border
+        img = torch.zeros(1, 3, H, W, dtype=torch.float32)
+        img[:, 0, border : H - border, border : W - border] = 0.90
+        img[:, 1, border : H - border, border : W - border] = 0.84
+        img[:, 2, border : H - border, border : W - border] = 0.72
+        x0, x1 = border + 24, W - border - 24
+        for sy in (110, 120, 130, 140, 150, 220, 230, 240, 250, 260):
+            img[:, :, sy : sy + 2, x0:x1] = 0.10
+
+        # Force saliency_net to fire strongly (~0.88) everywhere including dark borders
+        with torch.no_grad():
+            for m in model.router.saliency_net.modules():
+                if isinstance(m, torch.nn.Conv2d) and m.bias is not None:
+                    m.bias.fill_(2.0)
+
+        tgt_in = torch.tensor([[uni_omr.BOS_ID, 0, 1, 2, 3]], dtype=torch.long)
+        tgt_out = torch.tensor([[0, 1, 2, 3, uni_omr.EOS_ID]], dtype=torch.long)
+        out = model(img, tgt_in, return_aux=False, return_mtp=False)
+        rinfo = out["router_info"]
+        H_p, W_p = rinfo["grid_hw"]
+        border_cells = border // 16  # 3 cells strictly inside 58px border
+
+        score_2d = rinfo["saliency_map"][0, 0]
+        border_mean = float(score_2d[:border_cells, :].mean().item())
+        self.assertLess(
+            border_mean,
+            0.10,
+            f"Expected paper_gate to crush dark-border score < 0.10 even with +2.0 bias, got {border_mean:.4f}",
+        )
+
+        # Kept border token fraction must stay < 5% and ink_recall >= 0.85
+        kept_idx = rinfo["kept_idx"][0].tolist()
+        n_border_kept = sum(
+            1
+            for idx in kept_idx
+            for gy, gx in [divmod(int(idx), W_p)]
+            if gy < border_cells or gy >= H_p - border_cells or gx < border_cells or gx >= W_p - border_cells
+        )
+        border_frac = n_border_kept / max(1, len(kept_idx))
+        self.assertLess(border_frac, 0.05, f"Dark border tokens leaked: {border_frac * 100:.2f}%")
+        self.assertGreaterEqual(rinfo["ink_recall"], 0.85)
+
+        # ink_target must be strictly 0.0 on dark borders so BCE actively trains saliency_net to 0 there
+        ink_tgt_2d = rinfo["ink_target"][0, 0]
+        self.assertEqual(float(ink_tgt_2d[:border_cells, :].max().item()), 0.0)
+        losses = model.compute_loss(out, tgt_out, saliency_loss_weight=0.10)
+        self.assertGreater(float(losses["saliency_loss"].item()), 0.0)
+
+    def test_y_archival_clutter_aug_faint_verse_watermark_fast(self) -> None:
+        """(y) P4b: archival verse block, watermark/stain, and faint sepia ink are deterministic and fast."""
+        import random as _py_random
+        import time as _time
+
+        arr = np.full((960, 1280, 3), 236, dtype=np.uint8)
+        for sy in range(180, 720, 140):
+            for k in range(5):
+                arr[sy + k * 8 : sy + k * 8 + 2, 100:1180, :] = 35
+        base = Image.fromarray(arr, mode="RGB")
+        ink_u8 = (95, 78, 58)
+
+        # 1. Verse block & watermark/stain determinism, RGB/size preservation, pixel change, speed (<5ms)
+        for fn in (uni_omr._apply_archival_verse_block, uni_omr._apply_archival_watermark_stain):
+            a = fn(base, _py_random.Random(101), ink_u8)
+            b = fn(base, _py_random.Random(101), ink_u8)
+            self.assertEqual(a.size, (1280, 960))
+            self.assertEqual(a.mode, "RGB")
+            np.testing.assert_array_equal(np.asarray(a), np.asarray(b))
+            self.assertFalse(np.array_equal(np.asarray(a), arr))
+
+            t0 = _time.perf_counter()
+            for s in range(10):
+                _ = fn(base, _py_random.Random(200 + s), ink_u8)
+            ms = (_time.perf_counter() - t0) * 1000.0 / 10.0
+            self.assertLess(ms, 10.0, f"{fn.__name__} too slow: {ms:.2f} ms/img")
+
+        # 2. Integrated archival mode produces faint low-contrast sepia variants among 30 seeds
+        small = Image.fromarray(arr[::3, ::4], mode="RGB")
+        saw_faint = False
+        for s in range(30):
+            im = uni_omr.apply_online_augment(
+                small, rng=_py_random.Random(3000 + s), is_hw=True, hw_archival_prob=1.0
+            )
+            self.assertEqual(im.size, small.size)
+            interior = np.asarray(im, dtype=np.float32)[40:-40, 40:-40]
+            # Faint sepia ink compresses dark ink brightness upward (min luma > 95)
+            luma_min = float(interior.mean(axis=-1).min())
+            if luma_min > 95.0:
+                saw_faint = True
+                break
+        self.assertTrue(saw_faint, "Expected faint low-contrast sepia ink variant across 30 archival seeds")
+
 
 if __name__ == "__main__":
     unittest.main()

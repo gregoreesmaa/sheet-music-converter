@@ -465,11 +465,15 @@ class InkTokenRouter(nn.Module):
             self.ink_prior_scale.fill_(1.0)
 
     @staticmethod
-    def _compute_ink_darkness(images: torch.Tensor, h_p: int, w_p: int) -> torch.Tensor:
-        """Compute border-masked relative high-pass ink map ``(B, 1, H', W')``.
+    def _compute_ink_and_paper_gate(
+        images: torch.Tensor, h_p: int, w_p: int
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Compute border-masked relative high-pass ink map, soft paper_gate, and paper_mask_grid.
 
-        Suppresses dark exterior desk/scanner border rings via ``paper_mask``
-        and normalizes by local paper brightness so faint brown iron-gall ink
+        Suppresses dark exterior desk/scanner border rings (``local_bg <= 0.35``)
+        both in the high-pass ink prior and via a detached soft ``paper_gate``
+        (``1.0`` on paper, ``0.05`` on dark borders) applied to ``saliency_prob``,
+        while normalizing by local paper brightness so faint brown iron-gall ink
         on warm parchment remains strongly salient.
         """
         # Standard Rec.601 luma for RGB in [0, 1], computed in float32 for precision.
@@ -493,7 +497,22 @@ class InkTokenRouter(nn.Module):
         local_ink = ((local_bg - luma) / local_bg.clamp(min=0.15)).clamp(0.0, 1.0) * paper_mask
         ink_max = F.adaptive_max_pool2d(local_ink, (h_p, w_p))
         ink_avg = F.adaptive_avg_pool2d(local_ink, (h_p, w_p))
-        return 0.5 * ink_max + 0.5 * ink_avg
+        local_ink_grid = 0.5 * ink_max + 0.5 * ink_avg
+
+        local_bg_grid = F.adaptive_avg_pool2d(local_bg, (h_p, w_p))
+        paper_mask_grid = (local_bg_grid > 0.35).detach()
+        paper_gate = torch.where(
+            paper_mask_grid,
+            torch.ones_like(local_bg_grid),
+            torch.full_like(local_bg_grid, 0.05),
+        ).detach()
+        return local_ink_grid, paper_gate, paper_mask_grid
+
+    @staticmethod
+    def _compute_ink_darkness(images: torch.Tensor, h_p: int, w_p: int) -> torch.Tensor:
+        """Compute border-masked relative high-pass ink map ``(B, 1, H', W')``."""
+        local_ink_grid, _, _ = InkTokenRouter._compute_ink_and_paper_gate(images, h_p, w_p)
+        return local_ink_grid
 
     def forward(
         self,
@@ -525,8 +544,11 @@ class InkTokenRouter(nn.Module):
 
         ink_target: Optional[torch.Tensor] = None
         if images is not None:
-            local_ink_grid = self._compute_ink_darkness(images, H_p, W_p).to(saliency_logits.dtype)
-            ink_target = (local_ink_grid > 0.04).to(saliency_logits.dtype)
+            local_ink_grid, paper_gate, paper_mask_grid = self._compute_ink_and_paper_gate(images, H_p, W_p)
+            local_ink_grid = local_ink_grid.to(saliency_logits.dtype)
+            paper_gate = paper_gate.to(saliency_logits.dtype)
+            saliency_prob = saliency_prob * paper_gate
+            ink_target = ((local_ink_grid > 0.04) & paper_mask_grid).to(saliency_logits.dtype)
             if self.use_ink_prior:
                 flat = local_ink_grid.flatten(1)
                 denom = (
@@ -1009,6 +1031,7 @@ class UniOMRNet(nn.Module):
         # MTP auxiliary heads for offsets +2 .. +mtp_k (shared lm_head projection)
         n_extra_mtp = max(0, int(c.mtp_k) - 1)
         self.mtp_heads = nn.ModuleList([MTPHead(c.d_model) for _ in range(n_extra_mtp)])
+        self._struct_weight_cache: Dict[Tuple[int, float, torch.device, torch.dtype], torch.Tensor] = {}
 
     def _sinusoidal_pos2d(
         self,
@@ -1256,6 +1279,38 @@ class UniOMRNet(nn.Module):
             "router_info": router_info,
         }
 
+    def _get_struct_token_weights(
+        self,
+        vocab_size: int,
+        weight: float,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> torch.Tensor:
+        """Build and cache 1D per-token CE weights upweighting header/structural tokens."""
+        w_val = float(weight)
+        key = (int(vocab_size), w_val, device, dtype)
+        cached = self._struct_weight_cache.get(key)
+        if cached is not None:
+            return cached
+        tok_w = torch.ones(int(vocab_size), device=device, dtype=dtype)
+        for tok, tid in UNI_TOKEN_TO_ID.items():
+            if tid >= vocab_size:
+                continue
+            if (
+                tok.startswith("clef-")
+                or tok.startswith("key")
+                or tok.startswith("time-")
+                or tok == SYS_TOKEN
+                or tok == "grace"
+                or tok.startswith("bar")
+            ):
+                tok_w[tid] = w_val
+        if vocab_size != VOCAB_SIZE and vocab_size >= 4:
+            # Ensure tail <sys> token is upweighted even on legacy vocab sizes (e.g. 182)
+            tok_w[vocab_size - 1] = w_val
+        self._struct_weight_cache[key] = tok_w
+        return tok_w
+
     def compute_loss(
         self,
         out: Dict[str, Any],
@@ -1264,6 +1319,7 @@ class UniOMRNet(nn.Module):
         mtp_loss_weight: float = 0.30,
         uv_loss_weight: float = 0.20,
         saliency_loss_weight: float = 0.10,
+        struct_tok_weight: float = 1.0,
     ) -> Dict[str, torch.Tensor]:
         """Compute combined CE + MTP-k + auxiliary UV-flow + router saliency BCE losses.
 
@@ -1273,12 +1329,20 @@ class UniOMRNet(nn.Module):
             targets: ``(B, T)`` next-token target IDs (with ``PAD_ID`` ignored).
             uv_target: optional ``(B, 3, H, W)`` ground-truth ``(u, v, valid)`` map.
             saliency_loss_weight: weight on lightweight BCE supervision of ``saliency_logits``.
+            struct_tok_weight: optional loss multiplier (> 1.0) on header/structural tokens
+                (``clef-*``, ``key*``, ``time-*``, ``<sys>``, ``grace``, ``bar*``).
         """
         logits: torch.Tensor = out["logits"]
         V = logits.shape[-1]
+        ce_weight: Optional[torch.Tensor] = None
+        if float(struct_tok_weight) > 1.0:
+            ce_weight = self._get_struct_token_weights(
+                V, float(struct_tok_weight), logits.device, logits.dtype
+            )
         ce_loss = F.cross_entropy(
             logits.reshape(-1, V),
             targets.reshape(-1),
+            weight=ce_weight,
             ignore_index=PAD_ID,
         )
 
@@ -2011,6 +2075,102 @@ def _apply_performer_pencil_markup(
     return out
 
 
+def _apply_archival_verse_block(
+    img: Image.Image,
+    rng: Any,
+    ink_rgb_u8: Tuple[int, int, int],
+) -> Image.Image:
+    """Draw a fast handwritten-style verse/prose cursive squiggle block in bottom/top margin."""
+    out = img.copy() if img.mode == "RGB" else img.convert("RGB")
+    w, h = out.size
+    if w < 64 or h < 64:
+        return out
+    draw = ImageDraw.Draw(out, "RGBA")
+    place_bottom = rng.random() < 0.78
+    n_lines = rng.randint(2, 5)
+    line_gap = max(5, min(14, int(round(h * rng.uniform(0.014, 0.024)))))
+    block_h = n_lines * line_gap
+    if place_bottom:
+        y_start = max(int(h * 0.76), h - block_h - max(6, int(h * rng.uniform(0.02, 0.07))))
+    else:
+        y_start = max(4, int(h * rng.uniform(0.02, 0.06)))
+    x_left = int(w * rng.uniform(0.10, 0.28))
+    max_span = max(32, int(w * rng.uniform(0.30, 0.62)))
+    ir, ig, ib = ink_rgb_u8
+    alpha = rng.randint(120, 195)
+    col = (ir, ig, ib, alpha)
+    step_x = max(4, min(7, w // 120))
+    amp = max(1.5, min(3.5, line_gap * 0.28))
+
+    for li in range(n_lines):
+        y0 = y_start + li * line_gap
+        if y0 < 3 or y0 >= h - 3:
+            continue
+        x_end = min(w - 6, x_left + int(max_span * rng.uniform(0.65, 1.0)))
+        x = x_left + rng.randint(-4, 6)
+        phase = rng.uniform(0.0, 2.0 * math.pi)
+        while x < x_end - 8:
+            word_len = rng.randint(max(12, step_x * 3), max(22, step_x * 9))
+            wx_end = min(x_end, x + word_len)
+            pts: List[Tuple[int, int]] = []
+            cx = x
+            k = 0
+            while cx <= wx_end:
+                dy = math.sin(phase + k * 1.15) * amp + rng.uniform(-1.0, 1.0)
+                pts.append((max(0, min(w - 1, cx)), max(0, min(h - 1, int(round(y0 + dy))))))
+                cx += step_x
+                k += 1
+            if len(pts) >= 2:
+                draw.line(pts, fill=col, width=1)
+            x = wx_end + rng.randint(5, 12)
+    return out
+
+
+def _apply_archival_watermark_stain(
+    img: Image.Image,
+    rng: Any,
+    ink_rgb_u8: Tuple[int, int, int],
+) -> Image.Image:
+    """Draw a faint semi-transparent archival watermark or corner botanical/ink-stain blob."""
+    out = img.copy() if img.mode == "RGB" else img.convert("RGB")
+    w, h = out.size
+    if w < 64 or h < 64:
+        return out
+    draw = ImageDraw.Draw(out, "RGBA")
+    alpha = int(round(rng.uniform(0.12, 0.22) * 255.0))
+    ir, ig, ib = ink_rgb_u8
+    # Warm sepia/amber stain or faint archival stamp tint
+    sr = max(40, min(195, ir + rng.randint(10, 45)))
+    sg = max(35, min(175, ig + rng.randint(5, 35)))
+    sb = max(25, min(145, ib + rng.randint(-5, 25)))
+    col = (sr, sg, sb, alpha)
+
+    if rng.random() < 0.55:
+        # Corner botanical / ink-stain cluster (2-4 soft overlapping ellipses)
+        corner = rng.randint(0, 3)
+        rx_base = max(12, int(w * rng.uniform(0.05, 0.13)))
+        ry_base = max(12, int(h * rng.uniform(0.05, 0.13)))
+        cx = int(w * rng.uniform(0.06, 0.20)) if corner in (0, 2) else int(w * rng.uniform(0.80, 0.94))
+        cy = int(h * rng.uniform(0.06, 0.20)) if corner in (0, 1) else int(h * rng.uniform(0.80, 0.94))
+        for _ in range(rng.randint(2, 4)):
+            ox = rng.randint(-rx_base // 2, rx_base // 2)
+            oy = rng.randint(-ry_base // 2, ry_base // 2)
+            rx = max(6, int(rx_base * rng.uniform(0.55, 1.15)))
+            ry = max(6, int(ry_base * rng.uniform(0.55, 1.15)))
+            draw.ellipse([cx + ox - rx, cy + oy - ry, cx + ox + rx, cy + oy + ry], fill=col)
+    else:
+        # Faint semi-transparent library watermark oval/ring + inner cross-bar
+        rx = max(18, int(w * rng.uniform(0.08, 0.18)))
+        ry = max(14, int(h * rng.uniform(0.06, 0.14)))
+        cx = rng.randint(rx + 6, max(rx + 6, w - rx - 6))
+        cy = rng.randint(ry + 6, max(ry + 6, h - ry - 6))
+        draw.ellipse([cx - rx, cy - ry, cx + rx, cy + ry], outline=col, width=max(2, min(4, w // 220)))
+        irx, iry = int(rx * 0.72), int(ry * 0.72)
+        draw.ellipse([cx - irx, cy - iry, cx + irx, cy + iry], outline=col, width=1)
+        draw.line([(cx - irx, cy), (cx + irx, cy)], fill=col, width=1)
+    return out
+
+
 def apply_online_augment(
     img: Image.Image,
     rng: Optional[random.Random] = None,
@@ -2068,6 +2228,17 @@ def apply_online_augment(
         ib = min(ig - r.uniform(5.0, 20.0), r.uniform(45.0, 105.0))
         ink_rgb = np.array([ir, max(50.0, ig), max(35.0, ib)], dtype=np.float32).reshape(1, 1, 3) / 255.0
 
+        # Faint low-contrast sepia ink (p=0.25): compress ink-to-paper contrast for faint autographs
+        if r.random() < 0.25:
+            fade = r.uniform(0.35, 0.62)
+            ink_rgb = ink_rgb * (1.0 - fade) + paper_rgb * fade
+
+        ink_rgb_u8 = (
+            int(round(float(ink_rgb[0, 0, 0]) * 255.0)),
+            int(round(float(ink_rgb[0, 0, 1]) * 255.0)),
+            int(round(float(ink_rgb[0, 0, 2]) * 255.0)),
+        )
+
         h, w = luma.shape
         # Optional faint horizontally-flipped verso bleed-through (6-14% opacity) folded into luma
         if r.random() < 0.65:
@@ -2115,6 +2286,14 @@ def apply_online_augment(
         # Composer/copyist scratch-outs on archival pages (p=0.22 HW, p=0.06 printed)
         if r.random() < (0.22 if is_hw else 0.06):
             out = _apply_composer_scratchouts(out, r, is_hw=True)
+
+        # Handwritten-style verse/prose text block in bottom/top margin quiet area (p=0.20)
+        if r.random() < 0.20 and orig_w >= 64 and orig_h >= 64:
+            out = _apply_archival_verse_block(out, r, ink_rgb_u8)
+
+        # Faint semi-transparent watermark or corner botanical/ink-stain blob (p=0.15)
+        if r.random() < 0.15 and orig_w >= 64 and orig_h >= 64:
+            out = _apply_archival_watermark_stain(out, r, ink_rgb_u8)
 
         if r.random() < 0.40 and orig_w >= 48 and orig_h >= 48:
             has_dark_border = True
@@ -3835,6 +4014,7 @@ def run_train(args: argparse.Namespace, cfg: UniOMRConfig) -> Dict[str, Any]:
                             mtp_loss_weight=args.mtp_loss_weight,
                             uv_loss_weight=args.uv_loss_weight,
                             saliency_loss_weight=saliency_loss_weight,
+                            struct_tok_weight=args.struct_tok_weight,
                         )
 
                     (losses["loss"] * inv_ga).backward()
@@ -4103,6 +4283,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--mtp-loss-weight", type=float, default=0.30)
     p.add_argument("--uv-loss-weight", type=float, default=0.20)
     p.add_argument("--saliency-loss-weight", type=float, default=0.10, help="BCE auxiliary supervision weight on InkTokenRouter saliency_logits (default: 0.10)")
+    p.add_argument("--struct-tok-weight", type=float, default=1.0, help="Main CE loss multiplier (>1.0) on header/structural tokens: clef-*, key*, time-*, <sys>, grace, bar* (default: 1.0)")
     p.add_argument("--no-uv-aux", action="store_true", help="Disable auxiliary UV-flow head")
 
     # Runtime / training

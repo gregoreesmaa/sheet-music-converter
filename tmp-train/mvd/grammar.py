@@ -70,6 +70,10 @@ _WRITTEN = {'breve': 8.0, 'whole': 4.0, 'half': 2.0, 'quarter': 1.0,
 _BAR_EPS = 1e-6
 MAX_CHORDS_PER_ONSET = 8
 MAX_CONSECUTIVE_GRACE = 8
+MAX_CONSECUTIVE_BAR_REST = 8
+LAX_BAR_MULT = 2.5
+LAX_BAR_MIN_BEATS = 8.0
+SHORT_PICKUP_TIMES = frozenset(['time-1-32', 'time-1-16'])
 
 
 def _beats_of(time_tok):
@@ -131,6 +135,7 @@ class PrefixState:
                  'pend_spans',
                  'ev_base', 'ev_dots', 'ev_chord', 'ev_grace',
                  'chords_on_onset', 'grace_run',
+                 'consec_bar_rest_bars', 'bar_has_pitched', 'bar_has_bar_rest',
                  'allow_percussion_tab', 'vocab_map')
 
     def __init__(self, strict=False, allow_percussion_tab=False, vocab_map=None):
@@ -149,7 +154,8 @@ class PrefixState:
         self.opened = set()
         self.recent = []
         # T2.3 bar-duration books (kept in both modes so copy() stays
-        # uniform; only strict=True raises / masks on them): active
+        # uniform; strict=True caps at tsig, strict=False enforces a
+        # generous safety ceiling max(8.0, 2.5 * tsig)): active
         # time signature in quarter beats (None until seen),
         # per-voice running cursors, per-voice open tuplet ratio
         # stacks, queued tuplet starts, and the pending event's
@@ -168,6 +174,9 @@ class PrefixState:
         self.ev_grace = False
         self.chords_on_onset = 0
         self.grace_run = 0
+        self.consec_bar_rest_bars = 0
+        self.bar_has_pitched = False
+        self.bar_has_bar_rest = False
         # Gate-D opt-in: percussion/tab grammar transitions (OFF by default).
         self.allow_percussion_tab = bool(allow_percussion_tab)
         if vocab_map is not None:
@@ -205,6 +214,9 @@ class PrefixState:
         c.ev_grace = self.ev_grace
         c.chords_on_onset = self.chords_on_onset
         c.grace_run = self.grace_run
+        c.consec_bar_rest_bars = self.consec_bar_rest_bars
+        c.bar_has_pitched = self.bar_has_pitched
+        c.bar_has_bar_rest = self.bar_has_bar_rest
         c.allow_percussion_tab = self.allow_percussion_tab
         c.vocab_map = self.vocab_map
         return c
@@ -241,52 +253,76 @@ class PrefixState:
         return (self.ev_base * (2.0 - 2.0 ** (-self.ev_dots))
                 * self._open_scale())
 
+    def _beat_limit(self):
+        """Active per-voice beat ceiling (strict=tsig, lax=max(8.0, 2.5*tsig))."""
+        if self.tsig is None:
+            return None
+        if self.strict:
+            return self.tsig
+        return max(LAX_BAR_MIN_BEATS, LAX_BAR_MULT * self.tsig)
+
     def _dot_overshoots(self):
-        """Strict-only: the open event already exceeds the bar."""
-        return (self.strict and self.tsig is not None
+        """True if the open event already exceeds the active beat ceiling."""
+        limit = self._beat_limit()
+        return (limit is not None
                 and not self.ev_chord and not self.ev_grace
                 and self.ev_base is not None
                 and self.vcurs[self.seg] + self._pending_value()
-                > self.tsig + _BAR_EPS)
+                > limit + _BAR_EPS)
 
     def _dot_ok(self):
-        """Strict-only: one more dot keeps the open event in the bar.
+        """True if one more dot keeps the open event within the beat ceiling.
 
         Pure read (no state mutation) mirroring the projection
         :meth:`step` checks via :meth:`_dot_overshoots` after
         incrementing ``ev_dots``: chord tones add no duration and an
         absent time signature disables gating, so both stay legal.
         """
-        if not self.strict or self.tsig is None:
+        limit = self._beat_limit()
+        if limit is None:
             return True
         if self.ev_chord or self.ev_grace or self.ev_base is None:
             return True
         val = (self.ev_base * (2.0 - 2.0 ** (-(self.ev_dots + 1)))
                * self._open_scale())
-        return self.vcurs[self.seg] + val <= self.tsig + _BAR_EPS
+        return self.vcurs[self.seg] + val <= limit + _BAR_EPS
 
     def _blocks_duration(self, base):
-        """Strict-only: undotted ``base`` quarters already overshoot."""
-        if not self.strict or self.tsig is None:
+        """True if undotted ``base`` quarters would overshoot the beat ceiling."""
+        limit = self._beat_limit()
+        if limit is None:
             return False
-        if round(base * self._open_scale() * 480.0) <= 0:
+        if self.strict and round(base * self._open_scale() * 480.0) <= 0:
             return True
         return (self.vcurs[self.seg] + self._pending_value()
-                + base * self._open_scale() > self.tsig + _BAR_EPS)
+                + base * self._open_scale() > limit + _BAR_EPS)
 
     def _bar_is_full(self):
-        """Strict-only: the bar is full counting the still-open event.
+        """True if no further timed event can fit in the current voice/bar.
 
         ``vcurs`` lags by one event (it only closes on the next
         boundary token), so fullness must add the open event's
         projected value -- otherwise a full bar of notes still offers
         REST and traps the decoder in rest-mode with every duration
         overshooting (all logits -inf). ``_BAR_EPS`` absorbs tuplet/dot
-        float dust. Non-strict never reports full.
+        float dust.
         """
-        return (self.strict and self.tsig is not None
-                and self.vcurs[self.seg] + self._pending_value()
-                >= self.tsig - _BAR_EPS)
+        limit = self._beat_limit()
+        if limit is None:
+            return False
+        if self.strict:
+            return (self.vcurs[self.seg] + self._pending_value()
+                    >= limit - _BAR_EPS)
+        # In lax mode, full only once even the shortest duration (128th)
+        # would exceed the generous safety ceiling.
+        return (self.vcurs[self.seg] + self._pending_value()
+                + _WRITTEN['128th'] * self._open_scale() > limit + _BAR_EPS)
+
+    def _short_pickup_time_ok(self, prev_tok):
+        """Allow time-1-32 / time-1-16 only in header or immediately after a bar* token."""
+        if self.header_open:
+            return True
+        return prev_tok is not None and (prev_tok in BAR_LIKES or prev_tok in BAR_LEFT)
 
     def _drain(self):
         self.depth[self.seg] += self.pending
@@ -301,6 +337,10 @@ class PrefixState:
             # barline (all cursors idle); a courtesy change mid-bar
             # must not poison the running books, so it is stashed
             # and applied at the next barline instead.
+            if t in SHORT_PICKUP_TIMES:
+                prev_tok = self.recent[-2] if len(self.recent) >= 2 else None
+                if not self._short_pickup_time_ok(prev_tok):
+                    raise ValueError('spurious mid-bar pickup time %r' % t)
             if t in TIMES:
                 if all(v == 0.0 for v in self.vcurs):
                     self.tsig = _beats_of(t)
@@ -315,6 +355,12 @@ class PrefixState:
             if self.strict and len(self.recent) >= 2 \
                     and self.recent[-2] in BAR_LIKES:
                 raise ValueError('duplicate bar marker')
+            if self.bar_has_bar_rest and not self.bar_has_pitched:
+                self.consec_bar_rest_bars += 1
+            else:
+                self.consec_bar_rest_bars = 0
+            self.bar_has_pitched = False
+            self.bar_has_bar_rest = False
             # A stashed courtesy time-sig takes effect for the new
             # measure whose barline just arrived.
             if self.pending_tsig is not None:
@@ -337,9 +383,9 @@ class PrefixState:
             n = int(t.split('-')[1])
             if n == 0:
                 raise ValueError('bad voice token %r' % t)
+            if len(self.recent) >= 2 and self.recent[-2] == t:
+                raise ValueError('duplicate voice marker %r' % t)
             if self.strict:
-                if len(self.recent) >= 2 and self.recent[-2] == t:
-                    raise ValueError('duplicate voice marker %r' % t)
                 if (n != 1 and (n - 1) not in self.opened
                         and n not in self.opened):
                     raise ValueError('non-sequential voice %r' % t)
@@ -388,11 +434,11 @@ class PrefixState:
         if t in DURATIONS or t == REST or t == BAR_REST:
             self._drain()
             if t in DURATIONS:
-                if self.strict and self._blocks_duration(_WRITTEN[t]):
+                if self._blocks_duration(_WRITTEN[t]):
                     raise ValueError(
                         'duration overshoots bar: %.4f + %.4f > %.4f'
                         % (self.vcurs[self.seg],
-                           _WRITTEN[t] * self._open_scale(), self.tsig))
+                           _WRITTEN[t] * self._open_scale(), self._beat_limit()))
                 self.alter_seen = False
                 self.dot_seen = False
                 self.ev_base = _WRITTEN[t]
@@ -400,6 +446,8 @@ class PrefixState:
                 self.ev_grace = False
                 self.chords_on_onset = 0
                 self.grace_run = 0
+                self.bar_has_pitched = True
+                self.consec_bar_rest_bars = 0
                 return 'dur'
             if t == REST:
                 self.ev_base = None
@@ -407,6 +455,10 @@ class PrefixState:
                 self.chords_on_onset = 0
                 self.grace_run = 0
                 return 'rest'
+            if not self.bar_has_pitched and self.consec_bar_rest_bars >= MAX_CONSECUTIVE_BAR_REST:
+                raise ValueError(
+                    'consecutive bar-rest cap exceeded (%d)' % MAX_CONSECUTIVE_BAR_REST
+                )
             if self.strict and (self._bar_is_full() or self.vcurs[self.seg] > _BAR_EPS):
                 raise ValueError('bar-rest blocked in non-empty/full bar')
             self._drained_scale()
@@ -418,6 +470,7 @@ class PrefixState:
             self.seg_last[self.seg] = False
             self.chords_on_onset = 0
             self.grace_run = 0
+            self.bar_has_bar_rest = True
             return 'bound'
         raise ValueError('unexpected token %r' % t)
 
@@ -464,11 +517,11 @@ class PrefixState:
             if t not in DURATIONS:
                 raise ValueError('unpitched without duration %r' % t)
             self._drain()
-            if self.strict and not self.ev_grace and self._blocks_duration(_WRITTEN[t]):
+            if not self.ev_grace and self._blocks_duration(_WRITTEN[t]):
                 raise ValueError(
                     'duration overshoots bar: %.4f + %.4f > %.4f'
                     % (self.vcurs[self.seg],
-                       _WRITTEN[t] * self._open_scale(), self.tsig))
+                       _WRITTEN[t] * self._open_scale(), self._beat_limit()))
             self.alter_seen = False
             self.dot_seen = False
             self.ev_base = _WRITTEN[t]
@@ -477,6 +530,8 @@ class PrefixState:
         elif self.mode == 'dur':
             if t not in STEPS:
                 raise ValueError('bad step token %r' % t)
+            self.bar_has_pitched = True
+            self.consec_bar_rest_bars = 0
             self.mode = 'step'
         elif self.mode == 'step':
             if t not in OCTAVES:
@@ -526,11 +581,11 @@ class PrefixState:
         elif self.mode == 'rest':
             if t not in DURATIONS:
                 raise ValueError('bad rest duration %r' % t)
-            if self.strict and self._blocks_duration(_WRITTEN[t]):
+            if self._blocks_duration(_WRITTEN[t]):
                 raise ValueError(
                     'duration overshoots bar: %.4f + %.4f > %.4f'
                     % (self.vcurs[self.seg],
-                       _WRITTEN[t] * self._open_scale(), self.tsig))
+                       _WRITTEN[t] * self._open_scale(), self._beat_limit()))
             self.ev_base = _WRITTEN[t]
             self.ev_dots = 0
             self.mode = 'rest-tail'
@@ -561,12 +616,13 @@ class PrefixState:
             if not self.ev_chord and not self.ev_grace:
                 val = (self.ev_base * (2.0 - 2.0 ** (-self.ev_dots))
                        * scale)
-                if (self.strict and self.tsig is not None
+                limit = self._beat_limit()
+                if (limit is not None
                         and self.vcurs[self.seg] + val
-                        > self.tsig + _BAR_EPS):
+                        > limit + _BAR_EPS):
                     raise ValueError(
                         'duration overshoots bar: %.4f + %.4f > %.4f'
-                        % (self.vcurs[self.seg], val, self.tsig))
+                        % (self.vcurs[self.seg], val, limit))
                 self.vcurs[self.seg] += val
         self.ev_base = None
         self.ev_dots = 0
@@ -620,12 +676,12 @@ class PrefixState:
             for _vt in VOICES:
                 if _vt not in vm:
                     continue
+                if self.recent and self.recent[-1] == _vt:
+                    continue
                 if self.strict:
                     _vn = int(_vt.split('-')[1])
                     if _vn != 1 and (_vn - 1) not in self.opened \
                             and _vn not in self.opened:
-                        continue
-                    if self.recent and self.recent[-1] == _vt:
                         continue
                 allow.add(vm[_vt])
             if not (self.strict and (self.depth[self.seg] + self.pending >= 1
@@ -639,17 +695,29 @@ class PrefixState:
             # decoder with all logits -inf.
             if not self._bar_is_full():
                 allow.add(vm[REST])
-            # Iter-7 anti-loop: forbid BAR_REST when the bar is full or
-            # notes/rests have already been placed in the current voice/bar.
+            # Iter-7/8 anti-loop: forbid BAR_REST when consecutive pure-rest
+            # bars hit MAX_CONSECUTIVE_BAR_REST (both modes), or when strict
+            # bar is full / non-empty.
             cur_used = self.vcurs[self.seg] + self._pending_value()
-            if not (self.strict and (self._bar_is_full() or cur_used > _BAR_EPS)):
+            bar_rest_capped = (
+                not self.bar_has_pitched
+                and self.consec_bar_rest_bars >= MAX_CONSECUTIVE_BAR_REST
+            )
+            if not bar_rest_capped and not (
+                self.strict and (self._bar_is_full() or cur_used > _BAR_EPS)
+            ):
                 allow.add(vm[BAR_REST])
             if self.depth[self.seg] > 0:
                 allow.add(vm[TUPLET_STOP])
             if (placed if placed is not None else self.seg_last[self.seg]) \
                     and self.chords_on_onset < MAX_CHORDS_PER_ONSET:
                 allow.add(vm[CHORD])
-            allow.update(vm[t] for t in CLEFS | KEYS | TIMES if t in vm)
+            allow.update(vm[t] for t in CLEFS | KEYS if t in vm)
+            prev_tok = self.recent[-1] if self.recent else None
+            short_ok = self._short_pickup_time_ok(prev_tok)
+            for t in TIMES:
+                if t in vm and (short_ok or t not in SHORT_PICKUP_TIMES):
+                    allow.add(vm[t])
             if self.grace_run < MAX_CONSECUTIVE_GRACE:
                 allow.add(vm[GRACE])
             allow.update(vm[t] for t in DYNS | HAIRS | BAR_LEFT if t in vm)

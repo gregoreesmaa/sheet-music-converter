@@ -489,6 +489,112 @@ class TestUniDecodeCPU(unittest.TestCase):
         self.assertAlmostEqual(ns_custom.beam_length_penalty, 0.8)
         self.assertAlmostEqual(ns_custom.max_keep_ratio_override, 0.65)
 
+    def test_p5_anti_loop_dup_voice_bar_rest_cap_lax_ceiling_and_short_time(self) -> None:
+        """P5: duplicate voice-N, consecutive bar-rest cap, lax beat ceiling, and mid-bar time-1-16/1-32."""
+        v1_id = data.TOKEN_TO_ID["voice-1"]
+        bar_rest_id = data.TOKEN_TO_ID["bar-rest"]
+        half_id = data.TOKEN_TO_ID["half"]
+        t16_id = data.TOKEN_TO_ID["time-1-16"]
+        t32_id = data.TOKEN_TO_ID["time-1-32"]
+
+        # 1. Duplicate consecutive voice-N forbidden in BOTH strict=False and strict=True
+        for strict in (False, True):
+            st = grammar.PrefixState(strict=strict)
+            for tok in ("clef-G-2", "key+0", "time-4-4", "voice-1"):
+                st.step(tok)
+            self.assertNotIn(v1_id, st.allowed()[0])
+            with self.assertRaises(ValueError):
+                st.step("voice-1")
+
+        # 2. Consecutive pure-rest (bar-rest-only) bars capped at <= MAX_CONSECUTIVE_BAR_REST (8)
+        for strict in (False, True):
+            st = grammar.PrefixState(strict=strict)
+            for tok in ("clef-G-2", "key+0", "time-4-4"):
+                st.step(tok)
+            for i in range(grammar.MAX_CONSECUTIVE_BAR_REST):
+                self.assertIn(bar_rest_id, st.allowed()[0])
+                # Multi-voice pure-rest bar counts as 1 bar, not 2
+                for tok in ("voice-1", "bar-rest", "voice-2", "bar-rest", "bar"):
+                    st.step(tok)
+                self.assertEqual(st.consec_bar_rest_bars, i + 1)
+            # 9th consecutive pure-rest bar must be blocked
+            self.assertNotIn(bar_rest_id, st.allowed()[0])
+            with self.assertRaises(ValueError):
+                st.step("bar-rest")
+            # A pitched note resets consecutive bar-rest count to 0
+            for tok in ("quarter", "C", "4", "bar"):
+                st.step(tok)
+            self.assertEqual(st.consec_bar_rest_bars, 0)
+            self.assertIn(bar_rest_id, st.allowed()[0])
+
+        # 3. Lax (strict=False) beat ceiling: <= max(8.0, 2.5 * tsig) blocks 12x half G4 in 4/4
+        st_lax = grammar.PrefixState(strict=False)
+        for tok in ("clef-G-2", "key+0", "time-4-4"):
+            st_lax.step(tok)
+        # 5 half notes = 10.0 quarter-beats == 2.5 * 4.0 (allowed)
+        for _ in range(5):
+            self.assertIn(half_id, st_lax.allowed()[0])
+            for tok in ("half", "G", "4"):
+                st_lax.step(tok)
+        # 6th half note = 12.0 > 10.0 (blocked!)
+        self.assertNotIn(half_id, st_lax.allowed()[0])
+        with self.assertRaises(ValueError):
+            st_lax.step("half")
+
+        # 4. Mid-bar time-1-32 / time-1-16 forbidden; immediately after bar allowed
+        for strict in (False, True):
+            st = grammar.PrefixState(strict=strict)
+            for tok in ("clef-G-2", "key+0", "time-4-4", "quarter", "C", "4"):
+                st.step(tok)
+            allow = st.allowed()[0]
+            self.assertNotIn(t16_id, allow)
+            self.assertNotIn(t32_id, allow)
+            with self.assertRaises(ValueError):
+                st.step("time-1-32")
+            st.step("bar")
+            allow_after_bar = st.allowed()[0]
+            self.assertIn(t16_id, allow_after_bar)
+            self.assertIn(t32_id, allow_after_bar)
+            st.step("time-1-32")
+
+    def test_suite31_hw_all_45_gt_pass_lax_prefix_state(self) -> None:
+        """All 45 suite31_hw GT bekern sequences must pass PrefixState(strict=False) with 0 rejections."""
+        import subprocess
+        import tempfile
+
+        aser = Path(__file__).resolve().parents[2] / "converter" / "assembly-serialize" / "target" / "release" / "assembly-serialize.exe"
+        if not aser.is_file() or not ev.DEFAULT_MANIFEST.is_file():
+            self.skipTest("assembly-serialize binary or suite31_hw manifest not present")
+
+        _, pieces = ev.resolve_manifest_pieces(ev.DEFAULT_MANIFEST)
+        self.assertEqual(len(pieces), 45)
+        passed = 0
+        with tempfile.TemporaryDirectory() as td:
+            for p in pieces:
+                slug = p["slug"]
+                res = subprocess.run(
+                    [str(aser), "bekern", "--input", str(p["gt"]), "--out", td, "--stem", slug, "--page", "1"],
+                    capture_output=True,
+                    text=True,
+                    check=True,
+                )
+                self.assertEqual(res.returncode, 0)
+                toks = (Path(td) / f"{slug}-bekern.txt").read_text(encoding="utf-8").split()
+                st = grammar.PrefixState(strict=False)
+                for k, tok in enumerate(toks):
+                    allow, _ = st.allowed()
+                    tid = data.TOKEN_TO_ID[tok]
+                    self.assertIn(
+                        tid,
+                        allow,
+                        f"{slug}: PrefixState(strict=False) blocked token[{k}]={tok!r} after {toks[max(0, k - 6):k]}",
+                    )
+                    st.step(tok)
+                _, eos_ok = st.allowed()
+                self.assertTrue(eos_ok, f"{slug}: EOS blocked at end of GT stream")
+                passed += 1
+        self.assertEqual(passed, 45)
+
 
 if __name__ == "__main__":
     unittest.main()
