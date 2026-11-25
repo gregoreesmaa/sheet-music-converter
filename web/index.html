@@ -1,0 +1,147 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
+  <title>Sheet Music Converter — 100% Client-Side UniOMR + MuseScore (.mscz)</title>
+  <link rel="stylesheet" href="./style.css" />
+  <script
+    src="https://cdn.jsdelivr.net/npm/onnxruntime-web@1.20.1/dist/ort.webgpu.min.js"
+    crossorigin="anonymous"
+    defer
+  ></script>
+</head>
+<body>
+  <div class="app-shell">
+    <header class="topbar">
+      <div class="brand">
+        <span class="brand-mark" aria-hidden="true">&#119070;</span>
+        <div>
+          <h1>Sheet Music Converter</h1>
+          <p class="subtitle">100% in-browser UniOMR (ONNX) + <code>mscz-rs</code> WASM — zero server compute</p>
+        </div>
+      </div>
+      <div class="badges" aria-label="Runtime status">
+        <span id="badge-backend" class="badge badge-muted">ORT: Loading…</span>
+        <span id="badge-wasm" class="badge badge-muted">mscz-rs WASM: Loading…</span>
+        <span id="badge-models" class="badge badge-muted">Models: Checking…</span>
+      </div>
+    </header>
+
+    <div id="alert-banner" class="alert-banner hidden" role="status"></div>
+
+    <main class="workspace">
+      <!-- Left column: Upload & Preview -->
+      <section class="card upload-card">
+        <div class="card-header">
+          <h2>1. Sheet Music Image</h2>
+          <span id="img-meta" class="meta-pill hidden"></span>
+        </div>
+
+        <div id="drop-zone" class="drop-zone" tabindex="0" role="button" aria-label="Upload sheet music image">
+          <div id="drop-placeholder" class="drop-placeholder">
+            <div class="drop-icon" aria-hidden="true">&#128196;</div>
+            <p class="drop-title">Drop a sheet music photo or scan here</p>
+            <p class="drop-hint">PNG, JPEG, or WebP — stays 100% on your device</p>
+          </div>
+          <img id="preview-img" class="preview-img hidden" alt="Uploaded sheet music preview" />
+        </div>
+
+        <div class="upload-actions">
+          <label class="btn btn-secondary">
+            <span>Choose Image</span>
+            <input id="file-input" type="file" accept="image/*" hidden />
+          </label>
+          <label class="btn btn-secondary">
+            <span>Take Photo</span>
+            <input id="camera-input" type="file" accept="image/*" capture="environment" hidden />
+          </label>
+          <button id="btn-convert" class="btn btn-primary" disabled>
+            Convert to MuseScore
+          </button>
+          <button id="btn-cancel" class="btn btn-danger hidden">
+            Cancel
+          </button>
+        </div>
+
+        <div class="score-title-row">
+          <label for="score-title">Score title (embedded in <code>.mscz</code> / <code>.musicxml</code>)</label>
+          <input id="score-title" type="text" placeholder="Untitled Score" maxlength="120" />
+        </div>
+      </section>
+
+      <!-- Right column: Live Progress & Downloads -->
+      <section class="card output-card">
+        <div class="card-header">
+          <h2>2. Recognition &amp; Export</h2>
+          <span id="status-pill" class="meta-pill">Idle</span>
+        </div>
+
+        <div class="progress-block">
+          <div class="progress-track" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0">
+            <div id="progress-fill" class="progress-fill" style="width: 0%"></div>
+          </div>
+          <p id="status-text" class="status-text">Upload or photograph a page of sheet music to begin.</p>
+        </div>
+
+        <div class="stats-grid">
+          <div class="stat-box">
+            <span class="stat-label">Tokens</span>
+            <strong id="stat-tokens" class="stat-value">0</strong>
+          </div>
+          <div class="stat-box">
+            <span class="stat-label">Systems</span>
+            <strong id="stat-systems" class="stat-value">0</strong>
+          </div>
+          <div class="stat-box">
+            <span class="stat-label">Speed</span>
+            <strong id="stat-speed" class="stat-value">—</strong>
+          </div>
+          <div class="stat-box">
+            <span class="stat-label">Elapsed</span>
+            <strong id="stat-elapsed" class="stat-value">0.0 s</strong>
+          </div>
+        </div>
+
+        <div class="download-block">
+          <button id="btn-download-mscz" class="btn btn-download btn-mscz" disabled>
+            <span class="dl-title">Download .mscz (MuseScore)</span>
+            <span id="mscz-size" class="dl-sub">Native MuseScore 4 archive</span>
+          </button>
+          <button id="btn-download-xml" class="btn btn-download btn-xml" disabled>
+            <span class="dl-title">Download .musicxml</span>
+            <span id="xml-size" class="dl-sub">MusicXML 3.1 partwise</span>
+          </button>
+        </div>
+
+        <details id="bekern-details" class="bekern-panel">
+          <summary>
+            <span>Raw <code>bekern+</code> Tokens</span>
+            <span id="bekern-summary-meta" class="summary-meta">0 tokens</span>
+          </summary>
+          <div class="bekern-body">
+            <textarea
+              id="bekern-text"
+              rows="8"
+              spellcheck="false"
+              placeholder="Predicted bekern+ tokens will appear here…"
+            ></textarea>
+            <div class="bekern-actions">
+              <button id="btn-recompile" class="btn btn-small btn-secondary">Recompile .mscz / .musicxml</button>
+              <button id="btn-copy-bekern" class="btn btn-small btn-secondary">Copy Tokens</button>
+              <button id="btn-sample-bekern" class="btn btn-small btn-ghost">Load Sample (Test WASM)</button>
+            </div>
+          </div>
+        </details>
+      </section>
+    </main>
+
+    <footer class="footer">
+      <span>All neural inference (ONNX Runtime Web) and engraving compilation (<code>mscz-rs</code> WebAssembly) run locally in your browser.</span>
+    </footer>
+  </div>
+
+  <canvas id="work-canvas" hidden></canvas>
+  <script type="module" src="./app.js"></script>
+</body>
+</html>
