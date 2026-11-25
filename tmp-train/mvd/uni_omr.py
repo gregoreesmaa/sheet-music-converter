@@ -334,16 +334,36 @@ class MixStyle2d(nn.Module):
         self.eps = float(eps)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        if (not self.training) or self.p <= 0.0 or x.shape[0] < 2:
+        if (not self.training) or self.p <= 0.0:
             return x
-        if random.random() >= self.p:
-            return x
-
         B = x.shape[0]
         mu = x.mean(dim=(2, 3), keepdim=True)
         var = x.var(dim=(2, 3), unbiased=False, keepdim=True)
         sig = (var + self.eps).sqrt()
         mu_d, sig_d = mu.detach(), sig.detach()
+
+        if B < 2:
+            c = int(x.shape[1])
+            cache = getattr(self, "_prev_stats", None)
+            if cache is None:
+                cache = {}
+                self._prev_stats = cache
+            prev = cache.get(c)
+            cache[c] = (mu_d.clone(), sig_d.clone())
+            if prev is None or prev[0].device != mu_d.device or random.random() >= self.p:
+                return x
+            lmda = (
+                torch.distributions.Beta(self.alpha, self.alpha)
+                .sample((1, 1, 1, 1))
+                .to(device=x.device, dtype=x.dtype)
+            )
+            mu_mix = mu_d * lmda + prev[0].to(dtype=x.dtype) * (1.0 - lmda)
+            sig_mix = sig_d * lmda + prev[1].to(dtype=x.dtype) * (1.0 - lmda)
+            return ((x - mu_d) / sig_d) * sig_mix + mu_mix
+
+        if random.random() >= self.p:
+            return x
+
         x_normed = (x - mu_d) / sig_d
 
         lmda = (
@@ -3539,6 +3559,7 @@ def run_train(args: argparse.Namespace, cfg: UniOMRConfig) -> Dict[str, Any]:
                 last_n_in = int(out["router_info"]["n_in"])
                 last_n_out = int(out["router_info"]["n_out"])
                 last_kind = kind
+                del images, seq, uv_target, tgt_in, tgt_out, out, losses
 
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             opt.step()
