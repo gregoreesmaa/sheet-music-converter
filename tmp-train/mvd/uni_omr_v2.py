@@ -1146,36 +1146,38 @@ def compute_stroke_hog_target(
         luma = img_f.mean(dim=1, keepdim=True)
 
     device = luma.device
-    kx = torch.tensor(
-        [[[[-1.0, 0.0, 1.0], [-2.0, 0.0, 2.0], [-1.0, 0.0, 1.0]]]],
-        device=device,
-        dtype=torch.float32,
-    ) * 0.25
-    ky = torch.tensor(
-        [[[[-1.0, -2.0, -1.0], [0.0, 0.0, 0.0], [1.0, 2.0, 1.0]]]],
-        device=device,
-        dtype=torch.float32,
-    ) * 0.25
+    with torch.amp.autocast(device_type=device.type, enabled=False):
+        luma_f = luma.float()
+        kx = torch.tensor(
+            [[[[-1.0, 0.0, 1.0], [-2.0, 0.0, 2.0], [-1.0, 0.0, 1.0]]]],
+            device=device,
+            dtype=torch.float32,
+        ) * 0.25
+        ky = torch.tensor(
+            [[[[-1.0, -2.0, -1.0], [0.0, 0.0, 0.0], [1.0, 2.0, 1.0]]]],
+            device=device,
+            dtype=torch.float32,
+        ) * 0.25
 
-    gx = F.conv2d(luma, kx, padding=1)
-    gy = F.conv2d(luma, ky, padding=1)
-    mag = torch.sqrt(gx * gx + gy * gy + 1e-8)
-    angle = torch.remainder(torch.atan2(gy, gx), math.pi)
+        gx = F.conv2d(luma_f, kx, padding=1)
+        gy = F.conv2d(luma_f, ky, padding=1)
+        mag = torch.sqrt(gx * gx + gy * gy + 1e-8)
+        angle = torch.remainder(torch.atan2(gy, gx), math.pi)
 
-    bin_f = angle * (float(n_bins) / math.pi)
-    bin_lo = torch.floor(bin_f).to(torch.long) % n_bins
-    bin_hi = (bin_lo + 1) % n_bins
-    w_hi = bin_f - torch.floor(bin_f)
-    w_lo = 1.0 - w_hi
+        bin_f = angle * (float(n_bins) / math.pi)
+        bin_lo = torch.floor(bin_f).to(torch.long) % n_bins
+        bin_hi = (bin_lo + 1) % n_bins
+        w_hi = bin_f - torch.floor(bin_f)
+        w_lo = 1.0 - w_hi
 
-    B, _, H, W = luma.shape
-    hog_full = luma.new_zeros((B, n_bins, H, W))
-    hog_full.scatter_add_(1, bin_lo, mag * w_lo)
-    hog_full.scatter_add_(1, bin_hi, mag * w_hi)
+        B, _, H, W = luma_f.shape
+        hog_full = luma_f.new_zeros((B, n_bins, H, W), dtype=torch.float32)
+        hog_full.scatter_add_(1, bin_lo, (mag * w_lo).float())
+        hog_full.scatter_add_(1, bin_hi, (mag * w_hi).float())
 
-    hog_pooled = F.adaptive_avg_pool2d(hog_full, (int(target_hw[0]), int(target_hw[1])))
-    norm = torch.sqrt((hog_pooled * hog_pooled).sum(dim=1, keepdim=True) + 1e-4)
-    return hog_pooled / norm
+        hog_pooled = F.adaptive_avg_pool2d(hog_full, (int(target_hw[0]), int(target_hw[1])))
+        norm = torch.sqrt((hog_pooled * hog_pooled).sum(dim=1, keepdim=True) + 1e-4)
+        return hog_pooled / norm
 
 
 def compute_stroke_hog_loss(

@@ -408,36 +408,38 @@ def compute_sobel_hog_target(
         luma = img_f.mean(dim=1, keepdim=True)
 
     device = luma.device
-    kx = torch.tensor(
-        [[-1.0, 0.0, 1.0], [-2.0, 0.0, 2.0], [-1.0, 0.0, 1.0]],
-        device=device,
-        dtype=torch.float32,
-    ).view(1, 1, 3, 3)
-    ky = torch.tensor(
-        [[-1.0, -2.0, -1.0], [0.0, 0.0, 0.0], [1.0, 2.0, 1.0]],
-        device=device,
-        dtype=torch.float32,
-    ).view(1, 1, 3, 3)
+    with torch.amp.autocast(device_type=device.type, enabled=False):
+        luma_f = luma.float()
+        kx = torch.tensor(
+            [[-1.0, 0.0, 1.0], [-2.0, 0.0, 2.0], [-1.0, 0.0, 1.0]],
+            device=device,
+            dtype=torch.float32,
+        ).view(1, 1, 3, 3)
+        ky = torch.tensor(
+            [[-1.0, -2.0, -1.0], [0.0, 0.0, 0.0], [1.0, 2.0, 1.0]],
+            device=device,
+            dtype=torch.float32,
+        ).view(1, 1, 3, 3)
 
-    gx = F.conv2d(luma, kx, padding=1)
-    gy = F.conv2d(luma, ky, padding=1)
-    mag = torch.sqrt(gx * gx + gy * gy + 1e-8)
-    # Unsigned orientation in [0, pi)
-    angle = torch.remainder(torch.atan2(gy, gx), math.pi)
-    bin_pos = (angle / math.pi) * float(n_bins)
-    b0 = torch.floor(bin_pos).long().clamp(0, n_bins - 1)
-    b1 = (b0 + 1) % n_bins
-    w1 = bin_pos - torch.floor(bin_pos)
-    w0 = 1.0 - w1
+        gx = F.conv2d(luma_f, kx, padding=1)
+        gy = F.conv2d(luma_f, ky, padding=1)
+        mag = torch.sqrt(gx * gx + gy * gy + 1e-8)
+        # Unsigned orientation in [0, pi)
+        angle = torch.remainder(torch.atan2(gy, gx), math.pi)
+        bin_pos = (angle / math.pi) * float(n_bins)
+        b0 = torch.floor(bin_pos).long().clamp(0, n_bins - 1)
+        b1 = (b0 + 1) % n_bins
+        w1 = bin_pos - torch.floor(bin_pos)
+        w0 = 1.0 - w1
 
-    B, _, H, W = luma.shape
-    hog_full = torch.zeros((B, n_bins, H, W), device=device, dtype=torch.float32)
-    hog_full.scatter_add_(1, b0, mag * w0)
-    hog_full.scatter_add_(1, b1, mag * w1)
+        B, _, H, W = luma_f.shape
+        hog_full = torch.zeros((B, n_bins, H, W), device=device, dtype=torch.float32)
+        hog_full.scatter_add_(1, b0, (mag * w0).float())
+        hog_full.scatter_add_(1, b1, (mag * w1).float())
 
-    hog_pool = F.adaptive_avg_pool2d(hog_full, target_hw)
-    norm = torch.sqrt((hog_pool * hog_pool).sum(dim=1, keepdim=True) + 1e-6)
-    return (hog_pool / norm).detach()
+        hog_pool = F.adaptive_avg_pool2d(hog_full, target_hw)
+        norm = torch.sqrt((hog_pool * hog_pool).sum(dim=1, keepdim=True) + 1e-6)
+        return (hog_pool / norm).detach()
 
 
 class StrokeHOGHead(nn.Module):
