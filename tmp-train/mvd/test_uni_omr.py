@@ -1479,6 +1479,203 @@ class TestUniOMR(unittest.TestCase):
                 break
         self.assertTrue(saw_faint, "Expected faint low-contrast sepia ink variant across 30 archival seeds")
 
+    def test_z_tier1_algebraic_bg_pooling_and_channels_last(self) -> None:
+        """(z) Tier-1 #1/#2: Algebraic BG pooling matches naive O(N*D^2) formula (<1e-5) & channels_last parity."""
+        torch.manual_seed(1234)
+        router = uni_omr.InkTokenRouter(d_model=64, keep_ratio=0.40, n_bg_summary=4, use_ink_prior=True)
+        router.eval()
+
+        B, D, H_p, W_p = 2, 64, 8, 12
+        feat_2d = torch.randn(B, D, H_p, W_p)
+        images = torch.rand(B, 3, H_p * 16, W_p * 16)
+
+        with torch.no_grad():
+            out_tokens, out_coords, rinfo = router(feat_2d, images=images)
+            k = int(rinfo["k_kept"])
+            fast_bg = out_tokens[:, k:, :]  # (B, M, D)
+
+            # Reference naive O(N * D^2) formula
+            N = H_p * W_p
+            tokens_flat = feat_2d.flatten(2).transpose(1, 2)
+            score_flat = rinfo["saliency_map"].flatten(1)
+            kept_mask = torch.zeros(B, N, dtype=torch.bool)
+            kept_mask.scatter_(1, rinfo["kept_idx"], True)
+
+            bg_q = router.bg_queries.expand(B, -1, -1)
+            bg_k = router.bg_key_proj(tokens_flat)
+            bg_v = router.bg_val_proj(tokens_flat)
+            bg_logits = torch.bmm(bg_q, bg_k.transpose(1, 2)) / (D ** 0.5)
+            bg_logits = bg_logits - score_flat.unsqueeze(1)
+            bg_logits = bg_logits.masked_fill(kept_mask.unsqueeze(1), -1e4)
+            bg_attn = torch.nn.functional.softmax(bg_logits, dim=-1)
+            naive_bg = router.bg_out_norm(torch.bmm(bg_attn, bg_v))
+
+        max_diff = float((fast_bg - naive_bg).abs().max().item())
+        self.assertLess(max_diff, 1e-5, f"Algebraic BG pooling drift too large: {max_diff}")
+
+        # channels_last on DynamicConvBackbone: zero state_dict changes & exact/close logit parity
+        model_nchw = uni_omr.UniOMRNet(_small_cfg(d_model=64, dropout=0.0))
+        model_nhwc = uni_omr.UniOMRNet(_small_cfg(d_model=64, dropout=0.0))
+        model_nhwc.load_state_dict(model_nchw.state_dict(), strict=True)
+        model_nhwc.backbone.to(memory_format=torch.channels_last)
+        model_nchw.eval()
+        model_nhwc.eval()
+
+        self.assertEqual(set(model_nchw.state_dict().keys()), set(model_nhwc.state_dict().keys()))
+        for key in model_nchw.state_dict():
+            self.assertEqual(model_nchw.state_dict()[key].shape, model_nhwc.state_dict()[key].shape)
+
+        tgt = torch.tensor([[uni_omr.BOS_ID, 0, 1, 2, 3], [uni_omr.BOS_ID, 4, 5, 6, 7]], dtype=torch.long)
+        with torch.no_grad():
+            o1 = model_nchw(images, tgt, return_aux=False, return_mtp=False)["logits"]
+            o2 = model_nhwc(images, tgt, return_aux=False, return_mtp=False)["logits"]
+        self.assertLess(float((o1 - o2).abs().max().item()), 1e-4)
+
+    def test_za_tier1_apply_tok_dropout_false_deterministic(self) -> None:
+        """(za) Tier-1 #5: apply_tok_dropout=False yields deterministic identical logits when tok_dropout > 0."""
+        cfg = _small_cfg(d_model=64, dropout=0.0, tok_dropout=0.50)
+        model = uni_omr.UniOMRNet(cfg)
+        model.train()
+
+        mem = torch.randn(2, 24, 64)
+        tgt_in = torch.tensor(
+            [[uni_omr.BOS_ID, 1, 2, 3, 4, 5, 6, 7], [uni_omr.BOS_ID, 8, 9, 10, 11, 12, 13, 14]],
+            dtype=torch.long,
+        )
+
+        with torch.no_grad():
+            logits_a, _ = model.decode_tokens(tgt_in, mem, return_mtp=False, apply_tok_dropout=False)
+            logits_b, _ = model.decode_tokens(tgt_in, mem, return_mtp=False, apply_tok_dropout=False)
+            self.assertTrue(
+                torch.equal(logits_a, logits_b),
+                "apply_tok_dropout=False must produce identical logits across repeated calls",
+            )
+
+            # With apply_tok_dropout=True and tok_dropout=0.50, repeated calls should differ
+            logits_drop1, _ = model.decode_tokens(tgt_in, mem, return_mtp=False, apply_tok_dropout=True)
+            logits_drop2, _ = model.decode_tokens(tgt_in, mem, return_mtp=False, apply_tok_dropout=True)
+            self.assertFalse(
+                torch.equal(logits_drop1, logits_drop2),
+                "Expected apply_tok_dropout=True with tok_dropout=0.50 to perturb inputs across calls",
+            )
+
+    def test_zb_tier1_orient_buckets_strip_bs_log_every_and_gpu_ema(self) -> None:
+        """(zb) Tier-1 #4/#6/#7: Orientation-bucketed B=2 prefetch, --strip-batch-size, --log-every, --gpu-ema-decay."""
+        import json
+
+        with tempfile.TemporaryDirectory() as td:
+            td_path = Path(td)
+            pr_dir = td_path / "printed"
+            fp_root = td_path / "fullpage"
+            fp_pages = fp_root / "pages"
+            fp_strips = fp_root / "stage2_strips"
+            out_dir = td_path / "out"
+            for d in (pr_dir, fp_pages, fp_strips):
+                d.mkdir(parents=True)
+
+            bek_short = "clef-G-2\nquarter\nC\n4\nbar\n"
+            bek_long = "clef-G-2\nquarter\nC\n4\nquarter\nD\n4\nquarter\nE\n4\nquarter\nF\n4\nbar\n"
+            # 6 strips
+            for i in range(6):
+                arr_s = np.full((64, 128, 3), 245, dtype=np.uint8)
+                arr_s[20:44, 15:110, :] = 30
+                Image.fromarray(arr_s, mode="RGB").save(pr_dir / f"st{i}_p1_s0.png")
+                (pr_dir / f"st{i}_p1_s0-bekern.txt").write_text(
+                    bek_short if (i % 2 == 0) else bek_long, encoding="utf-8"
+                )
+
+            # 4 portrait (H=128, W=80) + 4 landscape (H=80, W=128) full pages
+            for i in range(4):
+                arr_p = np.full((128, 80, 3), 245, dtype=np.uint8)
+                arr_p[20:100, 10:70, :] = 25
+                Image.fromarray(arr_p, mode="RGB").save(fp_pages / f"port{i}_p1.png")
+                (fp_strips / f"port{i}_p1_s0-bekern.txt").write_text(
+                    bek_short if (i % 2 == 0) else bek_long, encoding="utf-8"
+                )
+
+                arr_l = np.full((80, 128, 3), 245, dtype=np.uint8)
+                arr_l[10:70, 20:100, :] = 25
+                Image.fromarray(arr_l, mode="RGB").save(fp_pages / f"land{i}_p1.png")
+                (fp_strips / f"land{i}_p1_s0-bekern.txt").write_text(
+                    bek_short if (i % 2 == 0) else bek_long, encoding="utf-8"
+                )
+
+            # 1. Verify AsyncThreadPrefetcher orientation bucketing never mixes portrait + landscape
+            fp_pairs = uni_omr.discover_fullpage_pairs([fp_root])
+            fp_ds = uni_omr.UniFullPageDataset(
+                fp_pairs, fullpage_max_dim=128, max_seq_len=32, augment=False, return_uint8=True
+            )
+            pf = uni_omr.AsyncThreadPrefetcher(
+                fp_ds, batch_size=2, shuffle=True, pin_memory=False, max_workers=2, prefetch_batches=2, seed=17
+            )
+            try:
+                for _ in range(8):
+                    b = next(pf)
+                    _, _, bh, bw = b["images"].shape
+                    # Pure portrait is 128x80, pure landscape is 80x128; mixed would pad to 128x128 square!
+                    self.assertNotEqual(
+                        (bh, bw),
+                        (128, 128),
+                        f"Orientation bucketing failed: got mixed square batch {(bh, bw)} for {b['sample_ids']}",
+                    )
+            finally:
+                pf.close()
+
+            # 2. End-to-end CLI smoke test with --channels-last, --strip-batch-size, --log-every, --gpu-ema-decay
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                rc = uni_omr.main([
+                    "--mode", "train",
+                    "--curriculum", "mixed",
+                    "--strip-dirs", str(pr_dir),
+                    "--fullpage-dirs", str(fp_root),
+                    "--channels-last",
+                    "--strip-batch-size", "4",
+                    "--batch-size", "2",
+                    "--grad-accum", "2",
+                    "--log-every", "3",
+                    "--gpu-ema-decay", "0.997",
+                    "--cass-prob", "0.25",
+                    "--tok-dropout", "0.10",
+                    "--grad-checkpoint",
+                    "--strip-height", "64",
+                    "--max-strip-width", "128",
+                    "--fullpage-max-dim", "128",
+                    "--max-seq-len", "32",
+                    "--d-model", "64",
+                    "--n-enc-layers", "1",
+                    "--n-dec-layers", "1",
+                    "--n-heads", "4",
+                    "--steps", "6",
+                    "--warmup-steps", "1",
+                    "--val-count", "2",
+                    "--eval-every", "6",
+                    "--eval-batch-size", "2",
+                    "--eval-max-len", "8",
+                    "--device", "cpu",
+                    "--out-dir", str(out_dir),
+                ])
+            self.assertEqual(rc, 0)
+            out_txt = buf.getvalue()
+            # --log-every 3 on 6 steps must print step 1, step 3, step 6 (and NOT step 2, 4, 5)
+            self.assertIn("step 1/6", out_txt)
+            self.assertIn("step 3/6", out_txt)
+            self.assertIn("step 6/6", out_txt)
+            self.assertNotIn("step 2/6", out_txt)
+            self.assertNotIn("step 4/6", out_txt)
+            self.assertNotIn("step 5/6", out_txt)
+
+            # GPU EMA shadow evaluated alongside student and saved uni_omr_ema_best.pt
+            self.assertIn("6 EMA", out_txt)
+            self.assertTrue((out_dir / "uni_omr_ema_best.pt").is_file())
+            ema_ck = torch.load(str(out_dir / "uni_omr_ema_best.pt"), map_location="cpu", weights_only=True)
+            self.assertIn("model", ema_ck)
+            self.assertAlmostEqual(float(ema_ck["ema_decay"]), 0.997, places=5)
+
+            eval_sum = json.loads((out_dir / "eval_summary.json").read_text(encoding="utf-8"))
+            self.assertIn("best_ema_ser", eval_sum)
+            self.assertIn("ema_eval", eval_sum["evals"][0])
+
 
 if __name__ == "__main__":
     unittest.main()

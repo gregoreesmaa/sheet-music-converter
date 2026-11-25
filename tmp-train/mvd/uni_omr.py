@@ -46,7 +46,8 @@ from PIL import Image, ImageDraw, ImageEnhance, ImageFilter
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.checkpoint import checkpoint as _grad_ckpt
+from torch.utils.data import DataLoader, Dataset, Subset
 
 try:
     from torch.nn.attention import SDPBackend as _SDPBackend, sdpa_kernel as _sdpa_kernel
@@ -565,7 +566,7 @@ class InkTokenRouter(nn.Module):
             score = saliency_prob
 
         score_flat = score.flatten(1)  # (B, N), bounded in [0, 2]
-        tokens_flat = feat_2d.flatten(2).transpose(1, 2)  # (B, N, D)
+        tokens_flat = feat_2d.permute(0, 2, 3, 1).reshape(B, N, D)  # (B, N, D) zero-copy for NHWC
 
         # Build (or reuse cached) 2D spatial coordinate grid (y, x).
         gkey = (H_p, W_p, feat_2d.device)
@@ -652,15 +653,17 @@ class InkTokenRouter(nn.Module):
             ink_recall = 1.0
 
         bg_q = self.bg_queries.expand(B, -1, -1)  # (B, M, D)
-        bg_k = self.bg_key_proj(tokens_flat)  # (B, N, D)
-        bg_v = self.bg_val_proj(tokens_flat)  # (B, N, D)
+        # Algebraic transpose: Q @ (X @ W_k^T)^T == (Q @ W_k) @ X^T, and (A @ X) @ W_v^T == A @ (X @ W_v^T).
+        # Avoids O(N * D^2) projections over all visual tokens while staying mathematically identical.
+        bg_q_proj = F.linear(bg_q, self.bg_key_proj.weight.t()).to(tokens_flat.dtype)  # (B, M, D)
 
         # Soft background affinity biases attention toward non-kept, low-score tokens.
-        bg_logits = torch.bmm(bg_q, bg_k.transpose(1, 2)) / math.sqrt(D)  # (B, M, N)
+        bg_logits = torch.bmm(bg_q_proj, tokens_flat.transpose(1, 2)) / math.sqrt(D)  # (B, M, N)
         bg_logits = bg_logits - score_flat.unsqueeze(1)  # prefer background
         bg_logits = bg_logits.masked_fill(kept_mask.unsqueeze(1), -1e4)
         bg_attn = F.softmax(bg_logits, dim=-1)
-        bg_tokens = self.bg_out_norm(torch.bmm(bg_attn, bg_v))  # (B, M, D)
+        pooled = torch.bmm(bg_attn, tokens_flat)  # (B, M, D)
+        bg_tokens = self.bg_out_norm(self.bg_val_proj(pooled))  # (B, M, D)
 
         # Assign center-of-page coordinates to background summary tokens.
         center_coord = base_center.expand(B, self.n_bg_summary, 2)
@@ -1073,7 +1076,12 @@ class UniOMRNet(nn.Module):
         return_aux: Optional[bool] = None,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Dict[str, Any]]:
         """Encode arbitrary-resolution ``(B, 3, H, W)`` images into routed memory tokens."""
-        feat_2d = self.backbone(images)  # (B, D, H', W')
+        backbone_in = (
+            images.to(memory_format=torch.channels_last)
+            if self.backbone.stage1.down[0].weight.is_contiguous(memory_format=torch.channels_last)
+            else images
+        )
+        feat_2d = self.backbone(backbone_in)  # (B, D, H', W')
         routed_tokens, routed_coords, router_info = self.router(
             feat_2d, images=images, keep_ratio_override=keep_ratio_override
         )
@@ -1087,8 +1095,12 @@ class UniOMRNet(nn.Module):
         )
         cos2d, sin2d = self.rope2d(routed_coords, dtype=routed_tokens.dtype)
         mem = routed_tokens + pos2d
-        if self.training and self.cfg.grad_checkpoint and torch.is_grad_enabled():
-            from torch.utils.checkpoint import checkpoint as _grad_ckpt
+        if (
+            self.training
+            and self.cfg.grad_checkpoint
+            and torch.is_grad_enabled()
+            and (mem.shape[0] * mem.shape[1] > 8000)
+        ):
             for layer in self.enc_layers:
                 mem = _grad_ckpt(
                     lambda _m, _c, _s, _l=layer: _l(_m, rope_cos=_c, rope_sin=_s),
@@ -1108,7 +1120,7 @@ class UniOMRNet(nn.Module):
             k_kept = int(router_info["k_kept"])
             kept_idx = router_info["kept_idx"]  # (B, k_kept)
             # Scatter encoder-refined kept tokens back onto the dense 2D grid.
-            dense_flat = feat_2d.flatten(2).transpose(1, 2).clone()  # (B, N, D)
+            dense_flat = feat_2d.permute(0, 2, 3, 1).reshape(B, H_p * W_p, D).clone()  # (B, N, D)
             idx_exp = kept_idx.unsqueeze(-1).expand(-1, -1, D)
             dense_flat.scatter_add_(1, idx_exp, mem[:, :k_kept, :])
             dense_2d = dense_flat.transpose(1, 2).view(B, D, H_p, W_p)
@@ -1123,6 +1135,7 @@ class UniOMRNet(nn.Module):
         return_mtp: Optional[bool] = None,
         past_kvs: Optional[List[Any]] = None,
         use_cache: bool = False,
+        apply_tok_dropout: bool = True,
     ) -> Any:
         """Run causal decoder over ``tgt_ids`` ``(B, T)`` conditioned on ``memory``.
 
@@ -1131,7 +1144,7 @@ class UniOMRNet(nn.Module):
         """
         _, T = tgt_ids.shape
         inp_ids = tgt_ids
-        if self.training and self.cfg.tok_dropout > 0.0 and not use_cache:
+        if self.training and apply_tok_dropout and self.cfg.tok_dropout > 0.0 and not use_cache:
             drop_mask = (
                 (torch.rand_like(inp_ids, dtype=torch.float32) < self.cfg.tok_dropout)
                 & (inp_ids != PAD_ID)
@@ -1148,6 +1161,12 @@ class UniOMRNet(nn.Module):
         cos1d = cos_all[:, :, past_len : past_len + T, :]
         sin1d = sin_all[:, :, past_len : past_len + T, :]
 
+        use_dec_ckpt = (
+            self.training
+            and self.cfg.grad_checkpoint
+            and torch.is_grad_enabled()
+            and (x.shape[0] * x.shape[1] > 2000)
+        )
         new_past_kvs: List[Any] = []
         for idx, layer in enumerate(self.dec_layers):
             layer_past = past_kvs[idx] if past_kvs is not None else None
@@ -1157,8 +1176,7 @@ class UniOMRNet(nn.Module):
                     past_kv=layer_past, use_cache=True,
                 )
                 new_past_kvs.append(layer_kv)
-            elif self.training and self.cfg.grad_checkpoint and torch.is_grad_enabled():
-                from torch.utils.checkpoint import checkpoint as _grad_ckpt
+            elif use_dec_ckpt:
                 x = _grad_ckpt(
                     lambda _x, _m, _c, _s, _l=layer: _l(_x, memory=_m, rope_cos=_c, rope_sin=_s),
                     x, memory, cos1d, sin1d,
@@ -2734,6 +2752,16 @@ def collate_uni_batch(samples: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
     }
 
 
+def _fast_image_is_landscape(path: Any) -> Optional[bool]:
+    """Header-only orientation probe (True if W > H, False if H >= W, None on failure)."""
+    try:
+        with Image.open(path) as im:
+            w, h = im.size
+            return bool(w > h)
+    except Exception:
+        return None
+
+
 class AsyncThreadPrefetcher:
     """Lightweight infinite multi-threaded batch prefetcher (zero Windows spawn overhead).
 
@@ -2742,6 +2770,9 @@ class AsyncThreadPrefetcher:
     release the Python GIL, this overlaps CPU I/O + augmentation with GPU compute
     without duplicating dataset state across spawned processes. For ``multi_scale``
     ``UniFullPageDataset``, samples a single shared ``target_dim`` per batch.
+    When ``batch_size >= 2`` on ``UniFullPageDataset``, partitions shuffled indices
+    into portrait (``H >= W``) and landscape (``W > H``) buckets so batches never
+    mix orientations into a giant padded square.
     """
 
     def __init__(
@@ -2770,6 +2801,23 @@ class AsyncThreadPrefetcher:
             getattr(dataset, "multi_scale", False)
             and hasattr(dataset, "fullpage_max_dim")
         )
+        self._use_orient_buckets = bool(
+            self.batch_size >= 2
+            and isinstance(dataset, UniFullPageDataset)
+            and hasattr(dataset, "pairs")
+        )
+        self._portrait_indices: List[int] = []
+        self._landscape_indices: List[int] = []
+        self._batches: List[List[int]] = []
+        self._batch_pos: int = 0
+        if self._use_orient_buckets:
+            for i, entry in enumerate(dataset.pairs):  # type: ignore[attr-defined]
+                if _fast_image_is_landscape(entry[0]):
+                    self._landscape_indices.append(i)
+                else:
+                    self._portrait_indices.append(i)
+            if not self._portrait_indices or not self._landscape_indices:
+                self._use_orient_buckets = False
         self._order: List[int] = []
         self._pos: int = 0
         self._closed: bool = False
@@ -2782,14 +2830,33 @@ class AsyncThreadPrefetcher:
             self._enqueue_one()
 
     def _next_batch_spec(self) -> List[Any]:
-        if self._pos >= len(self._order):
-            self._order = list(range(self.n_samples))
-            if self.shuffle:
-                self._rng.shuffle(self._order)
-            self._pos = 0
-        end = min(self._pos + self.batch_size, len(self._order))
-        idxs = self._order[self._pos : end]
-        self._pos = end
+        if self._use_orient_buckets:
+            if self._batch_pos >= len(self._batches):
+                p_idx = list(self._portrait_indices)
+                l_idx = list(self._landscape_indices)
+                if self.shuffle:
+                    self._rng.shuffle(p_idx)
+                    self._rng.shuffle(l_idx)
+                batches: List[List[int]] = []
+                for i in range(0, len(p_idx), self.batch_size):
+                    batches.append(p_idx[i : i + self.batch_size])
+                for i in range(0, len(l_idx), self.batch_size):
+                    batches.append(l_idx[i : i + self.batch_size])
+                if self.shuffle:
+                    self._rng.shuffle(batches)
+                self._batches = batches
+                self._batch_pos = 0
+            idxs = self._batches[self._batch_pos]
+            self._batch_pos += 1
+        else:
+            if self._pos >= len(self._order):
+                self._order = list(range(self.n_samples))
+                if self.shuffle:
+                    self._rng.shuffle(self._order)
+                self._pos = 0
+            end = min(self._pos + self.batch_size, len(self._order))
+            idxs = self._order[self._pos : end]
+            self._pos = end
         if self._is_multiscale_fp:
             batch_dim = _sample_weighted_fullpage_dim(
                 int(getattr(self.dataset, "fullpage_max_dim")), rng=self._rng
@@ -2931,8 +2998,24 @@ def eval_dataset(
     model.eval()
 
     if isinstance(val_samples, Dataset):
+        eval_ds: Dataset = val_samples
+        if batch_size > 1 and hasattr(val_samples, "pairs") and len(val_samples) > 1:  # type: ignore[arg-type]
+            sort_keys: List[Tuple[int, int, int]] = []
+            for idx, entry in enumerate(val_samples.pairs):  # type: ignore[attr-defined]
+                is_land = 1 if _fast_image_is_landscape(entry[0]) else 0
+                bek_part = entry[1]
+                try:
+                    if isinstance(bek_part, (list, tuple)):
+                        seq_len_est = sum(len(data.load_bekern(p)) for p in bek_part)
+                    else:
+                        seq_len_est = len(data.load_bekern(bek_part))
+                except Exception:
+                    seq_len_est = 0
+                sort_keys.append((is_land, seq_len_est, idx))
+            sort_keys.sort()
+            eval_ds = Subset(val_samples, [idx for _, _, idx in sort_keys])
         loader = DataLoader(
-            val_samples,
+            eval_ds,
             batch_size=batch_size,
             shuffle=False,
             num_workers=0,
@@ -2958,6 +3041,14 @@ def eval_dataset(
                 "mean_compression_x": 0.0,
                 "ink_recall": 0.0,
             }
+        if batch_size > 1 and len(sample_list) > 1:
+            sample_list = sorted(
+                sample_list,
+                key=lambda s: (
+                    1 if int(s["image"].shape[2]) > int(s["image"].shape[1]) else 0,
+                    int(s["seq"].shape[0]),
+                ),
+            )
         loader = [
             collate_uni_batch(sample_list[i : i + batch_size])
             for i in range(0, len(sample_list), batch_size)
@@ -3245,6 +3336,45 @@ class CPUEmaTeacher:
             self._teacher.to("cpu")
 
 
+class GPUEmaShadow:
+    """Lightweight device-resident EMA shadow state_dict updated every ``update_every`` steps."""
+
+    def __init__(self, model: nn.Module, decay: float = 0.997, update_every: int = 5) -> None:
+        self.decay = float(decay)
+        self.update_every = max(1, int(update_every))
+        self.decay_eff = self.decay ** self.update_every
+        self.shadow: Dict[str, torch.Tensor] = {
+            k: v.detach().clone()
+            for k, v in model.state_dict().items()
+        }
+
+    @torch.no_grad()
+    def update(self, model: nn.Module, step: int) -> bool:
+        if step % self.update_every != 0:
+            return False
+        d = self.decay_eff
+        for k, v in model.state_dict().items():
+            if k not in self.shadow:
+                continue
+            tgt = self.shadow[k]
+            src = v.detach()
+            if tgt.is_floating_point():
+                tgt.mul_(d).add_(src.to(dtype=tgt.dtype), alpha=1.0 - d)
+            else:
+                tgt.copy_(src)
+        return True
+
+    @contextlib.contextmanager
+    def swap_into(self, model: nn.Module) -> Iterator[None]:
+        """Temporarily swap EMA weights into ``model`` for evaluation (0 extra GPU VRAM)."""
+        backup = {k: v.detach().to("cpu", copy=True) for k, v in model.state_dict().items()}
+        model.load_state_dict(self.shadow, strict=True)
+        try:
+            yield
+        finally:
+            model.load_state_dict(backup, strict=True)
+
+
 def run_unsup_ema_round(
     student: UniOMRNet,
     ema_teacher: CPUEmaTeacher,
@@ -3473,6 +3603,8 @@ def run_train(args: argparse.Namespace, cfg: UniOMRConfig) -> Dict[str, Any]:
                 "[UniOMR reset-router] re-initialized router.saliency_net and reset ink_prior_scale=1.0",
                 flush=True,
             )
+    if getattr(args, "channels_last", False):
+        model.backbone.to(memory_format=torch.channels_last)
     model.train()
     if device.type == "cuda":
         try:
@@ -3484,6 +3616,15 @@ def run_train(args: argparse.Namespace, cfg: UniOMRConfig) -> Dict[str, Any]:
 
     steps = min(args.steps, 2) if args.dry_run else args.steps
     grad_accum = max(1, int(args.grad_accum))
+    strip_batch_size_arg = getattr(args, "strip_batch_size", None)
+    strip_batch_size = (
+        max(1, int(strip_batch_size_arg))
+        if strip_batch_size_arg is not None
+        else max(1, int(args.batch_size))
+    )
+    strip_grad_accum = max(1, (max(1, int(args.batch_size)) * grad_accum) // strip_batch_size)
+    log_every = max(1, int(getattr(args, "log_every", 10)))
+    gpu_ema_decay = float(max(0.0, min(0.99999, getattr(args, "gpu_ema_decay", 0.0))))
     use_bf16 = bool(args.bf16 and (device.type == "cuda" or hasattr(torch, "bfloat16")))
     prefetch_threads_arg = getattr(args, "prefetch_threads", None)
     if prefetch_threads_arg is None:
@@ -3634,7 +3775,7 @@ def run_train(args: argparse.Namespace, cfg: UniOMRConfig) -> Dict[str, Any]:
             if prefetch_threads > 0 and args.num_workers == 0 and len(st_tr) > 0:
                 pf_st = AsyncThreadPrefetcher(
                     strip_train_ds,
-                    batch_size=args.batch_size,
+                    batch_size=strip_batch_size,
                     shuffle=True,
                     pin_memory=(device.type == "cuda"),
                     max_workers=prefetch_threads,
@@ -3647,7 +3788,7 @@ def run_train(args: argparse.Namespace, cfg: UniOMRConfig) -> Dict[str, Any]:
             else:
                 strip_loader = DataLoader(
                     strip_train_ds,
-                    batch_size=args.batch_size,
+                    batch_size=strip_batch_size,
                     shuffle=True,
                     num_workers=args.num_workers,
                     collate_fn=collate_uni_batch,
@@ -3657,7 +3798,7 @@ def run_train(args: argparse.Namespace, cfg: UniOMRConfig) -> Dict[str, Any]:
                 strip_train_iter = _infinite_loader(strip_loader)
             print(
                 f"[UniOMR data] printed_strips: {len(st_tr)} train / {len(st_va)} val "
-                f"(H={args.strip_height}, maxW={args.max_strip_width}, aug={args.augment}, aug_prob={aug_prob:.2f})"
+                f"(H={args.strip_height}, maxW={args.max_strip_width}, bs={strip_batch_size}, aug={args.augment}, aug_prob={aug_prob:.2f})"
             )
 
         if hw_tr or hw_va:
@@ -3683,7 +3824,7 @@ def run_train(args: argparse.Namespace, cfg: UniOMRConfig) -> Dict[str, Any]:
             if prefetch_threads > 0 and args.num_workers == 0 and len(hw_tr) > 0:
                 pf_hw = AsyncThreadPrefetcher(
                     hw_train_ds,
-                    batch_size=args.batch_size,
+                    batch_size=strip_batch_size,
                     shuffle=True,
                     pin_memory=(device.type == "cuda"),
                     max_workers=prefetch_threads,
@@ -3696,7 +3837,7 @@ def run_train(args: argparse.Namespace, cfg: UniOMRConfig) -> Dict[str, Any]:
             else:
                 hw_loader = DataLoader(
                     hw_train_ds,
-                    batch_size=args.batch_size,
+                    batch_size=strip_batch_size,
                     shuffle=True,
                     num_workers=args.num_workers,
                     collate_fn=collate_uni_batch,
@@ -3799,7 +3940,7 @@ def run_train(args: argparse.Namespace, cfg: UniOMRConfig) -> Dict[str, Any]:
     mix_strip_domains = (
         strip_train_iter is not None
         and hw_strip_train_iter is not None
-        and args.batch_size >= 2
+        and strip_batch_size >= 2
         and cfg.mixstyle_prob > 0.0
     )
     pr_strip_pool: deque[Dict[str, Any]] = deque()
@@ -3818,11 +3959,31 @@ def run_train(args: argparse.Namespace, cfg: UniOMRConfig) -> Dict[str, Any]:
                 })
         return pool.popleft()
 
-    def _next_batch(step_idx: int, micro_idx: int) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor], str]:
+    def _step_is_fullpage(step_idx: int) -> bool:
         if not use_real_data:
+            return args.curriculum == "fullpage" or (args.curriculum == "mixed" and (step_idx % 2 == 1))
+        if args.curriculum == "fullpage":
+            return fullpage_train_iter is not None
+        if args.curriculum == "strip":
+            return not has_any_strip
+        if has_any_strip and fullpage_train_iter is not None:
+            return (
+                int(math.floor(step_idx * fullpage_frac + 1e-9))
+                > int(math.floor((step_idx - 1) * fullpage_frac + 1e-9))
+            )
+        return fullpage_train_iter is not None
+
+    def _next_batch(
+        step_idx: int,
+        micro_idx: int,
+        want_fp: Optional[bool] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor], str]:
+        is_fp = _step_is_fullpage(step_idx) if want_fp is None else bool(want_fp)
+        if not use_real_data:
+            bs_syn = args.batch_size if is_fp else strip_batch_size
             imgs, sq, uv = _make_synthetic_batch(
                 curriculum=args.curriculum,
-                batch_size=args.batch_size,
+                batch_size=bs_syn,
                 seq_len=args.seq_len,
                 device=device,
                 step=step_idx * grad_accum + micro_idx,
@@ -3830,22 +3991,7 @@ def run_train(args: argparse.Namespace, cfg: UniOMRConfig) -> Dict[str, Any]:
             )
             return imgs, sq, uv, args.curriculum
 
-        # Choose strip vs fullpage according to --curriculum.
-        want_fp = False
-        if args.curriculum == "fullpage":
-            want_fp = fullpage_train_iter is not None
-        elif args.curriculum == "strip":
-            want_fp = not has_any_strip
-        else:  # mixed: configurable fullpage_frac (default 0.65) when both exist
-            if has_any_strip and fullpage_train_iter is not None:
-                want_fp = (
-                    int(math.floor(step_idx * fullpage_frac + 1e-9))
-                    > int(math.floor((step_idx - 1) * fullpage_frac + 1e-9))
-                )
-            else:
-                want_fp = fullpage_train_iter is not None
-
-        if want_fp and fullpage_train_iter is not None:
+        if is_fp and fullpage_train_iter is not None:
             b = next(fullpage_train_iter)
             return _images_to_device_float(b["images"], device, non_blocking=True), b["seq"].to(device, non_blocking=True), None, "fullpage"
 
@@ -3855,14 +4001,14 @@ def run_train(args: argparse.Namespace, cfg: UniOMRConfig) -> Dict[str, Any]:
         if mix_strip_domains:
             picked: List[Dict[str, Any]] = []
             n_hw_in_batch = 0
-            for _ in range(args.batch_size):
+            for _ in range(strip_batch_size):
                 if strip_mixer.next_is_hw():
                     picked.append(_pop_strip_sample(hw_strip_pool, hw_strip_train_iter, "hw_strip"))
                     n_hw_in_batch += 1
                 else:
                     picked.append(_pop_strip_sample(pr_strip_pool, strip_train_iter, "strip"))
             b = collate_uni_batch(picked)
-            batch_kind = "mixed_strip" if (0 < n_hw_in_batch < args.batch_size) else ("hw_strip" if n_hw_in_batch > 0 else "strip")
+            batch_kind = "mixed_strip" if (0 < n_hw_in_batch < strip_batch_size) else ("hw_strip" if n_hw_in_batch > 0 else "strip")
             return _images_to_device_float(b["images"], device, non_blocking=True), b["seq"].to(device, non_blocking=True), None, batch_kind
 
         if strip_train_iter is not None and hw_strip_train_iter is not None:
@@ -3880,10 +4026,15 @@ def run_train(args: argparse.Namespace, cfg: UniOMRConfig) -> Dict[str, Any]:
 
     history: List[Dict[str, Any]] = []
     eval_history: List[Dict[str, Any]] = []
+    ema_eval_history: List[Dict[str, Any]] = []
     unsup_history: List[Dict[str, Any]] = []
     soup_ckpts: List[Path] = []
     soup_eval: Optional[Dict[str, Any]] = None
     best_val_ser: float = float("inf")
+    best_ema_ser: float = float("inf")
+    gpu_ema: Optional[GPUEmaShadow] = (
+        GPUEmaShadow(model, decay=gpu_ema_decay, update_every=5) if gpu_ema_decay > 0.0 else None
+    )
 
     def _run_eval_suite(step_label: Any) -> Dict[str, Any]:
         eval_rec: Dict[str, Any] = {"step": step_label}
@@ -3948,12 +4099,54 @@ def run_train(args: argparse.Namespace, cfg: UniOMRConfig) -> Dict[str, Any]:
         eval_rec["mean_val_ser"] = round(mean_ser, 6)
         return eval_rec
 
-    inv_ga = 1.0 / float(grad_accum)
+    log_loss_t = torch.zeros((), device=device, dtype=torch.float32)
+    log_ce_t = torch.zeros((), device=device, dtype=torch.float32)
+    log_mtp_t = torch.zeros((), device=device, dtype=torch.float32)
+    log_uv_t = torch.zeros((), device=device, dtype=torch.float32)
+    log_sal_t = torch.zeros((), device=device, dtype=torch.float32)
+    log_count = 0
+    pending_rows: List[Dict[str, Any]] = []
+
+    def _flush_log_window(print_step: bool = True) -> None:
+        nonlocal log_count
+        if log_count <= 0 or not pending_rows:
+            return
+        inv_cnt = 1.0 / float(log_count)
+        avg_loss, avg_ce, avg_mtp, avg_uv, avg_sal = (
+            (torch.stack([log_loss_t, log_ce_t, log_mtp_t, log_uv_t, log_sal_t]) * inv_cnt).cpu().tolist()
+        )
+        for prow in pending_rows:
+            prow["loss"] = float(avg_loss)
+            prow["ce_loss"] = float(avg_ce)
+            prow["mtp_loss"] = float(avg_mtp)
+            prow["uv_loss"] = float(avg_uv)
+            prow["saliency_loss"] = float(avg_sal)
+        last_row = pending_rows[-1]
+        history.extend(pending_rows)
+        pending_rows.clear()
+        log_loss_t.zero_()
+        log_ce_t.zero_()
+        log_mtp_t.zero_()
+        log_uv_t.zero_()
+        log_sal_t.zero_()
+        log_count = 0
+        if print_step:
+            print(
+                f"[UniOMR {'dry-run' if args.dry_run else 'train'} | {last_row['kind']}] "
+                f"step {last_row['step']}/{steps} | lr={last_row['lr']:.2e} | loss={last_row['loss']:.4f} "
+                f"(ce={last_row['ce_loss']:.4f}, mtp={last_row['mtp_loss']:.4f}, uv={last_row['uv_loss']:.4f}, sal={last_row['saliency_loss']:.4f}) | "
+                f"tokens {last_row['n_in']}->{last_row['n_out']}"
+            )
+
     try:
         for step in range(1, steps + 1):
             cur_lr = _lr_for_step(step, steps, args.lr, args.warmup_steps)
             for pg in opt.param_groups:
                 pg["lr"] = cur_lr
+
+            step_is_fp = _step_is_fullpage(step)
+            step_ga = grad_accum if step_is_fp else strip_grad_accum
+            inv_ga = 1.0 / float(step_ga)
 
             opt.zero_grad(set_to_none=True)
             acc_loss_t = torch.zeros((), device=device, dtype=torch.float32)
@@ -3966,8 +4159,8 @@ def run_train(args: argparse.Namespace, cfg: UniOMRConfig) -> Dict[str, Any]:
             last_kind = args.curriculum
 
             oom_hit = False
-            for micro in range(grad_accum):
-                images, seq, uv_target, kind = _next_batch(step, micro)
+            for micro in range(step_ga):
+                images, seq, uv_target, kind = _next_batch(step, micro, want_fp=step_is_fp)
                 tgt_in = seq[:, :-1]
                 tgt_out = seq[:, 1:]
 
@@ -3979,14 +4172,16 @@ def run_train(args: argparse.Namespace, cfg: UniOMRConfig) -> Dict[str, Any]:
                 )
                 try:
                     with amp_ctx:
-                        if cass_prob > 0.0 and tgt_in.shape[1] > 1:
+                        if cass_prob > 0.0 and kind != "strip" and tgt_in.shape[1] > 1:
                             # Two-pass parallel scheduled sampling (CASS): encode image ONCE,
-                            # run a no-grad draft decode to get parallel argmax predictions,
+                            # run a no-grad draft decode (without tok_dropout to avoid double-corruption),
                             # replace cass_prob of non-BOS/non-PAD tgt_in[:, 1:] with pred_ids[:, :-1],
                             # then run the real gradient-enabled decoder pass reusing mem.
                             mem, uv_pred, router_info = model.encode_image(images, return_aux=want_aux)
                             with torch.no_grad():
-                                draft_logits, _ = model.decode_tokens(tgt_in, mem.detach(), return_mtp=False)
+                                draft_logits, _ = model.decode_tokens(
+                                    tgt_in, mem.detach(), return_mtp=False, apply_tok_dropout=False
+                                )
                                 pred_ids = draft_logits.argmax(dim=-1)
                                 tail_in = tgt_in[:, 1:]
                                 cass_mask = (
@@ -4049,35 +4244,30 @@ def run_train(args: argparse.Namespace, cfg: UniOMRConfig) -> Dict[str, Any]:
 
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             opt.step()
-            if device.type == "cuda" and torch.cuda.memory_reserved(device) > 8 * (1024 ** 3):
+            if device.type == "cuda" and torch.cuda.memory_reserved(device) > 13 * (1024 ** 3):
                 torch.cuda.empty_cache()
 
             if ema_teacher is not None:
                 ema_teacher.update(model)
+            if gpu_ema is not None:
+                gpu_ema.update(model, step)
 
-            # Single GPU->CPU sync per optimizer step for logging scalars.
-            acc_loss, acc_ce, acc_mtp, acc_uv, acc_sal = (
-                torch.stack([acc_loss_t, acc_ce_t, acc_mtp_t, acc_uv_t, acc_sal_t]).cpu().tolist()
-            )
-            row = {
+            # Accumulate GPU scalars over log_every steps; sync GPU->CPU only on log steps.
+            log_loss_t.add_(acc_loss_t)
+            log_ce_t.add_(acc_ce_t)
+            log_mtp_t.add_(acc_mtp_t)
+            log_uv_t.add_(acc_uv_t)
+            log_sal_t.add_(acc_sal_t)
+            log_count += 1
+            pending_rows.append({
                 "step": step,
                 "kind": last_kind,
                 "lr": cur_lr,
-                "loss": float(acc_loss),
-                "ce_loss": float(acc_ce),
-                "mtp_loss": float(acc_mtp),
-                "uv_loss": float(acc_uv),
-                "saliency_loss": float(acc_sal),
                 "n_in": last_n_in,
                 "n_out": last_n_out,
-            }
-            history.append(row)
-            print(
-                f"[UniOMR {'dry-run' if args.dry_run else 'train'} | {last_kind}] "
-                f"step {step}/{steps} | lr={cur_lr:.2e} | loss={row['loss']:.4f} "
-                f"(ce={row['ce_loss']:.4f}, mtp={row['mtp_loss']:.4f}, uv={row['uv_loss']:.4f}, sal={row['saliency_loss']:.4f}) | "
-                f"tokens {last_n_in}->{last_n_out}"
-            )
+            })
+            if step == 1 or (step % log_every == 0) or step == steps:
+                _flush_log_window(print_step=True)
 
             # Periodic confidence-gated EMA unsupervised self-training round.
             if (
@@ -4122,6 +4312,27 @@ def run_train(args: argparse.Namespace, cfg: UniOMRConfig) -> Dict[str, Any]:
             if should_eval:
                 eval_rec = _run_eval_suite(step)
                 mean_ser = float(eval_rec["mean_val_ser"])
+
+                if gpu_ema is not None:
+                    with gpu_ema.swap_into(model):
+                        ema_eval_rec = _run_eval_suite(f"{step} EMA")
+                    ema_mean_ser = float(ema_eval_rec["mean_val_ser"])
+                    eval_rec["ema_eval"] = ema_eval_rec
+                    ema_eval_history.append(ema_eval_rec)
+                    if out_dir is not None and ema_mean_ser < best_ema_ser:
+                        best_ema_ser = ema_mean_ser
+                        torch.save(
+                            {
+                                "step": step,
+                                "val_ser": best_ema_ser,
+                                "ema_decay": gpu_ema_decay,
+                                "config": asdict(cfg),
+                                "vocab": list(data.VOCAB),
+                                "model": {k: v.detach().cpu() for k, v in gpu_ema.shadow.items()},
+                            },
+                            out_dir / "uni_omr_ema_best.pt",
+                        )
+
                 eval_history.append(eval_rec)
 
                 if out_dir is not None and mean_ser < best_val_ser:
@@ -4157,14 +4368,19 @@ def run_train(args: argparse.Namespace, cfg: UniOMRConfig) -> Dict[str, Any]:
                         except OSError:
                             pass
                 if out_dir is not None:
+                    periodic_payload: Dict[str, Any] = {
+                        "best_val_ser": best_val_ser,
+                        "evals": eval_history,
+                        "unsup": unsup_history,
+                    }
+                    if ema_eval_history:
+                        periodic_payload["best_ema_ser"] = best_ema_ser
                     (out_dir / "eval_summary.json").write_text(
-                        json.dumps(
-                            {"best_val_ser": best_val_ser, "evals": eval_history, "unsup": unsup_history},
-                            indent=2,
-                        ),
+                        json.dumps(periodic_payload, indent=2),
                         encoding="utf-8",
                     )
     finally:
+        _flush_log_window(print_step=False)
         for pf in prefetchers:
             pf.close()
 
@@ -4209,6 +4425,8 @@ def run_train(args: argparse.Namespace, cfg: UniOMRConfig) -> Dict[str, Any]:
                 "evals": eval_history,
                 "unsup": unsup_history,
             }
+            if ema_eval_history:
+                summary_payload["best_ema_ser"] = best_ema_ser
             if soup_eval is not None:
                 summary_payload["soup_eval"] = soup_eval
             (out_dir / "eval_summary.json").write_text(
@@ -4220,9 +4438,11 @@ def run_train(args: argparse.Namespace, cfg: UniOMRConfig) -> Dict[str, Any]:
         "steps": steps,
         "history": history,
         "eval_history": eval_history,
+        "ema_eval_history": ema_eval_history,
         "unsup_history": unsup_history,
         "soup_eval": soup_eval,
         "best_val_ser": best_val_ser if eval_history else None,
+        "best_ema_ser": best_ema_ser if ema_eval_history else None,
         "params": model.param_summary(),
     }
 
@@ -4288,11 +4508,15 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
     # Runtime / training
     p.add_argument("--bf16", action="store_true", help="Enable bfloat16 autocast")
-    p.add_argument("--grad-checkpoint", action="store_true", help="Enable gradient checkpointing on encoder/decoder transformer layers")
+    p.add_argument("--channels-last", action="store_true", help="Convert DynamicConvBackbone to channels_last (NHWC) memory format for faster Conv2d")
+    p.add_argument("--grad-checkpoint", action="store_true", help="Enable selective gradient checkpointing on large encoder/decoder transformer tensors")
     p.add_argument("--steps", type=int, default=100)
     p.add_argument("--batch-size", type=int, default=2)
+    p.add_argument("--strip-batch-size", type=int, default=None, help="Optional separate batch size for strip steps (default: --batch-size); auto-scales strip grad-accum to preserve effective batch size")
     p.add_argument("--eval-batch-size", type=int, default=None, help="Batch size for eval_dataset (default: 8 on CUDA, falls back to --batch-size on CPU/dry-run)")
     p.add_argument("--grad-accum", type=int, default=1, help="Gradient accumulation micro-steps")
+    p.add_argument("--log-every", type=int, default=10, help="Sync GPU scalars and print training log every N steps (default: 10; always logs step 1 and final step)")
+    p.add_argument("--gpu-ema-decay", type=float, default=0.0, help="Always-on device-resident EMA shadow decay updated every 5 steps (default: 0.0 = off; e.g. 0.997); saves uni_omr_ema_best.pt")
     p.add_argument("--warmup-steps", type=int, default=100, help="Linear LR warmup steps")
     p.add_argument("--eval-every", type=int, default=250, help="Evaluate on held-out val every N steps")
     p.add_argument("--eval-max-len", type=int, default=256, help="Max autoregressive decode tokens during eval")
