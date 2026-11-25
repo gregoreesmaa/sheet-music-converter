@@ -605,15 +605,22 @@ class InkTokenRouter(nn.Module):
         grid_coords = base_coords.expand(B, -1, -1)  # (B, N, 2)
 
         if self.dynamic_routing and keep_ratio_override is None:
-            with torch.no_grad():
-                # Threshold relative to per-image paper baseline (median bounded score in [0, 2]) so
-                # sparse pages drop to min_keep_ratio (~15%) while dense pages expand up to max_keep_ratio (~75%).
-                med = score_flat.median(dim=1, keepdim=True).values
-                above = (score_flat > (med + self.saliency_thr)).sum(dim=1)
-                k_dyn = int(above.max().item())
-                k_min = max(1, int(math.ceil(N * self.min_keep_ratio)))
-                k_max = max(k_min, min(N, int(math.ceil(N * self.max_keep_ratio))))
-                k = max(k_min, min(k_max, k_dyn))
+            if self.training:
+                # Zero-sync training fast path: sample target keep ratio on CPU across
+                # [min_keep_ratio, max_keep_ratio] to avoid mid-forward CUDA stream sync
+                # while keeping saliency_net gradients intact via saliency_loss & kept_gate.
+                r_dyn = random.uniform(self.min_keep_ratio, self.max_keep_ratio)
+                k = max(1, min(N, int(math.ceil(N * r_dyn))))
+            else:
+                with torch.no_grad():
+                    # Threshold relative to per-image paper baseline (median bounded score in [0, 2]) so
+                    # sparse pages drop to min_keep_ratio (~15%) while dense pages expand up to max_keep_ratio (~75%).
+                    med = score_flat.median(dim=1, keepdim=True).values
+                    above = (score_flat > (med + self.saliency_thr)).sum(dim=1)
+                    k_dyn = int(above.max().item())
+                    k_min = max(1, int(math.ceil(N * self.min_keep_ratio)))
+                    k_max = max(k_min, min(N, int(math.ceil(N * self.max_keep_ratio))))
+                    k = max(k_min, min(k_max, k_dyn))
         else:
             k = max(1, min(N, int(math.ceil(N * ratio))))
 
@@ -4853,6 +4860,8 @@ def run_train(args: argparse.Namespace, cfg: UniOMRConfig) -> Dict[str, Any]:
     lr_schedule = str(getattr(args, "lr_schedule", "cosine"))
     wsd_decay_frac = float(getattr(args, "wsd_decay_frac", 0.25))
     min_lr_ratio = float(getattr(args, "min_lr_ratio", 0.05))
+    save_every_sec = max(0.0, float(getattr(args, "save_every_minutes", 5.0)) * 60.0)
+    last_time_save = time.perf_counter()
     last_empty_cache_step = -25
 
     try:
@@ -5008,6 +5017,39 @@ def run_train(args: argparse.Namespace, cfg: UniOMRConfig) -> Dict[str, Any]:
             })
             if step == 1 or (step % log_every == 0) or step == steps:
                 _flush_log_window(print_step=True)
+
+            # Time-based atomic rolling checkpoint save (never lose > save_every_minutes of training).
+            if save_every_sec > 0.0 and (not args.dry_run) and (time.perf_counter() - last_time_save) >= save_every_sec:
+                last_time_save = time.perf_counter()
+                latest_path = out_dir / "uni_omr_latest.pt"
+                latest_tmp = out_dir / "uni_omr_latest.pt.tmp"
+                torch.save(
+                    {
+                        "cfg": asdict(cfg),
+                        "model": model.state_dict(),
+                        "step": step,
+                        "best_val_ser": best_val_ser,
+                    },
+                    latest_tmp,
+                )
+                os.replace(latest_tmp, latest_path)
+                ema_note = ""
+                if gpu_ema is not None:
+                    ema_latest_path = out_dir / "uni_omr_ema_latest.pt"
+                    ema_latest_tmp = out_dir / "uni_omr_ema_latest.pt.tmp"
+                    torch.save(
+                        {
+                            "cfg": asdict(cfg),
+                            "model": gpu_ema.cpu_state_dict(model),
+                            "step": step,
+                            "best_val_ser": best_ema_val_ser,
+                            "ema_decay": gpu_ema.decay,
+                        },
+                        ema_latest_tmp,
+                    )
+                    os.replace(ema_latest_tmp, ema_latest_path)
+                    ema_note = " + uni_omr_ema_latest.pt"
+                print(f"  [autosave @ step {step}] saved {latest_path.name}{ema_note}")
 
             # Periodic confidence-gated EMA unsupervised self-training round.
             if (
@@ -5303,6 +5345,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--wsd-decay-frac", type=float, default=0.25, help="Final fraction of steps spent decaying under --lr-schedule wsd (default: 0.25)")
     p.add_argument("--min-lr-ratio", type=float, default=0.05, help="Minimum LR ratio relative to --lr at end of schedule (default: 0.05)")
     p.add_argument("--eval-every", type=int, default=250, help="Evaluate on held-out val every N steps")
+    p.add_argument("--save-every-minutes", type=float, default=5.0, help="Atomically save rolling uni_omr_latest.pt (+ EMA) every N minutes (default: 5.0; 0 disables)")
     p.add_argument("--eval-max-len", type=int, default=256, help="Max autoregressive decode tokens during eval")
     p.add_argument("--seq-len", type=int, default=32, help="Synthetic sequence length for --dry-run")
     p.add_argument("--lr", type=float, default=3e-4)
