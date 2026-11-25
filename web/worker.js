@@ -1260,6 +1260,7 @@ const state = {
   wasmReady: false,
   modelsReady: false,
   backend: 'wasm',
+  capabilities: { webgpu: false, webnn: false, wasm: true },
   numThreads: 1,
   useMtp: false,
   mtpK: 1,
@@ -1299,6 +1300,7 @@ function normalizeVocab(raw) {
   const eosId = raw.eos_id ?? tokenToId['<eos>'] ?? 235;
   const sysId = raw.sys_id ?? tokenToId['<sys>'] ?? 236;
 
+  const nHeads = raw.n_heads ?? 6;
   return {
     idToToken,
     tokenToId,
@@ -1309,7 +1311,8 @@ function normalizeVocab(raw) {
     sysId,
     maxDim: raw.max_dim ?? 1280,
     nDecLayers: raw.n_dec_layers ?? 6,
-    nHeads: raw.n_heads ?? 6,
+    nHeads,
+    nKvHeads: raw.n_kv_heads ?? nHeads,
     headDim: raw.head_dim ?? 64,
   };
 }
@@ -1334,6 +1337,10 @@ async function detectWebGpu() {
   }
 }
 
+function detectWebNn() {
+  return typeof navigator !== 'undefined' && 'ml' in navigator;
+}
+
 async function createOrtSession(ort, url, provider, extraOpts = {}) {
   return await ort.InferenceSession.create(url, {
     executionProviders: [provider],
@@ -1345,7 +1352,7 @@ async function createOrtSession(ort, url, provider, extraOpts = {}) {
 
 async function warmupWebGpuSessions(ort, encSession, decSession, vocab) {
   const nLayers = vocab.nDecLayers || 6;
-  const nHeads = vocab.nHeads || 6;
+  const nKvHeads = vocab.nKvHeads ?? vocab.nHeads ?? 6;
   const headDim = vocab.headDim || 64;
   const bosId = vocab.bosId;
 
@@ -1367,8 +1374,8 @@ async function warmupWebGpuSessions(ort, encSession, decSession, vocab) {
 
     // 2. Minimal T=1 decoder run
     for (let i = 0; i < nLayers; i++) {
-      emptyK.push(new ort.Tensor('float32', new Float32Array(0), [1, nHeads, 0, headDim]));
-      emptyV.push(new ort.Tensor('float32', new Float32Array(0), [1, nHeads, 0, headDim]));
+      emptyK.push(new ort.Tensor('float32', new Float32Array(0), [1, nKvHeads, 0, headDim]));
+      emptyV.push(new ort.Tensor('float32', new Float32Array(0), [1, nKvHeads, 0, headDim]));
     }
     tokT1 = new ort.Tensor('int64', BigInt64Array.from([BigInt(bosId)]), [1, 1]);
     posT1 = new ort.Tensor('int64', BigInt64Array.from([0n]), [1]);
@@ -1507,10 +1514,13 @@ async function handleInit(msg = {}) {
     state.numThreads = threads;
 
     const hasWebGpu = msg?.forceBackend === 'wasm' ? false : await detectWebGpu();
+    const hasWebNn = detectWebNn();
+    state.capabilities = { webgpu: hasWebGpu, webnn: hasWebNn, wasm: true };
     state.backend = hasWebGpu ? 'webgpu' : 'wasm';
     self.postMessage({
       type: 'ort-ready',
       backend: state.backend,
+      capabilities: state.capabilities,
       numThreads: state.numThreads,
     });
   } catch (err) {
@@ -1592,6 +1602,7 @@ async function handleInit(msg = {}) {
     self.postMessage({
       type: 'models-ready',
       backend: state.backend,
+      capabilities: state.capabilities,
       numThreads: state.numThreads,
       useMtp: state.useMtp,
       mtpK: state.mtpK,
@@ -1640,6 +1651,7 @@ async function handleRecognizePage(msg) {
   const maxTokens = state.modelIo.max_tokens || DEFAULT_MAX_TOKENS;
   const nLayers = state.vocab.nDecLayers || state.modelIo.n_dec_layers || 6;
   const nHeads = state.vocab.nHeads || state.modelIo.n_heads || 6;
+  const nKvHeads = state.vocab.nKvHeads ?? state.modelIo.n_kv_heads ?? nHeads;
   const headDim = state.vocab.headDim || state.modelIo.head_dim || 64;
   const { bosId, eosId, sysId, padId, idToToken, tokenToId, vocabSize } = state.vocab;
 
@@ -1686,8 +1698,8 @@ async function handleRecognizePage(msg) {
 
     stage = 'decoding';
     for (let i = 0; i < nLayers; i++) {
-      pastK.push(new ort.Tensor('float32', new Float32Array(0), [1, nHeads, 0, headDim]));
-      pastV.push(new ort.Tensor('float32', new Float32Array(0), [1, nHeads, 0, headDim]));
+      pastK.push(new ort.Tensor('float32', new Float32Array(0), [1, nKvHeads, 0, headDim]));
+      pastV.push(new ort.Tensor('float32', new Float32Array(0), [1, nKvHeads, 0, headDim]));
     }
 
     const generatedIds = [];
@@ -1861,8 +1873,8 @@ async function handleRecognizePage(msg) {
         const nextPastK = [];
         const nextPastV = [];
         for (let i = 0; i < nLayers; i++) {
-          nextPastK.push(await sliceKvTensor(ort, out[`present_k_${i}`], nHeads, keepLen, headDim));
-          nextPastV.push(await sliceKvTensor(ort, out[`present_v_${i}`], nHeads, keepLen, headDim));
+          nextPastK.push(await sliceKvTensor(ort, out[`present_k_${i}`], nKvHeads, keepLen, headDim));
+          nextPastV.push(await sliceKvTensor(ort, out[`present_v_${i}`], nKvHeads, keepLen, headDim));
         }
         for (const t of pastK) if (t && typeof t.dispose === 'function') t.dispose();
         for (const t of pastV) if (t && typeof t.dispose === 'function') t.dispose();
