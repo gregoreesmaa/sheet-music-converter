@@ -16,14 +16,19 @@ if str(_THIS_DIR) not in sys.path:
     sys.path.insert(0, str(_THIS_DIR))
 
 from uni_omr_v2 import (  # noqa: E402
+    AnisotropicMusicBlock,
     AspectNormalizedRoPE2D,
     BOS_ID,
     EOS_ID,
+    GroupedQueryAttention,
+    InkTokenRouterV2,
     PAD_ID,
     SYS_ID,
     VOCAB_SIZE,
     UniOMRv2Config,
     UniOMRv2Net,
+    compute_sys_count_loss,
+    compute_sys_y_loss,
 )
 
 
@@ -65,17 +70,17 @@ def _check_presets_param_counts_and_byte_budgets() -> dict:
     assert 0 < s_small["deepstack_params"] < 500_000, f"small deepstack={s_small['deepstack_params']}"
     assert 0 < s_edge["deepstack_params"] < 500_000, f"edge deepstack={s_edge['deepstack_params']}"
 
-    # small_45m: ~43M total, < 25 MB pure INT4 (even with scales!), < 55 MB hybrid.
-    assert 40_000_000 <= s_small["total_params"] <= 46_000_000, f"small total={s_small['total_params']}"
+    # small_45m: ~41M total (trimmed axial_ffn_mult=2.0), < 25 MB pure INT4, < 55 MB hybrid.
+    assert 38_000_000 <= s_small["total_params"] <= 46_000_000, f"small total={s_small['total_params']}"
     assert s_small["pure_int4_mb"] < 25.0, f"small pure_int4_mb={s_small['pure_int4_mb']:.2f}"
     assert s_small["pure_int4_with_scales_mb"] < 25.0, (
         f"small pure_int4_with_scales_mb={s_small['pure_int4_with_scales_mb']:.2f}"
     )
     assert s_small["hybrid_fp16_int4_with_scales_mb"] < 55.0
 
-    # edge85m: d_model=512, ~80-85M total, < 55 MB Hybrid FP16/INT4-QAT (even with group-32 scales!).
+    # edge85m: d_model=512, ~78M total (trimmed axial_ffn_mult=2.0), < 55 MB Hybrid FP16/INT4-QAT.
     assert m_edge.cfg.d_model == 512
-    assert 79_000_000 <= s_edge["total_params"] <= 86_000_000, f"edge total={s_edge['total_params']}"
+    assert 75_000_000 <= s_edge["total_params"] <= 86_000_000, f"edge total={s_edge['total_params']}"
     assert s_edge["hybrid_fp16_int4_mb"] < 52.0, f"edge hybrid_raw={s_edge['hybrid_fp16_int4_mb']:.2f}"
     assert s_edge["hybrid_fp16_int4_with_scales_mb"] < 55.0, (
         f"edge hybrid_scaled={s_edge['hybrid_fp16_int4_with_scales_mb']:.2f}"
@@ -178,13 +183,13 @@ def test_forward_backward_portrait_landscape_and_mem_cap() -> None:
         # Verify gradients flow through backbone, encoder, QK-Norm, DeepStack, decoder, MTP, and all 3 aux heads.
         assert model.backbone.stage1.down[0].weight.grad is not None
         assert model.backbone.p2_to_p3.proj.weight.grad is not None
-        assert model.encoder.axial_layers[0].row_attn.q_proj.weight.grad is not None
+        assert model.encoder.axial_layers[0].row_attn.qkv_proj.weight.grad is not None
         assert model.encoder.axial_layers[0].row_attn.q_norm.weight.grad is not None
         assert model.encoder.axial_layers[0].row_attn.k_norm.weight.grad is not None
         assert model.encoder.axial_layers[0].col_attn.q_norm.weight.grad is not None
         assert model.encoder.axial_layers[0].col_attn.k_norm.weight.grad is not None
         assert model.encoder.patch_merger.fc1.weight.grad is not None
-        assert model.encoder.global_layers[0].self_attn.q_proj.weight.grad is not None
+        assert model.encoder.global_layers[0].self_attn.qkv_proj.weight.grad is not None
         assert model.encoder.global_layers[0].self_attn.q_norm.weight.grad is not None
         assert model.encoder.global_layers[0].self_attn.k_norm.weight.grad is not None
         assert model.deepstack_fusions[0].gate.grad is not None
@@ -326,12 +331,102 @@ def test_qat_int4_controller_v2_and_zero_schema_change() -> None:
     _check_qat_int4_controller_v2_and_zero_schema_change()
 
 
+def test_iter11_optimizations() -> None:
+    """Verify Iter-11 compute/memory optimizations: 1/4-split, native GQA, branchless losses, precompute_cross_kv, RoPE1D cache."""
+    torch.manual_seed(99)
+
+    # 1. AnisotropicMusicBlock 1/4-channel split (including non-divisible-by-4 remainder on identity)
+    blk = AnisotropicMusicBlock(channels=18, expand_ratio=2.0)
+    assert blk.split_sizes == (4, 4, 4, 6)
+    y_blk = blk(torch.randn(2, 18, 16, 16))
+    assert y_blk.shape == (2, 18, 16, 16)
+
+    # 2. Native PyTorch enable_gqa=True vs _expand_kv fallback parity
+    gqa = GroupedQueryAttention(d_model=64, n_heads=8, n_kv_heads=2, use_native_gqa=True).eval()
+    q_in = torch.randn(2, 10, 64)
+    kv_in = torch.randn(2, 15, 64)
+    with torch.no_grad():
+        out_native = gqa(q_in, kv_in, is_causal=False)
+        gqa.use_native_gqa = False
+        out_expand = gqa(q_in, kv_in, is_causal=False)
+    assert float((out_native - out_expand).abs().max().item()) < 1e-5
+
+    # 3. Branchless aux losses return exact 0.0 when no valid entries exist
+    pred_y = torch.rand(2, 8, requires_grad=True)
+    tgt_y_empty = torch.full((2, 8), -1.0)
+    loss_y_empty = compute_sys_y_loss(pred_y, tgt_y_empty)
+    assert float(loss_y_empty.item()) == 0.0
+    pred_cnt = torch.rand(2, requires_grad=True)
+    tgt_cnt_empty = torch.full((2,), -1.0)
+    loss_cnt_empty = compute_sys_count_loss(pred_cnt, tgt_cnt_empty)
+    assert float(loss_cnt_empty.item()) == 0.0
+
+    # 4. precompute_cross_kv parity + DeepStackFusion guard on cached steps + RoPE1D pow2 cache
+    cfg = _tiny_cfg(n_heads=8, n_kv_heads=2, dropout=0.0)
+    model = UniOMRv2Net(cfg).eval()
+    images = torch.rand(1, 3, 128, 128)
+    tgt_ids = torch.randint(0, VOCAB_SIZE - 4, (1, 10))
+    tgt_ids[:, 0] = BOS_ID
+
+    fusion_calls = [0]
+    orig_f0 = model.deepstack_fusions[0].forward
+
+    def _counted_f0(*args, **kwargs):
+        fusion_calls[0] += 1
+        return orig_f0(*args, **kwargs)
+
+    model.deepstack_fusions[0].forward = _counted_f0  # type: ignore[method-assign]
+    with torch.no_grad():
+        mem_levels, _, _ = model.encode_image(images, return_aux=False)
+        full_logits, _, _ = model.decode_tokens(tgt_ids, mem_levels, return_mtp=False, return_aux=False)
+        fusion_calls[0] = 0
+
+        past_kvs = model.precompute_cross_kv(mem_levels)
+        assert fusion_calls[0] == 1, f"precompute_cross_kv should call fusion[0] once, got {fusion_calls[0]}"
+
+        step_logits = []
+        for t in range(tgt_ids.shape[1]):
+            # Deliberately pass memory=mem_levels on every cached step to prove the guard skips DeepStackFusion!
+            lt, _, past_kvs = model.decode_tokens(
+                tgt_ids[:, t : t + 1],
+                memory=mem_levels,
+                return_mtp=False,
+                return_aux=False,
+                past_kvs=past_kvs,
+                use_cache=True,
+            )
+            step_logits.append(lt)
+        assert fusion_calls[0] == 1, f"DeepStackFusion must not re-run on cached steps, got {fusion_calls[0]}"
+        precomp_logits = torch.cat(step_logits, dim=1)
+        assert float((full_logits - precomp_logits).abs().max().item()) < 1e-4
+
+        # RoPE1D power-of-2 cache pre-allocation (min 512)
+        c1, _ = model.rope1d(10, device=images.device, dtype=images.dtype)
+        assert c1.shape[2] == 10
+        assert model.rope1d._cache[(images.device, images.dtype)][0] == 512
+        c2, _ = model.rope1d(513, device=images.device, dtype=images.dtype)
+        assert c2.shape[2] == 513
+        assert model.rope1d._cache[(images.device, images.dtype)][0] == 1024
+
+    # 5. InkTokenRouterV2 training-mode fixed k (zero CUDA-CPU sync) vs eval dynamic k
+    router = InkTokenRouterV2(d_model=64, dynamic_routing=True, min_keep_ratio=0.15, max_keep_ratio=0.75)
+    feat = torch.randn(2, 64, 8, 8)  # N=64
+    img = torch.rand(2, 3, 128, 128)
+    router.train()
+    _, _, info_tr = router(feat, images=img)
+    assert info_tr["k_kept"] == 48  # ceil(64 * 0.75) = 48
+    router.eval()
+    _, _, info_ev = router(feat, images=img)
+    assert 10 <= info_ev["k_kept"] <= 48
+
+
 def main() -> None:
     summaries = _check_presets_param_counts_and_byte_budgets()
     test_aspect_normalized_rope2d_resolution_invariance()
     test_forward_backward_portrait_landscape_and_mem_cap()
     max_diff = _check_gqa_kv_cache_decode_parity_and_4x_shrink()
     n_qat = _check_qat_int4_controller_v2_and_zero_schema_change()
+    test_iter11_optimizations()
 
     print("=== UniOMR v2 CPU Unit Tests PASSED ===")
     for name, s in summaries.items():

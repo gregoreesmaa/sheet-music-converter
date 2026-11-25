@@ -5046,7 +5046,7 @@ def run_train(args: argparse.Namespace, cfg: UniOMRConfig) -> Dict[str, Any]:
                             "cfg": asdict(cfg),
                             "model": gpu_ema.cpu_state_dict(model),
                             "step": step,
-                            "best_val_ser": best_ema_val_ser,
+                            "best_val_ser": best_ema_ser,
                             "ema_decay": gpu_ema.decay,
                         },
                         ema_latest_tmp,

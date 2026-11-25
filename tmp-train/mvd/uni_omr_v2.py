@@ -146,22 +146,20 @@ def _sdpa(
     v: torch.Tensor,
     attn_mask: Optional[torch.Tensor] = None,
     is_causal: bool = False,
+    enable_gqa: bool = False,
 ) -> torch.Tensor:
     """SDPA wrapper enforcing CUTLASS EFFICIENT_ATTENTION on CUDA (avoids cuDNN 9.10 stalls)."""
+    sdpa_kwargs: Dict[str, Any] = dict(attn_mask=attn_mask, dropout_p=0.0, is_causal=is_causal)
+    if enable_gqa:
+        sdpa_kwargs["enable_gqa"] = True
     if q.device.type == "cuda" and _sdpa_kernel is not None:
         if _SDPA_HAS_SET_PRIORITY:
             with _sdpa_kernel(_CUDA_SDPA_BACKENDS, set_priority=True):
-                return F.scaled_dot_product_attention(
-                    q, k, v, attn_mask=attn_mask, dropout_p=0.0, is_causal=is_causal
-                )
+                return F.scaled_dot_product_attention(q, k, v, **sdpa_kwargs)
         if attn_mask is None:
             with _sdpa_kernel(_CUDA_SDPA_BACKENDS):
-                return F.scaled_dot_product_attention(
-                    q, k, v, attn_mask=None, dropout_p=0.0, is_causal=is_causal
-                )
-    return F.scaled_dot_product_attention(
-        q, k, v, attn_mask=attn_mask, dropout_p=0.0, is_causal=is_causal
-    )
+                return F.scaled_dot_product_attention(q, k, v, **sdpa_kwargs)
+    return F.scaled_dot_product_attention(q, k, v, **sdpa_kwargs)
 
 
 # ---------------------------------------------------------------------------
@@ -177,6 +175,7 @@ class UniOMRv2Config:
     n_global_layers: int = 4
     n_dec_layers: int = 8
     ffn_mult: float = 4.0
+    axial_ffn_mult: float = 2.0
     dropout: float = 0.1
     vocab_size: int = VOCAB_SIZE
 
@@ -233,6 +232,7 @@ class UniOMRv2Config:
             n_global_layers=4,
             n_dec_layers=8,
             ffn_mult=4.0,
+            axial_ffn_mult=2.0,
             backbone_channels=(64, 128, 240, 448),
             backbone_blocks=(1, 2, 3, 3),
             backbone_expand=2.0,
@@ -254,6 +254,7 @@ class UniOMRv2Config:
             n_global_layers=4,
             n_dec_layers=10,
             ffn_mult=4.0,
+            axial_ffn_mult=2.0,
             backbone_channels=(64, 128, 240, 448),
             backbone_blocks=(1, 2, 3, 3),
             backbone_expand=2.0,
@@ -270,23 +271,28 @@ class UniOMRv2Config:
 # ---------------------------------------------------------------------------
 
 class AnisotropicMusicBlock(nn.Module):
-    """Depthwise-separable inverted-bottleneck block with parallel anisotropic strips.
+    """InceptionNeXt 1/4-channel-split inverted-bottleneck block with parallel anisotropic strips.
 
-    Parallel depthwise branches:
-      - ``1x9`` horizontal strip (staff lines, beams, slurs, hairpins)
-      - ``9x1`` vertical strip (stems, chords, barlines, braces)
-      - ``3x3`` local kernel (noteheads, accidentals, dots, flags)
-    Followed by GroupNorm + SiLU + pointwise inverted bottleneck.
+    Splits channels into 4 groups (``c4 = channels // 4``, remainder on identity):
+      - ``1x9`` horizontal strip on ``c4`` (staff lines, beams, slurs, hairpins)
+      - ``9x1`` vertical strip on ``c4`` (stems, chords, barlines, braces)
+      - ``3x3`` local kernel on ``c4`` (noteheads, accidentals, dots, flags)
+      - identity pass-through on remaining ``channels - 3 * c4`` channels
+    Concatenated before GroupNorm + pointwise ``pw1 -> GELU -> pw2`` inverted bottleneck.
     """
 
     def __init__(self, channels: int, expand_ratio: float = 2.0, max_groups: int = 16) -> None:
         super().__init__()
+        if channels < 4:
+            raise ValueError(f"AnisotropicMusicBlock requires channels >= 4, got {channels}")
         g = _group_count(channels, max_groups)
         hidden = max(channels, int(round(channels * expand_ratio)))
+        c4 = channels // 4
+        self.split_sizes: Tuple[int, int, int, int] = (c4, c4, c4, channels - 3 * c4)
 
-        self.dw_horiz = nn.Conv2d(channels, channels, kernel_size=(1, 9), padding=(0, 4), groups=channels, bias=False)
-        self.dw_vert = nn.Conv2d(channels, channels, kernel_size=(9, 1), padding=(4, 0), groups=channels, bias=False)
-        self.dw_local = nn.Conv2d(channels, channels, kernel_size=(3, 3), padding=(1, 1), groups=channels, bias=False)
+        self.dw_horiz = nn.Conv2d(c4, c4, kernel_size=(1, 9), padding=(0, 4), groups=c4, bias=False)
+        self.dw_vert = nn.Conv2d(c4, c4, kernel_size=(9, 1), padding=(4, 0), groups=c4, bias=False)
+        self.dw_local = nn.Conv2d(c4, c4, kernel_size=(3, 3), padding=(1, 1), groups=c4, bias=False)
         self.gn1 = nn.GroupNorm(g, channels)
 
         self.pw1 = nn.Conv2d(channels, hidden, kernel_size=1, bias=False)
@@ -294,9 +300,10 @@ class AnisotropicMusicBlock(nn.Module):
         self.gn2 = nn.GroupNorm(g, channels)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        h = self.dw_horiz(x) + self.dw_vert(x) + self.dw_local(x)
-        h = F.silu(self.gn1(h))
-        h = self.pw2(F.silu(self.pw1(h)))
+        x_h, x_v, x_l, x_id = torch.split(x, self.split_sizes, dim=1)
+        h = torch.cat([self.dw_horiz(x_h), self.dw_vert(x_v), self.dw_local(x_l), x_id], dim=1)
+        h = self.gn1(h)
+        h = self.pw2(F.gelu(self.pw1(h)))
         h = self.gn2(h)
         return F.silu(x + h)
 
@@ -326,22 +333,15 @@ class _AnisoStage(nn.Module):
 
 
 class _P2LateralFuse(nn.Module):
-    """Lossless PixelUnshuffle(2) lateral skip from P2 (/4) into /8 stages."""
+    """Lateral projection from pre-unshuffled P2 (/4 -> /8) into /8 stages."""
 
     def __init__(self, p2_ch: int, target_ch: int) -> None:
         super().__init__()
-        self.unshuffle = nn.PixelUnshuffle(2)
         self.proj = nn.Conv2d(p2_ch * 4, target_ch, kernel_size=1, bias=False)
         self.norm = nn.GroupNorm(_group_count(target_ch, 16), target_ch)
 
-    def forward(self, p2: torch.Tensor, target_hw: Tuple[int, int]) -> torch.Tensor:
-        _, _, h2, w2 = p2.shape
-        pad_h = h2 % 2
-        pad_w = w2 % 2
-        if pad_h or pad_w:
-            p2 = F.pad(p2, (0, pad_w, 0, pad_h), mode="replicate")
-        folded = self.unshuffle(p2)
-        out = F.silu(self.norm(self.proj(folded)))
+    def forward(self, p2_unshuffled: torch.Tensor, target_hw: Tuple[int, int]) -> torch.Tensor:
+        out = F.silu(self.norm(self.proj(p2_unshuffled)))
         if out.shape[-2:] != target_hw:
             out = F.interpolate(out, size=target_hw, mode="bilinear", align_corners=False)
         return out
@@ -378,6 +378,7 @@ class AnisotropicMusicBackbone(nn.Module):
         self.stage3 = _AnisoStage(c2, c3, n_blocks=n3, stride=2, expand_ratio=expand_ratio)
         self.stage4 = _AnisoStage(c3, c4, n_blocks=n4, stride=1, expand_ratio=expand_ratio)
 
+        self.p2_unshuffle = nn.PixelUnshuffle(2)
         self.p2_to_p3 = _P2LateralFuse(c2, c3)
         self.p2_to_p4 = _P2LateralFuse(c2, c4)
 
@@ -392,10 +393,15 @@ class AnisotropicMusicBackbone(nn.Module):
     ) -> Any:
         h1 = self.mixstyle(self.stage1(x))
         p2 = self.mixstyle(self.stage2(h1))  # /4
+        _, _, h2, w2 = p2.shape
+        pad_h = h2 % 2
+        pad_w = w2 % 2
+        p2_padded = F.pad(p2, (0, pad_w, 0, pad_h), mode="replicate") if (pad_h or pad_w) else p2
+        p2_unshuffled = self.p2_unshuffle(p2_padded)
         p3 = self.stage3(p2)                 # /8
-        p3 = p3 + self.p2_to_p3(p2, (p3.shape[2], p3.shape[3]))
+        p3 = p3 + self.p2_to_p3(p2_unshuffled, (p3.shape[2], p3.shape[3]))
         p4 = self.stage4(p3)                 # /8
-        p4 = p4 + self.p2_to_p4(p2, (p4.shape[2], p4.shape[3]))
+        p4 = p4 + self.p2_to_p4(p2_unshuffled, (p4.shape[2], p4.shape[3]))
         out = self.out_norm(self.proj(p4))
         if return_pyramid:
             return out, p2, p3
@@ -477,9 +483,7 @@ class _SelfAttention(nn.Module):
         self.d_model = d_model
         self.n_heads = n_heads
         self.head_dim = d_model // n_heads
-        self.q_proj = nn.Linear(d_model, d_model, bias=False)
-        self.k_proj = nn.Linear(d_model, d_model, bias=False)
-        self.v_proj = nn.Linear(d_model, d_model, bias=False)
+        self.qkv_proj = nn.Linear(d_model, 3 * d_model, bias=False)
         self.o_proj = nn.Linear(d_model, d_model, bias=False)
         self.q_norm = RMSNorm(self.head_dim)
         self.k_norm = RMSNorm(self.head_dim)
@@ -491,9 +495,10 @@ class _SelfAttention(nn.Module):
         rope_sin: torch.Tensor,
     ) -> torch.Tensor:
         B, L, _ = x.shape
-        q = self.q_norm(self.q_proj(x).view(B, L, self.n_heads, self.head_dim)).transpose(1, 2)
-        k = self.k_norm(self.k_proj(x).view(B, L, self.n_heads, self.head_dim)).transpose(1, 2)
-        v = self.v_proj(x).view(B, L, self.n_heads, self.head_dim).transpose(1, 2)
+        q, k, v = self.qkv_proj(x).chunk(3, dim=-1)
+        q = self.q_norm(q.view(B, L, self.n_heads, self.head_dim)).transpose(1, 2)
+        k = self.k_norm(k.view(B, L, self.n_heads, self.head_dim)).transpose(1, 2)
+        v = v.view(B, L, self.n_heads, self.head_dim).transpose(1, 2)
         q, k = apply_rope(q, k, rope_cos, rope_sin)
         out = _sdpa(q, k, v, attn_mask=None, is_causal=False)
         out = out.transpose(1, 2).contiguous().view(B, L, self.d_model)
@@ -607,6 +612,54 @@ class InkTokenRouterV2(nn.Module):
         self.bg_out_norm = RMSNorm(d_model)
         self._grid_cache: Dict[Tuple[int, int, torch.device], Tuple[torch.Tensor, torch.Tensor]] = {}
 
+    @staticmethod
+    def _compute_ink_and_paper_gate(
+        images: torch.Tensor, h_p: int, w_p: int
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Compute border-masked relative high-pass ink map, soft paper_gate, and effective_paper.
+
+        Uses a narrow 1-patch (3x3, padding=1) erosion of ``paper_mask_grid`` so
+        tight-margin bordered handwritten photos do not lose edge ink while still
+        suppressing exterior dark desk/scanner border rings.
+        """
+        img_f = images.float()
+        if img_f.shape[1] == 3:
+            luma = (
+                0.299 * img_f[:, 0:1]
+                + 0.587 * img_f[:, 1:2]
+                + 0.114 * img_f[:, 2:3]
+            )
+        else:
+            luma = img_f.mean(dim=1, keepdim=True)
+        local_bg = F.avg_pool2d(
+            F.avg_pool2d(luma, kernel_size=(1, 31), stride=1, padding=(0, 15), count_include_pad=False),
+            kernel_size=(31, 1),
+            stride=1,
+            padding=(15, 0),
+            count_include_pad=False,
+        )
+        paper_mask = (local_bg > 0.35).to(luma.dtype)
+        local_ink = ((local_bg - luma) / local_bg.clamp(min=0.15)).clamp(0.0, 1.0) * paper_mask
+        ink_max = F.adaptive_max_pool2d(local_ink, (h_p, w_p))
+        ink_avg = F.adaptive_avg_pool2d(local_ink, (h_p, w_p))
+        local_ink_grid = 0.5 * ink_max + 0.5 * ink_avg
+
+        local_bg_grid = F.adaptive_avg_pool2d(local_bg, (h_p, w_p))
+        paper_mask_grid = (local_bg_grid > 0.35).detach()
+        non_paper = (~paper_mask_grid).to(torch.float32)
+        border_dilated = F.max_pool2d(non_paper, kernel_size=3, stride=1, padding=1) > 0.5
+        interior_paper = paper_mask_grid & (~border_dilated)
+        has_interior = interior_paper.flatten(1).any(dim=1).view(-1, 1, 1, 1)
+        effective_paper = torch.where(has_interior, interior_paper, paper_mask_grid).detach()
+
+        local_ink_grid = local_ink_grid * effective_paper.to(local_ink_grid.dtype)
+        paper_gate = torch.where(
+            effective_paper,
+            torch.ones_like(local_bg_grid),
+            torch.full_like(local_bg_grid, 0.05),
+        ).detach()
+        return local_ink_grid, paper_gate, effective_paper
+
     def forward(
         self,
         feat_2d: torch.Tensor,
@@ -624,7 +677,7 @@ class InkTokenRouterV2(nn.Module):
 
         ink_target: Optional[torch.Tensor] = None
         if images is not None:
-            local_ink_grid, paper_gate, paper_mask_grid = InkTokenRouter._compute_ink_and_paper_gate(
+            local_ink_grid, paper_gate, paper_mask_grid = self._compute_ink_and_paper_gate(
                 images, H_p, W_p
             )
             local_ink_grid = local_ink_grid.to(saliency_logits.dtype)
@@ -632,9 +685,9 @@ class InkTokenRouterV2(nn.Module):
             saliency_prob = saliency_prob * paper_gate
             ink_target = ((local_ink_grid > 0.04) & paper_mask_grid).to(saliency_logits.dtype)
             if self.use_ink_prior:
-                flat = local_ink_grid.flatten(1)
+                flat_f = local_ink_grid.flatten(1).float()
                 denom = (
-                    torch.quantile(flat.float(), 0.99, dim=-1)
+                    (flat_f.mean(dim=-1) + 2.5 * flat_f.std(dim=-1, unbiased=False))
                     .clamp(min=1e-4)
                     .view(B, 1, 1, 1)
                     .to(local_ink_grid.dtype)
@@ -667,13 +720,17 @@ class InkTokenRouterV2(nn.Module):
         grid_coords = base_coords.expand(B, -1, -1)
 
         if self.dynamic_routing and keep_ratio_override is None:
-            with torch.no_grad():
-                med = score_flat.median(dim=1, keepdim=True).values
-                above = (score_flat > (med + self.saliency_thr)).sum(dim=1)
-                k_dyn = int(above.max().item())
-                k_min = max(1, int(math.ceil(N * self.min_keep_ratio)))
-                k_max = max(k_min, min(N, int(math.ceil(N * self.max_keep_ratio))))
-                k = max(k_min, min(k_max, k_dyn))
+            if self.training:
+                max_k = min(N, max(1, self.max_mem_tokens - self.n_bg_summary))
+                k = min(max(int(math.ceil(N * self.max_keep_ratio)), 1), max_k)
+            else:
+                with torch.no_grad():
+                    med = score_flat.median(dim=1, keepdim=True).values
+                    above = (score_flat > (med + self.saliency_thr)).sum(dim=1)
+                    k_dyn = int(above.max().item())
+                    k_min = max(1, int(math.ceil(N * self.min_keep_ratio)))
+                    k_max = max(k_min, min(N, int(math.ceil(N * self.max_keep_ratio))))
+                    k = max(k_min, min(k_max, k_dyn))
         else:
             k = max(1, min(N, int(math.ceil(N * ratio))))
 
@@ -789,13 +846,14 @@ class HybridAxialMergerEncoder(nn.Module):
         self.cfg = cfg
         d_model = cfg.d_model
         d_ff = int(round(d_model * cfg.ffn_mult))
+        axial_d_ff = int(round(d_model * cfg.axial_ffn_mult))
         head_dim = d_model // cfg.n_heads
 
         self.axial_rope = AspectNormalizedRoPE1D(
             head_dim=head_dim, base=cfg.rope_base, coord_scale=cfg.rope_coord_scale
         )
         self.axial_layers = nn.ModuleList([
-            AxialEncoderLayer(d_model, cfg.n_heads, d_ff, dropout=cfg.dropout)
+            AxialEncoderLayer(d_model, cfg.n_heads, axial_d_ff, dropout=cfg.dropout)
             for _ in range(cfg.n_axial_layers)
         ])
 
@@ -897,7 +955,7 @@ class HybridAxialMergerEncoder(nn.Module):
         mid_idx = max(0, (n_global // 2) - 1)
         mem_global_mid = mem_post_merger
         for i, layer in enumerate(self.global_layers):
-            if use_ckpt and (mem.shape[0] * mem.shape[1] > 4000):
+            if use_ckpt and (mem.shape[0] * mem.shape[1] > 12000):
                 mem = _grad_ckpt(
                     lambda _m, _c, _s, _l=layer: _l(_m, rope_cos=_c, rope_sin=_s),
                     mem, cos2d, sin2d,
@@ -983,33 +1041,31 @@ def compute_sys_y_loss(
     sys_y_target: torch.Tensor,
     sys_y_mask: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
-    """Masked Smooth-L1 loss on ``<sys>`` normalized vertical center predictions.
+    """Branchless masked Smooth-L1 loss on ``<sys>`` normalized vertical center predictions.
 
-    Positions with ``sys_y_target < 0`` (or ``sys_y_mask == False``) are ignored.
+    Positions with ``sys_y_target < 0`` (or ``sys_y_mask == False``) are ignored
+    with zero CUDA-CPU synchronization.
     """
     valid = sys_y_target >= 0.0
     if sys_y_mask is not None:
         valid = valid & sys_y_mask.to(torch.bool)
-    if not bool(valid.any()):
-        return sys_y_pred.new_zeros(())
-    pred = sys_y_pred[valid].float()
-    tgt = sys_y_target[valid].float().clamp(0.0, 1.0)
-    return F.smooth_l1_loss(pred, tgt, beta=0.05).to(sys_y_pred.dtype)
+    valid_f = valid.float()
+    tgt = sys_y_target.float().clamp(0.0, 1.0)
+    per_elem = F.smooth_l1_loss(sys_y_pred.float(), tgt, beta=0.05, reduction="none")
+    loss = (per_elem * valid_f).sum() / valid_f.sum().clamp(min=1.0)
+    return loss.to(sys_y_pred.dtype)
 
 
 def compute_sys_count_loss(
     sys_count_pred: torch.Tensor,
     sys_count_target: torch.Tensor,
 ) -> torch.Tensor:
-    """Smooth-L1 loss on per-page system count ``N_sys`` (ignores ``target < 0``)."""
-    valid = sys_count_target >= 0.0
-    if not bool(valid.any()):
-        return sys_count_pred.new_zeros(())
-    return F.smooth_l1_loss(
-        sys_count_pred[valid].float(),
-        sys_count_target[valid].float(),
-        beta=0.5,
-    ).to(sys_count_pred.dtype)
+    """Branchless Smooth-L1 loss on per-page system count ``N_sys`` (ignores ``target < 0``)."""
+    valid_f = (sys_count_target >= 0.0).float()
+    tgt = sys_count_target.float().clamp(min=0.0)
+    per_elem = F.smooth_l1_loss(sys_count_pred.float(), tgt, beta=0.5, reduction="none")
+    loss = (per_elem * valid_f).sum() / valid_f.sum().clamp(min=1.0)
+    return loss.to(sys_count_pred.dtype)
 
 
 def compute_staff_seg_loss(
@@ -1043,7 +1099,13 @@ class GroupedQueryAttention(nn.Module):
     KV-cache RAM and memory bandwidth drop by ``n_heads / n_kv_heads`` (4x).
     """
 
-    def __init__(self, d_model: int, n_heads: int = 8, n_kv_heads: int = 2) -> None:
+    def __init__(
+        self,
+        d_model: int,
+        n_heads: int = 8,
+        n_kv_heads: int = 2,
+        use_native_gqa: bool = True,
+    ) -> None:
         super().__init__()
         if d_model % n_heads != 0:
             raise ValueError(f"d_model ({d_model}) must be divisible by n_heads ({n_heads})")
@@ -1055,6 +1117,7 @@ class GroupedQueryAttention(nn.Module):
         self.n_rep = n_heads // n_kv_heads
         self.head_dim = d_model // n_heads
         self.kv_dim = n_kv_heads * self.head_dim
+        self.use_native_gqa = bool(use_native_gqa)
 
         self.q_proj = nn.Linear(d_model, d_model, bias=False)
         self.k_proj = nn.Linear(d_model, self.kv_dim, bias=False)
@@ -1113,9 +1176,12 @@ class GroupedQueryAttention(nn.Module):
                 eff_mask = col_idx <= row_idx
                 use_causal_flag = False
 
-        k_exp = self._expand_kv(k)
-        v_exp = self._expand_kv(v)
-        out = _sdpa(q, k_exp, v_exp, attn_mask=eff_mask, is_causal=use_causal_flag)
+        if self.use_native_gqa and self.n_rep > 1:
+            out = _sdpa(q, k, v, attn_mask=eff_mask, is_causal=use_causal_flag, enable_gqa=True)
+        else:
+            k_exp = self._expand_kv(k)
+            v_exp = self._expand_kv(v)
+            out = _sdpa(q, k_exp, v_exp, attn_mask=eff_mask, is_causal=use_causal_flag, enable_gqa=False)
         out = out.transpose(1, 2).contiguous().view(B, Lq, self.d_model)
         out = self.o_proj(out)
         if use_cache:
@@ -1255,6 +1321,25 @@ class QATInt4ControllerV2(QATInt4Controller):
 # 5. UniOMRv2Net — Full Unified Model
 # ---------------------------------------------------------------------------
 
+class _CachedRoPE1D(RoPE1D):
+    """RoPE1D with power-of-2 cache pre-allocation (min 512) to avoid O(T^2) rebuilds in generate()."""
+
+    def forward(self, seq_len: int, device: torch.device, dtype: torch.dtype) -> Tuple[torch.Tensor, torch.Tensor]:
+        key = (device, dtype)
+        entry = self._cache.get(key)
+        if entry is None or entry[0] < seq_len:
+            alloc_len = max(512, 1 << (seq_len - 1).bit_length()) if seq_len > 0 else 512
+            pos = torch.arange(alloc_len, device=device, dtype=torch.float32)
+            freqs = torch.outer(pos, self.inv_freq.to(device))  # (L, D/2)
+            emb = torch.cat([freqs, freqs], dim=-1)  # (L, D)
+            cos = emb.cos().to(dtype)[None, None, :, :]
+            sin = emb.sin().to(dtype)[None, None, :, :]
+            self._cache[key] = (alloc_len, cos, sin)
+            return cos[:, :, :seq_len, :], sin[:, :, :seq_len, :]
+        _, cos, sin = entry
+        return cos[:, :, :seq_len, :], sin[:, :, :seq_len, :]
+
+
 class UniOMRv2Net(nn.Module):
     """UniOMR v2: Anisotropic FPN + Hybrid Axial/Merger/2D-RoPE Encoder + GQA MTP-4 Decoder."""
 
@@ -1287,7 +1372,7 @@ class UniOMRv2Net(nn.Module):
         # 4. GQA Causal Decoder + DeepStack Multi-Level Visual Injection + MTP-4
         pad_idx = PAD_ID if PAD_ID < c.vocab_size else (c.vocab_size - 4 if c.vocab_size >= 4 else None)
         self.tok_emb = nn.Embedding(c.vocab_size, c.d_model, padding_idx=pad_idx)
-        self.rope1d = RoPE1D(head_dim=head_dim, base=c.rope_base)
+        self.rope1d = _CachedRoPE1D(head_dim=head_dim, base=c.rope_base)
         self.deepstack_fusions = nn.ModuleList([
             DeepStackFusion(c.d_model) for _ in range(min(2, c.n_dec_layers))
         ])
@@ -1354,6 +1439,31 @@ class UniOMRv2Net(nn.Module):
 
         return mem_levels, aux_enc, router_info
 
+    def precompute_cross_kv(
+        self,
+        mem_levels: Any,
+    ) -> List[Tuple[None, Tuple[torch.Tensor, torch.Tensor]]]:
+        """Precompute DeepStackFusion + cross-attention K/V once per page for cached decoding."""
+        if isinstance(mem_levels, (tuple, list)):
+            mem_post_merger, mem_global_mid, mem_final = mem_levels
+            level_mems: Optional[Tuple[torch.Tensor, torch.Tensor]] = (mem_post_merger, mem_global_mid)
+        else:
+            mem_final = mem_levels
+            level_mems = None
+
+        past_kvs: List[Tuple[None, Tuple[torch.Tensor, torch.Tensor]]] = []
+        for idx, layer in enumerate(self.dec_layers):
+            if level_mems is not None and idx < len(self.deepstack_fusions):
+                layer_mem = self.deepstack_fusions[idx](mem_final, level_mems[idx])
+            else:
+                layer_mem = mem_final
+            ca = layer.cross_attn
+            B, Lk, _ = layer_mem.shape
+            k = ca.k_norm(ca.k_proj(layer_mem).view(B, Lk, ca.n_kv_heads, ca.head_dim)).transpose(1, 2)
+            v = ca.v_proj(layer_mem).view(B, Lk, ca.n_kv_heads, ca.head_dim).transpose(1, 2)
+            past_kvs.append((None, (k, v)))
+        return past_kvs
+
     def decode_tokens(
         self,
         tgt_ids: torch.Tensor,
@@ -1399,12 +1509,13 @@ class UniOMRv2Net(nn.Module):
             self.training
             and self.cfg.grad_checkpoint
             and torch.is_grad_enabled()
-            and (x.shape[0] * x.shape[1] > 2000)
+            and (x.shape[0] * x.shape[1] > 8000)
         )
         new_past_kvs: List[Any] = []
         for idx, layer in enumerate(self.dec_layers):
             layer_past = past_kvs[idx] if past_kvs is not None else None
-            if mem_final is None:
+            need_cross_kv = (not use_cache) or (layer_past is None) or (layer_past[1] is None)
+            if (not need_cross_kv) or (mem_final is None):
                 layer_mem = None
             elif level_mems is not None and idx < len(self.deepstack_fusions):
                 layer_mem = self.deepstack_fusions[idx](mem_final, level_mems[idx])
@@ -1458,14 +1569,14 @@ class UniOMRv2Net(nn.Module):
         B = images.shape[0]
         device = images.device
         cur_ids = torch.full((B, 1), BOS_ID, dtype=torch.long, device=device)
-        past_kvs: Optional[List[Any]] = None
+        past_kvs: Optional[List[Any]] = self.precompute_cross_kv(mem)
         finished = torch.zeros(B, dtype=torch.bool, device=device)
         out_tokens: List[torch.Tensor] = [cur_ids]
 
         for _ in range(max_len):
             logits, _, past_kvs = self.decode_tokens(
                 cur_ids,
-                memory=mem if past_kvs is None else None,
+                memory=None,
                 return_mtp=False,
                 return_aux=False,
                 past_kvs=past_kvs,

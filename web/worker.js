@@ -12,6 +12,8 @@ import {
   initMsczWasm,
   bekernToMscz,
   bekernToMusicXml,
+  bekernToMsczAndMusicXml,
+  validateBekernSyntax,
 } from './wasm/mscz_wasm.js';
 
 const ORT_CDN_BASE = 'https://cdn.jsdelivr.net/npm/onnxruntime-web@1.21.0/dist/';
@@ -1100,11 +1102,41 @@ function splitSystemIntoHeaderAndMeasures(sysText) {
   return { header, measures };
 }
 
-export function compileBekernWithFallback(rawBekern, title, { toMscz = bekernToMscz, toMusicXml = bekernToMusicXml, onWarn = null } = {}) {
+export function compileBekernWithFallback(
+  rawBekern,
+  title,
+  {
+    toMsczAndMusicXml = null,
+    toMscz = null,
+    toMusicXml = null,
+    validateSyntax = null,
+    onWarn = null,
+  } = {},
+) {
+  const hasCustomSplit = typeof toMscz === 'function' || typeof toMusicXml === 'function';
+  const effToMscz = toMscz ?? bekernToMscz;
+  const effToMusicXml = toMusicXml ?? bekernToMusicXml;
+  const compileBoth = typeof toMsczAndMusicXml === 'function'
+    ? toMsczAndMusicXml
+    : hasCustomSplit
+      ? (txt, t) => ({ msczBytes: effToMscz(txt, t), musicXml: effToMusicXml(txt, t) })
+      : bekernToMsczAndMusicXml;
+  const probeValid = typeof validateSyntax === 'function'
+    ? validateSyntax
+    : hasCustomSplit
+      ? (probe) => {
+          try {
+            effToMscz(probe, title);
+            return true;
+          } catch {
+            return false;
+          }
+        }
+      : validateBekernSyntax;
+
   const sanitized = sanitizeBekernForMscz(rawBekern);
   try {
-    const msczBytes = toMscz(sanitized, title);
-    const musicXml = toMusicXml(sanitized, title);
+    const { msczBytes, musicXml } = compileBoth(sanitized, title);
     return { msczBytes, musicXml, bekern: sanitized, usedFallback: false, droppedMeasures: 0 };
   } catch (firstErr) {
     if (typeof onWarn === 'function') {
@@ -1118,10 +1150,15 @@ export function compileBekernWithFallback(rawBekern, title, { toMscz = bekernToM
       const keptMeasures = [];
       for (const mToks of measures) {
         const probe = [...header, ...mToks].join(' ');
+        let ok = false;
         try {
-          toMscz(probe, title);
-          keptMeasures.push(mToks.join(' '));
+          ok = Boolean(probeValid(probe));
         } catch {
+          ok = false;
+        }
+        if (ok) {
+          keptMeasures.push(mToks.join(' '));
+        } else {
           droppedMeasures += 1;
         }
       }
@@ -1133,8 +1170,7 @@ export function compileBekernWithFallback(rawBekern, title, { toMscz = bekernToM
     }
     const recovered = keptSystems.join(' <sys> ');
     if (!recovered) throw firstErr;
-    const msczBytes = toMscz(recovered, title);
-    const musicXml = toMusicXml(recovered, title);
+    const { msczBytes, musicXml } = compileBoth(recovered, title);
     if (typeof onWarn === 'function') {
       onWarn(`mscz-rs measure-by-measure fallback succeeded (dropped ${droppedMeasures} malformed measure(s))`);
     }

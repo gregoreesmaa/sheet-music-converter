@@ -5,6 +5,8 @@
  *   - initMsczWasm(wasmUrl?) -> Promise<void>
  *   - bekernToMscz(bekernText, title?) -> Uint8Array
  *   - bekernToMusicXml(bekernText, title?) -> string
+ *   - bekernToMsczAndMusicXml(bekernText, title?) -> { msczBytes: Uint8Array, musicXml: string }
+ *   - validateBekernSyntax(bekernText) -> boolean
  *   - stitchPagesBekern(pages) -> string
  */
 
@@ -125,6 +127,71 @@ export function bekernToMscz(bekernText, title = '') {
 export function bekernToMusicXml(bekernText, title = '') {
   const bytes = callCompiler('bekern_to_musicxml', bekernText, title);
   return textDecoder.decode(bytes);
+}
+
+/**
+ * Compile a `bekern+` token stream into BOTH native MuseScore 4 `.mscz` bytes
+ * and a MusicXML 3.1 UTF-8 string in a single WASM parse pass.
+ * Automatically falls back to separate `bekernToMscz` + `bekernToMusicXml`
+ * calls if the loaded WASM binary does not export `bekern_to_mscz_and_musicxml`.
+ * @param {string} bekernText
+ * @param {string} [title]
+ * @returns {{ msczBytes: Uint8Array, musicXml: string }}
+ */
+export function bekernToMsczAndMusicXml(bekernText, title = '') {
+  if (!wasmExports) {
+    throw new Error('mscz-rs WASM not initialized; call await initMsczWasm() first');
+  }
+  if (typeof wasmExports.bekern_to_mscz_and_musicxml !== 'function') {
+    return {
+      msczBytes: bekernToMscz(bekernText, title),
+      musicXml: bekernToMusicXml(bekernText, title),
+    };
+  }
+  const framed = callCompiler('bekern_to_mscz_and_musicxml', bekernText, title);
+  if (framed.byteLength < 4) {
+    throw new Error('bekern_to_mscz_and_musicxml returned truncated frame');
+  }
+  const view = new DataView(framed.buffer, framed.byteOffset, framed.byteLength);
+  const msczLen = view.getUint32(0, true);
+  if (4 + msczLen > framed.byteLength) {
+    throw new Error(`bekern_to_mscz_and_musicxml invalid frame length (${msczLen} > ${framed.byteLength - 4})`);
+  }
+  const msczBytes = framed.slice(4, 4 + msczLen);
+  const musicXml = textDecoder.decode(framed.subarray(4 + msczLen));
+  return { msczBytes, musicXml };
+}
+
+/**
+ * Fast parse-only syntax validator for `bekern+` streams (skips `.mscx`/MusicXML/ZIP).
+ * Automatically falls back to `bekernToMscz` if the loaded WASM binary does not
+ * export `validate_bekern_syntax`.
+ * @param {string} bekernText
+ * @returns {boolean}
+ */
+export function validateBekernSyntax(bekernText) {
+  if (!wasmExports) {
+    throw new Error('mscz-rs WASM not initialized; call await initMsczWasm() first');
+  }
+  if (typeof wasmExports.validate_bekern_syntax !== 'function') {
+    try {
+      bekernToMscz(bekernText, '');
+      return true;
+    } catch {
+      return false;
+    }
+  }
+  const { memory, wasm_alloc, wasm_free, validate_bekern_syntax } = wasmExports;
+  const bytes = textEncoder.encode(String(bekernText ?? ''));
+  const ptr = wasm_alloc(bytes.length);
+  try {
+    if (bytes.length > 0) {
+      new Uint8Array(memory.buffer, ptr, bytes.length).set(bytes);
+    }
+    return validate_bekern_syntax(ptr, bytes.length) === 1;
+  } finally {
+    wasm_free(ptr, bytes.length);
+  }
 }
 
 /**
