@@ -12,6 +12,56 @@ const SAMPLE_BEKERN =
   'clef-G-2 key+1 time-4-4 quarter G 4 quarter A 4 eighth B 4 eighth C 5 quarter D 5 bar ' +
   'half E 5 quarter D 5 quarter C 5 bar quarter B 4 quarter A 4 half G 4 bar-light-heavy';
 
+// --- Crude Rollbar-like client error & console log forwarder (POST /__log) ---
+const CLIENT_SESSION_ID = Math.random().toString(36).slice(2, 10);
+function sendClientLog(level, msg, extra = null, src = 'ui') {
+  try {
+    const body = JSON.stringify({
+      sid: CLIENT_SESSION_ID,
+      level,
+      src,
+      msg: String(msg ?? '').slice(0, 4000),
+      extra: extra ? JSON.parse(JSON.stringify(extra, (_, v) => (v instanceof Error ? { name: v.name, message: v.message, stack: v.stack } : v))) : undefined,
+      href: location.href,
+    });
+    if (navigator.sendBeacon) {
+      navigator.sendBeacon('/__log', new Blob([body], { type: 'application/json' }));
+    } else {
+      fetch('/__log', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body, keepalive: true }).catch(() => {});
+    }
+  } catch (_) {}
+}
+for (const lvl of ['error', 'warn']) {
+  const orig = console[lvl].bind(console);
+  console[lvl] = (...args) => {
+    orig(...args);
+    const text = args.map((a) => (a instanceof Error ? `${a.name}: ${a.message}\n${a.stack || ''}` : typeof a === 'object' ? (() => { try { return JSON.stringify(a); } catch { return String(a); } })() : String(a))).join(' ');
+    sendClientLog(lvl, text);
+  };
+}
+window.addEventListener('error', (ev) => {
+  sendClientLog('error', ev.message || 'window.error', {
+    filename: ev.filename,
+    lineno: ev.lineno,
+    colno: ev.colno,
+    stack: ev.error?.stack,
+  });
+});
+window.addEventListener('unhandledrejection', (ev) => {
+  const r = ev.reason;
+  sendClientLog('error', r instanceof Error ? `${r.name}: ${r.message}` : String(r), {
+    type: 'unhandledrejection',
+    stack: r?.stack,
+  });
+});
+sendClientLog('info', 'client_boot', {
+  ua: navigator.userAgent,
+  isSecureContext: window.isSecureContext,
+  crossOriginIsolated: window.crossOriginIsolated,
+  hasSAB: typeof SharedArrayBuffer !== 'undefined',
+  hasWebGPU: typeof navigator.gpu !== 'undefined',
+});
+
 // DOM refs
 const els = {
   badgeBackend: document.getElementById('badge-backend'),

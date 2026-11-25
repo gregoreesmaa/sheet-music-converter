@@ -17,6 +17,28 @@ import {
 const ORT_CDN_BASE = 'https://cdn.jsdelivr.net/npm/onnxruntime-web@1.20.1/dist/';
 const ORT_ESM_URL = `${ORT_CDN_BASE}ort.webgpu.min.mjs`;
 
+// --- Crude Rollbar-like worker error & console forwarder (POST /__log) ---
+function sendWorkerLog(level, msg, extra = null) {
+  try {
+    const body = JSON.stringify({ level, src: 'worker', msg: String(msg ?? '').slice(0, 4000), extra: extra || undefined });
+    fetch('/__log', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body }).catch(() => {});
+  } catch (_) {}
+}
+for (const lvl of ['error', 'warn']) {
+  const orig = console[lvl].bind(console);
+  console[lvl] = (...args) => {
+    orig(...args);
+    sendWorkerLog(lvl, args.map((a) => (a instanceof Error ? `${a.name}: ${a.message}\n${a.stack || ''}` : String(a))).join(' '));
+  };
+}
+self.addEventListener('error', (ev) => {
+  sendWorkerLog('error', ev.message || 'worker.error', { filename: ev.filename, lineno: ev.lineno, stack: ev.error?.stack });
+});
+self.addEventListener('unhandledrejection', (ev) => {
+  const r = ev.reason;
+  sendWorkerLog('error', r instanceof Error ? `${r.name}: ${r.message}` : String(r), { type: 'unhandledrejection', stack: r?.stack });
+});
+
 const state = {
   ort: null,
   wasmReady: false,

@@ -14,6 +14,8 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import datetime
+import json
 import os
 import socket
 import ssl
@@ -22,6 +24,9 @@ import threading
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import unquote
+
+_LOG_LOCK = threading.Lock()
+_CLIENT_LOG_PATH: Path | None = None
 
 
 class StaticIsolatedHandler(SimpleHTTPRequestHandler):
@@ -60,6 +65,40 @@ class StaticIsolatedHandler(SimpleHTTPRequestHandler):
             self.send_error(403, "Forbidden")
             return
         super().do_HEAD()
+
+    def do_POST(self) -> None:
+        """Crude Rollbar-like client telemetry/error sink (POST /__log)."""
+        clean_path = self.path.split("?", 1)[0]
+        if clean_path != "/__log":
+            self.send_error(404, "Not Found")
+            return
+        try:
+            length = min(65536, max(0, int(self.headers.get("Content-Length", "0"))))
+            raw = self.rfile.read(length) if length > 0 else b""
+            try:
+                payload = json.loads(raw.decode("utf-8", errors="replace")) if raw else {}
+            except Exception:
+                payload = {"msg": raw.decode("utf-8", errors="replace")[:2000]}
+            if not isinstance(payload, dict):
+                payload = {"msg": str(payload)[:2000]}
+            rec = {
+                "ts": datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds"),
+                "ip": self.client_address[0] if self.client_address else "unknown",
+                **payload,
+            }
+            level = str(rec.get("level", "info")).upper()
+            src = str(rec.get("src", "ui"))
+            msg = str(rec.get("msg", ""))[:500]
+            print(f"[CLIENT {level} | {rec['ip']} | {src}] {msg}", flush=True)
+            if _CLIENT_LOG_PATH is not None:
+                line = json.dumps(rec, ensure_ascii=False) + "\n"
+                with _LOG_LOCK:
+                    with _CLIENT_LOG_PATH.open("a", encoding="utf-8") as f:
+                        f.write(line)
+        except Exception as exc:
+            print(f"[CLIENT LOG ERR] {exc}", file=sys.stderr, flush=True)
+        self.send_response(204)
+        self.end_headers()
 
     def end_headers(self) -> None:
         # Required for SharedArrayBuffer (multi-threaded ORT WASM) + WebGPU isolation.
@@ -132,6 +171,8 @@ def main() -> None:
     cert_path = (args.cert or (serve_dir / "certs" / "telkutaga.crt")).resolve()
     key_path = (args.key or (serve_dir / "certs" / "telkutaga.key")).resolve()
 
+    global _CLIENT_LOG_PATH
+    _CLIENT_LOG_PATH = serve_dir / "client_logs.jsonl"
     os.chdir(serve_dir)
     lan_ip = detect_lan_ip()
 
