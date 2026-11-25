@@ -324,6 +324,22 @@ class PrefixState:
             return True
         return prev_tok is not None and (prev_tok in BAR_LIKES or prev_tok in BAR_LEFT)
 
+    def _header_attr_ok(self):
+        """Allow key*/time-* at system start, bar start, or full-bar end (courtesy change).
+
+        Forbids stray mid-bar key*/time-* emitted after a note/rest inside an
+        incomplete bar (0 < cur_used < tsig - eps), while preserving opening
+        headers, post-barline changes, and full-bar courtesy changes.
+        """
+        if self.header_open:
+            return True
+        cur_used = self.vcurs[self.seg] + self._pending_value()
+        if cur_used <= _BAR_EPS:
+            return True
+        if self.tsig is not None and cur_used >= self.tsig - _BAR_EPS:
+            return True
+        return False
+
     def _drain(self):
         self.depth[self.seg] += self.pending
         self.pending = 0
@@ -332,11 +348,13 @@ class PrefixState:
         if t in CLEFS or t in KEYS or t in TIMES or (
                 self.allow_percussion_tab and t in TAB_CLEFS):
             # Mid-stream attribute changes (bekern+): clef/key/time
-            # may appear at any measure start (or mid-measure voice
-            # cursor). A time token retunes the books at a true
-            # barline (all cursors idle); a courtesy change mid-bar
-            # must not poison the running books, so it is stashed
+            # may appear at any measure start (or courtesy end of a full
+            # measure). Forbid stray key*/time-* inside an incomplete bar.
+            # A time token retunes the books at a true barline (all
+            # cursors idle); a courtesy change at full-bar end is stashed
             # and applied at the next barline instead.
+            if (t in KEYS or t in TIMES) and not self._header_attr_ok():
+                raise ValueError('spurious mid-bar header %r' % t)
             if t in SHORT_PICKUP_TIMES:
                 prev_tok = self.recent[-2] if len(self.recent) >= 2 else None
                 if not self._short_pickup_time_ok(prev_tok):
@@ -629,22 +647,68 @@ class PrefixState:
         self.ev_chord = False
         self.ev_grace = False
 
-    def cycle_forbidden(self, max_repeats=12):
-        """Token STRING that would extend a tight cycle past ``max_repeats``.
+    def cycle_forbidden(
+        self,
+        max_repeats=12,
+        ngram_min=8,
+        ngram_max=16,
+        max_ngram_repeats=3,
+        bar_ngram_max=64,
+    ):
+        """Token STRING that would extend a tight cycle or n-gram loop.
 
-        Returns the single forbidden continuation token, or None. Only
-        exact adjacent repeats of a short period (<= 24 tokens, >=
-        ``max_repeats`` back-to-back repeats) count — musical repeats
-        separated by other material, and bounded ostinati (corpus max
-        10 adjacent repeats), never trigger. Suspended while the header
-        is open (headers legitimately cycle clef/key/time per staff).
+        Returns the single forbidden continuation token, or None. Checks:
+        1. Identical 8-to-16-token pattern repeated ``max_ngram_repeats`` (3)
+           consecutive times (blocks the 4th consecutive repeat while keeping
+           real musical ostinatos up to 3 repeats legal).
+        2. Identical bar-containing pattern of length 17..64 repeated
+           ``max_ngram_repeats`` (3) consecutive times (kills verbatim
+           multi-bar loops without touching non-bar ostinatos).
+        3. Exact adjacent repeats of any short period (1..24 tokens) past
+           ``max_repeats`` (12) consecutive repeats.
+
+        Suspended while the header is open (headers legitimately cycle
+        clef/key/time per staff).
         """
         if self.header_open:
             return None
         r = self.recent
         n = len(r)
+        # 1. Conservative 8..16-token n-gram loop guard (>3 consecutive repeats)
+        for p in range(ngram_min, ngram_max + 1):
+            if n < max_ngram_repeats * p:
+                continue
+            if r[n - p] != r[n - 2 * p]:
+                continue
+            base = r[n - p:]
+            ok = True
+            for k in range(1, max_ngram_repeats):
+                if r[n - (k + 1) * p:n - k * p] != base:
+                    ok = False
+                    break
+            if ok:
+                return base[0]
+        # 2. Verbatim bar-level loop guard for longer measures (17..64 tokens, >3x)
+        for p in range(ngram_max + 1, bar_ngram_max + 1):
+            if n < max_ngram_repeats * p:
+                continue
+            if r[n - p] != r[n - 2 * p]:
+                continue
+            base = r[n - p:]
+            if not any(tok in BAR_LIKES for tok in base):
+                continue
+            ok = True
+            for k in range(1, max_ngram_repeats):
+                if r[n - (k + 1) * p:n - k * p] != base:
+                    ok = False
+                    break
+            if ok:
+                return base[0]
+        # 3. General short-period tight-cycle guard (1..24 tokens, >= max_repeats)
         for p in range(1, 25):
             if n < max_repeats * p:
+                continue
+            if r[n - p] != r[n - 2 * p]:
                 continue
             base = r[n - p:]
             ok = True
@@ -712,12 +776,15 @@ class PrefixState:
             if (placed if placed is not None else self.seg_last[self.seg]) \
                     and self.chords_on_onset < MAX_CHORDS_PER_ONSET:
                 allow.add(vm[CHORD])
-            allow.update(vm[t] for t in CLEFS | KEYS if t in vm)
-            prev_tok = self.recent[-1] if self.recent else None
-            short_ok = self._short_pickup_time_ok(prev_tok)
-            for t in TIMES:
-                if t in vm and (short_ok or t not in SHORT_PICKUP_TIMES):
-                    allow.add(vm[t])
+            allow.update(vm[t] for t in CLEFS if t in vm)
+            hdr_ok = self._header_attr_ok()
+            if hdr_ok:
+                allow.update(vm[t] for t in KEYS if t in vm)
+                prev_tok = self.recent[-1] if self.recent else None
+                short_ok = self._short_pickup_time_ok(prev_tok)
+                for t in TIMES:
+                    if t in vm and (short_ok or t not in SHORT_PICKUP_TIMES):
+                        allow.add(vm[t])
             if self.grace_run < MAX_CONSECUTIVE_GRACE:
                 allow.add(vm[GRACE])
             allow.update(vm[t] for t in DYNS | HAIRS | BAR_LEFT if t in vm)

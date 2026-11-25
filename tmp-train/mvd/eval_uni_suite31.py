@@ -23,6 +23,7 @@ from __future__ import annotations
 import argparse
 import contextlib
 from dataclasses import asdict, fields
+import difflib
 import json
 import statistics
 import sys
@@ -235,6 +236,193 @@ def _truncate_past_kvs(
     return trimmed
 
 
+def compute_token_lcs_f1(ref_toks: Sequence[str], hyp_toks: Sequence[str]) -> float:
+    """Ordered token LCS F1 (``2 * matches / (|ref| + |hyp|)``) via SequenceMatcher.
+
+    Unlike bag-of-tokens F1, ordered LCS F1 penalizes token loops and
+    mis-ordered repetitions directly.
+    """
+    if not ref_toks and not hyp_toks:
+        return 1.0
+    if not ref_toks or not hyp_toks:
+        return 0.0
+    sm = difflib.SequenceMatcher(a=list(ref_toks), b=list(hyp_toks), autojunk=False)
+    matches = sum(block.size for block in sm.get_matching_blocks())
+    return 2.0 * float(matches) / float(len(ref_toks) + len(hyp_toks))
+
+
+def _measure_violation_errors(state: grammar.PrefixState) -> Tuple[float, float]:
+    """Return ``(meter_err, voice_err)`` for the measure about to close in ``state``.
+
+    * ``meter_err``: max ``|vcurs[v] - tsig|`` over active voices (0.0 if no tsig).
+    * ``voice_err``: max ``|vcurs[v] - vcurs[active[0]]|`` over active voices
+      when multiple voices are present (0.0 for single-voice bars).
+    """
+    eff_vcurs = list(state.vcurs)
+    if 0 <= state.seg < len(eff_vcurs):
+        eff_vcurs[state.seg] += state._pending_value()
+    active = [
+        i for i, v in enumerate(eff_vcurs)
+        if v > grammar._BAR_EPS or (i + 1) in state.opened
+    ]
+    if not active:
+        active = [0]
+
+    meter_err = 0.0
+    if state.tsig is not None:
+        meter_err = max(abs(eff_vcurs[v] - state.tsig) for v in active)
+
+    voice_err = 0.0
+    if len(active) > 1:
+        ref_v = eff_vcurs[active[0]]
+        voice_err = max(abs(eff_vcurs[v] - ref_v) for v in active[1:])
+
+    return float(meter_err), float(voice_err)
+
+
+@torch.no_grad()
+def _beam_repair_measure(
+    model: uni_omr.UniOMRNet,
+    kv_prefix: List[Any],
+    base_cross_kvs: List[Tuple[torch.Tensor, torch.Tensor]],
+    trigger_id: int,
+    bar_start_state: grammar.PrefixState,
+    beam_size: int,
+    max_bar_toks: int,
+    vocab_size: int,
+    use_grammar: bool,
+    strict_grammar: bool,
+    device: torch.device,
+) -> Tuple[Optional[List[int]], Optional[grammar.PrefixState], List[Any], float]:
+    """Run a ``beam_size``-beam search over one measure starting after ``trigger_id``.
+
+    Scores each closed measure by ``log_prob - 6.0 * meter_err - 4.0 * voice_err``.
+    Returns ``(best_toks, best_state, kv0, best_score)`` where ``kv0`` covers
+    ``kv_prefix + [trigger_id]`` (so caller can fast-prefill ``best_toks[:-1]``).
+    If no beam closes a bar within ``max_bar_toks``, returns ``(None, None, kv0, -inf)``.
+    """
+    _, _, eos_id, sys_id, _, id_to_tok = _vocab_spec(vocab_size)
+    trig_t = torch.tensor([[trigger_id]], dtype=torch.long, device=device)
+    logits0, _, kv0 = model.decode_tokens(
+        trig_t,
+        memory=None,
+        return_mtp=False,
+        past_kvs=kv_prefix,
+        use_cache=True,
+    )
+    if max_bar_toks <= 0:
+        return None, None, kv0, float("-inf")
+
+    # Active beams: (bar_toks, raw_log_prob, grammar_state)
+    active_beams: List[Tuple[List[int], float, grammar.PrefixState]] = [
+        ([], 0.0, bar_start_state.copy())
+    ]
+    # Finished bars: (score, raw_log_prob, bar_toks, end_state)
+    finished_bars: List[Tuple[float, float, List[int], grammar.PrefixState]] = []
+
+    step_logits = logits0[:, -1, :]  # (1, V)
+    past_kvs: List[Any] = kv0
+    k_per_beam = min(vocab_size, beam_size + 1)
+
+    for step_idx in range(max_bar_toks):
+        if step_idx > 0:
+            cur_ids = torch.tensor(
+                [[b_toks[-1]] for b_toks, _, _ in active_beams],
+                dtype=torch.long,
+                device=device,
+            )
+            logits, _, past_kvs = model.decode_tokens(
+                cur_ids,
+                memory=None,
+                return_mtp=False,
+                past_kvs=past_kvs,
+                use_cache=True,
+            )
+            step_logits = logits[:, -1, :]  # (n_active, V)
+
+        step_lp = F.log_softmax(step_logits.float(), dim=-1)  # (n_active, V)
+        candidates: List[Tuple[float, int, int]] = []  # (raw_lp, parent_idx, tok_id)
+
+        for i, (_, beam_lp, beam_state) in enumerate(active_beams):
+            row_logits = step_logits[i]
+            row_lp = step_lp[i]
+            used_mask = False
+            if use_grammar:
+                allowed = _allowed_ids_for_state(beam_state, vocab_size)
+                if allowed:
+                    idx_t = torch.tensor(allowed, dtype=torch.long, device=device)
+                    sub_logits = row_logits.index_select(0, idx_t)
+                    if bool(torch.isfinite(sub_logits).any()):
+                        sub_lp = row_lp.index_select(0, idx_t)
+                        k_take = min(k_per_beam, len(allowed))
+                        top_vals, top_pos = torch.topk(sub_lp, k=k_take, dim=-1)
+                        for val_t, pos_t in zip(top_vals.tolist(), top_pos.tolist()):
+                            tok_id = int(allowed[int(pos_t)])
+                            candidates.append((beam_lp + float(val_t), i, tok_id))
+                        used_mask = True
+            if not used_mask:
+                k_take = min(k_per_beam, vocab_size)
+                top_vals, top_ids = torch.topk(row_lp, k=k_take, dim=-1)
+                for val_t, tid_t in zip(top_vals.tolist(), top_ids.tolist()):
+                    candidates.append((beam_lp + float(val_t), i, int(tid_t)))
+
+        if not candidates:
+            break
+
+        candidates.sort(key=lambda c: c[0], reverse=True)
+        next_active: List[Tuple[List[int], float, grammar.PrefixState]] = []
+        next_parents: List[int] = []
+
+        for rank, (raw_lp, parent_i, tok_id) in enumerate(candidates):
+            p_toks, _, p_state = active_beams[parent_i]
+            new_toks = p_toks + [tok_id]
+            tok_str = id_to_tok.get(tok_id)
+            is_bar_close = tok_str in grammar.BAR_LIKES
+            is_end = is_bar_close or tok_id == eos_id or tok_id == sys_id
+
+            if is_end:
+                meter_err, voice_err = _measure_violation_errors(p_state)
+                score = raw_lp - 6.0 * meter_err - 4.0 * voice_err
+                end_state = _advance_grammar_state(
+                    p_state.copy(), tok_id, strict=strict_grammar, vocab_size=vocab_size
+                )
+                finished_bars.append((score, raw_lp, new_toks, end_state))
+                continue
+
+            if len(next_active) < beam_size:
+                c_state = _advance_grammar_state(
+                    p_state.copy(), tok_id, strict=strict_grammar, vocab_size=vocab_size
+                )
+                next_active.append((new_toks, raw_lp, c_state))
+                next_parents.append(parent_i)
+
+            if len(next_active) >= beam_size and rank >= beam_size * 2:
+                break
+
+        active_beams = next_active
+        if not active_beams:
+            break
+
+        # Exact upper bound: future log_prob <= 0 and meter_err, voice_err >= 0.
+        if len(finished_bars) >= beam_size:
+            best_fin_score = max(f[0] for f in finished_bars)
+            best_act_lp = max(a[1] for a in active_beams)
+            if best_fin_score >= best_act_lp:
+                break
+
+        if step_idx + 1 < max_bar_toks:
+            parent_idx_t = torch.tensor(next_parents, dtype=torch.long, device=device)
+            past_kvs = _reorder_beam_kvs(past_kvs, parent_idx_t, base_cross_kvs)
+
+    if not finished_bars:
+        return None, None, kv0, float("-inf")
+
+    best_score, _, best_toks, best_state = max(
+        finished_bars, key=lambda f: (f[0], f[1])
+    )
+    return best_toks, best_state, kv0, float(best_score)
+
+
 @contextlib.contextmanager
 def override_max_keep_ratio(
     model: uni_omr.UniOMRNet,
@@ -337,6 +525,8 @@ def generate_mtp_spec(
     strict_grammar: bool = False,
     keep_ratio_override: Optional[float] = None,
     return_stats: bool = True,
+    measure_beam_size: int = 0,
+    max_bar_toks: int = 120,
 ) -> Any:
     """MTP-k self-speculative KV-cached decoding using ``model.mtp_heads``.
 
@@ -346,20 +536,78 @@ def generate_mtp_spec(
     length), and guarantees exact token-for-token parity with standard greedy
     ``model.generate()`` (or ``generate_constrained()`` when ``use_grammar=True``).
 
+    When ``measure_beam_size > 1``, tracks measure boundaries and, whenever an
+    interior closed measure violates meter or cross-voice duration conservation,
+    rewinds KV cache to the bar start, runs a ``measure_beam_size``-beam search
+    scored by ``log_prob - 6.0 * meter_err - 4.0 * voice_err``, and resumes
+    fast MTP-k decoding from the winning measure.
+
     Returns:
         ``(seq_ids, stats)`` when ``return_stats=True``, else ``seq_ids``.
     """
     t0 = time.perf_counter()
+    B = int(images.shape[0])
+    device = images.device
+    vocab_size = int(model.cfg.vocab_size)
+    pad_id, bos_id, eos_id, sys_id, tok_to_id, id_to_tok = _vocab_spec(vocab_size)
+    use_measure_beam = int(measure_beam_size) > 1
+
+    # For B > 1 with measure-scoped beam search, run each item independently and pad.
+    if use_measure_beam and B > 1:
+        seqs_b: List[torch.Tensor] = []
+        tot_prop = 0
+        tot_acc = 0
+        tot_passes = 0
+        tot_triggers = 0
+        tot_repaired = 0
+        last_router_info: Dict[str, Any] = {}
+        for b in range(B):
+            s_b, st_b = generate_mtp_spec(
+                model,
+                images[b : b + 1],
+                max_len=max_len,
+                use_grammar=use_grammar,
+                strict_grammar=strict_grammar,
+                keep_ratio_override=keep_ratio_override,
+                return_stats=True,
+                measure_beam_size=measure_beam_size,
+                max_bar_toks=max_bar_toks,
+            )
+            seqs_b.append(s_b[0])
+            tot_prop += int(st_b["draft_proposed"])
+            tot_acc += int(st_b["draft_accepted"])
+            tot_passes += int(st_b["verify_passes"])
+            tot_triggers += int(st_b.get("measure_beam_triggers", 0))
+            tot_repaired += int(st_b.get("measure_beam_repaired", 0))
+            last_router_info = st_b.get("router_info", {})
+        max_out = max(int(s.shape[0]) for s in seqs_b)
+        seq = torch.full((B, max_out), pad_id, dtype=torch.long, device=device)
+        for b, s in enumerate(seqs_b):
+            seq[b, : int(s.shape[0])] = s
+        elapsed = max(1e-6, time.perf_counter() - t0)
+        total_gen_toks = int((seq[:, 1:] != pad_id).sum().item())
+        stats = {
+            "mtp_k": 1 + len(model.mtp_heads),
+            "draft_proposed": tot_prop,
+            "draft_accepted": tot_acc,
+            "acceptance_rate": round(tot_acc / max(1, tot_prop), 6) if tot_prop > 0 else 0.0,
+            "verify_passes": tot_passes,
+            "tokens_generated": total_gen_toks,
+            "mean_tokens_per_pass": round(total_gen_toks / max(1, tot_passes), 3),
+            "elapsed_secs": round(elapsed, 6),
+            "tokens_per_sec": round(total_gen_toks / elapsed, 2),
+            "measure_beam_triggers": tot_triggers,
+            "measure_beam_repaired": tot_repaired,
+            "router_info": last_router_info,
+        }
+        return (seq, stats) if return_stats else seq
+
     mem, _, router_info = model.encode_image(
         images,
         keep_ratio_override=keep_ratio_override,
         return_aux=False,
     )
-    B = int(images.shape[0])
-    device = images.device
     n_mtp = len(model.mtp_heads)
-    vocab_size = int(model.cfg.vocab_size)
-    pad_id, bos_id, eos_id, _, tok_to_id, _ = _vocab_spec(vocab_size)
 
     bos = torch.full((B, 1), bos_id, dtype=torch.long, device=device)
     if max_len <= 0:
@@ -373,6 +621,8 @@ def generate_mtp_spec(
             "mean_tokens_per_pass": 0.0,
             "elapsed_secs": max(1e-6, time.perf_counter() - t0),
             "tokens_per_sec": 0.0,
+            "measure_beam_triggers": 0,
+            "measure_beam_repaired": 0,
             "router_info": router_info,
         }
         return (bos, stats) if return_stats else bos
@@ -380,10 +630,19 @@ def generate_mtp_spec(
     finished = [False] * B
     states = (
         [grammar.PrefixState(strict=strict_grammar, vocab_map=tok_to_id) for _ in range(B)]
-        if use_grammar
+        if (use_grammar or use_measure_beam)
         else None
     )
     out_tokens: List[torch.Tensor] = [bos]
+
+    # Measure-scoped beam tracking state (B == 1 when use_measure_beam is True).
+    bar_idx = 0
+    bar_start_idx = 1
+    bar_start_state: Optional[grammar.PrefixState] = (
+        states[0].copy() if (use_measure_beam and states is not None) else None
+    )
+    measure_beam_triggers = 0
+    measure_beam_repaired = 0
 
     def _pick_step(step_logits: torch.Tensor) -> torch.Tensor:
         if not use_grammar:
@@ -401,19 +660,52 @@ def generate_mtp_spec(
                 picked.append(_select_constrained_token(step_logits[b], states[b]))
         return torch.tensor(picked, dtype=torch.long, device=device)
 
-    def _commit_token(tok: torch.Tensor) -> None:
+    def _commit_token(tok: torch.Tensor) -> bool:
+        """Append ``tok``, advance grammar state, and return True if measure-beam triggers."""
+        nonlocal bar_idx, bar_start_idx, bar_start_state
         out_tokens.append(tok.unsqueeze(1))
+        trigger_repair = False
         for b in range(B):
             if finished[b]:
                 continue
             tid = int(tok[b].item())
             if tid == eos_id:
                 finished[b] = True
+                continue
+            if states is None:
+                continue
+            if use_measure_beam and b == 0:
+                tok_str = id_to_tok.get(tid)
+                is_bar_close = tok_str in grammar.BAR_LIKES
+                if is_bar_close:
+                    bar_len = len(out_tokens) - bar_start_idx
+                    if (
+                        bar_idx >= 1
+                        and tok_str != "bar-light-heavy"
+                        and 1 <= bar_len <= max_bar_toks
+                    ):
+                        meter_err, voice_err = _measure_violation_errors(states[0])
+                        if meter_err > 1e-3 or voice_err > 1e-3:
+                            trigger_repair = True
+                    states[0] = _advance_grammar_state(
+                        states[0], tid, strict=strict_grammar, vocab_size=vocab_size
+                    )
+                    if not trigger_repair:
+                        bar_idx += 1
+                        bar_start_idx = len(out_tokens)
+                        bar_start_state = states[0].copy()
+                else:
+                    states[0] = _advance_grammar_state(
+                        states[0], tid, strict=strict_grammar, vocab_size=vocab_size
+                    )
+                    if tid == sys_id or states[0].header_open:
+                        bar_start_idx = len(out_tokens)
+                        bar_start_state = states[0].copy()
             elif use_grammar:
-                assert states is not None
                 states[b] = _advance_grammar_state(
                     states[b], tid, strict=strict_grammar, vocab_size=vocab_size
                 )
+        return trigger_repair
 
     def _extract_drafts(mtp_logits_list: List[torch.Tensor], pos_idx: int) -> List[torch.Tensor]:
         drafts_out: List[torch.Tensor] = []
@@ -433,6 +725,15 @@ def generate_mtp_spec(
         past_kvs=None,
         use_cache=True,
     )
+    base_cross_kvs: List[Tuple[torch.Tensor, torch.Tensor]] = []
+    if use_measure_beam:
+        for _, cross_kv in past_kvs:
+            ck, cv = cross_kv
+            base_cross_kvs.append((
+                ck.expand(measure_beam_size, -1, -1, -1).contiguous(),
+                cv.expand(measure_beam_size, -1, -1, -1).contiguous(),
+            ))
+
     cur_tok = _pick_step(logits0[:, -1, :])
     _commit_token(cur_tok)
     gen_len = 1
@@ -441,6 +742,68 @@ def generate_mtp_spec(
     draft_proposed = 0
     draft_accepted = 0
     verify_passes = 1  # counts prefill pass
+
+    def _apply_measure_repair(cur_kv: List[Any]) -> None:
+        nonlocal gen_len, past_kvs, cur_tok, drafts
+        nonlocal bar_idx, bar_start_idx, bar_start_state
+        nonlocal measure_beam_triggers, measure_beam_repaired
+        assert states is not None and bar_start_state is not None
+        measure_beam_triggers += 1
+        orig_bar_toks = [int(t[0, 0].item()) for t in out_tokens[bar_start_idx:]]
+        kv_prefix = _truncate_past_kvs(cur_kv, bar_start_idx - 1)
+        trigger_id = int(out_tokens[bar_start_idx - 1][0, 0].item())
+        rem_steps = min(max_bar_toks, max_len - (bar_start_idx - 1))
+
+        best_toks, best_state, kv0, _ = _beam_repair_measure(
+            model=model,
+            kv_prefix=kv_prefix,
+            base_cross_kvs=base_cross_kvs,
+            trigger_id=trigger_id,
+            bar_start_state=bar_start_state,
+            beam_size=int(measure_beam_size),
+            max_bar_toks=rem_steps,
+            vocab_size=vocab_size,
+            use_grammar=use_grammar,
+            strict_grammar=strict_grammar,
+            device=device,
+        )
+        if best_toks is not None and best_state is not None:
+            if best_toks != orig_bar_toks:
+                measure_beam_repaired += 1
+            out_tokens[bar_start_idx:] = [
+                torch.tensor([[t]], dtype=torch.long, device=device) for t in best_toks
+            ]
+            gen_len = len(out_tokens) - 1
+            states[0] = best_state
+            if best_toks[-1] == eos_id:
+                finished[0] = True
+                past_kvs = kv0
+                drafts = []
+            else:
+                if len(best_toks) > 1:
+                    prefill_ids = torch.tensor(
+                        [best_toks[:-1]], dtype=torch.long, device=device
+                    )
+                    _, _, past_kvs = model.decode_tokens(
+                        prefill_ids,
+                        memory=None,
+                        return_mtp=False,
+                        past_kvs=kv0,
+                        use_cache=True,
+                    )
+                else:
+                    past_kvs = kv0
+                cur_tok = torch.tensor([best_toks[-1]], dtype=torch.long, device=device)
+                drafts = []
+        else:
+            # Fallback: keep original greedy measure and resume cleanly.
+            past_kvs = _truncate_past_kvs(cur_kv, len(out_tokens) - 1)
+            cur_tok = out_tokens[-1].squeeze(1)
+            drafts = []
+
+        bar_idx += 1
+        bar_start_idx = len(out_tokens)
+        bar_start_state = states[0].copy()
 
     # Invariant at top of loop:
     #   - out_tokens has [BOS, tok_1, ..., tok_{gen_len}]
@@ -480,32 +843,42 @@ def generate_mtp_spec(
                         draft_j[b] = pad_id
 
             if bool((target_j == draft_j).all()):
-                _commit_token(draft_j)
+                trig = _commit_token(draft_j)
                 gen_len += 1
                 n_acc += 1
                 draft_accepted += 1
+                if trig:
+                    _apply_measure_repair(new_past_kvs)
+                    mismatched = True
+                    break
                 if all(finished):
                     past_kvs = _truncate_past_kvs(new_past_kvs, past_len + 1 + n_acc)
                     mismatched = True
                     break
             else:
                 # First mismatch at draft j: commit corrected target_j and truncate KV cache.
-                _commit_token(target_j)
+                trig = _commit_token(target_j)
                 gen_len += 1
-                cur_tok = target_j
-                drafts = _extract_drafts(v_mtp, j) if n_mtp > 0 else []
-                past_kvs = _truncate_past_kvs(new_past_kvs, past_len + 1 + n_acc)
+                if trig:
+                    _apply_measure_repair(new_past_kvs)
+                else:
+                    cur_tok = target_j
+                    drafts = _extract_drafts(v_mtp, j) if n_mtp > 0 else []
+                    past_kvs = _truncate_past_kvs(new_past_kvs, past_len + 1 + n_acc)
                 mismatched = True
                 break
 
         if not mismatched and not all(finished):
             # All m drafts matched: emit the free bonus token from position m!
             bonus_tok = _pick_step(v_logits[:, m, :])
-            _commit_token(bonus_tok)
+            trig = _commit_token(bonus_tok)
             gen_len += 1
-            cur_tok = bonus_tok
-            drafts = _extract_drafts(v_mtp, m) if n_mtp > 0 else []
-            past_kvs = new_past_kvs
+            if trig:
+                _apply_measure_repair(new_past_kvs)
+            else:
+                cur_tok = bonus_tok
+                drafts = _extract_drafts(v_mtp, m) if n_mtp > 0 else []
+                past_kvs = new_past_kvs
 
     elapsed = max(1e-6, time.perf_counter() - t0)
     seq = torch.cat(out_tokens, dim=1)
@@ -522,6 +895,8 @@ def generate_mtp_spec(
         "mean_tokens_per_pass": round(total_gen_toks / max(1, verify_passes), 3),
         "elapsed_secs": round(elapsed, 6),
         "tokens_per_sec": round(total_gen_toks / elapsed, 2),
+        "measure_beam_triggers": int(measure_beam_triggers),
+        "measure_beam_repaired": int(measure_beam_repaired),
         "router_info": router_info,
     }
     if return_stats:
@@ -887,17 +1262,25 @@ def _summarize_slice(rows: Sequence[Dict[str, Any]], domain: str) -> Dict[str, A
     draft_prop = sum(int(r.get(p + "draft_proposed", 0) or 0) for r in ok)
     draft_acc = sum(int(r.get(p + "draft_accepted", 0) or 0) for r in ok)
 
+    mbeam_trig = sum(int(r.get(p + "measure_beam_triggers", 0) or 0) for r in ok)
+    mbeam_rep = sum(int(r.get(p + "measure_beam_repaired", 0) or 0) for r in ok)
+
     return {
         "n_pieces": len(rows),
         "n_scored": n,
         "tok_f1_mean": _mean([r.get(p + "tok_f1") for r in ok]),
+        "tok_lcs_mean": _mean([r.get(p + "tok_lcs") for r in ok]),
         "tok_ser_mean": _mean([r.get(p + "tok_ser") for r in ok]),
         "note_f1_mean": _mean([r.get(p + "note_f1") for r in ok]),
         "note_ser_mean": _mean([r.get(p + "note_ser") for r in ok]),
+        "note_hr_ratio_mean": _mean([r.get(p + "note_hr_ratio") for r in ok]),
+        "note_hr_ratio_median": _med([r.get(p + "note_hr_ratio") for r in ok]),
         "fixes_median": _med([r.get(p + "proxy_fixes") for r in ok]),
         "decode_ok_rate": round(dec_ok / max(1, n), 4) if n else None,
         "tok_per_sec_mean": _mean([r.get(p + "tok_per_sec") for r in ok]),
         "mtp_acceptance_rate": round(draft_acc / draft_prop, 4) if draft_prop > 0 else None,
+        "measure_beam_triggers": mbeam_trig,
+        "measure_beam_repaired": mbeam_rep,
     }
 
 
@@ -917,6 +1300,9 @@ def evaluate_suite31(args: argparse.Namespace) -> Dict[str, Any]:
     if beam_size < 1:
         raise ValueError(f"--beam-size must be >= 1, got {beam_size}")
     beam_length_penalty = float(getattr(args, "beam_length_penalty", 0.6))
+    measure_beam_size = int(getattr(args, "measure_beam_size", 0))
+    if measure_beam_size < 0:
+        raise ValueError(f"--measure-beam-size must be >= 0, got {measure_beam_size}")
     max_keep_ratio_override = getattr(args, "max_keep_ratio_override", None)
 
     if beam_size > 1:
@@ -927,9 +1313,10 @@ def evaluate_suite31(args: argparse.Namespace) -> Dict[str, Any]:
         )
     else:
         mode_tag = (
-            ("mtp-spec" if args.use_mtp_spec else "greedy")
+            ("mtp-spec" if (args.use_mtp_spec or measure_beam_size > 1) else "greedy")
             + ("+grammar" if args.use_grammar else "")
             + ("(strict)" if (args.use_grammar and args.strict_grammar) else "")
+            + (f"+mbeam{measure_beam_size}" if measure_beam_size > 1 else "")
         )
     mkr_str = (
         f" | max_keep_ratio_override={float(max_keep_ratio_override):g}"
@@ -993,7 +1380,7 @@ def evaluate_suite31(args: argparse.Namespace) -> Dict[str, Any]:
                                 use_grammar=args.use_grammar,
                                 strict_grammar=args.strict_grammar,
                             )
-                        elif args.use_mtp_spec:
+                        elif args.use_mtp_spec or measure_beam_size > 1:
                             seq, mtp_stats = generate_mtp_spec(
                                 model,
                                 img_t,
@@ -1001,6 +1388,7 @@ def evaluate_suite31(args: argparse.Namespace) -> Dict[str, Any]:
                                 use_grammar=args.use_grammar,
                                 strict_grammar=args.strict_grammar,
                                 return_stats=True,
+                                measure_beam_size=measure_beam_size,
                             )
                         elif args.use_grammar:
                             seq = generate_constrained(
@@ -1032,10 +1420,11 @@ def evaluate_suite31(args: argparse.Namespace) -> Dict[str, Any]:
                     pred_raw_toks = trim_truncated_tokens(pred_raw_toks)
                 hyp_page_toks, n_sys = stitch_uni_tokens(pred_raw_toks)
 
-                # 1. Token-level F1 & SER
+                # 1. Token-level F1, ordered TokLCS F1 & SER
                 tok_edits = uni_omr.levenshtein_distance(ref_page_toks, hyp_page_toks)
                 tok_ser = tok_edits / max(1, len(ref_page_toks))
                 _, _, tok_f1 = uni_omr.compute_token_f1(ref_page_toks, hyp_page_toks)
+                tok_lcs = compute_token_lcs_f1(ref_page_toks, hyp_page_toks)
 
                 # 2. Note-level F1 & SER via assembly-serialize + eval-harness
                 hyp_txt = workdir / f"uni-{slug}-{domain}-hyp-bekern.txt"
@@ -1044,6 +1433,9 @@ def evaluate_suite31(args: argparse.Namespace) -> Dict[str, Any]:
                 p_dec = esg.run_cli([
                     esg.ASER, "bekern-decode", "--input", str(hyp_txt), "--out", str(hyp_notes),
                 ])
+                ref_notes_cnt: Optional[int] = None
+                hyp_notes_cnt: Optional[int] = None
+                note_hr_ratio: Optional[float] = None
                 if p_dec.returncode != 0 or not hyp_notes.exists():
                     note_f1 = 0.0
                     note_ser = 1.0
@@ -1064,15 +1456,23 @@ def evaluate_suite31(args: argparse.Namespace) -> Dict[str, Any]:
                     proxy_fixes = sc.get("proxy_fixes")
                     decode_ok = not bool(sc.get("zeroed"))
                     zero_reason = sc.get("zero_reason")
+                    ref_notes_cnt = sc.get("ref_len")
+                    hyp_notes_cnt = sc.get("hyp_len")
+                    if ref_notes_cnt is not None and ref_notes_cnt > 0 and hyp_notes_cnt is not None:
+                        note_hr_ratio = float(hyp_notes_cnt) / float(ref_notes_cnt)
 
                 n_gen = max(1, len(pred_raw_toks) + 1)
                 tok_per_sec = n_gen / elapsed
 
                 pfx = domain + "_"
                 prow[pfx + "tok_f1"] = round(tok_f1, 6)
+                prow[pfx + "tok_lcs"] = round(tok_lcs, 6)
                 prow[pfx + "tok_ser"] = round(tok_ser, 6)
                 prow[pfx + "note_f1"] = round(note_f1, 6)
                 prow[pfx + "note_ser"] = round(note_ser, 6)
+                prow[pfx + "ref_notes"] = ref_notes_cnt
+                prow[pfx + "hyp_notes"] = hyp_notes_cnt
+                prow[pfx + "note_hr_ratio"] = round(note_hr_ratio, 4) if note_hr_ratio is not None else None
                 prow[pfx + "proxy_fixes"] = proxy_fixes
                 prow[pfx + "decode_ok"] = decode_ok
                 prow[pfx + "zero_reason"] = zero_reason
@@ -1084,18 +1484,26 @@ def evaluate_suite31(args: argparse.Namespace) -> Dict[str, Any]:
                     prow[pfx + "draft_proposed"] = mtp_stats["draft_proposed"]
                     prow[pfx + "draft_accepted"] = mtp_stats["draft_accepted"]
                     prow[pfx + "mtp_acceptance_rate"] = mtp_stats["acceptance_rate"]
+                    prow[pfx + "measure_beam_triggers"] = mtp_stats.get("measure_beam_triggers", 0)
+                    prow[pfx + "measure_beam_repaired"] = mtp_stats.get("measure_beam_repaired", 0)
 
                 mtp_str = (
                     f" mtp_acc={mtp_stats['acceptance_rate']:.2f}"
                     if mtp_stats is not None
                     else ""
                 )
+                mb_str = (
+                    f" mb={mtp_stats.get('measure_beam_repaired', 0)}/{mtp_stats.get('measure_beam_triggers', 0)}"
+                    if (mtp_stats is not None and measure_beam_size > 1)
+                    else ""
+                )
+                hr_str = f" H/R={note_hr_ratio:.2f}" if note_hr_ratio is not None else ""
                 dec_str = "OK" if decode_ok else f"FAIL({zero_reason})"
                 print(
                     f"[{idx:02d}/{len(pieces):02d}] {slug:34s} [{tag}|{domain:5s}] "
-                    f"tokF1={tok_f1:.3f} tokSER={tok_ser:.3f} | "
-                    f"noteF1={note_f1:.3f} noteSER={note_ser:.3f} ({dec_str}) | "
-                    f"sys={n_sys} tok={len(hyp_page_toks):4d} {tok_per_sec:5.1f}tok/s{mtp_str}",
+                    f"tokF1={tok_f1:.3f} tokLCS={tok_lcs:.3f} tokSER={tok_ser:.3f} | "
+                    f"noteF1={note_f1:.3f} noteSER={note_ser:.3f}{hr_str} ({dec_str}) | "
+                    f"sys={n_sys} tok={len(hyp_page_toks):4d} {tok_per_sec:5.1f}tok/s{mtp_str}{mb_str}",
                     flush=True,
                 )
 
@@ -1128,6 +1536,7 @@ def evaluate_suite31(args: argparse.Namespace) -> Dict[str, Any]:
             "use_mtp_spec": bool(args.use_mtp_spec),
             "beam_size": beam_size,
             "beam_length_penalty": beam_length_penalty,
+            "measure_beam_size": measure_beam_size,
             "max_keep_ratio_override": (
                 float(max_keep_ratio_override)
                 if max_keep_ratio_override is not None
@@ -1161,15 +1570,15 @@ def _fmt_f(val: Optional[float], width: int = 6, prec: int = 4) -> str:
 
 
 def _print_summary_table(summary: Dict[str, Dict[str, Any]], mode_tag: str) -> None:
-    print("=" * 94, flush=True)
+    print("=" * 112, flush=True)
     print(f"UniOMR Suite31+HW Summary ({mode_tag})", flush=True)
-    print("=" * 94, flush=True)
+    print("=" * 112, flush=True)
     print(
-        f"{'Slice':15s} | {'N':>3s} | {'Tok F1':>7s} | {'Tok SER':>7s} | "
-        f"{'Note F1':>7s} | {'Note SER':>8s} | {'DecOK':>6s} | {'Tok/s':>6s} | {'MTP Acc':>7s}",
+        f"{'Slice':15s} | {'N':>3s} | {'Tok F1':>7s} | {'TokLCS':>7s} | {'Tok SER':>7s} | "
+        f"{'Note F1':>7s} | {'Note SER':>8s} | {'H/R':>6s} | {'DecOK':>6s} | {'Tok/s':>6s} | {'MTP Acc':>7s}",
         flush=True,
     )
-    print("-" * 94, flush=True)
+    print("-" * 112, flush=True)
     for key in (
         "printed_clean",
         "printed_photo",
@@ -1182,12 +1591,13 @@ def _print_summary_table(summary: Dict[str, Dict[str, Any]], mode_tag: str) -> N
         dec_pct = f"{s['decode_ok_rate'] * 100.0:5.1f}%" if s["decode_ok_rate"] is not None else "   n/a"
         print(
             f"{key:15s} | {s['n_scored']:3d} | {_fmt_f(s['tok_f1_mean'], 7, 4)} | "
-            f"{_fmt_f(s['tok_ser_mean'], 7, 4)} | {_fmt_f(s['note_f1_mean'], 7, 4)} | "
-            f"{_fmt_f(s['note_ser_mean'], 8, 4)} | {dec_pct:>6s} | "
+            f"{_fmt_f(s.get('tok_lcs_mean'), 7, 4)} | {_fmt_f(s['tok_ser_mean'], 7, 4)} | "
+            f"{_fmt_f(s['note_f1_mean'], 7, 4)} | {_fmt_f(s['note_ser_mean'], 8, 4)} | "
+            f"{_fmt_f(s.get('note_hr_ratio_mean'), 6, 3)} | {dec_pct:>6s} | "
             f"{_fmt_f(s['tok_per_sec_mean'], 6, 1)} | {_fmt_f(s['mtp_acceptance_rate'], 7, 3)}",
             flush=True,
         )
-    print("=" * 94, flush=True)
+    print("=" * 112, flush=True)
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
@@ -1214,6 +1624,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
         type=float,
         default=0.6,
         help="Length normalization exponent for beam search (score / len**alpha)",
+    )
+    ap.add_argument(
+        "--measure-beam-size",
+        type=int,
+        default=0,
+        help="Violation-triggered measure-scoped beam search width (0 = off, e.g. 4 when enabled)",
     )
     ap.add_argument(
         "--max-keep-ratio-override",

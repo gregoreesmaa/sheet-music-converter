@@ -469,13 +469,15 @@ class InkTokenRouter(nn.Module):
     def _compute_ink_and_paper_gate(
         images: torch.Tensor, h_p: int, w_p: int
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Compute border-masked relative high-pass ink map, soft paper_gate, and paper_mask_grid.
+        """Compute border-masked relative high-pass ink map, soft paper_gate, and effective_paper.
 
         Suppresses dark exterior desk/scanner border rings (``local_bg <= 0.35``)
-        both in the high-pass ink prior and via a detached soft ``paper_gate``
-        (``1.0`` on paper, ``0.05`` on dark borders) applied to ``saliency_prob``,
-        while normalizing by local paper brightness so faint brown iron-gall ink
-        on warm parchment remains strongly salient.
+        and erodes ``paper_mask_grid`` by 2 patches (5x5 max-pool dilation of
+        non-paper) to eliminate the 2-patch (~32px) bright-paper-to-dark-desk
+        transition halo both in ``local_ink_grid`` (before ``q99`` normalization)
+        and via a detached soft ``paper_gate`` (``1.0`` on interior paper, ``0.05``
+        outside), while normalizing by local paper brightness so faint brown
+        iron-gall ink on warm parchment remains strongly salient.
         """
         # Standard Rec.601 luma for RGB in [0, 1], computed in float32 for precision.
         img_f = images.float()
@@ -502,12 +504,20 @@ class InkTokenRouter(nn.Module):
 
         local_bg_grid = F.adaptive_avg_pool2d(local_bg, (h_p, w_p))
         paper_mask_grid = (local_bg_grid > 0.35).detach()
+        non_paper = (~paper_mask_grid).to(torch.float32)
+        border_dilated = F.max_pool2d(non_paper, kernel_size=5, stride=1, padding=2) > 0.5
+        interior_paper = paper_mask_grid & (~border_dilated)
+        # Fallback if entire image is dark/eroded away:
+        has_interior = interior_paper.flatten(1).any(dim=1).view(-1, 1, 1, 1)
+        effective_paper = torch.where(has_interior, interior_paper, paper_mask_grid).detach()
+
+        local_ink_grid = local_ink_grid * effective_paper.to(local_ink_grid.dtype)
         paper_gate = torch.where(
-            paper_mask_grid,
+            effective_paper,
             torch.ones_like(local_bg_grid),
             torch.full_like(local_bg_grid, 0.05),
         ).detach()
-        return local_ink_grid, paper_gate, paper_mask_grid
+        return local_ink_grid, paper_gate, effective_paper
 
     @staticmethod
     def _compute_ink_darkness(images: torch.Tensor, h_p: int, w_p: int) -> torch.Tensor:
@@ -1304,8 +1314,9 @@ class UniOMRNet(nn.Module):
         device: torch.device,
         dtype: torch.dtype,
     ) -> torch.Tensor:
-        """Build and cache 1D per-token CE weights upweighting header/structural tokens."""
+        """Build and cache 1D per-token CE weights upweighting header/structural and micro-rhythm tokens."""
         w_val = float(weight)
+        micro_w = 0.5 * (1.0 + w_val)
         key = (int(vocab_size), w_val, device, dtype)
         cached = self._struct_weight_cache.get(key)
         if cached is not None:
@@ -1323,6 +1334,12 @@ class UniOMRNet(nn.Module):
                 or tok.startswith("bar")
             ):
                 tok_w[tid] = w_val
+            elif (
+                tok.startswith("tuplet-start-")
+                or tok == "tuplet-stop"
+                or tok in ("32nd", "64th", "a2", "a-2")
+            ):
+                tok_w[tid] = micro_w
         if vocab_size != VOCAB_SIZE and vocab_size >= 4:
             # Ensure tail <sys> token is upweighted even on legacy vocab sizes (e.g. 182)
             tok_w[vocab_size - 1] = w_val
@@ -1720,7 +1737,7 @@ def apply_clean_scale_jitter(img: Image.Image, rng: Optional[random.Random] = No
 
 
 def _add_archival_empty_staves(arr: np.ndarray, r: Any) -> None:
-    """Draw 1-2 faint empty pre-ruled 5-line staves in quiet top/bottom margins (in-place)."""
+    """Draw 1-2 faint empty pre-ruled 5-line staves in quiet top/bottom margins or inter-system gaps (in-place)."""
     h, w = arr.shape[:2]
     if h < 128 or w < 64:
         return
@@ -1746,6 +1763,36 @@ def _add_archival_empty_staves(arr: np.ndarray, r: Any) -> None:
         band = arr[bot_y0 : bot_y1 + staff_h, x0:x1]
         if float(band.mean()) > 0.85:
             candidates.append(r.randint(bot_y0, bot_y1))
+    # Inter-system quiet gaps (between 14% and 86% of page height)
+    mid_y0 = max(2, int(round(h * 0.14)))
+    mid_y1 = min(h - staff_h - 2, int(round(h * 0.86)) - staff_h)
+    if mid_y1 >= mid_y0:
+        row_means = arr[mid_y0 : mid_y1 + staff_h, x0:x1].mean(axis=1)
+        pad_gap = max(3, spacing)
+        min_gap = staff_h + 2 * pad_gap
+        quiet = row_means > 0.94
+        run_start: Optional[int] = None
+        inter_cands: List[int] = []
+        for idx_q, is_q in enumerate(quiet):
+            if is_q:
+                if run_start is None:
+                    run_start = idx_q
+            else:
+                if run_start is not None:
+                    if (idx_q - run_start) >= min_gap:
+                        lo_y = mid_y0 + run_start + pad_gap
+                        hi_y = mid_y0 + idx_q - staff_h - pad_gap
+                        if hi_y >= lo_y:
+                            inter_cands.append(r.randint(lo_y, hi_y))
+                    run_start = None
+        if run_start is not None and (len(quiet) - run_start) >= min_gap:
+            lo_y = mid_y0 + run_start + pad_gap
+            hi_y = mid_y0 + len(quiet) - staff_h - pad_gap
+            if hi_y >= lo_y:
+                inter_cands.append(r.randint(lo_y, hi_y))
+        if inter_cands:
+            r.shuffle(inter_cands)
+            candidates.extend(inter_cands[:2])
 
     if not candidates:
         return
@@ -1757,6 +1804,130 @@ def _add_archival_empty_staves(arr: np.ndarray, r: Any) -> None:
             y = y_start + k * spacing
             if 0 <= y < h:
                 arr[y, x0:x1] = np.minimum(arr[y, x0:x1], line_luma)
+
+
+def _apply_system1_left_indent(
+    img: Image.Image,
+    rng: Any,
+    paper_fill: Optional[Tuple[int, int, int]] = None,
+) -> Image.Image:
+    """Apply 15-35% left indentation to System 1 (compressing horizontally so 0 notes are clipped)."""
+    out = img.copy() if img.mode == "RGB" else img.convert("RGB")
+    w, h = out.size
+    if w < 128 or h < 256:
+        return out
+    gray = np.asarray(out.convert("L"), dtype=np.float32) * (1.0 / 255.0)
+    row_means = gray.mean(axis=1)
+    # Use relative paper-baseline threshold so off-white / cream paper works cleanly
+    paper_level = float(np.percentile(row_means, 90.0))
+    ink_thr = paper_level - 0.025
+    # Locate the first ink band (System 1) in the upper half of the page
+    ink_rows = np.where(row_means < ink_thr)[0]
+    if len(ink_rows) == 0:
+        return out
+    y0 = int(ink_rows[0])
+    if y0 > int(h * 0.35):
+        return out
+    min_gap = max(14, int(round(h * 0.035)))
+    max_y1 = min(h, y0 + int(round(h * 0.36)))
+    quiet_run = 0
+    y1 = max_y1
+    found_gap = False
+    for y in range(y0, max_y1):
+        if row_means[y] >= ink_thr:
+            quiet_run += 1
+            if quiet_run >= min_gap:
+                y1 = y - quiet_run + 1
+                found_gap = True
+                break
+        else:
+            quiet_run = 0
+    band_h = y1 - y0
+    if not found_gap or band_h < max(12, int(round(h * 0.03))):
+        return out
+    pad_y = max(2, min(4, y0))
+    crop_y0 = max(0, y0 - pad_y)
+    crop_y1 = min(h, y1 + pad_y)
+    crop_h = crop_y1 - crop_y0
+    indent_px = max(8, int(round(w * rng.uniform(0.15, 0.35))))
+    new_band_w = w - indent_px
+    if new_band_w < 32:
+        return out
+    band = out.crop((0, crop_y0, w, crop_y1)).resize((new_band_w, crop_h), Image.Resampling.BILINEAR)
+    if paper_fill is None:
+        # Estimate paper tone from top margin
+        top_strip = np.asarray(out.crop((0, 0, w, max(2, crop_y0))), dtype=np.float32)
+        if top_strip.size >= 3:
+            med = np.median(top_strip.reshape(-1, 3), axis=0)
+            paper_fill = (int(round(med[0])), int(round(med[1])), int(round(med[2])))
+        else:
+            paper_fill = (248, 246, 240)
+    draw = ImageDraw.Draw(out)
+    draw.rectangle([0, crop_y0, indent_px, crop_y1 - 1], fill=paper_fill)
+    out.paste(band, (indent_px, crop_y0))
+    return out
+
+
+def _apply_corner_sticky_note(img: Image.Image, rng: Any) -> Image.Image:
+    """Draw a small opaque corner sticky-note / archival label occlusion (5-12% W x H)."""
+    out = img.copy() if img.mode == "RGB" else img.convert("RGB")
+    w, h = out.size
+    if w < 64 or h < 64:
+        return out
+    nw = max(6, int(round(w * rng.uniform(0.05, 0.12))))
+    nh = max(6, int(round(h * rng.uniform(0.05, 0.12))))
+    margin_x = int(round(w * rng.uniform(0.0, 0.025)))
+    margin_y = int(round(h * rng.uniform(0.0, 0.025)))
+    corner = rng.randint(0, 3)
+    x0 = margin_x if corner in (0, 2) else max(0, w - nw - margin_x)
+    y0 = margin_y if corner in (0, 1) else max(0, h - nh - margin_y)
+    x1 = min(w - 1, x0 + nw)
+    y1 = min(h - 1, y0 + nh)
+
+    # Pale yellow, pale pink, or pale kraft/brown archival label
+    palette = (
+        (246, 236, 168),
+        (240, 202, 210),
+        (214, 188, 150),
+    )
+    br, bg, bb = rng.choice(palette)
+    fill = (
+        max(0, min(255, br + rng.randint(-8, 8))),
+        max(0, min(255, bg + rng.randint(-8, 8))),
+        max(0, min(255, bb + rng.randint(-8, 8))),
+    )
+    edge = (max(0, fill[0] - 28), max(0, fill[1] - 28), max(0, fill[2] - 28))
+    draw = ImageDraw.Draw(out)
+    draw.rectangle([x0, y0, x1, y1], fill=fill, outline=edge, width=1)
+    return out
+
+
+def _apply_hw_lowres_defocus_compress(img: Image.Image, rng: Any) -> Image.Image:
+    """Low-res downscale (800-1150px round-trip) + mild defocus blur + contrast compression."""
+    out = img if img.mode == "RGB" else img.convert("RGB")
+    orig_w, orig_h = out.size
+    if orig_w < 48 or orig_h < 48:
+        return out
+    max_side = max(orig_w, orig_h)
+    if max_side > 800:
+        rt_max = rng.randint(800, min(1150, max_side))
+        scale = float(rt_max) / float(max_side)
+    else:
+        scale = rng.uniform(0.65, 0.85)
+    dw = max(32, int(round(orig_w * scale)))
+    dh = max(32, int(round(orig_h * scale)))
+    if (dw, dh) != (orig_w, orig_h):
+        out = out.resize((dw, dh), Image.Resampling.BILINEAR).resize(
+            (orig_w, orig_h), Image.Resampling.BILINEAR
+        )
+    out = out.filter(ImageFilter.GaussianBlur(radius=rng.uniform(0.5, 1.1)))
+    # Compress ink-to-paper contrast toward page paper tone (targeting faint InkMn ~ 0.06-0.10)
+    arr = np.asarray(out, dtype=np.float32) * (1.0 / 255.0)
+    paper_ref = np.percentile(arr.reshape(-1, 3), 85.0, axis=0).reshape(1, 1, 3)
+    c_fac = rng.uniform(0.48, 0.74)
+    arr = paper_ref + (arr - paper_ref) * c_fac
+    np.clip(arr, 0.0, 1.0, out=arr)
+    return Image.fromarray((arr * 255.0).astype(np.uint8), mode="RGB")
 
 
 def _apply_archival_border_and_colorbar(
@@ -2225,11 +2396,24 @@ def apply_online_augment(
         bg_v = r.randint(235, 255)
         return (bg_v, max(225, bg_v - r.randint(0, 5)), max(215, bg_v - r.randint(0, 12)))
 
+    # Random top/bottom white margin padding (p=0.25): pad 2-8% white margin on top/bottom
+    # so top-aligned clean scores don't behave differently from bordered photos.
+    if r.random() < 0.25 and orig_w >= 32 and orig_h >= 32:
+        pad_t = max(2, int(round(orig_h * r.uniform(0.02, 0.08))))
+        pad_b = max(2, int(round(orig_h * r.uniform(0.02, 0.08))))
+        canvas = Image.new("RGB", (orig_w, orig_h + pad_t + pad_b), _sample_paper_fill())
+        canvas.paste(out, (0, pad_t))
+        out = canvas.resize((orig_w, orig_h), Image.Resampling.BILINEAR)
+
     if do_archival:
         # Historical Manuscript / Archival Mode:
-        #   1) Optional faint empty pre-ruled 5-line staves in top/bottom quiet margin (p=0.25)
-        #   2) Parchment + brown iron-gall ink color transfer + mottled foxing + verso bleed
-        #   3) Optional archival black border + small colorbar strip (p=0.40)
+        #   1) Optional System-1 left indentation (15-35%, p=0.10)
+        #   2) Optional faint empty pre-ruled 5-line staves in margins / inter-system gaps (p=0.25)
+        #   3) Parchment + brown iron-gall ink color transfer + mottled foxing + verso bleed
+        #   4) Optional corner sticky-note/blot occlusion (p=0.12), archival border + colorbar (p=0.40)
+        #   5) Optional low-res round-trip downscale + defocus blur + contrast compression
+        if r.random() < 0.10 and orig_w >= 128 and orig_h >= 256:
+            out = _apply_system1_left_indent(out, r)
         luma = np.asarray(out.convert("L"), dtype=np.float32) * (1.0 / 255.0)
         if r.random() < 0.25:
             _add_archival_empty_staves(luma, r)
@@ -2313,6 +2497,10 @@ def apply_online_augment(
         if r.random() < 0.15 and orig_w >= 64 and orig_h >= 64:
             out = _apply_archival_watermark_stain(out, r, ink_rgb_u8)
 
+        # Corner opaque sticky-note / archival label occlusion (p=0.12)
+        if r.random() < 0.12 and orig_w >= 64 and orig_h >= 64:
+            out = _apply_corner_sticky_note(out, r)
+
         if r.random() < 0.40 and orig_w >= 48 and orig_h >= 48:
             has_dark_border = True
             base_d = r.randint(6, 36)
@@ -2329,8 +2517,11 @@ def apply_online_augment(
             )
             out = out.rotate(angle, resample=Image.Resampling.BILINEAR, expand=False, fillcolor=rot_fill)
 
-        # Mild blur / JPEG
-        if r.random() < 0.25:
+        # Low-res round-trip downscale + defocus blur + contrast compression (dense/landscape HW)
+        lowres_p = 0.25 if orig_w > orig_h else 0.15
+        if r.random() < lowres_p and orig_w >= 48 and orig_h >= 48:
+            out = _apply_hw_lowres_defocus_compress(out, r)
+        elif r.random() < 0.25:
             out = out.filter(ImageFilter.GaussianBlur(radius=r.uniform(0.3, 0.8)))
         if r.random() < 0.40:
             buf = io.BytesIO()
@@ -2339,9 +2530,13 @@ def apply_online_augment(
             out = Image.open(buf).convert("RGB")
         return out
 
-    # 0. Pre-warp paper-surface manual corrections & performer pencil/highlighter markup
+    # 0. Pre-warp paper-surface manual corrections, HW layout/sticky-note, & performer markup
+    if is_hw and r.random() < 0.10 and orig_w >= 128 and orig_h >= 256:
+        out = _apply_system1_left_indent(out, r)
     if r.random() < (0.22 if is_hw else 0.06):
         out = _apply_composer_scratchouts(out, r, is_hw=is_hw)
+    if is_hw and r.random() < 0.12 and orig_w >= 64 and orig_h >= 64:
+        out = _apply_corner_sticky_note(out, r)
     if not is_hw and r.random() < 0.18:
         out = _apply_performer_pencil_markup(out, r)
 
@@ -2460,8 +2655,10 @@ def apply_online_augment(
         bw = gray.point(lambda px, t=thr: 255 if px >= t else 0, mode="L")
         return bw.convert("RGB")
 
-    # 6. Mild Gaussian blur
-    if r.random() < 0.30:
+    # 6. Mild Gaussian blur (or HW low-res round-trip + defocus + contrast compression)
+    if is_hw and r.random() < (0.25 if orig_w > orig_h else 0.15) and orig_w >= 48 and orig_h >= 48:
+        out = _apply_hw_lowres_defocus_compress(out, r)
+    elif r.random() < 0.30:
         out = out.filter(ImageFilter.GaussianBlur(radius=r.uniform(0.3, 1.0)))
 
     # 7. JPEG compression artifacts

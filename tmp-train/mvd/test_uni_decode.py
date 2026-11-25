@@ -595,6 +595,182 @@ class TestUniDecodeCPU(unittest.TestCase):
                 passed += 1
         self.assertEqual(passed, 45)
 
+    def test_iter9_ngram_repetition_guard_and_midbar_header_guard(self) -> None:
+        """Iter-9 guards: >3x 8..16-token repeat blocked; mid-bar key/time blocked in incomplete bars."""
+        # 1. 8..16-token pattern: 3 consecutive repeats allowed, 4th blocked.
+        ostinato_12 = [
+            "eighth", "C", "4",
+            "eighth", "D", "4",
+            "eighth", "E", "4",
+            "eighth", "F", "4",
+        ]
+        self.assertEqual(len(ostinato_12), 12)
+        st = grammar.PrefixState(strict=False)
+        for tok in ("clef-G-2", "key+0", "time-4-4"):
+            st.step(tok)
+        # 1st and 2nd repeats: cycle_forbidden must still be None
+        for rep in range(2):
+            for tok in ostinato_12:
+                st.step(tok)
+            self.assertIsNone(st.cycle_forbidden(), f"Blocked too early after {rep + 1} repeats")
+        # 3rd repeat completes -> 4th repeat's opening token ('eighth') must now be forbidden
+        for tok in ostinato_12:
+            st.step(tok)
+        self.assertEqual(st.cycle_forbidden(), "eighth")
+        allowed = ev._allowed_ids_for_state(st, uni_omr.VOCAB_SIZE)
+        self.assertNotIn(data.TOKEN_TO_ID["eighth"], allowed)
+
+        # 2. Tight note loop `eighth C 4` (period 9 = 3x3) blocked after 9 notes (3x period-9)
+        st_note = grammar.PrefixState(strict=False)
+        for tok in ("clef-G-2", "key+0", "time-4-4"):
+            st_note.step(tok)
+        for _ in range(9):
+            for tok in ("eighth", "C", "4"):
+                st_note.step(tok)
+        self.assertEqual(st_note.cycle_forbidden(), "eighth")
+
+        # 3. Verbatim multi-bar loop (21 tokens containing 'bar') blocked after 3 bars
+        bar_21 = [
+            "voice-1", "quarter", "C", "4", "quarter", "D", "4",
+            "quarter", "E", "4", "quarter", "F", "4",
+            "voice-2", "half", "G", "3", "half", "A", "3", "bar",
+        ]
+        self.assertEqual(len(bar_21), 21)
+        st_bar = grammar.PrefixState(strict=False)
+        for tok in ("clef-G-2", "key+0", "time-4-4"):
+            st_bar.step(tok)
+        for _ in range(3):
+            for tok in bar_21:
+                st_bar.step(tok)
+        self.assertEqual(st_bar.cycle_forbidden(), "voice-1")
+
+        # 4. Mid-bar time-* / key* forbidden in incomplete bar; allowed in header, after bar, and at full-bar courtesy
+        t68_id = data.TOKEN_TO_ID["time-6-8"]
+        t58_id = data.TOKEN_TO_ID["time-5-8"]
+        k_m2_id = data.TOKEN_TO_ID["key-2"]
+        for strict in (False, True):
+            st_h = grammar.PrefixState(strict=strict)
+            # System header: allowed
+            self.assertIn(t68_id, st_h.allowed()[0])
+            self.assertIn(k_m2_id, st_h.allowed()[0])
+            for tok in ("clef-G-2", "key+0", "time-4-4", "quarter", "C", "4"):
+                st_h.step(tok)
+            # Incomplete bar (1.0 / 4.0 beats): time-* and key* forbidden
+            allow_mid = st_h.allowed()[0]
+            self.assertNotIn(t68_id, allow_mid)
+            self.assertNotIn(t58_id, allow_mid)
+            self.assertNotIn(k_m2_id, allow_mid)
+            with self.assertRaises(ValueError):
+                st_h.step("time-6-8")
+            with self.assertRaises(ValueError):
+                st_h.step("key-2")
+            # Complete the bar (4.0 / 4.0 beats): courtesy key/time allowed
+            for tok in ("half", "D", "4", "quarter", "E", "4"):
+                st_h.step(tok)
+            allow_full = st_h.allowed()[0]
+            self.assertIn(t68_id, allow_full)
+            self.assertIn(k_m2_id, allow_full)
+            # Immediately after barline: allowed
+            st_h.step("bar")
+            allow_bar = st_h.allowed()[0]
+            self.assertIn(t68_id, allow_bar)
+            self.assertIn(k_m2_id, allow_bar)
+            st_h.step("key-2")
+            st_h.step("time-6-8")
+
+    def test_iter9_measure_beam_and_tok_lcs_metrics(self) -> None:
+        """Violation-triggered measure-scoped beam search, TokLCS, and CLI flag."""
+        # 1. _measure_violation_errors checks
+        st = grammar.PrefixState(strict=False)
+        for tok in ("clef-G-2", "key+0", "time-4-4", "half", "C", "4", "half", "D", "4"):
+            st.step(tok)
+        self.assertEqual(ev._measure_violation_errors(st), (0.0, 0.0))
+
+        st_bad = grammar.PrefixState(strict=False)
+        for tok in ("clef-G-2", "key+0", "time-4-4", "voice-1", "whole", "C", "4", "voice-2", "half", "G", "3"):
+            st_bad.step(tok)
+        m_err, v_err = ev._measure_violation_errors(st_bad)
+        self.assertAlmostEqual(m_err, 2.0, places=5)
+        self.assertAlmostEqual(v_err, 2.0, places=5)
+
+        # 2. TokLCS penalizes loops while scoring exact match = 1.0
+        ref = ["clef-G-2", "time-4-4", "quarter", "C", "4", "quarter", "D", "4", "bar"]
+        self.assertAlmostEqual(ev.compute_token_lcs_f1(ref, ref), 1.0, places=5)
+        looped = ref + ["quarter", "C", "4"] * 20
+        self.assertLess(ev.compute_token_lcs_f1(ref, looped), 0.30)
+
+        # 3. End-to-end generate_mtp_spec with measure_beam_size=4 (B=1 and B=2)
+        model = _make_tiny_model(seed=61, mtp_k=4)
+        g = torch.Generator(device="cpu").manual_seed(610)
+        for batch_size in (1, 2):
+            imgs = torch.rand((batch_size, 3, 64, 64), generator=g)
+            seq, stats = ev.generate_mtp_spec(
+                model,
+                imgs,
+                max_len=24,
+                use_grammar=True,
+                strict_grammar=False,
+                return_stats=True,
+                measure_beam_size=4,
+            )
+            self.assertEqual(seq.shape[0], batch_size)
+            self.assertIn("measure_beam_triggers", stats)
+            self.assertIn("measure_beam_repaired", stats)
+            for row in seq.tolist():
+                toks = ev.decode_uni_compat(row, vocab_size=model.cfg.vocab_size, skip_special=True)
+                st_chk = grammar.PrefixState(strict=False)
+                for tok in toks:
+                    if tok == uni_omr.SYS_TOKEN:
+                        st_chk = grammar.PrefixState(strict=False)
+                    else:
+                        st_chk.step(tok)
+
+        # 4. Direct _beam_repair_measure verification (KV-cache rewind + scoring)
+        model_r = _make_tiny_model(seed=73, mtp_k=4)
+        img_r = torch.rand((1, 3, 64, 64))
+        with torch.no_grad():
+            mem_r, _, _ = model_r.encode_image(img_r, return_aux=False)
+            prefix_toks = ["clef-G-2", "key+0", "time-4-4", "whole", "C", "4"]
+            prefix_ids = [uni_omr.BOS_ID] + [data.TOKEN_TO_ID[t] for t in prefix_toks]
+            _, _, kv_pre = model_r.decode_tokens(
+                torch.tensor([prefix_ids], dtype=torch.long),
+                memory=mem_r,
+                return_mtp=False,
+                past_kvs=None,
+                use_cache=True,
+            )
+            base_cross = [
+                (ck.expand(4, -1, -1, -1).contiguous(), cv.expand(4, -1, -1, -1).contiguous())
+                for _, (ck, cv) in kv_pre
+            ]
+            st_pre = grammar.PrefixState(strict=False)
+            for t in prefix_toks + ["bar"]:
+                st_pre.step(t)
+            best_toks, best_st, kv0, _ = ev._beam_repair_measure(
+                model=model_r,
+                kv_prefix=kv_pre,
+                base_cross_kvs=base_cross,
+                trigger_id=data.TOKEN_TO_ID["bar"],
+                bar_start_state=st_pre,
+                beam_size=4,
+                max_bar_toks=24,
+                vocab_size=model_r.cfg.vocab_size,
+                use_grammar=True,
+                strict_grammar=False,
+                device=torch.device("cpu"),
+            )
+            self.assertEqual(int(kv0[0][0][0].shape[2]), len(prefix_ids) + 1)
+            if best_toks is not None:
+                self.assertIsNotNone(best_st)
+                self.assertGreater(len(best_toks), 0)
+
+        # 5. CLI default and custom --measure-beam-size
+        ap = ev.build_arg_parser()
+        ns_def = ap.parse_args(["--ckpt", "dummy.pt"])
+        self.assertEqual(ns_def.measure_beam_size, 0)
+        ns_mb = ap.parse_args(["--ckpt", "dummy.pt", "--measure-beam-size", "4"])
+        self.assertEqual(ns_mb.measure_beam_size, 4)
+
 
 if __name__ == "__main__":
     unittest.main()

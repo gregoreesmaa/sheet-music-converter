@@ -1676,6 +1676,88 @@ class TestUniOMR(unittest.TestCase):
             self.assertIn("best_ema_ser", eval_sum)
             self.assertIn("ema_eval", eval_sum["evals"][0])
 
+    def test_zc_iter9_router_erosion_micro_weights_and_augments(self) -> None:
+        """(zc) Iter 9: 2-patch router border erosion, micro-rhythm/double-accidental weights, and new HW/printed augs."""
+        import random as _py_random
+
+        # 1. Router 2-patch dark-desk halo erosion + all-dark fallback
+        H, W = 512, 512
+        border = 64  # 4 cells at stride 16
+        img = torch.zeros(1, 3, H, W, dtype=torch.float32)
+        # Warm parchment interior + faint HW ink in center
+        img[:, 0, border : H - border, border : W - border] = 0.88
+        img[:, 1, border : H - border, border : W - border] = 0.82
+        img[:, 2, border : H - border, border : W - border] = 0.70
+        for sy in (180, 190, 200, 210, 220, 280, 290, 300, 310, 320):
+            img[:, :, sy : sy + 2, 130:382] = 0.45
+
+        local_ink_grid, paper_gate, eff_paper = uni_omr.InkTokenRouter._compute_ink_and_paper_gate(img, 32, 32)
+        # Transition ring (cells 4 and 5 adjacent to border cells 0..3) must be zeroed & gated to 0.05
+        self.assertEqual(float(local_ink_grid[0, 0, :6, :].max().item()), 0.0)
+        self.assertEqual(float(local_ink_grid[0, 0, -6:, :].max().item()), 0.0)
+        self.assertEqual(float(local_ink_grid[0, 0, :, :6].max().item()), 0.0)
+        self.assertEqual(float(local_ink_grid[0, 0, :, -6:].max().item()), 0.0)
+        self.assertAlmostEqual(float(paper_gate[0, 0, 4, 16].item()), 0.05, places=5)
+        self.assertAlmostEqual(float(paper_gate[0, 0, 5, 16].item()), 0.05, places=5)
+        # Interior faint ink must remain strongly active
+        self.assertTrue(bool(eff_paper[0, 0, 12, 16].item()))
+        self.assertGreater(float(local_ink_grid[0, 0, 11:15, 10:22].max().item()), 0.05)
+
+        # Fallback when entire image is dark (no interior paper after erosion): stays finite & non-crashing
+        dark_img = torch.full((1, 3, 128, 128), 0.10, dtype=torch.float32)
+        li_d, pg_d, ep_d = uni_omr.InkTokenRouter._compute_ink_and_paper_gate(dark_img, 8, 8)
+        self.assertTrue(torch.isfinite(li_d).all())
+        self.assertTrue(torch.isfinite(pg_d).all())
+        self.assertFalse(bool(ep_d.any().item()))
+
+        # 2. Micro-rhythm & double-accidental CE weights = 0.5 * (1 + struct_tok_weight)
+        model = uni_omr.UniOMRNet(_small_cfg(d_model=64, n_enc_layers=1, n_dec_layers=1, n_heads=4, mtp_k=1))
+        w2 = model._get_struct_token_weights(uni_omr.VOCAB_SIZE, 2.0, torch.device("cpu"), torch.float32)
+        for tok in ("tuplet-start-3-2", "tuplet-stop", "32nd", "64th", "a2", "a-2"):
+            self.assertAlmostEqual(float(w2[uni_omr.UNI_TOKEN_TO_ID[tok]].item()), 1.5, places=5)
+        for tok in ("clef-G-2", "key+0", "time-4-4", "<sys>", "grace", "bar"):
+            self.assertAlmostEqual(float(w2[uni_omr.UNI_TOKEN_TO_ID[tok]].item()), 2.0, places=5)
+        for tok in ("quarter", "C", "4", "a1", "a-1"):
+            self.assertAlmostEqual(float(w2[uni_omr.UNI_TOKEN_TO_ID[tok]].item()), 1.0, places=5)
+
+        # 3. Inter-system empty pre-ruled staves
+        luma = np.ones((400, 300), dtype=np.float32)
+        # Put dark ink everywhere except the single inter-system quiet band y=135..255
+        luma[0:135, 20:280] = 0.1
+        luma[255:400, 20:280] = 0.1
+        uni_omr._add_archival_empty_staves(luma, _py_random.Random(123))
+        # Quiet inter-system band 135..255 must now contain faint pre-ruled staff lines (< 0.90)
+        self.assertLess(float(luma[135:255, 50:250].min()), 0.90)
+
+        # 4. System-1 left indentation, corner sticky-note, and HW low-res defocus/compress
+        arr = np.full((384, 288, 3), 248, dtype=np.uint8)
+        # System 1 at y=40..90, System 2 at y=200..250
+        arr[40:90:10, 16:272, :] = 20
+        arr[200:250:10, 16:272, :] = 20
+        base = Image.fromarray(arr, mode="RGB")
+
+        ind1 = uni_omr._apply_system1_left_indent(base, _py_random.Random(77))
+        ind2 = uni_omr._apply_system1_left_indent(base, _py_random.Random(77))
+        self.assertEqual(ind1.size, base.size)
+        np.testing.assert_array_equal(np.asarray(ind1), np.asarray(ind2))
+        ind_arr = np.asarray(ind1)
+        # Leftmost 12% of System 1 must now be clean paper (> 235), while System 2 remains untouched
+        self.assertGreater(float(ind_arr[40:90, 16:34].mean()), 235.0)
+        np.testing.assert_array_equal(ind_arr[200:250], arr[200:250])
+
+        sn1 = uni_omr._apply_corner_sticky_note(base, _py_random.Random(88))
+        sn2 = uni_omr._apply_corner_sticky_note(base, _py_random.Random(88))
+        self.assertEqual(sn1.size, base.size)
+        np.testing.assert_array_equal(np.asarray(sn1), np.asarray(sn2))
+        self.assertFalse(np.array_equal(np.asarray(sn1), arr))
+
+        lr1 = uni_omr._apply_hw_lowres_defocus_compress(base, _py_random.Random(99))
+        lr2 = uni_omr._apply_hw_lowres_defocus_compress(base, _py_random.Random(99))
+        self.assertEqual(lr1.size, base.size)
+        np.testing.assert_array_equal(np.asarray(lr1), np.asarray(lr2))
+        # Contrast compression lifts darkest ink pixels upward from 20
+        self.assertGreater(float(np.asarray(lr1).min()), 30.0)
+
 
 if __name__ == "__main__":
     unittest.main()
