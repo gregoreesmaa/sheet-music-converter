@@ -20,7 +20,8 @@ import modal
 EXP_ID = "2026-11-26T00-55-trial-render-diff-rlvr"
 HF_REPO = "gregoreesmaa/sheet-music-converter-omr"
 
-REPO_ROOT = Path(__file__).resolve().parents[2]
+_p = Path(__file__).resolve()
+REPO_ROOT = _p.parents[2] if len(_p.parents) > 2 else _p.parent
 MSCZ_ROOT = REPO_ROOT.parent / "mscz-rs"
 
 app = modal.App("exp7-trial-render-diff-rlvr")
@@ -48,6 +49,7 @@ image = (
         "huggingface_hub>=0.26",
         "pillow",
         "numpy",
+        "scipy",
         "tqdm",
         "verovio",
         "resvg-py",
@@ -585,5 +587,5 @@ def main(
     lr: float = 2e-5,
     kl_beta: float = 0.04,
 ) -> None:
-    res = run_exp7.remote(steps=steps, group_size=group_size, lr=lr, kl_beta=kl_beta)
-    print("Exp 7 finished:", res)
+    call = run_exp7.spawn(steps=steps, group_size=group_size, lr=lr, kl_beta=kl_beta)
+    print(f"[exp7] Spawned detached Modal function call: {call.object_id}", flush=True)

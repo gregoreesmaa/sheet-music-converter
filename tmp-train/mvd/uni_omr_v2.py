@@ -194,7 +194,7 @@ class UniOMRv2Config:
     min_keep_ratio: float = 0.15
     max_keep_ratio: float = 0.75
     saliency_thr: float = 0.05
-    max_mem_tokens: int = 3072
+    max_mem_tokens: int = 10240
     n_bg_summary: int = 4
     use_ink_prior: bool = True
     router_hidden: int = 64
@@ -627,7 +627,7 @@ class InkTokenRouterV2(nn.Module):
         min_keep_ratio: float = 0.15,
         max_keep_ratio: float = 0.75,
         saliency_thr: float = 0.05,
-        max_mem_tokens: int = 3072,
+        max_mem_tokens: int = 10240,
         router_hidden: int = 64,
     ) -> None:
         super().__init__()
@@ -662,11 +662,15 @@ class InkTokenRouterV2(nn.Module):
     def _compute_ink_and_paper_gate(
         images: torch.Tensor, h_p: int, w_p: int
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Compute border-masked relative high-pass ink map, soft paper_gate, and effective_paper.
+        """Compute edge-connected dark-border-masked high-pass ink map and soft paper_gate.
 
-        Uses a narrow 1-patch (3x3, padding=1) erosion of ``paper_mask_grid`` so
-        tight-margin bordered handwritten photos do not lose edge ink while still
-        suppressing exterior dark desk/scanner border rings.
+        Uses a fast vectorized 4-edge inward scan stopping at the first bright
+        pixel (``luma >= 0.45``) to isolate only dark exterior desk/scanner
+        borders (``luma < 0.30`` connected to the outer boundary), dilates that
+        outer border mask by 16px in pixel space (separable 1x33 + 33x1 max-pool)
+        to eliminate the paper-to-desk transition halo, and pools to the feature
+        grid. Interior shadows and dense dark ink on aged/shadowed real HW photos
+        are NEVER masked out.
         """
         img_f = images.float()
         if img_f.shape[1] == 3:
@@ -677,6 +681,24 @@ class InkTokenRouterV2(nn.Module):
             )
         else:
             luma = img_f.mean(dim=1, keepdim=True)
+
+        # Edge-connected dark-border mask: 4-edge inward scan stopping at first bright pixel (luma >= 0.45)
+        bright_i = (luma >= 0.45).to(torch.int32)
+        top_dark = bright_i.cumsum(dim=2) == 0
+        bot_dark = bright_i.flip(dims=(2,)).cumsum(dim=2).flip(dims=(2,)) == 0
+        left_dark = bright_i.cumsum(dim=3) == 0
+        right_dark = bright_i.flip(dims=(3,)).cumsum(dim=3).flip(dims=(3,)) == 0
+        border_px = ((top_dark | bot_dark | left_dark | right_dark) & (luma < 0.30)).to(luma.dtype)
+
+        # Dilate ONLY the outer border mask by 16px in pixel space (separable 1x33 + 33x1)
+        border_dilated_px = F.max_pool2d(
+            F.max_pool2d(border_px, kernel_size=(1, 33), stride=1, padding=(0, 16)),
+            kernel_size=(33, 1),
+            stride=1,
+            padding=(16, 0),
+        )
+        paper_px = (1.0 - border_dilated_px).clamp(0.0, 1.0)
+
         local_bg = F.avg_pool2d(
             F.avg_pool2d(luma, kernel_size=(1, 31), stride=1, padding=(0, 15), count_include_pad=False),
             kernel_size=(31, 1),
@@ -684,25 +706,19 @@ class InkTokenRouterV2(nn.Module):
             padding=(15, 0),
             count_include_pad=False,
         )
-        paper_mask = (local_bg > 0.35).to(luma.dtype)
-        local_ink = ((local_bg - luma) / local_bg.clamp(min=0.15)).clamp(0.0, 1.0) * paper_mask
+        local_ink = ((local_bg - luma) / local_bg.clamp(min=0.15)).clamp(0.0, 1.0) * paper_px
         ink_max = F.adaptive_max_pool2d(local_ink, (h_p, w_p))
         ink_avg = F.adaptive_avg_pool2d(local_ink, (h_p, w_p))
         local_ink_grid = 0.5 * ink_max + 0.5 * ink_avg
 
-        local_bg_grid = F.adaptive_avg_pool2d(local_bg, (h_p, w_p))
-        paper_mask_grid = (local_bg_grid > 0.35).detach()
-        non_paper = (~paper_mask_grid).to(torch.float32)
-        border_dilated = F.max_pool2d(non_paper, kernel_size=3, stride=1, padding=1) > 0.5
-        interior_paper = paper_mask_grid & (~border_dilated)
-        has_interior = interior_paper.flatten(1).any(dim=1).view(-1, 1, 1, 1)
-        effective_paper = torch.where(has_interior, interior_paper, paper_mask_grid).detach()
+        paper_grid_f = F.adaptive_avg_pool2d(paper_px, (h_p, w_p))
+        effective_paper = (paper_grid_f > 0.5).detach()
 
         local_ink_grid = local_ink_grid * effective_paper.to(local_ink_grid.dtype)
         paper_gate = torch.where(
             effective_paper,
-            torch.ones_like(local_bg_grid),
-            torch.full_like(local_bg_grid, 0.05),
+            torch.ones_like(paper_grid_f),
+            torch.full_like(paper_grid_f, 0.05),
         ).detach()
         return local_ink_grid, paper_gate, effective_paper
 

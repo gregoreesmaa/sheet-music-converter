@@ -8,8 +8,8 @@
 ## 2. Identifiers for Follow-Up Queries (Zero-Prior-Context Handoff)
 - **Modal Profile:** `gregoreesmaa1`
 - **Modal App Name:** `exp4-ablation-muon-vs-adamw`
-- **Modal App ID:** `ap-tXKsJnindxtL8tMh5RqEt9` (function call `fc-01M8AF527AAWGQAAMD5A90PSHT`)
-- **Modal Dashboard URL:** https://modal.com/apps/gregoreesmaa1/main/ap-tXKsJnindxtL8tMh5RqEt9
+- **Modal App ID:** `ap-6azxTTf3jTgmB8eoXTxJA1` (function call `fc-01M8AFSHX65D36Y2Z8WTS2QDXK`)
+- **Modal Dashboard URL:** https://modal.com/apps/gregoreesmaa1/main/ap-6azxTTf3jTgmB8eoXTxJA1
 - **Modal GPU / Runtime Verified:** `NVIDIA L4 (cc=8.9)` | `torch=2.15.0+cu132` | `native_muon=True`
 - **Modal Volume:** `omr-cache` mounted at `/vol`
   - Cached dataset: `/vol/datasets/iter10_5_proxy_2k/`
@@ -26,10 +26,10 @@
 .\.venv\Scripts\modal.exe app list
 
 # Stream or inspect logs
-.\.venv\Scripts\modal.exe app logs ap-tXKsJnindxtL8tMh5RqEt9
+.\.venv\Scripts\modal.exe app logs ap-6azxTTf3jTgmB8eoXTxJA1
 
 # Stop runaway job if needed
-.\.venv\Scripts\modal.exe app stop ap-tXKsJnindxtL8tMh5RqEt9
+.\.venv\Scripts\modal.exe app stop ap-6azxTTf3jTgmB8eoXTxJA1
 
 # Pull final comparison JSON from Hugging Face once COMPLETED
 .\.venv\Scripts\python.exe -c "from huggingface_hub import hf_hub_download; print(hf_hub_download('gregoreesmaa/sheet-music-converter-omr', 'evals/2026-11-26T00-54-ablation-muon-vs-adamw.json', repo_type='dataset'))"

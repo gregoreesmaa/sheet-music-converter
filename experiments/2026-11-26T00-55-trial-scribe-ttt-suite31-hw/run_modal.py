@@ -576,11 +576,11 @@ def main(
     max_dim: int = 1536,
     max_len: int = 4096,
 ) -> None:
-    summary = run_ttt_experiment.remote(
+    call = run_ttt_experiment.spawn(
         step_counts=[3, 5],
         ttt_lr=ttt_lr,
         adapt_scope=adapt_scope,
         max_dim=max_dim,
         max_len=max_len,
     )
-    print(json.dumps(summary, indent=2))
+    print(f"[exp6] Spawned detached call_id={call.object_id}", flush=True)

@@ -10,9 +10,9 @@
 
 - **Modal Profile:** `gregoreesmaa1`
 - **Modal App Name:** `exp8-ablation-spinquant-int4-parity`
-- **Modal App ID:** `ap-OrTAfTJlPV0o9aSWO0r59l`
-- **Modal Function Call ID:** `fc-01M8AFE2AHDQ7KS9W8JQX0T4PT`
-- **Modal Dashboard URL:** `https://modal.com/apps/gregoreesmaa1/main/ap-OrTAfTJlPV0o9aSWO0r59l`
+- **Modal App ID:** `ap-UF5TSgqpk19Vh8ifT7xkw0`
+- **Modal Function Call ID:** `fc-01M8AG6HGY2FPZMBHNBYX83839`
+- **Modal Dashboard URL:** `https://modal.com/apps/gregoreesmaa1/main/ap-UF5TSgqpk19Vh8ifT7xkw0`
 - **Modal Volume:** `omr-cache` mounted at `/vol` (cached eval tar at `/vol/datasets/suite31_hw_eval/`, output JSON at `/vol/evals/2026-11-26T00-55-ablation-spinquant-int4-parity.json`)
 - **Modal Secret:** `hf-secret` (`HF_TOKEN`)
 - **Hugging Face Repo:** `gregoreesmaa/sheet-music-converter-omr` (`repo_type="dataset"`)
@@ -26,10 +26,10 @@
 .\.venv\Scripts\modal.exe app list
 
 # Stream live logs
-.\.venv\Scripts\modal.exe app logs ap-OrTAfTJlPV0o9aSWO0r59l
+.\.venv\Scripts\modal.exe app logs ap-UF5TSgqpk19Vh8ifT7xkw0
 
 # Stop runaway job if needed
-.\.venv\Scripts\modal.exe app stop ap-OrTAfTJlPV0o9aSWO0r59l
+.\.venv\Scripts\modal.exe app stop ap-UF5TSgqpk19Vh8ifT7xkw0
 
 # Download completed eval JSON from Hugging Face
 $env:CUDA_VISIBLE_DEVICES=""

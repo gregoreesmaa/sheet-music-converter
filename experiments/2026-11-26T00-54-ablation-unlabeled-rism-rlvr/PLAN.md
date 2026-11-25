@@ -8,8 +8,9 @@
 ## 2. Identifiers for Follow-Up Queries (Zero-Prior-Context Handoff)
 - **Modal Profile:** `gregoreesmaa1`
 - **Modal App Name:** `exp5-ablation-unlabeled-rism-rlvr`
-- **Modal App ID:** `ap-3sWux2VnlHBiucILEOgZlC`
-- **Modal Dashboard URL:** `https://modal.com/apps/gregoreesmaa1/main/ap-3sWux2VnlHBiucILEOgZlC`
+- **Modal App ID:** `ap-ozqdCx4lsObGII8YLKdwFV`
+- **Modal Function Call ID:** `fc-01M8AG6ZSQ1ND65K1EK8M2WSCY`
+- **Modal Dashboard URL:** `https://modal.com/apps/gregoreesmaa1/main/ap-ozqdCx4lsObGII8YLKdwFV`
 - **Modal Volume:** `omr-cache` mounted at `/vol` (checkpoints at `/vol/ckpts/exp5_rism_rlvr/`)
 - **Modal Secret:** `hf-secret` (`HF_TOKEN`)
 - **Hugging Face Repo:** `gregoreesmaa/sheet-music-converter-omr` (private dataset)
@@ -23,10 +24,10 @@
 .\.venv\Scripts\modal.exe app list
 
 # Tail live container logs
-.\.venv\Scripts\modal.exe app logs ap-3sWux2VnlHBiucILEOgZlC
+.\.venv\Scripts\modal.exe app logs ap-ozqdCx4lsObGII8YLKdwFV
 
 # Stop runaway job if needed
-.\.venv\Scripts\modal.exe app stop ap-3sWux2VnlHBiucILEOgZlC
+.\.venv\Scripts\modal.exe app stop ap-ozqdCx4lsObGII8YLKdwFV
 
 # Inspect Hugging Face run ledger & eval once complete
 .\.venv\Scripts\python.exe -c "from huggingface_hub import hf_hub_download; p = hf_hub_download('gregoreesmaa/sheet-music-converter-omr', 'runs/2026-11-26T00-54-ablation-unlabeled-rism-rlvr.json', repo_type='dataset'); print(open(p).read())"

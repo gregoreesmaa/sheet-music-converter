@@ -11,9 +11,9 @@
 ## 2. Identifiers for Follow-Up Queries
 - **Modal Profile:** `gregoreesmaa1`
 - **Modal App Name:** `exp3-ablation-vir-vico-router`
-- **Modal App ID:** `ap-s2HoXUXOCRrpAI3CMHFQJF`
-- **Modal Orchestrator Call ID:** `fc-01M8AF0D8N8XRAJGEXJAP8NJ7B`
-- **Modal Dashboard URL:** `https://modal.com/apps/gregoreesmaa1/main/ap-s2HoXUXOCRrpAI3CMHFQJF`
+- **Modal App ID:** `ap-8ZDdiVYjK1SGxUf0v43qH7`
+- **Modal Orchestrator Call ID:** `fc-01M8AFS35PEGQHJ63D0N2JEMZ6`
+- **Modal Dashboard URL:** `https://modal.com/apps/gregoreesmaa1/main/ap-8ZDdiVYjK1SGxUf0v43qH7`
 - **Modal Volume:** `omr-cache` (mounted at `/vol`)
   - Cached dataset: `/vol/datasets/iter10_5_proxy_2k/`
   - 5-min rolling checkpoints: `/vol/ckpts/exp3_vir_vico/baseline/` and `/vol/ckpts/exp3_vir_vico/vir_vico/`
@@ -29,10 +29,10 @@
 .\.venv\Scripts\modal.exe app list
 
 # Tail live logs
-.\.venv\Scripts\modal.exe app logs ap-s2HoXUXOCRrpAI3CMHFQJF
+.\.venv\Scripts\modal.exe app logs ap-8ZDdiVYjK1SGxUf0v43qH7
 
 # Stop run if needed (5-min checkpoints remain on Volume `omr-cache`)
-.\.venv\Scripts\modal.exe app stop ap-s2HoXUXOCRrpAI3CMHFQJF
+.\.venv\Scripts\modal.exe app stop ap-8ZDdiVYjK1SGxUf0v43qH7
 
 # Pull completed comparison JSON from Hugging Face
 $env:CUDA_VISIBLE_DEVICES=""

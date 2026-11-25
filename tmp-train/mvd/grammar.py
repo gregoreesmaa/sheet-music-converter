@@ -1325,3 +1325,90 @@ def allowed_next_strict(prefix_ids):
     if st is None:
         return _fail_open()
     return st.allowed()
+
+
+def _voice_sort_key(tok):
+    """Numeric sort key for ``voice-<k>`` tokens (falls back to lexicographic)."""
+    try:
+        return (0, int(tok.split('-', 1)[1]), tok)
+    except (IndexError, ValueError):
+        return (1, 0, tok)
+
+
+def _canonicalize_single_measure(measure_toks):
+    """Reorder an onset-interleaved multi-voice measure into canonical voice-major order.
+
+    Measures that are monophonic or already have each ``voice-k`` appearing at most
+    once in non-decreasing order are returned verbatim (idempotent, zero perturbation).
+    """
+    voice_positions = [i for i, t in enumerate(measure_toks) if t in VOICES]
+    if len(voice_positions) < 2:
+        return list(measure_toks)
+
+    seen_voices = [measure_toks[i] for i in voice_positions]
+    if len(seen_voices) == len(set(seen_voices)):
+        sort_keys = [_voice_sort_key(v) for v in seen_voices]
+        if sort_keys == sorted(sort_keys):
+            return list(measure_toks)
+
+    first_v = voice_positions[0]
+    prefix = list(measure_toks[:first_v])
+    # Collect (voice_tok, segment_toks) runs.
+    runs = []
+    for idx, pos in enumerate(voice_positions):
+        end = voice_positions[idx + 1] if (idx + 1) < len(voice_positions) else len(measure_toks)
+        v_tok = measure_toks[pos]
+        seg = list(measure_toks[pos + 1 : end])
+        runs.append([v_tok, seg])
+
+    # Leading dynamics immediately preceding a voice switch (e.g.
+    # ``... tie-start dyn-f voice-2 quarter C 4``) belong to the upcoming voice.
+    for idx in range(len(runs) - 1):
+        prev_seg = runs[idx][1]
+        carry = []
+        while prev_seg and prev_seg[-1] in DYNS:
+            carry.append(prev_seg.pop())
+        if carry:
+            carry.reverse()
+            runs[idx + 1][1] = carry + runs[idx + 1][1]
+
+    grouped = {}
+    for v_tok, seg in runs:
+        grouped.setdefault(v_tok, []).extend(seg)
+
+    out = prefix
+    for v_tok in sorted(grouped.keys(), key=_voice_sort_key):
+        out.append(v_tok)
+        out.extend(grouped[v_tok])
+    return out
+
+
+def canonicalize_measure_voices(tokens):
+    """Canonicalize per-measure voice ordering to voice-major across ``<sys>`` & barlines.
+
+    Eliminates semantically identical onset-interleaved vs voice-major serialization
+    splits (e.g. ``voice-1 ... voice-2 ... voice-1 ... voice-2 ... bar`` ->
+    ``voice-1 ... voice-2 ... bar``) while leaving already-canonical measures untouched.
+    """
+    if not tokens:
+        return []
+
+    out = []
+    cur_measure = []
+    for tok in tokens:
+        if tok == '<sys>':
+            if cur_measure:
+                out.extend(_canonicalize_single_measure(cur_measure))
+                cur_measure = []
+            out.append(tok)
+        elif tok in BAR_LIKES:
+            if cur_measure:
+                out.extend(_canonicalize_single_measure(cur_measure))
+                cur_measure = []
+            out.append(tok)
+        else:
+            cur_measure.append(tok)
+
+    if cur_measure:
+        out.extend(_canonicalize_single_measure(cur_measure))
+    return out

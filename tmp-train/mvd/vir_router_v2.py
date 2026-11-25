@@ -163,6 +163,25 @@ def compute_ink_and_paper_gate_f32(
     else:
         luma = img_f.mean(dim=1, keepdim=True)
 
+    # Pure-float32 edge-connected dark-border mask (4-edge inward scan stopping
+    # at first bright pixel luma >= 0.45; interior dark shadows/ink are NEVER masked).
+    bright_f = (luma >= 0.45).to(torch.float32)
+    top_dark = (bright_f.cumsum(dim=2) < 0.5).to(torch.float32)
+    bot_dark = (bright_f.flip(dims=(2,)).cumsum(dim=2).flip(dims=(2,)) < 0.5).to(torch.float32)
+    left_dark = (bright_f.cumsum(dim=3) < 0.5).to(torch.float32)
+    right_dark = (bright_f.flip(dims=(3,)).cumsum(dim=3).flip(dims=(3,)) < 0.5).to(torch.float32)
+    edge_connected_f = (top_dark + bot_dark + left_dark + right_dark).clamp(0.0, 1.0)
+    dark_px_f = (luma < 0.30).to(torch.float32)
+    border_px = edge_connected_f * dark_px_f
+
+    border_dilated_px = F.max_pool2d(
+        F.max_pool2d(border_px, kernel_size=(1, 33), stride=1, padding=(0, 16)),
+        kernel_size=(33, 1),
+        stride=1,
+        padding=(16, 0),
+    )
+    paper_px = (1.0 - border_dilated_px).clamp(0.0, 1.0)
+
     local_bg = F.avg_pool2d(
         F.avg_pool2d(
             luma,
@@ -176,23 +195,22 @@ def compute_ink_and_paper_gate_f32(
         padding=(15, 0),
         count_include_pad=False,
     )
-    paper_mask = (local_bg > 0.35).to(torch.float32)
-    local_ink = ((local_bg - luma) / local_bg.clamp(min=0.15)).clamp(0.0, 1.0) * paper_mask
+    local_ink = ((local_bg - luma) / local_bg.clamp(min=0.15)).clamp(0.0, 1.0) * paper_px
 
     in_h, in_w = int(img_f.shape[2]), int(img_f.shape[3])
     if in_h == h_p * 16 and in_w == w_p * 16:
         ks = (16, 16)
         ink_max = F.max_pool2d(local_ink, kernel_size=ks, stride=ks)
         ink_avg = F.avg_pool2d(local_ink, kernel_size=ks, stride=ks)
-        local_bg_grid = F.avg_pool2d(local_bg, kernel_size=ks, stride=ks)
+        paper_grid_f = F.avg_pool2d(paper_px, kernel_size=ks, stride=ks)
     else:
         ink_max = F.adaptive_max_pool2d(local_ink, (h_p, w_p))
         ink_avg = F.adaptive_avg_pool2d(local_ink, (h_p, w_p))
-        local_bg_grid = F.adaptive_avg_pool2d(local_bg, (h_p, w_p))
+        paper_grid_f = F.adaptive_avg_pool2d(paper_px, (h_p, w_p))
 
     local_ink_grid = 0.5 * ink_max + 0.5 * ink_avg
-    paper_f = (local_bg_grid > 0.35).to(torch.float32)
-    paper_gate, effective_paper_f = erode_paper_gate_f32(paper_f, bg_floor=bg_floor)
+    effective_paper_f = (paper_grid_f > 0.5).to(torch.float32)
+    paper_gate = float(bg_floor) + (1.0 - float(bg_floor)) * effective_paper_f
     local_ink_grid = local_ink_grid * effective_paper_f
     return local_ink_grid.detach(), paper_gate.detach(), effective_paper_f.detach()
 
@@ -226,7 +244,7 @@ class ViRTwoTierRouter(nn.Module):
         min_keep_ratio: float = 0.15,
         max_keep_ratio: float = 0.75,
         saliency_thr: float = 0.05,
-        max_mem_tokens: int = 2176,
+        max_mem_tokens: int = 10240,
         router_hidden: int = 64,
         merge_temp: float = 0.25,
         spatial_gamma: float = 2.0,

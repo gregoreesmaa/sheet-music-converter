@@ -89,6 +89,7 @@ from uni_omr import (  # noqa: E402
     _strip_group_key,
     collate_uni_batch,
     discover_fullpage_pairs,
+    filter_fullpage_pairs_by_systems,
     discover_strip_pairs,
     eval_dataset,
     split_train_val,
@@ -959,6 +960,17 @@ def _build_datasets_and_iters(
                     domain = str(rec.get("domain", "")).strip().lower()
                     if img_p.is_file() and beks:
                         fp_pairs.append((img_p, beks, domain))
+        max_sys_cap = int(getattr(args, "max_systems_per_page", 16))
+        if fp_pairs and max_sys_cap > 0:
+            fp_pairs, n_dropped_sys = filter_fullpage_pairs_by_systems(
+                fp_pairs, max_systems_per_page=max_sys_cap
+            )
+            if n_dropped_sys > 0:
+                print(
+                    f"[v2-data] filtered {n_dropped_sys} full-page rows with > {max_sys_cap} systems "
+                    f"({len(fp_pairs)} kept)",
+                    flush=True,
+                )
         if fp_pairs:
             fp_tr, fp_va = split_train_val(
                 fp_pairs,
@@ -1749,7 +1761,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--keep-ratio", type=float, default=0.40)
     p.add_argument("--dynamic-routing", action="store_true", default=True)
     p.add_argument("--no-dynamic-routing", dest="dynamic_routing", action="store_false")
-    p.add_argument("--max-mem-tokens", type=int, default=3072)
+    p.add_argument("--max-mem-tokens", type=int, default=10240)
     p.add_argument("--mtp-k", type=int, default=4)
     p.add_argument("--use-sys-y-aux", action="store_true", default=True)
     p.add_argument("--use-sys-count-aux", action="store_true", default=True)
@@ -1805,6 +1817,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--hw-strip-dirs", nargs="*", default=[])
     p.add_argument("--fullpage-dirs", nargs="*", default=[])
     p.add_argument("--fullpage-manifest", type=str, default=None)
+    p.add_argument("--max-systems-per-page", type=int, default=16, help="Drop full-page rows with more than this many systems (default: 16; 0 disables)")
     p.add_argument("--strip-height", type=int, default=192)
     p.add_argument("--max-strip-width", type=int, default=1024)
     p.add_argument("--fullpage-max-dim", type=int, default=1280)

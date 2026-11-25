@@ -304,5 +304,5 @@ def run_vjepa21_pretrain(steps: int = 1500, init_from: str = "") -> Dict[str, An
 
 @app.local_entrypoint()
 def main(steps: int = 1500, init_from: str = "") -> None:
-    result = run_vjepa21_pretrain.remote(steps=steps, init_from=init_from)
-    print(json.dumps(result, indent=2), flush=True)
+    call = run_vjepa21_pretrain.spawn(steps=steps, init_from=init_from)
+    print(f"[exp2] Spawned detached call_id={call.object_id}", flush=True)

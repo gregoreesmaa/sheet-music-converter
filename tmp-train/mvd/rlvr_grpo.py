@@ -171,13 +171,15 @@ def compute_sequence_f1(ref_items: Sequence[Any], hyp_items: Sequence[Any]) -> f
 
 
 def _check_measure_valid(state: grammar.PrefixState, tol: float = METER_TOL) -> Optional[bool]:
-    """Check whether the open measure in ``state`` obeys ``|vcurs - tsig| < tol``.
+    """Check whether the open measure in ``state`` obeys beat conservation.
 
-    Returns ``None`` if no time signature is active or the measure is empty;
-    otherwise returns ``True`` iff every active voice matches ``tsig`` within ``tol``.
+    Enforces BOTH:
+      1. Cross-voice agreement ``|vcurs[v] - vcurs[active[0]]| < tol`` whenever
+         multiple voices are active (even on continuation systems with ``tsig is None``).
+      2. Time-signature conservation ``|vcurs[v] - tsig| < tol`` whenever ``tsig`` is set.
+
+    Returns ``None`` if the measure is empty or neither constraint applies.
     """
-    if state.tsig is None:
-        return None
     eff_vcurs = list(state.vcurs)
     if 0 <= state.seg < len(eff_vcurs):
         eff_vcurs[state.seg] += state._pending_value()
@@ -188,7 +190,21 @@ def _check_measure_valid(state: grammar.PrefixState, tol: float = METER_TOL) -> 
     ]
     if not active:
         return None
-    return all(abs(eff_vcurs[v] - state.tsig) < tol for v in active)
+    has_tsig = state.tsig is not None
+    has_multi_voice = len(active) > 1
+    if not has_tsig and not has_multi_voice:
+        return None
+    meter_ok = (
+        all(abs(eff_vcurs[v] - state.tsig) < tol for v in active)
+        if has_tsig
+        else True
+    )
+    voice_ok = (
+        all(abs(eff_vcurs[v] - eff_vcurs[active[0]]) < tol for v in active[1:])
+        if has_multi_voice
+        else True
+    )
+    return bool(meter_ok and voice_ok)
 
 
 def _walk_parse_and_meter(
@@ -211,10 +227,10 @@ def _walk_parse_and_meter(
 
     for tok in tokens:
         if tok == uni_omr.SYS_TOKEN:
-            # Current system must end cleanly and be non-empty.
+            # Current system must have >=1 musical event, be under MAX_SYSTEMS, and end cleanly.
             _, eos_ok = st.allowed()
             after_bar = bool(st.recent) and (st.recent[-1] in grammar.BAR_LIKES)
-            if not st.recent or not (eos_ok or after_bar):
+            if not st.can_emit_sys() or not (eos_ok or after_bar):
                 parse_ok = False
                 break
             # Record any unclosed trailing measure in this system.
@@ -223,7 +239,7 @@ def _walk_parse_and_meter(
                 system_bars[-1].append(tail_valid)
             if st.tsig is not None:
                 last_tsig = st.tsig
-            st = grammar.PrefixState(strict=False)
+            st.reset_system()
             st.tsig = last_tsig
             system_bars.append([])
             continue

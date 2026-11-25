@@ -17,8 +17,8 @@ Zero-Prior-Context Handoff plan for **Cloud Experiment 2**: V-JEPA 2.1 + DINOv3 
 
 - **Modal Profile:** `gregoreesmaa1`
 - **Modal App Name:** `exp2-vjepa21-gram-rism-v2`
-- **Modal App ID:** `ap-VDgc7PqnXbaBLqqRVHPNd1`
-- **Modal Dashboard URL:** `https://modal.com/apps/gregoreesmaa1/main/ap-VDgc7PqnXbaBLqqRVHPNd1`
+- **Modal App ID:** `ap-2nt0fsApbBEPxzXGMGYPZL` (call ID: `fc-01M8AFRPK4GY0HAC18W4VPFY09`)
+- **Modal Dashboard URL:** `https://modal.com/apps/gregoreesmaa1/main/ap-2nt0fsApbBEPxzXGMGYPZL`
 - **Modal Shared Volume:** `omr-cache` (mounted at `/vol`)
   - Cached dataset: `/vol/datasets/rism_hw/` (marker: `/vol/datasets/rism_hw/.unpacked_rism_hw_5707`)
   - Checkpoints: `/vol/ckpts/exp2_vjepa21_rism_v2/`
@@ -37,10 +37,10 @@ Zero-Prior-Context Handoff plan for **Cloud Experiment 2**: V-JEPA 2.1 + DINOv3 
 .\.venv\Scripts\modal.exe app list
 
 # Tail live logs
-.\.venv\Scripts\modal.exe app logs ap-VDgc7PqnXbaBLqqRVHPNd1
+.\.venv\Scripts\modal.exe app logs ap-2nt0fsApbBEPxzXGMGYPZL
 
 # Stop runaway job if needed
-.\.venv\Scripts\modal.exe app stop -y ap-VDgc7PqnXbaBLqqRVHPNd1
+.\.venv\Scripts\modal.exe app stop -y ap-2nt0fsApbBEPxzXGMGYPZL
 
 # Check HF run ledger & uploaded artifacts
 $env:CUDA_VISIBLE_DEVICES=""; .\.venv\Scripts\python.exe -c "from huggingface_hub import HfApi; api=HfApi(); print('\n'.join(f for f in api.list_repo_files('gregoreesmaa/sheet-music-converter-omr', repo_type='dataset') if '2026-11-26T00-54-vjepa21-gram-rism-v2' in f))"

@@ -43,6 +43,7 @@ image = (
         "huggingface_hub>=0.26",
         "pillow",
         "numpy",
+        "scipy",
         "tqdm",
     )
     # Keep repo code LAST so edits rebuild in ~2s instead of reinstalling PyTorch.
@@ -774,11 +775,11 @@ def main(
     lr: float = 1.0e-5,
     kl_beta: float = 0.04,
 ) -> None:
-    res = run_experiment.remote(
+    call = run_experiment.spawn(
         updates=updates,
         group_size=group_size,
         max_len=max_len,
         lr=lr,
         kl_beta=kl_beta,
     )
-    print(json.dumps(res, indent=2))
+    print(f"[exp5] Spawned detached Modal function call: {call.object_id}", flush=True)

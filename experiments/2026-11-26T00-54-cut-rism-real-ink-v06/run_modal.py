@@ -232,6 +232,7 @@ def _read_latest_log_metrics(log_path: Path) -> Dict[str, Any]:
 
 
 @app.function(
+    image=image,
     gpu="L4",
     timeout=7200,
     volumes={"/vol": vol},
@@ -511,10 +512,10 @@ def main(
     save_every: int = 500,
     skip_train: bool = False,
 ) -> None:
-    res = run_experiment.remote(
+    call = run_experiment.spawn(
         steps=steps,
         batch_size=batch_size,
         save_every=save_every,
         skip_train=skip_train,
     )
-    print(json.dumps(res, indent=2))
+    print(f"[exp1] Spawned detached call_id={call.object_id}", flush=True)

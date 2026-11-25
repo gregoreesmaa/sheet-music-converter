@@ -17,8 +17,8 @@
 |---|---|
 | **Modal Profile** | `gregoreesmaa1` |
 | **Modal App Name** | `exp1-cut-rism-real-ink-v06` |
-| **Modal `app_id`** | `ap-6sVnb4KRrDaXVEHZUrYmQv` |
-| **Modal Dashboard URL** | https://modal.com/apps/gregoreesmaa1/main/ap-6sVnb4KRrDaXVEHZUrYmQv |
+| **Modal `app_id`** | `ap-t4DJkB0arrH71y2Il6Xt11` (`call_id`: `fc-01M8AFTESJC0S1YHDC6M0DDMX7`) |
+| **Modal Dashboard URL** | https://modal.com/apps/gregoreesmaa1/main/ap-t4DJkB0arrH71y2Il6Xt11 |
 | **Modal Volume** | `omr-cache` (mounted at `/vol`: `/vol/datasets/`, `/vol/ckpts/2026-11-26T00-54-cut-rism-real-ink-v06/`, `/vol/out/cut_rism_v06/`) |
 | **Modal Secret** | `hf-secret` (`HF_TOKEN`) |
 | **HF Dataset Repo** | `gregoreesmaa/sheet-music-converter-omr` |
@@ -33,10 +33,10 @@
 .\.venv\Scripts\modal.exe app list
 
 # Tail live container logs
-.\.venv\Scripts\modal.exe app logs ap-6sVnb4KRrDaXVEHZUrYmQv
+.\.venv\Scripts\modal.exe app logs ap-t4DJkB0arrH71y2Il6Xt11
 
 # Stop / cancel runaway job
-.\.venv\Scripts\modal.exe app stop ap-6sVnb4KRrDaXVEHZUrYmQv
+.\.venv\Scripts\modal.exe app stop ap-t4DJkB0arrH71y2Il6Xt11
 
 # Resume cleanly (auto-loads /vol/ckpts/.../cut_rism_latest.pt or HF latest, skips translated PNGs)
 .\.venv\Scripts\modal.exe run --detach experiments/2026-11-26T00-54-cut-rism-real-ink-v06/run_modal.py

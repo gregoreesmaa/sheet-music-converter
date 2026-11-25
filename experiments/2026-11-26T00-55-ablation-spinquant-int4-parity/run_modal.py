@@ -46,6 +46,8 @@ image = (
         "numpy",
         "pillow",
         "onnx==1.23.2",
+        "onnx-ir",
+        "onnxscript",
         "onnxruntime==1.31.1",
         "huggingface_hub",
     )

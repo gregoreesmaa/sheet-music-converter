@@ -1705,6 +1705,18 @@ def discover_strip_pairs(
     return pairs
 
 
+def filter_fullpage_pairs_by_systems(
+    fp_pairs: Sequence[Tuple[Any, ...]],
+    max_systems_per_page: int = 16,
+) -> Tuple[List[Tuple[Any, ...]], int]:
+    """Drop full-page rows with more than ``max_systems_per_page`` systems (0 disables)."""
+    limit = int(max_systems_per_page)
+    if limit <= 0:
+        return list(fp_pairs), 0
+    kept = [p for p in fp_pairs if len(p[1]) <= limit]
+    return kept, len(fp_pairs) - len(kept)
+
+
 def discover_fullpage_pairs(
     fullpage_dirs: Sequence[str | Path],
     max_samples: Optional[int] = None,
@@ -4567,6 +4579,17 @@ def run_train(args: argparse.Namespace, cfg: UniOMRConfig) -> Dict[str, Any]:
                         domain = str(rec.get("domain", "")).strip().lower()
                         if img_p.is_file() and beks:
                             fp_pairs.append((img_p, beks, domain))
+            max_sys_cap = int(getattr(args, "max_systems_per_page", 16))
+            if fp_pairs and max_sys_cap > 0:
+                fp_pairs, n_dropped_sys = filter_fullpage_pairs_by_systems(
+                    fp_pairs, max_systems_per_page=max_sys_cap
+                )
+                if n_dropped_sys > 0:
+                    print(
+                        f"[data] filtered {n_dropped_sys} full-page rows with > {max_sys_cap} systems "
+                        f"({len(fp_pairs)} kept)",
+                        flush=True,
+                    )
             if fp_pairs:
                 fp_tr, fp_va = split_train_val(
                     fp_pairs,
@@ -5474,6 +5497,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--fullpage-frac", type=float, default=0.65, help="Fraction of mixed-curriculum steps sampled from fullpage data when both strips and fullpage exist (default: 0.65)")
     p.add_argument("--fullpage-dirs", nargs="*", default=[], help="Directories of full-page training pairs")
     p.add_argument("--fullpage-manifest", type=str, default=None, help="Path to full-page manifest.jsonl")
+    p.add_argument("--max-systems-per-page", type=int, default=16, help="Drop full-page rows with more than this many systems (default: 16; 0 disables)")
     p.add_argument("--stratified-fullpage", action="store_true", help="Enable 5-bucket domain/renderer-stratified full-page sampling (legacy_printed 26%%, multi_renderer_printed 22%%, rare_printed 7%%, synth_hw 27%%, real_hw 18%%)")
     p.add_argument("--uv-mask-dir", type=str, default=None, help="Directory of photo-degrade UV flow masks")
 

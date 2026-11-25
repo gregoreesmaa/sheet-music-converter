@@ -282,6 +282,68 @@ def _measure_violation_errors(state: grammar.PrefixState) -> Tuple[float, float]
     return float(meter_err), float(voice_err)
 
 
+def _measure_signed_offset(state: grammar.PrefixState) -> Optional[float]:
+    """Return signed ``vcur - tsig`` for the primary active voice, or None if no tsig."""
+    if state.tsig is None:
+        return None
+    eff_vcurs = list(state.vcurs)
+    if 0 <= state.seg < len(eff_vcurs):
+        eff_vcurs[state.seg] += state._pending_value()
+    active = [
+        i for i, v in enumerate(eff_vcurs)
+        if v > grammar._BAR_EPS or (i + 1) in state.opened
+    ]
+    if not active:
+        active = [0]
+    return round(float(eff_vcurs[active[0]] - state.tsig), 4)
+
+
+class MeasureBeamHeaderGuard:
+    """Abort meter-only measure-beam repair when a wrong ``time-X-Y`` header is detected.
+
+    If ``> const_offset_limit`` (default 3, i.e. ``>= 4``) bars trigger with the exact
+    same non-zero signed meter offset while all active voices agree (``voice_err <= tol``),
+    the piece almost certainly has a misread time-signature header (e.g. ``time-3-2``
+    on a ``4/2`` piece) rather than local intra-bar rhythm errors. Once tripped, meter-only
+    repairs are disabled for the current time-signature regime while genuine cross-voice
+    mismatches (``voice_err > tol``) remain eligible for repair.
+    """
+
+    def __init__(self, const_offset_limit: int = 3, tol: float = 1e-3) -> None:
+        self.const_offset_limit = int(const_offset_limit)
+        self.tol = float(tol)
+        self.last_tsig: Optional[float] = None
+        self.offset_counts: Dict[float, int] = {}
+        self.tripped: bool = False
+
+    def should_repair(
+        self,
+        state: grammar.PrefixState,
+        meter_err: float,
+        voice_err: float,
+    ) -> bool:
+        if meter_err <= self.tol and voice_err <= self.tol:
+            return False
+        if state.tsig != self.last_tsig:
+            self.last_tsig = state.tsig
+            self.offset_counts.clear()
+            self.tripped = False
+        # Cross-voice mismatch is independent of the time-signature header.
+        if voice_err > self.tol:
+            return True
+        if self.tripped:
+            return False
+        signed_off = _measure_signed_offset(state)
+        if signed_off is not None and abs(signed_off) > self.tol:
+            key = round(signed_off, 3)
+            cnt = self.offset_counts.get(key, 0) + 1
+            self.offset_counts[key] = cnt
+            if cnt > self.const_offset_limit:
+                self.tripped = True
+                return False
+        return True
+
+
 @torch.no_grad()
 def _beam_repair_measure(
     model: uni_omr.UniOMRNet,
@@ -657,6 +719,7 @@ def generate_mtp_spec(
     )
     measure_beam_triggers = 0
     measure_beam_repaired = 0
+    header_guard = MeasureBeamHeaderGuard() if use_measure_beam else None
 
     def _pick_step(step_logits: torch.Tensor) -> torch.Tensor:
         if not use_grammar:
@@ -699,7 +762,10 @@ def generate_mtp_spec(
                         and 1 <= bar_len <= max_bar_toks
                     ):
                         meter_err, voice_err = _measure_violation_errors(states[0])
-                        if meter_err > 1e-3 or voice_err > 1e-3:
+                        if header_guard is not None:
+                            if header_guard.should_repair(states[0], meter_err, voice_err):
+                                trigger_repair = True
+                        elif meter_err > 1e-3 or voice_err > 1e-3:
                             trigger_repair = True
                     states[0] = _advance_grammar_state(
                         states[0], tid, strict=strict_grammar, vocab_size=vocab_size
@@ -911,6 +977,7 @@ def generate_mtp_spec(
         "tokens_per_sec": round(total_gen_toks / elapsed, 2),
         "measure_beam_triggers": int(measure_beam_triggers),
         "measure_beam_repaired": int(measure_beam_repaired),
+        "measure_beam_header_guard_tripped": bool(header_guard.tripped) if header_guard is not None else False,
         "router_info": router_info,
     }
     if return_stats:
@@ -1434,11 +1501,15 @@ def evaluate_suite31(args: argparse.Namespace) -> Dict[str, Any]:
                     pred_raw_toks = trim_truncated_tokens(pred_raw_toks)
                 hyp_page_toks, n_sys = stitch_uni_tokens(pred_raw_toks)
 
-                # 1. Token-level F1, ordered TokLCS F1 & SER
+                # 1. Token-level F1, ordered TokLCS F1, canonical voice-major TokLCS & SER
                 tok_edits = uni_omr.levenshtein_distance(ref_page_toks, hyp_page_toks)
                 tok_ser = tok_edits / max(1, len(ref_page_toks))
                 _, _, tok_f1 = uni_omr.compute_token_f1(ref_page_toks, hyp_page_toks)
                 tok_lcs = compute_token_lcs_f1(ref_page_toks, hyp_page_toks)
+                canonical_tok_lcs = compute_token_lcs_f1(
+                    grammar.canonicalize_measure_voices(ref_page_toks),
+                    grammar.canonicalize_measure_voices(hyp_page_toks),
+                )
 
                 # 2. Note-level F1 & SER via assembly-serialize + eval-harness
                 hyp_txt = workdir / f"uni-{slug}-{domain}-hyp-bekern.txt"
@@ -1481,6 +1552,7 @@ def evaluate_suite31(args: argparse.Namespace) -> Dict[str, Any]:
                 pfx = domain + "_"
                 prow[pfx + "tok_f1"] = round(tok_f1, 6)
                 prow[pfx + "tok_lcs"] = round(tok_lcs, 6)
+                prow[pfx + "canonical_tok_lcs"] = round(canonical_tok_lcs, 6)
                 prow[pfx + "tok_ser"] = round(tok_ser, 6)
                 prow[pfx + "note_f1"] = round(note_f1, 6)
                 prow[pfx + "note_ser"] = round(note_ser, 6)

@@ -8,8 +8,8 @@
 ## 2. Identifiers for Follow-Up Queries (Zero-Prior-Context Handoff)
 - **Modal Profile:** `gregoreesmaa1`
 - **Modal App Name:** `exp6-trial-scribe-ttt-suite31-hw`
-- **Modal App ID:** `ap-x3HATdhn6O1gLztsLTSnVO` (`ephemeral (detached)`, `NVIDIA L4`, `cc=8.9`, `bf16=True`)
-- **Modal Dashboard URL:** `https://modal.com/apps/gregoreesmaa1/main/ap-x3HATdhn6O1gLztsLTSnVO`
+- **Modal App ID:** `ap-eLJrorKeWReglJ2HRrX7IB` (call ID: `fc-01M8AFT2HGFZQDE4F8ME2G19JR`, `ephemeral (detached)`, `NVIDIA L4`, `cc=8.9`, `bf16=True`)
+- **Modal Dashboard URL:** `https://modal.com/apps/gregoreesmaa1/main/ap-eLJrorKeWReglJ2HRrX7IB`
 - **Modal Shared Volume:** `omr-cache` (mounted at `/vol`)
 - **Modal Secret:** `hf-secret` (`HF_TOKEN`)
 - **Hugging Face Repo:** `gregoreesmaa/sheet-music-converter-omr` (`repo_type="dataset"`)
@@ -22,10 +22,10 @@
 .\.venv\Scripts\modal.exe app list
 
 # Tail live logs
-.\.venv\Scripts\modal.exe app logs ap-x3HATdhn6O1gLztsLTSnVO
+.\.venv\Scripts\modal.exe app logs ap-eLJrorKeWReglJ2HRrX7IB
 
 # Stop runaway job if needed
-.\.venv\Scripts\modal.exe app stop ap-x3HATdhn6O1gLztsLTSnVO
+.\.venv\Scripts\modal.exe app stop ap-eLJrorKeWReglJ2HRrX7IB
 
 # Download final eval JSON from Hugging Face once completed
 .\.venv\Scripts\python.exe -c "from huggingface_hub import hf_hub_download; print(hf_hub_download('gregoreesmaa/sheet-music-converter-omr', 'evals/2026-11-26T00-55-trial-scribe-ttt-suite31-hw.json', repo_type='dataset'))"
