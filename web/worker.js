@@ -1376,7 +1376,7 @@ async function warmupWebGpuSessions(ort, encSession, decSession, vocab) {
   }
 }
 
-function detectRepetitionLoop(tokenIds) {
+function detectRepetitionLoop(tokenIds, idToToken = null) {
   const n = tokenIds.length;
   if (n >= 24) {
     const last = tokenIds[n - 1];
@@ -1384,17 +1384,34 @@ function detectRepetitionLoop(tokenIds) {
     while (run < 24 && tokenIds[n - 1 - run] === last) run++;
     if (run >= 24) return { detected: true, period: 1, cutAt: n - run };
   }
-  const maxP = Math.min(32, Math.floor(n / 4));
+  // Never falsely kill legitimate multi-bar rests (bar-rest bar x N) or normal
+  // musical ostinatos (e.g. 4-8 repeated chords/measures):
+  //   - For short periods p=2..5 (like "bar-rest bar" or "quarter C 4"),
+  //     require >= 32 consecutive repeats (>= 64 tokens for bar-rest bar!).
+  //   - For medium/long periods p=6..32, require >= 6 consecutive repeats
+  //     (and >= 48 tokens total in the loop).
+  const maxP = Math.min(32, Math.floor(n / 6));
   for (let p = 2; p <= maxP; p++) {
+    const minReps = p <= 5 ? Math.max(16, Math.ceil(64 / p)) : Math.max(6, Math.ceil(48 / p));
+    if (n < p * (minReps + 1)) continue;
     let match = true;
-    for (let k = 0; k < p * 3; k++) {
+    const span = p * minReps;
+    for (let k = 0; k < span; k++) {
       if (tokenIds[n - 1 - k] !== tokenIds[n - 1 - k - p]) {
         match = false;
         break;
       }
     }
     if (match) {
-      return { detected: true, period: p, cutAt: n - p * 3 };
+      // Allow up to 64 consecutive bar-rest measures (e.g. orchestral parts)
+      if (p === 2 && idToToken) {
+        const t0 = idToToken[tokenIds[n - 1]];
+        const t1 = idToToken[tokenIds[n - 2]];
+        if ((t0 === 'bar' && t1 === 'bar-rest') || (t1 === 'bar' && t0 === 'bar-rest')) {
+          if (n < 130) continue;
+        }
+      }
+      return { detected: true, period: p, cutAt: n - span };
     }
   }
   return { detected: false };
@@ -1821,7 +1838,7 @@ async function handleRecognizePage(msg) {
 
         if (done) break;
 
-        const loopCheck = detectRepetitionLoop(generatedIds);
+        const loopCheck = detectRepetitionLoop(generatedIds, idToToken);
         if (loopCheck.detected) {
           stoppedByLoop = true;
           generatedTokens.length = Math.max(0, loopCheck.cutAt);
@@ -1885,7 +1902,7 @@ async function handleRecognizePage(msg) {
         curId = nextId;
         emitToken(nextId);
 
-        const loopCheck = detectRepetitionLoop(generatedIds);
+        const loopCheck = detectRepetitionLoop(generatedIds, idToToken);
         if (loopCheck.detected) {
           stoppedByLoop = true;
           generatedTokens.length = Math.max(0, loopCheck.cutAt);
