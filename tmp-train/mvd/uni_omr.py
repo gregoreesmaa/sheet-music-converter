@@ -1736,6 +1736,281 @@ def _apply_archival_border_and_colorbar(
     return canvas.resize((orig_w, orig_h), Image.Resampling.BILINEAR)
 
 
+def _apply_composer_scratchouts(
+    img: Image.Image,
+    rng: Any,
+    is_hw: bool = True,
+) -> Image.Image:
+    """Simulate compact composer/copyist deletions (phantom ink + heavy cancellation).
+
+    Draws 1-3 compact (15-55 x 12-35 px) phantom notehead/stem fragments and cancels
+    them with diagonal cross-hatching, zig-zag strikethroughs, or smudged ink blotches.
+    Uses ``ImageDraw.Draw(out, "RGBA")`` directly on the RGB canvas for <1 ms speed.
+    """
+    out = img.copy() if img.mode == "RGB" else img.convert("RGB")
+    w, h = out.size
+    if w < 48 or h < 48:
+        return out
+
+    draw = ImageDraw.Draw(out, "RGBA")
+    n_patches = rng.randint(1, 3)
+    max_bw = min(55, max(16, w // 4))
+    max_bh = min(35, max(13, h // 4))
+    min_bw = min(15, max_bw)
+    min_bh = min(12, max_bh)
+
+    def _sample_ink(alpha_lo: int = 185, alpha_hi: int = 245) -> Tuple[int, int, int, int]:
+        if is_hw:
+            ir = rng.randint(36, 98)
+            ig = max(18, ir - rng.randint(6, 22))
+            ib = max(10, ig - rng.randint(6, 20))
+        else:
+            base = rng.randint(14, 64)
+            ir = max(0, min(85, base + rng.randint(-4, 6)))
+            ig = max(0, min(85, base + rng.randint(-4, 6)))
+            ib = max(0, min(95, base + rng.randint(-4, 16)))
+        return (ir, ig, ib, rng.randint(alpha_lo, alpha_hi))
+
+    for _ in range(n_patches):
+        bw = rng.randint(min_bw, max_bw)
+        bh = rng.randint(min_bh, max_bh)
+        # Prefer quiet margins or inter-staff bands without covering large page areas
+        zone = rng.random()
+        if zone < 0.25:
+            # Top or bottom margin
+            x0 = rng.randint(max(2, int(w * 0.04)), max(3, w - bw - max(2, int(w * 0.04))))
+            if rng.random() < 0.5:
+                y0 = rng.randint(2, max(2, min(h - bh - 2, int(h * 0.14))))
+            else:
+                y_lo = max(2, int(h * 0.84) - bh)
+                y0 = rng.randint(min(y_lo, h - bh - 2), max(2, h - bh - 2))
+        elif zone < 0.45:
+            # Left or right margin
+            y0 = rng.randint(max(2, int(h * 0.06)), max(3, h - bh - max(2, int(h * 0.06))))
+            if rng.random() < 0.5:
+                x0 = rng.randint(2, max(2, min(w - bw - 2, int(w * 0.12))))
+            else:
+                x_lo = max(2, int(w * 0.86) - bw)
+                x0 = rng.randint(min(x_lo, w - bw - 2), max(2, w - bw - 2))
+        else:
+            # Interior inter-staff / near-ink area
+            x0 = rng.randint(max(2, int(w * 0.06)), max(3, w - bw - max(2, int(w * 0.06))))
+            y0 = rng.randint(max(2, int(h * 0.10)), max(3, h - bh - max(2, int(h * 0.10))))
+        x1 = x0 + bw
+        y1 = y0 + bh
+
+        # 1. Phantom ink cluster: 1-3 tiny noteheads + stems + optional beam/scribble
+        ink_phantom = _sample_ink(170, 230)
+        n_notes = rng.randint(1, 3)
+        stem_tops: List[Tuple[int, int]] = []
+        for ni in range(n_notes):
+            nx = x0 + max(3, int(round((ni + 0.5) * bw / max(1, n_notes)))) + rng.randint(-2, 2)
+            nx = max(x0 + 3, min(x1 - 3, nx))
+            ny = rng.randint(y0 + max(3, bh // 3), max(y0 + max(3, bh // 3), y1 - 3))
+            rx = rng.randint(2, 4)
+            ry = rng.randint(2, 3)
+            draw.ellipse([nx - rx, ny - ry, nx + rx, ny + ry], fill=ink_phantom)
+            stem_x = min(x1 - 1, nx + rx)
+            stem_y = max(y0 + 1, ny - rng.randint(max(6, bh // 2), max(7, bh - 2)))
+            draw.line([(stem_x, ny), (stem_x, stem_y)], fill=ink_phantom, width=rng.randint(1, 2))
+            stem_tops.append((stem_x, stem_y))
+        if len(stem_tops) >= 2:
+            draw.line([stem_tops[0], stem_tops[-1]], fill=ink_phantom, width=2)
+
+        # 2. Heavy cancellation stroke pattern
+        style = rng.choice(("crosshatch", "zigzag", "blotch_smudge"))
+        if style == "crosshatch":
+            n_fwd = rng.randint(4, 8)
+            for k in range(n_fwd):
+                frac = (k + 0.5) / n_fwd
+                cx = x0 + int(round(frac * bw))
+                dx = rng.randint(max(3, bw // 6), max(4, bw // 3))
+                draw.line(
+                    [(max(0, cx - dx), y1 + rng.randint(-2, 2)), (min(w - 1, cx + dx), y0 + rng.randint(-2, 2))],
+                    fill=_sample_ink(190, 245),
+                    width=rng.randint(1, 3),
+                )
+            n_bwd = rng.randint(3, 6)
+            for k in range(n_bwd):
+                frac = (k + 0.5) / n_bwd
+                cx = x0 + int(round(frac * bw))
+                dx = rng.randint(max(3, bw // 6), max(4, bw // 3))
+                draw.line(
+                    [(max(0, cx - dx), y0 + rng.randint(-2, 2)), (min(w - 1, cx + dx), y1 + rng.randint(-2, 2))],
+                    fill=_sample_ink(185, 240),
+                    width=rng.randint(1, 2),
+                )
+        elif style == "zigzag":
+            n_pts = rng.randint(7, 13)
+            pts: List[Tuple[int, int]] = []
+            for k in range(n_pts):
+                px = x0 + int(round((k / max(1, n_pts - 1)) * bw)) + rng.randint(-2, 2)
+                py = (y0 + rng.randint(0, max(1, bh // 4))) if (k % 2 == 0) else (y1 - rng.randint(0, max(1, bh // 4)))
+                pts.append((max(0, min(w - 1, px)), max(0, min(h - 1, py))))
+            draw.line(pts, fill=_sample_ink(200, 250), width=rng.randint(2, 3))
+            # Reinforcing horizontal cancel slash
+            ym = (y0 + y1) // 2
+            draw.line(
+                [(max(0, x0 - 2), ym + rng.randint(-3, 3)), (min(w - 1, x1 + 2), ym + rng.randint(-3, 3))],
+                fill=_sample_ink(190, 245),
+                width=rng.randint(2, 3),
+            )
+        else:
+            # Smudged erasure / ink blotch + heavy scribble strokes
+            n_blobs = rng.randint(2, 4)
+            for _ in range(n_blobs):
+                bx0 = rng.randint(x0, max(x0, x1 - max(6, bw // 3)))
+                by0 = rng.randint(y0, max(y0, y1 - max(5, bh // 3)))
+                bx1 = min(x1, bx0 + rng.randint(max(6, bw // 3), max(7, int(bw * 0.75))))
+                by1 = min(y1, by0 + rng.randint(max(5, bh // 3), max(6, int(bh * 0.75))))
+                draw.ellipse([bx0, by0, bx1, by1], fill=_sample_ink(105, 175))
+            for _ in range(rng.randint(3, 5)):
+                sx0 = rng.randint(x0, x1)
+                sy0 = rng.randint(y0, y1)
+                sx1 = rng.randint(x0, x1)
+                sy1 = rng.randint(y0, y1)
+                draw.line([(sx0, sy0), (sx1, sy1)], fill=_sample_ink(200, 250), width=rng.randint(2, 4))
+
+    return out
+
+
+def _apply_performer_pencil_markup(
+    img: Image.Image,
+    rng: Any,
+) -> Image.Image:
+    """Simulate realistic musicians' pencil & translucent highlighter markings on printed scores.
+
+    Draws thin/translucent graphite ovals, underlines, brackets/cut arrows, bowing marks
+    (``V`` / ``Π``) / breath commas, and/or 1-2 translucent highlighter bands while keeping
+    underlying printed notation 100% legible.
+    """
+    out = img.copy() if img.mode == "RGB" else img.convert("RGB")
+    w, h = out.size
+    if w < 48 or h < 48:
+        return out
+
+    draw = ImageDraw.Draw(out, "RGBA")
+    drew_any = False
+
+    def _sample_graphite(alpha_lo: int = 110, alpha_hi: int = 175) -> Tuple[int, int, int, int]:
+        g = rng.randint(75, 135)
+        gr = max(70, min(140, g + rng.randint(-5, 5)))
+        gg = max(70, min(140, g + rng.randint(-4, 4)))
+        gb = max(70, min(142, g + rng.randint(-5, 7)))
+        return (gr, gg, gb, rng.randint(alpha_lo, alpha_hi))
+
+    def _draw_hand_oval() -> None:
+        rx = rng.randint(max(6, min(10, w // 16)), max(8, min(28, w // 8)))
+        ry = rng.randint(max(5, min(8, h // 16)), max(7, min(22, h // 8)))
+        cx = rng.randint(rx + 4, max(rx + 4, w - rx - 4))
+        cy = rng.randint(ry + 4, max(ry + 4, h - ry - 4))
+        n_seg = rng.randint(12, 16)
+        pts: List[Tuple[int, int]] = []
+        phase = rng.uniform(0.0, 2.0 * math.pi)
+        for k in range(n_seg + 2):
+            ang = phase + (2.0 * math.pi * k) / n_seg
+            jr = rng.uniform(0.88, 1.12)
+            px = int(round(cx + rx * jr * math.cos(ang)))
+            py = int(round(cy + ry * jr * math.sin(ang)))
+            pts.append((max(0, min(w - 1, px)), max(0, min(h - 1, py))))
+        draw.line(pts, fill=_sample_graphite(), width=rng.randint(1, 2))
+
+    # 1. Translucent yellow/pink/green highlighter bands (1-2 bands, alpha 0.18-0.32)
+    if rng.random() < 0.45:
+        palette = ((255, 245, 70), (255, 135, 190), (120, 240, 130))
+        for _ in range(rng.randint(1, 2)):
+            hr, hg, hb = rng.choice(palette)
+            ha = int(round(rng.uniform(0.18, 0.32) * 255.0))
+            band_len = rng.randint(max(24, int(w * 0.08)), max(28, int(w * 0.28)))
+            band_h = rng.randint(max(8, min(12, h // 24)), max(10, min(24, h // 12)))
+            x0 = rng.randint(max(4, int(w * 0.05)), max(5, w - band_len - max(4, int(w * 0.05))))
+            y0 = rng.randint(max(4, int(h * 0.08)), max(5, h - band_h - max(4, int(h * 0.08))))
+            dy = rng.randint(-4, 4)
+            poly = [
+                (x0, y0),
+                (x0 + band_len, max(0, min(h - 1, y0 + dy))),
+                (x0 + band_len, max(0, min(h - 1, y0 + band_h + dy))),
+                (x0, min(h - 1, y0 + band_h)),
+            ]
+            draw.polygon(poly, fill=(hr, hg, hb, ha))
+        drew_any = True
+
+    # 2. Graphite hand-drawn ovals/circles (1-3)
+    if rng.random() < 0.75:
+        for _ in range(rng.randint(1, 3)):
+            _draw_hand_oval()
+        drew_any = True
+
+    # 3. Underlines, brackets, or cut arrows (1-2)
+    if rng.random() < 0.65:
+        for _ in range(rng.randint(1, 2)):
+            col = _sample_graphite()
+            kind = rng.choice(("underline", "bracket", "arrow"))
+            if kind == "underline":
+                ulen = rng.randint(max(20, min(35, w // 6)), max(25, min(140, w // 3)))
+                ux0 = rng.randint(4, max(4, w - ulen - 4))
+                uy0 = rng.randint(8, max(8, h - 8))
+                n_u = rng.randint(5, 8)
+                pts = [
+                    (
+                        ux0 + int(round(ulen * k / (n_u - 1))),
+                        max(0, min(h - 1, uy0 + rng.randint(-2, 2))),
+                    )
+                    for k in range(n_u)
+                ]
+                draw.line(pts, fill=col, width=rng.randint(1, 2))
+            elif kind == "bracket":
+                bh = rng.randint(14, min(42, max(15, h // 6)))
+                bw = rng.randint(5, 10)
+                bx = rng.randint(12, max(12, w - 12))
+                by = rng.randint(8, max(8, h - bh - 8))
+                sgn = 1 if rng.random() < 0.5 else -1
+                draw.line(
+                    [(bx + sgn * bw, by), (bx, by), (bx, by + bh), (bx + sgn * bw, by + bh)],
+                    fill=col,
+                    width=rng.randint(1, 2),
+                )
+            else:
+                ax0 = rng.randint(12, max(12, w - 24))
+                ay0 = rng.randint(12, max(12, h - 24))
+                adx = rng.choice((-1, 1)) * rng.randint(12, 28)
+                ady = rng.choice((-1, 1)) * rng.randint(10, 22)
+                ax1 = max(2, min(w - 3, ax0 + adx))
+                ay1 = max(2, min(h - 3, ay0 + ady))
+                draw.line([(ax0, ay0), (ax1, ay1)], fill=col, width=rng.randint(1, 2))
+                # Arrowhead ticks at (ax1, ay1)
+                sx = -1 if ax1 >= ax0 else 1
+                sy = -1 if ay1 >= ay0 else 1
+                draw.line([(ax1, ay1), (max(0, min(w - 1, ax1 + sx * 6)), ay1)], fill=col, width=1)
+                draw.line([(ax1, ay1), (ax1, max(0, min(h - 1, ay1 + sy * 6)))], fill=col, width=1)
+        drew_any = True
+
+    # 4. Bowing symbols (V, Π) and breath commas (1-3)
+    if rng.random() < 0.65:
+        for _ in range(rng.randint(1, 3)):
+            col = _sample_graphite()
+            sym = rng.choice(("upbow", "downbow", "comma"))
+            mx = rng.randint(10, max(10, w - 14))
+            my = rng.randint(10, max(10, h - 16))
+            if sym == "upbow":
+                # V shape
+                draw.line([(mx - 5, my - 6), (mx, my + 6), (mx + 5, my - 6)], fill=col, width=rng.randint(1, 2))
+            elif sym == "downbow":
+                # Π shape (thick top bar + 2 legs)
+                draw.line([(mx - 5, my - 5), (mx + 5, my - 5)], fill=col, width=3)
+                draw.line([(mx - 5, my - 5), (mx - 5, my + 5)], fill=col, width=1)
+                draw.line([(mx + 5, my - 5), (mx + 5, my + 5)], fill=col, width=1)
+            else:
+                # Breath comma
+                draw.line([(mx + 1, my - 4), (mx + 2, my), (mx - 2, my + 5)], fill=col, width=rng.randint(1, 2))
+        drew_any = True
+
+    if not drew_any:
+        _draw_hand_oval()
+
+    return out
+
+
 def apply_online_augment(
     img: Image.Image,
     rng: Optional[random.Random] = None,
@@ -1837,6 +2112,10 @@ def apply_online_augment(
         np.clip(arr, 0.0, 1.0, out=arr)
         out = Image.fromarray((arr * 255.0).astype(np.uint8), mode="RGB")
 
+        # Composer/copyist scratch-outs on archival pages (p=0.22 HW, p=0.06 printed)
+        if r.random() < (0.22 if is_hw else 0.06):
+            out = _apply_composer_scratchouts(out, r, is_hw=True)
+
         if r.random() < 0.40 and orig_w >= 48 and orig_h >= 48:
             has_dark_border = True
             base_d = r.randint(6, 36)
@@ -1862,6 +2141,12 @@ def apply_online_augment(
             buf.seek(0)
             out = Image.open(buf).convert("RGB")
         return out
+
+    # 0. Pre-warp paper-surface manual corrections & performer pencil/highlighter markup
+    if r.random() < (0.22 if is_hw else 0.06):
+        out = _apply_composer_scratchouts(out, r, is_hw=is_hw)
+    if not is_hw and r.random() < 0.18:
+        out = _apply_performer_pencil_markup(out, r)
 
     # 1. Dark desk inset/border framing (p=0.50): pad 2-10% per side with dark desk RGB 0..70
     if r.random() < 0.50 and orig_w >= 32 and orig_h >= 32:

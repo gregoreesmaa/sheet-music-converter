@@ -1269,6 +1269,72 @@ class TestUniOMR(unittest.TestCase):
         self.assertEqual(scaled.size, base.size)
         self.assertGreater(float(np.asarray(scaled)[0, 0].mean()), 230.0)
 
+    def test_u_composer_scratchouts_deterministic_and_fast(self) -> None:
+        """(u) _apply_composer_scratchouts preserves (W,H)/RGB, is deterministic, modifies pixels, and runs <20 ms at 1280x960."""
+        import random as _py_random
+        import time as _time
+
+        arr = np.full((960, 1280, 3), 244, dtype=np.uint8)
+        for sy in range(140, 820, 120):
+            for k in range(5):
+                arr[sy + k * 8 : sy + k * 8 + 2, 90:1190, :] = 25
+        base = Image.fromarray(arr, mode="RGB")
+
+        for is_hw in (True, False):
+            out_a = uni_omr._apply_composer_scratchouts(base, _py_random.Random(1337), is_hw=is_hw)
+            out_b = uni_omr._apply_composer_scratchouts(base, _py_random.Random(1337), is_hw=is_hw)
+            out_c = uni_omr._apply_composer_scratchouts(base, _py_random.Random(2027), is_hw=is_hw)
+
+            self.assertEqual(out_a.size, (1280, 960))
+            self.assertEqual(out_a.mode, "RGB")
+            arr_a = np.asarray(out_a)
+            np.testing.assert_array_equal(arr_a, np.asarray(out_b))
+            self.assertFalse(np.array_equal(arr_a, arr), f"Expected pixel changes for is_hw={is_hw}")
+            self.assertFalse(np.array_equal(arr_a, np.asarray(out_c)), "Expected different seed to produce different output")
+            # Keep scratch-outs compact: changed pixel fraction must remain small (<5% of page)
+            changed_frac = float((arr_a != arr).any(axis=-1).mean())
+            self.assertLess(changed_frac, 0.05, f"Scratch-outs obscured too much of page: {changed_frac:.4f}")
+
+        # Speed check at 1280x960 (<20 ms/img)
+        n_runs = 10
+        t0 = _time.perf_counter()
+        for s in range(n_runs):
+            im = uni_omr._apply_composer_scratchouts(base, _py_random.Random(500 + s), is_hw=(s % 2 == 0))
+            self.assertEqual(im.size, (1280, 960))
+        ms_per_img = (_time.perf_counter() - t0) * 1000.0 / n_runs
+        self.assertLess(ms_per_img, 20.0, f"_apply_composer_scratchouts too slow: {ms_per_img:.2f} ms/img")
+
+    def test_v_performer_pencil_markup_deterministic_and_fast(self) -> None:
+        """(v) _apply_performer_pencil_markup preserves (W,H)/RGB, is deterministic, modifies pixels, and runs <20 ms at 1280x960."""
+        import random as _py_random
+        import time as _time
+
+        arr = np.full((960, 1280, 3), 250, dtype=np.uint8)
+        for sy in range(140, 820, 120):
+            for k in range(5):
+                arr[sy + k * 8 : sy + k * 8 + 2, 90:1190, :] = 15
+        base = Image.fromarray(arr, mode="RGB")
+
+        out_a = uni_omr._apply_performer_pencil_markup(base, _py_random.Random(4242))
+        out_b = uni_omr._apply_performer_pencil_markup(base, _py_random.Random(4242))
+        out_c = uni_omr._apply_performer_pencil_markup(base, _py_random.Random(9001))
+
+        self.assertEqual(out_a.size, (1280, 960))
+        self.assertEqual(out_a.mode, "RGB")
+        arr_a = np.asarray(out_a)
+        np.testing.assert_array_equal(arr_a, np.asarray(out_b))
+        self.assertFalse(np.array_equal(arr_a, arr), "Expected performer markup to modify pixels")
+        self.assertFalse(np.array_equal(arr_a, np.asarray(out_c)), "Expected different seed to produce different output")
+
+        # Speed check at 1280x960 (<20 ms/img)
+        n_runs = 10
+        t0 = _time.perf_counter()
+        for s in range(n_runs):
+            im = uni_omr._apply_performer_pencil_markup(base, _py_random.Random(700 + s))
+            self.assertEqual(im.size, (1280, 960))
+        ms_per_img = (_time.perf_counter() - t0) * 1000.0 / n_runs
+        self.assertLess(ms_per_img, 20.0, f"_apply_performer_pencil_markup too slow: {ms_per_img:.2f} ms/img")
+
 
 if __name__ == "__main__":
     unittest.main()
