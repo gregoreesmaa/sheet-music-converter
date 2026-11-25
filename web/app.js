@@ -235,7 +235,9 @@ async function initRuntime() {
       return;
     }
     state.vocab = normalizeVocab(vocabRaw);
-    state.modelIo = (await fetchJsonOptional('./models/model_io.json')) || {};
+    state.modelIo = vocabRaw.model_io_file
+      ? (await fetchJsonOptional(`./models/${vocabRaw.model_io_file}`)) || {}
+      : vocabRaw;
 
     const encoderUrl = state.modelIo.encoder_file
       ? `./models/${state.modelIo.encoder_file}`
