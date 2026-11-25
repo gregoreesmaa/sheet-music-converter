@@ -981,6 +981,98 @@ class MTPHead(nn.Module):
 
 
 # ---------------------------------------------------------------------------
+# Native Symmetric Group-Wise INT4 QAT (Zero Schema Change)
+# ---------------------------------------------------------------------------
+
+def fake_quant_int4_ste(w: torch.Tensor, block_size: int = 32) -> torch.Tensor:
+    """Symmetric group-wise INT4 weight fake-quantization with Straight-Through Estimator (STE).
+
+    Matches ONNX Runtime ``MatMulNBits`` symmetric INT4 (``[-8, 7]`` per group of
+    ``block_size`` along ``in_features``), padding non-multiples of ``block_size``
+    with zeros before grouping and slicing back to the original shape.
+    """
+    if block_size <= 0:
+        raise ValueError(f"block_size must be positive, got {block_size}")
+    orig_shape = w.shape
+    in_f = orig_shape[-1]
+    pad = (block_size - (in_f % block_size)) % block_size
+    w_f = w.float()
+    if pad:
+        w_f = F.pad(w_f, (0, pad))
+    w_g = w_f.reshape(-1, block_size)
+    scale = (w_g.abs().amax(dim=-1, keepdim=True) / 7.0).clamp(min=1e-8)
+    q = torch.round(w_g / scale).clamp(-8.0, 7.0)
+    w_dq = (q * scale).reshape(*orig_shape[:-1], -1)
+    if pad:
+        w_dq = w_dq[..., :in_f]
+    w_dq = w_dq.to(w.dtype)
+    return w + (w_dq - w).detach()
+
+
+class QATInt4Controller:
+    """Zero-schema-change symmetric group-wise INT4 QAT controller for ``UniOMRNet``.
+
+    Monkey-patches ``forward`` on Transformer ``nn.Linear`` layers inside
+    ``enc_layers``, ``dec_layers``, ``mtp_heads``, and ``lm_head`` (skipping
+    ``backbone``, ``router``, ``tok_emb``, ``pos2d_proj``, and norms) without
+    adding parameters or buffers, preserving 100% ``state_dict()`` compatibility
+    (``strict=True``).
+    """
+
+    TARGET_ROOTS: Tuple[str, ...] = ("enc_layers", "dec_layers", "mtp_heads", "lm_head")
+
+    def __init__(self, model: nn.Module, block_size: int = 32, enabled: bool = False) -> None:
+        if block_size <= 0:
+            raise ValueError(f"block_size must be positive, got {block_size}")
+        self.model = model
+        self.block_size = int(block_size)
+        self.enabled = bool(enabled)
+        self._orig_forwards: Dict[nn.Linear, Any] = {}
+        self.target_names: List[str] = []
+        self._attach()
+
+    def _attach(self) -> None:
+        for root_name in self.TARGET_ROOTS:
+            root_mod = getattr(self.model, root_name, None)
+            if root_mod is None:
+                continue
+            for sub_name, mod in root_mod.named_modules():
+                if isinstance(mod, nn.Linear) and mod not in self._orig_forwards:
+                    full_name = f"{root_name}.{sub_name}" if sub_name else root_name
+                    self._orig_forwards[mod] = mod.forward
+                    self.target_names.append(full_name)
+                    self._patch_linear(mod)
+
+    def _patch_linear(self, mod: nn.Linear) -> None:
+        controller = self
+
+        def _qat_forward(x: torch.Tensor) -> torch.Tensor:
+            if controller.enabled:
+                w_q = fake_quant_int4_ste(mod.weight, block_size=controller.block_size)
+                return F.linear(x, w_q, mod.bias)
+            return F.linear(x, mod.weight, mod.bias)
+
+        mod.forward = _qat_forward  # type: ignore[method-assign]
+
+    @property
+    def num_layers(self) -> int:
+        return len(self.target_names)
+
+    def enable(self) -> None:
+        self.enabled = True
+
+    def disable(self) -> None:
+        self.enabled = False
+
+    def detach(self) -> None:
+        """Restore original ``forward`` methods on all patched ``nn.Linear`` modules."""
+        for mod, orig_fwd in self._orig_forwards.items():
+            mod.forward = orig_fwd  # type: ignore[method-assign]
+        self._orig_forwards.clear()
+        self.target_names.clear()
+
+
+# ---------------------------------------------------------------------------
 # UniOMRNet — Full Unified Model
 # ---------------------------------------------------------------------------
 
@@ -3846,6 +3938,19 @@ def run_train(args: argparse.Namespace, cfg: UniOMRConfig) -> Dict[str, Any]:
     ema_decay = float(getattr(args, "ema_decay", 0.995))
     cass_prob = float(max(0.0, min(1.0, getattr(args, "cass_prob", 0.0))))
     soup_last_k = max(0, int(getattr(args, "soup_last_k", 0)))
+    qat_int4 = bool(getattr(args, "qat_int4", False))
+    qat_int4_last_frac = float(max(0.0, min(1.0, getattr(args, "qat_int4_last_frac", 0.15))))
+    qat_int4_block_size = max(1, int(getattr(args, "qat_int4_block_size", 32)))
+    qat_ctrl: Optional[QATInt4Controller] = (
+        QATInt4Controller(model, block_size=qat_int4_block_size, enabled=False)
+        if qat_int4
+        else None
+    )
+    qat_start_step = (
+        steps + 1
+        if qat_int4_last_frac <= 0.0
+        else max(1, int(steps * (1.0 - qat_int4_last_frac)))
+    )
 
     out_dir = Path(args.out_dir) if args.out_dir else None
     if out_dir is not None and not args.dry_run:
@@ -4337,6 +4442,14 @@ def run_train(args: argparse.Namespace, cfg: UniOMRConfig) -> Dict[str, Any]:
 
     try:
         for step in range(1, steps + 1):
+            if qat_ctrl is not None and (not qat_ctrl.enabled) and step >= qat_start_step:
+                qat_ctrl.enable()
+                print(
+                    f"[UniOMR QAT-INT4] enabled on {qat_ctrl.num_layers} Linear layers "
+                    f"(block_size={qat_ctrl.block_size}) at step {step}/{steps}",
+                    flush=True,
+                )
+
             cur_lr = _lr_for_step(step, steps, args.lr, args.warmup_steps)
             for pg in opt.param_groups:
                 pg["lr"] = cur_lr
@@ -4631,6 +4744,9 @@ def run_train(args: argparse.Namespace, cfg: UniOMRConfig) -> Dict[str, Any]:
                 encoding="utf-8",
             )
 
+    if qat_ctrl is not None:
+        qat_ctrl.detach()
+
     return {
         "steps": steps,
         "history": history,
@@ -4705,6 +4821,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
     # Runtime / training
     p.add_argument("--bf16", action="store_true", help="Enable bfloat16 autocast")
+    p.add_argument("--qat-int4", action="store_true", help="Enable symmetric group-wise INT4 QAT on Transformer Linear layers during the final fraction of training steps")
+    p.add_argument("--qat-int4-last-frac", type=float, default=0.15, help="Final fraction of training steps to enable INT4 QAT when --qat-int4 is set (default: 0.15)")
+    p.add_argument("--qat-int4-block-size", type=int, default=32, help="Group block size for symmetric INT4 QAT weight quantization (default: 32, matching MatMulNBits)")
     p.add_argument("--channels-last", action="store_true", help="Convert DynamicConvBackbone to channels_last (NHWC) memory format for faster Conv2d")
     p.add_argument("--grad-checkpoint", action="store_true", help="Enable selective gradient checkpointing on large encoder/decoder transformer tensors")
     p.add_argument("--steps", type=int, default=100)

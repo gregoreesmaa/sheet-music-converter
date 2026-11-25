@@ -1758,6 +1758,142 @@ class TestUniOMR(unittest.TestCase):
         # Contrast compression lifts darkest ink pixels upward from 20
         self.assertGreater(float(np.asarray(lr1).min()), 30.0)
 
+    def test_zd_qat_int4_fake_quant_ste_and_padding(self) -> None:
+        """(zd) fake_quant_int4_ste exact symmetric INT4 rounding, STE grad==1 passthrough, and padding."""
+        # 1. Exact rounding on a known 2-group tensor (block_size=4)
+        # Group 0: max abs = 7.0 -> scale = 1.0 -> exact integer rounding in [-8, 7]
+        # Group 1: max abs = 0.7 -> scale = 0.1
+        w = torch.tensor(
+            [[7.0, -6.4, 3.2, 0.0, 0.7, -0.36, 0.14, -0.04]],
+            dtype=torch.float32,
+            requires_grad=True,
+        )
+        w_q = uni_omr.fake_quant_int4_ste(w, block_size=4)
+        expected = torch.tensor(
+            [[7.0, -6.0, 3.0, 0.0, 0.7, -0.4, 0.1, 0.0]],
+            dtype=torch.float32,
+        )
+        self.assertTrue(torch.allclose(w_q, expected, atol=1e-6), f"Got {w_q} vs {expected}")
+
+        # Exact STE gradient passthrough (d(sum(w_q))/dw == 1 everywhere)
+        w_q.sum().backward()
+        self.assertIsNotNone(w.grad)
+        self.assertTrue(torch.equal(w.grad, torch.ones_like(w)))
+
+        # 2. Non-multiple-of-32 in_features padding (shape 5 x 50, block_size=32)
+        torch.manual_seed(77)
+        w_pad = torch.randn(5, 50, dtype=torch.float32, requires_grad=True)
+        w_pad_q = uni_omr.fake_quant_int4_ste(w_pad, block_size=32)
+        self.assertEqual(w_pad_q.shape, (5, 50))
+        self.assertTrue(torch.isfinite(w_pad_q).all())
+        self.assertFalse(torch.equal(w_pad_q, w_pad))
+        # First 32 columns must match independent 32-col quantization
+        w_head_q = uni_omr.fake_quant_int4_ste(w_pad[:, :32].detach(), block_size=32)
+        self.assertTrue(torch.allclose(w_pad_q[:, :32], w_head_q, atol=1e-6))
+        # STE gradient passthrough with non-uniform upstream weights
+        upstream = torch.randn_like(w_pad)
+        (w_pad_q * upstream).sum().backward()
+        self.assertTrue(torch.allclose(w_pad.grad, upstream, atol=1e-6))
+
+        # 3. All-zero tensor stays finite (scale clamped to 1e-8)
+        w_zero = torch.zeros(2, 32, dtype=torch.float32, requires_grad=True)
+        w_zero_q = uni_omr.fake_quant_int4_ste(w_zero, block_size=32)
+        self.assertTrue(torch.isfinite(w_zero_q).all())
+        self.assertEqual(float(w_zero_q.abs().max().item()), 0.0)
+
+    def test_ze_qat_int4_controller_targeting_compat_and_cli(self) -> None:
+        """(ze) QATInt4Controller targets only Transformer Linears, keeps strict=True state_dict, and runs in CLI."""
+        cfg = _small_cfg(d_model=64, n_enc_layers=2, n_dec_layers=2, n_heads=4, mtp_k=4, dropout=0.0)
+        model = uni_omr.UniOMRNet(cfg)
+        sd_before = {k: v.detach().clone() for k, v in model.state_dict().items()}
+
+        img = torch.rand(2, 3, 128, 192)
+        tgt_in = torch.randint(0, len(data.VOCAB), (2, 10))
+        tgt_out = torch.randint(0, len(data.VOCAB), (2, 10))
+
+        model.eval()
+        with torch.no_grad():
+            logits_ref = model(img, tgt_in, return_aux=False, return_mtp=False)["logits"].clone()
+
+        ctrl = uni_omr.QATInt4Controller(model, block_size=32, enabled=False)
+        # Expected count: 2*6 (enc) + 2*10 (dec) + 3 (mtp_heads) + 1 (lm_head) = 36
+        self.assertEqual(ctrl.num_layers, 36)
+        allowed_prefixes = ("enc_layers.", "dec_layers.", "mtp_heads.", "lm_head")
+        for name in ctrl.target_names:
+            self.assertTrue(
+                name == "lm_head" or name.startswith(allowed_prefixes[:3]),
+                f"Unexpected QAT target: {name}",
+            )
+        # Ensure non-target modules are never patched
+        for forbidden in ("backbone", "router", "tok_emb", "pos2d_proj", "uv_head", "enc_norm", "dec_norm"):
+            self.assertFalse(
+                any(n == forbidden or n.startswith(f"{forbidden}.") for n in ctrl.target_names),
+                f"Forbidden module {forbidden} was patched by QATInt4Controller",
+            )
+
+        # Disabled QAT matches reference bit-identically
+        with torch.no_grad():
+            logits_disabled = model(img, tgt_in, return_aux=False, return_mtp=False)["logits"]
+        self.assertTrue(torch.equal(logits_ref, logits_disabled))
+
+        # Enabled QAT alters logits via INT4 weight quantization while keeping state_dict 100% identical
+        ctrl.enable()
+        sd_after = model.state_dict()
+        self.assertEqual(list(sd_before.keys()), list(sd_after.keys()))
+        for k in sd_before:
+            self.assertTrue(torch.equal(sd_before[k], sd_after[k]), f"state_dict tensor changed for {k}")
+
+        fresh = uni_omr.UniOMRNet(cfg)
+        inc = fresh.load_state_dict(sd_after, strict=True)
+        self.assertEqual(len(inc.missing_keys), 0)
+        self.assertEqual(len(inc.unexpected_keys), 0)
+
+        with torch.no_grad():
+            logits_qat = model(img, tgt_in, return_aux=False, return_mtp=False)["logits"]
+        self.assertTrue(torch.isfinite(logits_qat).all())
+        self.assertFalse(torch.allclose(logits_ref, logits_qat, atol=1e-6))
+
+        # Training step with QAT active produces finite gradients on all parameters
+        model.train()
+        opt = torch.optim.AdamW(model.parameters(), lr=1e-3)
+        opt.zero_grad()
+        out = model(img, tgt_in, return_aux=False, return_mtp=True)
+        losses = model.compute_loss(out, tgt_out, mtp_loss_weight=0.30, uv_loss_weight=0.0)
+        self.assertTrue(torch.isfinite(losses["loss"]))
+        losses["loss"].backward()
+        for name, p in model.named_parameters():
+            if p.requires_grad and not name.startswith("uv_head."):
+                self.assertIsNotNone(p.grad, f"Missing grad under QAT for {name}")
+                self.assertTrue(torch.isfinite(p.grad).all(), f"Non-finite grad under QAT for {name}")
+        opt.step()
+
+        # Detach restores original forwards cleanly
+        ctrl.detach()
+        self.assertEqual(ctrl.num_layers, 0)
+
+        # CLI smoke test: --qat-int4 --qat-int4-last-frac 0.5 --qat-int4-block-size 32
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            rc = uni_omr.main([
+                "--mode", "train",
+                "--curriculum", "strip",
+                "--d-model", "64",
+                "--n-enc-layers", "1",
+                "--n-dec-layers", "1",
+                "--n-heads", "4",
+                "--mtp-k", "2",
+                "--steps", "2",
+                "--seq-len", "16",
+                "--qat-int4",
+                "--qat-int4-last-frac", "0.5",
+                "--qat-int4-block-size", "32",
+                "--device", "cpu",
+                "--dry-run",
+            ])
+        self.assertEqual(rc, 0)
+        out_txt = buf.getvalue()
+        self.assertIn("[UniOMR QAT-INT4] enabled on 18 Linear layers (block_size=32) at step 1/2", out_txt)
+
 
 if __name__ == "__main__":
     unittest.main()
