@@ -937,6 +937,22 @@ async function handleInit() {
   }
 }
 
+export function formatOrtError(err, ctx = {}) {
+  const raw = err instanceof Error ? (err.message || String(err)) : String(err ?? 'Unknown error');
+  const isNumericPtr = typeof err === 'number' || /^\s*\d+\s*$/.test(raw);
+  const parts = [];
+  if (ctx.stage) parts.push(`stage=${ctx.stage}`);
+  if (ctx.width && ctx.height) parts.push(`image=${ctx.width}x${ctx.height}`);
+  if (typeof ctx.nMem === 'number' && ctx.nMem > 0) parts.push(`n_mem=${ctx.nMem}`);
+  if (typeof ctx.step === 'number' && ctx.step >= 0) parts.push(`step=${ctx.step}`);
+  if (ctx.backend) parts.push(`backend=${ctx.backend}${ctx.numThreads ? `(${ctx.numThreads}T)` : ''}`);
+  const meta = parts.length > 0 ? ` [${parts.join(', ')}]` : '';
+  if (isNumericPtr) {
+    return `WASM runtime exception (likely out-of-memory, ptr=${raw.trim()})${meta}`;
+  }
+  return `${raw}${meta}`;
+}
+
 async function handleRecognizePage(msg) {
   const { requestId, nchwBuffer, width, height, pageIndex = 1, pageCount = 1 } = msg;
   if (!state.modelsReady || !state.ort) {
@@ -957,6 +973,9 @@ async function handleRecognizePage(msg) {
   let encOutputs = null;
   let pastK = [];
   let pastV = [];
+  let stage = 'encoding';
+  let currentStep = -1;
+  let nMem = 0;
 
   try {
     const nchw = new Float32Array(nchwBuffer);
@@ -978,6 +997,10 @@ async function handleRecognizePage(msg) {
     encOutputs = await state.encoderSession.run({ image: imgTensor });
     if (typeof imgTensor.dispose === 'function') imgTensor.dispose();
     imgTensor = null;
+    const ck0 = encOutputs.cross_k_0;
+    if (ck0 && Array.isArray(ck0.dims) && ck0.dims.length >= 3) {
+      nMem = ck0.dims[2];
+    }
 
     const encodeMs = performance.now() - t0;
 
@@ -986,6 +1009,7 @@ async function handleRecognizePage(msg) {
       return;
     }
 
+    stage = 'decoding';
     for (let i = 0; i < nLayers; i++) {
       pastK.push(new ort.Tensor('float32', new Float32Array(0), [1, nHeads, 0, headDim]));
       pastV.push(new ort.Tensor('float32', new Float32Array(0), [1, nHeads, 0, headDim]));
@@ -1014,14 +1038,17 @@ async function handleRecognizePage(msg) {
     });
 
     for (let step = 0; step < maxTokens; step++) {
+      currentStep = step;
       if (state.cancelRequested) {
         self.postMessage({ type: 'cancelled', requestId });
         return;
       }
 
+      const tokenIdTensor = new ort.Tensor('int64', BigInt64Array.from([BigInt(curId)]), [1, 1]);
+      const stepPosTensor = new ort.Tensor('int64', BigInt64Array.from([BigInt(step)]), [1]);
       const feeds = {
-        token_id: new ort.Tensor('int64', BigInt64Array.from([BigInt(curId)]), [1, 1]),
-        step_pos: new ort.Tensor('int64', BigInt64Array.from([BigInt(step)]), [1]),
+        token_id: tokenIdTensor,
+        step_pos: stepPosTensor,
       };
       for (let i = 0; i < nLayers; i++) {
         feeds[`past_k_${i}`] = pastK[i];
@@ -1030,7 +1057,13 @@ async function handleRecognizePage(msg) {
         feeds[`cross_v_${i}`] = encOutputs[`cross_v_${i}`];
       }
 
-      const out = await state.decoderSession.run(feeds);
+      let out;
+      try {
+        out = await state.decoderSession.run(feeds);
+      } finally {
+        if (typeof tokenIdTensor.dispose === 'function') tokenIdTensor.dispose();
+        if (typeof stepPosTensor.dispose === 'function') stepPosTensor.dispose();
+      }
       const logitsTensor = out.logits;
       const nextId = fsa.selectNextToken(logitsTensor.data, vocabSize);
       fsa.step(nextId);
@@ -1108,10 +1141,27 @@ async function handleRecognizePage(msg) {
       pageCount,
     });
   } catch (err) {
+    const errCtx = {
+      stage,
+      width,
+      height,
+      step: currentStep,
+      nMem,
+      pageIndex,
+      pageCount,
+      backend: state.backend,
+      numThreads: state.numThreads,
+      elapsedMs: Math.round(performance.now() - t0),
+    };
+    const formatted = formatOrtError(err, errCtx);
+    sendWorkerLog('error', `recognize-page failed: ${formatted}`, {
+      ...errCtx,
+      rawError: err instanceof Error ? { name: err.name, message: err.message, stack: err.stack } : String(err),
+    });
     self.postMessage({
       type: 'error',
       requestId,
-      message: err?.message || String(err),
+      message: formatted,
     });
   } finally {
     if (imgTensor && typeof imgTensor.dispose === 'function') imgTensor.dispose();

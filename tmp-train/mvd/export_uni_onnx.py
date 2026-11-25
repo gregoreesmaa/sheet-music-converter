@@ -80,11 +80,46 @@ def _manual_sdpa(
     k: torch.Tensor,
     v: torch.Tensor,
 ) -> torch.Tensor:
-    """Explicit scaled dot-product attention (opset-17 clean, no custom op)."""
+    """Explicit scaled dot-product attention (opset-17 clean, no custom op).
+
+    Used by the single-step decoder where Lq == 1 (negligible O(Lk) memory).
+    """
     scale = 1.0 / math.sqrt(q.shape[-1])
     attn = torch.matmul(q, k.transpose(-2, -1)) * scale
     attn = F.softmax(attn, dim=-1)
     return torch.matmul(attn, v)
+
+
+@torch.jit.script
+def _chunked_sdpa(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    chunk_q: int = 256,
+) -> torch.Tensor:
+    """Q-chunked scaled dot-product attention exported as an ONNX opset-17 Loop.
+
+    Mathematically identical to full SDPA, but caps peak attention buffer size
+    at O(H * chunk_q * Lk) instead of O(H * Lq * Lk). For dense full pages
+    (k ~ 15,000, H = 6), this drops peak encoder attention memory from ~9.7 GB
+    (which crashes 32-bit WASM with std::bad_alloc) down to ~90-180 MB.
+    """
+    lq = q.shape[2]
+    d = q.shape[3]
+    scale = 1.0 / math.sqrt(float(d))
+    k_t = k.transpose(-2, -1)
+    chunks: List[torch.Tensor] = []
+    i = 0
+    while i < lq:
+        end = i + chunk_q
+        if end > lq:
+            end = lq
+        q_chunk = q[:, :, i:end, :]
+        scores = torch.matmul(q_chunk, k_t) * scale
+        probs = F.softmax(scores, dim=-1)
+        chunks.append(torch.matmul(probs, v))
+        i = end
+    return torch.cat(chunks, dim=2)
 
 
 def _rotate_half(x: torch.Tensor) -> torch.Tensor:
@@ -115,9 +150,10 @@ def _stride_hw(backbone_stride: Any) -> Tuple[int, int]:
 class UniOMREncoderONNX(nn.Module):
     """ONNX-exportable UniOMR encoder with pre-projected decoder cross-attention K/V."""
 
-    def __init__(self, model: uni_omr.UniOMRNet) -> None:
+    def __init__(self, model: uni_omr.UniOMRNet, attn_chunk_q: int = 256) -> None:
         super().__init__()
         self.cfg = model.cfg
+        self.attn_chunk_q = int(attn_chunk_q)
         self.backbone = model.backbone
         self.router = model.router
         self.rope2d = model.rope2d
@@ -321,7 +357,7 @@ class UniOMREncoderONNX(nn.Module):
         k = sa.k_proj(h).view(1, -1, self.n_heads, self.head_dim).transpose(1, 2)
         v = sa.v_proj(h).view(1, -1, self.n_heads, self.head_dim).transpose(1, 2)
         q, k = _apply_rope(q, k, cos2d, sin2d)
-        attn_out = _manual_sdpa(q, k, v).transpose(1, 2).contiguous().view(1, -1, self.d_model)
+        attn_out = _chunked_sdpa(q, k, v, self.attn_chunk_q).transpose(1, 2).contiguous().view(1, -1, self.d_model)
         x = x + sa.o_proj(attn_out)
 
         h2 = _rms_norm_onnx(x, layer.norm2.weight, layer.norm2.eps)
@@ -502,13 +538,14 @@ def export_models(
     out_dir: Path,
     opset: int = 17,
     quantize: bool = True,
+    attn_chunk_q: int = 256,
 ) -> Dict[str, Any]:
     out_dir.mkdir(parents=True, exist_ok=True)
     n_dec = int(cfg.n_dec_layers)
     n_heads = int(cfg.n_heads)
     head_dim = int(cfg.d_model) // n_heads
 
-    enc_wrapper = UniOMREncoderONNX(model).eval()
+    enc_wrapper = UniOMREncoderONNX(model, attn_chunk_q=attn_chunk_q).eval()
     dec_wrapper = UniOMRDecoderStepONNX(model).eval()
 
     enc_fp32_path = out_dir / "uni_omr_encoder_fp32.onnx"
@@ -763,6 +800,7 @@ def main() -> None:
     parser.add_argument("--ckpt", type=Path, default=DEFAULT_CKPT)
     parser.add_argument("--out-dir", type=Path, default=DEFAULT_OUT_DIR)
     parser.add_argument("--opset", type=int, default=17)
+    parser.add_argument("--attn-chunk-q", type=int, default=256)
     parser.add_argument("--no-quantize", action="store_true")
     parser.add_argument("--test-image", type=Path, default=DEFAULT_TEST_IMAGE)
     parser.add_argument("--parity-tokens", type=int, default=30)
@@ -784,6 +822,7 @@ def main() -> None:
         args.out_dir,
         opset=args.opset,
         quantize=(not args.no_quantize),
+        attn_chunk_q=args.attn_chunk_q,
     )
 
     vocab_meta = build_vocab_json(cfg, meta.get("vocab"))

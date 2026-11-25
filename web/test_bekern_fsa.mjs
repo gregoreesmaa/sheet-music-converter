@@ -32,6 +32,7 @@ import {
   BekernFsa,
   sanitizeBekernForMscz,
   compileBekernWithFallback,
+  formatOrtError,
 } from './worker.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -246,6 +247,21 @@ WebAssembly.instantiateStreaming = origInstantiateStreaming;
   assert.ok(res.bekern.includes('quarter B 4 half C 5'));
   assert.ok(warnings.length >= 2, 'Expected warning logs on fallback');
   console.log(`[PASS] (d) Measure-by-measure fallback dropped 1 malformed measure, kept 2 valid measures (${res.msczBytes.length} B)`);
+}
+
+// (e) formatOrtError formats numeric Emscripten C++ exception pointers with stage/dims/step context
+{
+  const msg1 = formatOrtError(75852400, { stage: 'encoding', width: 912, height: 1280, step: -1, backend: 'wasm', numThreads: 8 });
+  assert.ok(msg1.includes('WASM runtime exception (likely out-of-memory, ptr=75852400)'), msg1);
+  assert.ok(msg1.includes('stage=encoding') && msg1.includes('image=912x1280') && msg1.includes('backend=wasm(8T)'), msg1);
+
+  const msg2 = formatOrtError(new Error('36622584'), { stage: 'decoding', width: 912, height: 1280, nMem: 14729, step: 42 });
+  assert.ok(msg2.includes('WASM runtime exception (likely out-of-memory, ptr=36622584)'), msg2);
+  assert.ok(msg2.includes('stage=decoding') && msg2.includes('n_mem=14729') && msg2.includes('step=42'), msg2);
+
+  const msg3 = formatOrtError(new Error('invalid tensor shape'), { stage: 'encoding', width: 512, height: 256 });
+  assert.ok(msg3.includes('invalid tensor shape') && msg3.includes('stage=encoding'), msg3);
+  console.log('[PASS] (e) formatOrtError handles numeric WASM exception pointers and normal errors');
 }
 
 console.log('ALL TESTS PASSED');
