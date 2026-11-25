@@ -5,6 +5,7 @@
  *   - initMsczWasm(wasmUrl?) -> Promise<void>
  *   - bekernToMscz(bekernText, title?) -> Uint8Array
  *   - bekernToMusicXml(bekernText, title?) -> string
+ *   - stitchPagesBekern(pages) -> string
  */
 
 const textEncoder = new TextEncoder();
@@ -124,4 +125,53 @@ export function bekernToMscz(bekernText, title = '') {
 export function bekernToMusicXml(bekernText, title = '') {
   const bytes = callCompiler('bekern_to_musicxml', bekernText, title);
   return textDecoder.decode(bytes);
+}
+
+/**
+ * Stitch an array of per-page `bekern+` token strings into a single `<sys>`-joined
+ * multi-page `bekern+` stream, carrying over active `clef-*`/`key*`/`time-*` headers
+ * whenever Page 2+ omits them.
+ * @param {string[]} pages
+ * @returns {string}
+ */
+export function stitchPagesBekern(pages) {
+  if (!wasmExports) {
+    throw new Error('mscz-rs WASM not initialized; call await initMsczWasm() first');
+  }
+  const {
+    memory,
+    wasm_alloc,
+    wasm_free,
+    wasm_result_ptr,
+    wasm_result_len,
+    wasm_error_ptr,
+    wasm_error_len,
+    stitch_pages_bekern,
+  } = wasmExports;
+
+  const joined = (Array.isArray(pages) ? pages : [String(pages ?? '')])
+    .map((p) => String(p ?? '').replace(/\r?\n/g, ' '))
+    .join('\n');
+  const bytes = textEncoder.encode(joined);
+  const ptr = wasm_alloc(bytes.length);
+
+  try {
+    if (bytes.length > 0) {
+      new Uint8Array(memory.buffer, ptr, bytes.length).set(bytes);
+    }
+    const outLen = stitch_pages_bekern(ptr, bytes.length);
+    if (outLen === 0) {
+      const errPtr = wasm_error_ptr();
+      const errLen = wasm_error_len();
+      const errMsg = errLen > 0
+        ? textDecoder.decode(new Uint8Array(memory.buffer, errPtr, errLen))
+        : 'stitch_pages_bekern failed with unknown error';
+      throw new Error(errMsg);
+    }
+    const resPtr = wasm_result_ptr();
+    const resLen = wasm_result_len();
+    return textDecoder.decode(new Uint8Array(memory.buffer.slice(resPtr, resPtr + resLen)));
+  } finally {
+    wasm_free(ptr, bytes.length);
+  }
 }

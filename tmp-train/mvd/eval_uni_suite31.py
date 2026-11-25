@@ -348,7 +348,10 @@ def _beam_repair_measure(
             row_lp = step_lp[i]
             used_mask = False
             if use_grammar:
-                allowed = _allowed_ids_for_state(beam_state, vocab_size)
+                allowed = [
+                    tid for tid in _allowed_ids_for_state(beam_state, vocab_size)
+                    if tid != eos_id and tid != sys_id
+                ]
                 if allowed:
                     idx_t = torch.tensor(allowed, dtype=torch.long, device=device)
                     sub_logits = row_logits.index_select(0, idx_t)
@@ -361,10 +364,18 @@ def _beam_repair_measure(
                             candidates.append((beam_lp + float(val_t), i, tok_id))
                         used_mask = True
             if not used_mask:
-                k_take = min(k_per_beam, vocab_size)
-                top_vals, top_ids = torch.topk(row_lp, k=k_take, dim=-1)
+                masked_lp = row_lp.clone()
+                masked_lp[eos_id] = float("-inf")
+                masked_lp[sys_id] = float("-inf")
+                k_take = min(k_per_beam, max(1, vocab_size - 2))
+                top_vals, top_ids = torch.topk(masked_lp, k=k_take, dim=-1)
                 for val_t, tid_t in zip(top_vals.tolist(), top_ids.tolist()):
-                    candidates.append((beam_lp + float(val_t), i, int(tid_t)))
+                    if float(val_t) == float("-inf"):
+                        continue
+                    tid_int = int(tid_t)
+                    if tid_int == eos_id or tid_int == sys_id:
+                        continue
+                    candidates.append((beam_lp + float(val_t), i, tid_int))
 
         if not candidates:
             break
@@ -374,13 +385,14 @@ def _beam_repair_measure(
         next_parents: List[int] = []
 
         for rank, (raw_lp, parent_i, tok_id) in enumerate(candidates):
+            if tok_id == eos_id or tok_id == sys_id:
+                continue
             p_toks, _, p_state = active_beams[parent_i]
             new_toks = p_toks + [tok_id]
             tok_str = id_to_tok.get(tok_id)
             is_bar_close = tok_str in grammar.BAR_LIKES
-            is_end = is_bar_close or tok_id == eos_id or tok_id == sys_id
 
-            if is_end:
+            if is_bar_close:
                 meter_err, voice_err = _measure_violation_errors(p_state)
                 score = raw_lp - 6.0 * meter_err - 4.0 * voice_err
                 end_state = _advance_grammar_state(
@@ -681,7 +693,7 @@ def generate_mtp_spec(
                     bar_len = len(out_tokens) - bar_start_idx
                     if (
                         bar_idx >= 1
-                        and tok_str != "bar-light-heavy"
+                        and tok_str == "bar"
                         and 1 <= bar_len <= max_bar_toks
                     ):
                         meter_err, voice_err = _measure_violation_errors(states[0])

@@ -22,8 +22,9 @@ to training code, which this module must not contain).
 from __future__ import annotations
 
 import json
+import random
 from pathlib import Path
-from typing import Dict, Iterator, List, Sequence, Union
+from typing import Dict, Iterator, List, Optional, Sequence, Tuple, Union
 
 import numpy as np
 from PIL import Image
@@ -39,7 +40,10 @@ __all__ = [
     "EXT_DYNAMICS_VOCAB",
     "EXT_LYRIC_MARKERS_VOCAB",
     "EXT_PERCUSSION_TAB_VOCAB",
+    "MULTIPAGE_STATE_TOKENS",
     "build_vocab",
+    "extract_page_tail_state",
+    "format_prev_state_prefix",
     "AUX_CLASSES",
     "encode",
     "decode",
@@ -304,17 +308,27 @@ EXT_PERCUSSION_TAB_VOCAB: List[str] = (
     + ["fret-%d" % f for f in range(0, 25)]
 )
 
+# Opt-in Multi-Page Streaming Symbolic State Prefix tokens (NOT appended to
+# default VOCAB so existing IDs 0..236 stay 100% compatible with Iter 8/9
+# checkpoints).
+MULTIPAGE_STATE_TOKENS: List[str] = [
+    "<prev_state>",
+    "</prev_state>",
+    "<partial_bar>",
+]
+
 
 def build_vocab(
     *,
     include_ext_dynamics: bool = False,
     include_lyric_markers: bool = False,
     include_percussion_tab: bool = False,
+    include_multipage_state: bool = False,
 ) -> tuple[List[str], Dict[str, int]]:
-    """Build an append-only vocabulary preserving base ``VOCAB`` IDs 0..177.
+    """Build an append-only vocabulary preserving base ``VOCAB`` IDs.
 
-    Default flags return an exact copy of ``VOCAB`` (len 178). Enabling any
-    extension appends its tokens strictly after index 177 so existing
+    Default flags return an exact copy of ``VOCAB``. Enabling any extension
+    appends its tokens strictly after the base vocabulary so existing
     checkpoints load cleanly via vocab-expand.
     """
     vocab = list(VOCAB)
@@ -324,8 +338,337 @@ def build_vocab(
         vocab.extend(EXT_LYRIC_MARKERS_VOCAB)
     if include_percussion_tab:
         vocab.extend(EXT_PERCUSSION_TAB_VOCAB)
+    if include_multipage_state:
+        vocab.extend(MULTIPAGE_STATE_TOKENS)
     assert len(vocab) == len(set(vocab)), "extended vocab has duplicates"
     return vocab, {t: i for i, t in enumerate(vocab)}
+
+
+# ---------------------------------------------------------------------------
+# Multi-Page Streaming Symbolic State Prefix (<prev_state> ... </prev_state>)
+# ---------------------------------------------------------------------------
+
+_TAIL_STEPS = frozenset(_STEPS)
+_TAIL_OCTAVES = frozenset(_OCTAVES + ["-1", "9"])
+_TAIL_BAR_CLOSE = frozenset(
+    ("bar", "bar-light-heavy", "bar-repeat-right", "bar-double")
+)
+_TAIL_SPECIALS = frozenset(
+    ("<pad>", "<bos>", "<eos>", "<prev_state>", "</prev_state>", "<partial_bar>")
+)
+_PERTURB_CLEFS: List[str] = ["clef-G-2", "clef-F-4", "clef-C-3", "clef-C-4"]
+_PERTURB_KEYS: List[str] = list(_KEYS)
+_PERTURB_TIMES: List[str] = list(_TIMES)
+
+
+def _is_clef_tok(tok: str) -> bool:
+    return tok.startswith("clef-")
+
+
+def _is_key_tok(tok: str) -> bool:
+    return tok.startswith("key") and len(tok) >= 4 and (tok[3] in "+-" or tok[3].isdigit())
+
+
+def _is_time_tok(tok: str) -> bool:
+    return tok.startswith("time-")
+
+
+def _is_header_tok(tok: str) -> bool:
+    return _is_clef_tok(tok) or _is_key_tok(tok) or _is_time_tok(tok)
+
+
+def _infer_staff_count(chunks: List[List[str]]) -> int:
+    """Infer number of staves per system from ``<sys>``-split page chunks."""
+    m = len(chunks)
+    if m <= 1:
+        return m
+
+    first_clefs: List[Optional[str]] = []
+    has_time: List[bool] = []
+    for ch in chunks:
+        c0 = next((t for t in ch if _is_clef_tok(t)), None)
+        first_clefs.append(c0)
+        has_time.append(any(_is_time_tok(t) for t in ch))
+
+    non_none_clefs = [c for c in first_clefs if c is not None]
+    if len(set(non_none_clefs)) <= 1:
+        return 1
+
+    # Smallest repeating clef period p >= 2 dividing m.
+    for p in range(2, m + 1):
+        if m % p != 0:
+            continue
+        ok = True
+        for i in range(m):
+            ci = first_clefs[i]
+            cp = first_clefs[i % p]
+            if ci is not None and cp is not None and ci != cp:
+                ok = False
+                break
+        if ok:
+            return p
+
+    # Fallback: leading chunks carrying a time signature (opening system).
+    lead_time = 0
+    for ht in has_time:
+        if ht:
+            lead_time += 1
+        else:
+            break
+    if lead_time >= 2 and m % lead_time == 0:
+        return lead_time
+
+    return m
+
+
+def _extract_single_staff_tail(chunks: Sequence[List[str]]) -> List[str]:
+    """Walk one staff's chronological chunks and return its canonical tail state."""
+    active_clef: Optional[str] = None
+    active_key: Optional[str] = None
+    active_time: Optional[str] = None
+    open_ties: List[Tuple[str, str]] = []
+    slur_depth = 0
+    open_hairpin: Optional[str] = None
+    open_repeat = False
+    has_bar_content = False
+
+    last_step: Optional[str] = None
+    last_pitch: Optional[Tuple[str, str]] = None
+
+    for ch in chunks:
+        for tok in ch:
+            if tok in _TAIL_SPECIALS:
+                continue
+            if _is_clef_tok(tok):
+                active_clef = tok
+                last_step = None
+                continue
+            if _is_key_tok(tok):
+                active_key = tok
+                last_step = None
+                continue
+            if _is_time_tok(tok):
+                active_time = tok
+                last_step = None
+                continue
+
+            if tok in _TAIL_BAR_CLOSE:
+                has_bar_content = False
+                if tok == "bar-repeat-right":
+                    open_repeat = False
+                last_step = None
+                continue
+
+            has_bar_content = True
+
+            if tok == "bar-repeat-left":
+                open_repeat = True
+                last_step = None
+                continue
+            if tok == "hairpin-cresc-start":
+                open_hairpin = "hairpin-cresc-start"
+                last_step = None
+                continue
+            if tok == "hairpin-dim-start":
+                open_hairpin = "hairpin-dim-start"
+                last_step = None
+                continue
+            if tok == "hairpin-stop":
+                open_hairpin = None
+                last_step = None
+                continue
+            if tok == "slur-start":
+                slur_depth += 1
+                continue
+            if tok == "slur-stop":
+                if slur_depth > 0:
+                    slur_depth -= 1
+                continue
+            if tok in _TAIL_STEPS:
+                last_step = tok
+                continue
+            if tok in _TAIL_OCTAVES and last_step is not None:
+                last_pitch = (last_step, tok)
+                last_step = None
+                continue
+            if tok == "tie-start":
+                if last_pitch is not None and last_pitch not in open_ties:
+                    open_ties.append(last_pitch)
+                continue
+            if tok == "tie-stop":
+                if last_pitch is not None and last_pitch in open_ties:
+                    open_ties.remove(last_pitch)
+                continue
+
+            # Reset pending step on any non-octave token (e.g. rest, duration).
+            if tok not in _ALTERS and tok != "dot":
+                last_step = None
+
+    out: List[str] = []
+    if active_clef is not None:
+        out.append(active_clef)
+    if active_key is not None:
+        out.append(active_key)
+    if active_time is not None:
+        out.append(active_time)
+    for step, octv in open_ties:
+        out.extend(["tie-start", step, octv])
+    if slur_depth > 0:
+        out.append("slur-start")
+    if open_hairpin is not None:
+        out.append(open_hairpin)
+    if open_repeat:
+        out.append("bar-repeat-left")
+    if has_bar_content:
+        out.append("<partial_bar>")
+    return out
+
+
+def extract_page_tail_state(bekern_str: str) -> List[str]:
+    """Extract a compact canonical tail state from a page's ``bekern+`` string.
+
+    Walks all ``<sys>``-separated chunks, tracks active ``clef-*``, ``key*``,
+    and ``time-*`` per staff, plus open ``tie-start <step> <oct>``, open
+    ``slur-start``, open ``hairpin-cresc-start`` / ``hairpin-dim-start``,
+    open ``bar-repeat-left``, and ``<partial_bar>`` if the last measure did
+    not close with a barline. Multi-staff states are separated by ``<sys>``.
+    """
+    if not bekern_str or not str(bekern_str).strip():
+        return []
+
+    raw_tokens = str(bekern_str).split()
+    # Strip any leading <prev_state> ... </prev_state> prefix if present.
+    tokens: List[str] = []
+    in_prev_state = False
+    for tok in raw_tokens:
+        if tok == "<prev_state>":
+            in_prev_state = True
+            continue
+        if tok == "</prev_state>":
+            in_prev_state = False
+            continue
+        if in_prev_state or tok in _TAIL_SPECIALS:
+            continue
+        tokens.append(tok)
+
+    if not tokens:
+        return []
+
+    chunks: List[List[str]] = []
+    cur: List[str] = []
+    for tok in tokens:
+        if tok == "<sys>":
+            if cur:
+                chunks.append(cur)
+                cur = []
+        else:
+            cur.append(tok)
+    if cur:
+        chunks.append(cur)
+
+    if not chunks:
+        return []
+
+    n_staves = _infer_staff_count(chunks)
+    staff_chunks: List[List[List[str]]] = [[] for _ in range(n_staves)]
+    for idx, ch in enumerate(chunks):
+        staff_chunks[idx % n_staves].append(ch)
+
+    result: List[str] = []
+    for s_idx, s_chunks in enumerate(staff_chunks):
+        s_tail = _extract_single_staff_tail(s_chunks)
+        if not s_tail:
+            continue
+        if result:
+            result.append("<sys>")
+        result.extend(s_tail)
+    return result
+
+
+def _split_state_fields(state_tokens: Sequence[str]) -> List[List[str]]:
+    """Group canonical tail-state tokens into atomic fields for corruption."""
+    fields: List[List[str]] = []
+    i = 0
+    n = len(state_tokens)
+    while i < n:
+        tok = state_tokens[i]
+        if tok == "tie-start" and i + 2 < n:
+            fields.append([tok, state_tokens[i + 1], state_tokens[i + 2]])
+            i += 3
+        else:
+            fields.append([tok])
+            i += 1
+    return fields
+
+
+def _perturb_field(field: List[str], rng) -> Optional[List[str]]:
+    """Return a perturbed replacement for a single field, or None if non-perturbable."""
+    if len(field) != 1:
+        return None
+    tok = field[0]
+    if _is_clef_tok(tok):
+        alts = [c for c in _PERTURB_CLEFS if c != tok]
+        return [alts[rng.randrange(len(alts))]] if alts else None
+    if _is_key_tok(tok):
+        alts = [k for k in _PERTURB_KEYS if k != tok]
+        return [alts[rng.randrange(len(alts))]] if alts else None
+    if _is_time_tok(tok):
+        alts = [t for t in _PERTURB_TIMES if t != tok]
+        return [alts[rng.randrange(len(alts))]] if alts else None
+    if tok == "hairpin-cresc-start":
+        return ["hairpin-dim-start"]
+    if tok == "hairpin-dim-start":
+        return ["hairpin-cresc-start"]
+    return None
+
+
+def format_prev_state_prefix(
+    state_tokens: Sequence[str],
+    rng=None,
+    empty_prob: float = 0.25,
+    corrupt_prob: float = 0.20,
+) -> List[str]:
+    """Wrap tail-state tokens in ``<prev_state> ... </prev_state>`` with
+    anti-exposure-bias 3-way corruption.
+
+    Schedule (default):
+      - ``empty_prob`` (25%): empty dropout ``["<prev_state>", "</prev_state>"]``
+      - ``corrupt_prob`` (20%): drop or perturb 1 atomic field
+      - remaining (55%): clean ground-truth state tokens
+    """
+    if rng is None:
+        rng = random
+    toks = list(state_tokens) if state_tokens else []
+    if not toks:
+        return ["<prev_state>", "</prev_state>"]
+
+    u = rng.random()
+    if u < empty_prob:
+        return ["<prev_state>", "</prev_state>"]
+
+    if u < empty_prob + corrupt_prob:
+        fields = _split_state_fields(toks)
+        mutable_indices = [i for i, f in enumerate(fields) if f != ["<sys>"]]
+        if mutable_indices:
+            pick = mutable_indices[rng.randrange(len(mutable_indices))]
+            perturbed = _perturb_field(fields[pick], rng)
+            if perturbed is not None and rng.random() < 0.5:
+                fields[pick] = perturbed
+            else:
+                fields.pop(pick)
+            # Clean any leading/trailing/double <sys> left behind by a drop.
+            cleaned: List[str] = []
+            for f in fields:
+                if f == ["<sys>"]:
+                    if cleaned and cleaned[-1] != "<sys>":
+                        cleaned.append("<sys>")
+                else:
+                    cleaned.extend(f)
+            if cleaned and cleaned[-1] == "<sys>":
+                cleaned.pop()
+            return ["<prev_state>", *cleaned, "</prev_state>"]
+
+    return ["<prev_state>", *toks, "</prev_state>"]
 
 # Expected 10-class auxiliary-box ontology. Mirrors dataset-pack's
 # ``STRICT_DEFAULT_CLASSES``. The loader itself reads class names from

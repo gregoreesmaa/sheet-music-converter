@@ -662,6 +662,422 @@ export function sanitizeBekernForMscz(rawText) {
   return systems.join(' <sys> ');
 }
 
+// ---------------------------------------------------------------------------
+// Multi-Page Streaming Symbolic State Prefix & Cross-Page Header Carryover
+// (JS twin of tmp-train/mvd/data.py extract_page_tail_state)
+// ---------------------------------------------------------------------------
+
+const TAIL_SPECIALS = new Set([
+  '<pad>',
+  '<bos>',
+  '<eos>',
+  '<prev_state>',
+  '</prev_state>',
+  '<partial_bar>',
+]);
+
+function inferStaffCount(chunks) {
+  const m = chunks.length;
+  if (m <= 1) return m;
+
+  const firstClefs = chunks.map((ch) => ch.find((t) => isValidClef(t)) ?? null);
+  const hasTime = chunks.map((ch) => ch.some((t) => isValidTime(t)));
+  const distinctClefs = new Set(firstClefs.filter((c) => c !== null));
+  if (distinctClefs.size <= 1) return 1;
+
+  for (let p = 2; p <= m; p++) {
+    if (m % p !== 0) continue;
+    let ok = true;
+    for (let i = 0; i < m; i++) {
+      const ci = firstClefs[i];
+      const cp = firstClefs[i % p];
+      if (ci !== null && cp !== null && ci !== cp) {
+        ok = false;
+        break;
+      }
+    }
+    if (ok) return p;
+  }
+
+  let leadTime = 0;
+  for (const ht of hasTime) {
+    if (ht) leadTime += 1;
+    else break;
+  }
+  if (leadTime >= 2 && m % leadTime === 0) return leadTime;
+
+  return m;
+}
+
+function extractSingleStaffTail(chunks) {
+  let activeClef = null;
+  let activeKey = null;
+  let activeTime = null;
+  const openTies = [];
+  let slurDepth = 0;
+  let openHairpin = null;
+  let openRepeat = false;
+  let hasBarContent = false;
+
+  let lastStep = null;
+  let lastPitch = null;
+
+  for (const ch of chunks) {
+    for (const tok of ch) {
+      if (TAIL_SPECIALS.has(tok)) continue;
+      if (isValidClef(tok)) {
+        activeClef = tok;
+        lastStep = null;
+        continue;
+      }
+      if (isValidKey(tok)) {
+        activeKey = tok;
+        lastStep = null;
+        continue;
+      }
+      if (isValidTime(tok)) {
+        activeTime = tok;
+        lastStep = null;
+        continue;
+      }
+      if (BAR_CLOSE_SET.has(tok)) {
+        hasBarContent = false;
+        if (tok === 'bar-repeat-right') openRepeat = false;
+        lastStep = null;
+        continue;
+      }
+
+      hasBarContent = true;
+
+      if (tok === 'bar-repeat-left') {
+        openRepeat = true;
+        lastStep = null;
+        continue;
+      }
+      if (tok === 'hairpin-cresc-start') {
+        openHairpin = 'hairpin-cresc-start';
+        lastStep = null;
+        continue;
+      }
+      if (tok === 'hairpin-dim-start') {
+        openHairpin = 'hairpin-dim-start';
+        lastStep = null;
+        continue;
+      }
+      if (tok === 'hairpin-stop') {
+        openHairpin = null;
+        lastStep = null;
+        continue;
+      }
+      if (tok === 'slur-start') {
+        slurDepth += 1;
+        continue;
+      }
+      if (tok === 'slur-stop') {
+        if (slurDepth > 0) slurDepth -= 1;
+        continue;
+      }
+      if (STEP_SET.has(tok)) {
+        lastStep = tok;
+        continue;
+      }
+      if (OCT_SET.has(tok) && lastStep !== null) {
+        lastPitch = `${lastStep} ${tok}`;
+        lastStep = null;
+        continue;
+      }
+      if (tok === 'tie-start') {
+        if (lastPitch !== null && !openTies.includes(lastPitch)) {
+          openTies.push(lastPitch);
+        }
+        continue;
+      }
+      if (tok === 'tie-stop') {
+        if (lastPitch !== null) {
+          const idx = openTies.indexOf(lastPitch);
+          if (idx >= 0) openTies.splice(idx, 1);
+        }
+        continue;
+      }
+      if (!ALTER_SET.has(tok) && tok !== 'dot') {
+        lastStep = null;
+      }
+    }
+  }
+
+  const out = [];
+  if (activeClef !== null) out.push(activeClef);
+  if (activeKey !== null) out.push(activeKey);
+  if (activeTime !== null) out.push(activeTime);
+  for (const pitchKey of openTies) {
+    const [step, oct] = pitchKey.split(' ');
+    out.push('tie-start', step, oct);
+  }
+  if (slurDepth > 0) out.push('slur-start');
+  if (openHairpin !== null) out.push(openHairpin);
+  if (openRepeat) out.push('bar-repeat-left');
+  if (hasBarContent) out.push('<partial_bar>');
+  return out;
+}
+
+export function extractPageTailState(bekernStr) {
+  const raw = String(bekernStr ?? '').trim();
+  if (!raw) return [];
+
+  const rawTokens = raw.split(/\s+/);
+  const tokens = [];
+  let inPrevState = false;
+  for (const tok of rawTokens) {
+    if (tok === '<prev_state>') {
+      inPrevState = true;
+      continue;
+    }
+    if (tok === '</prev_state>') {
+      inPrevState = false;
+      continue;
+    }
+    if (inPrevState || TAIL_SPECIALS.has(tok)) continue;
+    tokens.push(tok);
+  }
+  if (tokens.length === 0) return [];
+
+  const chunks = [];
+  let cur = [];
+  for (const tok of tokens) {
+    if (tok === '<sys>') {
+      if (cur.length > 0) {
+        chunks.push(cur);
+        cur = [];
+      }
+    } else {
+      cur.push(tok);
+    }
+  }
+  if (cur.length > 0) chunks.push(cur);
+  if (chunks.length === 0) return [];
+
+  const nStaves = inferStaffCount(chunks);
+  const staffChunks = Array.from({ length: nStaves }, () => []);
+  for (let i = 0; i < chunks.length; i++) {
+    staffChunks[i % nStaves].push(chunks[i]);
+  }
+
+  const result = [];
+  for (const sChunks of staffChunks) {
+    const sTail = extractSingleStaffTail(sChunks);
+    if (sTail.length === 0) continue;
+    if (result.length > 0) result.push('<sys>');
+    result.push(...sTail);
+  }
+  return result;
+}
+
+function parseTailStateHeaders(prevTailState) {
+  const toks = Array.isArray(prevTailState)
+    ? prevTailState.map((t) => String(t ?? '').trim()).filter(Boolean)
+    : String(prevTailState ?? '').trim().split(/\s+/).filter(Boolean);
+  if (toks.length === 0) return [];
+
+  const staves = [];
+  let cur = { clef: null, key: null, time: null };
+  const flush = () => {
+    if (cur.clef || cur.key || cur.time) {
+      staves.push(cur);
+    }
+    cur = { clef: null, key: null, time: null };
+  };
+  for (const t of toks) {
+    if (t === '<sys>') {
+      flush();
+    } else if (isValidClef(t)) {
+      cur.clef = t;
+    } else if (isValidKey(t)) {
+      cur.key = t;
+    } else if (isValidTime(t)) {
+      cur.time = t;
+    }
+  }
+  flush();
+  return staves;
+}
+
+/**
+ * Carry over omitted Page 2+ headers (time-*, and missing key* / clef-*)
+ * from the previous page's extracted tail state into each system/staff chunk.
+ */
+export function applyCrossPageHeaderCarryover(pageBekern, prevTailState) {
+  const raw = String(pageBekern ?? '').trim();
+  if (!raw) return '';
+  const prevStaves = parseTailStateHeaders(prevTailState);
+  if (prevStaves.length === 0) return raw;
+
+  const runningStaves = prevStaves.map((s) => ({ ...s }));
+  const rawSystems = raw.split(/\s*<sys>\s*/).filter(Boolean);
+  if (rawSystems.length === 0) return raw;
+
+  const outSystems = [];
+  for (let idx = 0; idx < rawSystems.length; idx++) {
+    const toks = rawSystems[idx].split(/\s+/).filter(Boolean);
+    if (toks.length === 0) continue;
+
+    const staff = runningStaves[idx % runningStaves.length];
+    let headerEnd = 0;
+    let leadClef = null;
+    let leadKey = null;
+    let leadTime = null;
+    while (headerEnd < toks.length) {
+      const t = toks[headerEnd];
+      if (isValidClef(t)) {
+        leadClef = t;
+        headerEnd += 1;
+      } else if (isValidKey(t)) {
+        leadKey = t;
+        headerEnd += 1;
+      } else if (isValidTime(t)) {
+        leadTime = t;
+        headerEnd += 1;
+      } else {
+        break;
+      }
+    }
+
+    let finalToks;
+    if (leadClef && leadKey && leadTime) {
+      finalToks = toks;
+    } else {
+      const mergedHeader = [];
+      const effClef = leadClef || staff.clef;
+      const effKey = leadKey || staff.key;
+      const effTime = leadTime || staff.time;
+      if (effClef) mergedHeader.push(effClef);
+      if (effKey) mergedHeader.push(effKey);
+      if (effTime) mergedHeader.push(effTime);
+      finalToks = [...mergedHeader, ...toks.slice(headerEnd)];
+    }
+
+    // Update running staff state across the chunk so mid-page changes propagate.
+    for (const t of finalToks) {
+      if (isValidClef(t)) staff.clef = t;
+      else if (isValidKey(t)) staff.key = t;
+      else if (isValidTime(t)) staff.time = t;
+    }
+
+    outSystems.push(finalToks.join(' '));
+  }
+
+  return outSystems.join(' <sys> ');
+}
+
+/**
+ * Optional 1-shot KV-cache prefix prefill for `<prev_state> ... </prev_state>`.
+ * Completely no-op when `prevStateIds` is omitted/empty or `<prev_state>` is
+ * not present in `tokenToId` (existing checkpoints work identically).
+ */
+export async function prefillPrevStateKv({
+  ort,
+  decoderSession,
+  encOutputs,
+  pastK,
+  pastV,
+  nLayers,
+  prevStateIds,
+  tokenToId,
+  useMtp,
+}) {
+  if (
+    !Array.isArray(prevStateIds) ||
+    prevStateIds.length === 0 ||
+    !tokenToId ||
+    tokenToId['<prev_state>'] === undefined
+  ) {
+    return { pastK, pastV, prefilledLen: 0 };
+  }
+
+  const L = prevStateIds.length;
+  if (useMtp) {
+    // WebGPU MTP-4 decoder accepts dynamic [1, L] token_ids -> 1-shot prefill!
+    const tokenIdsTensor = new ort.Tensor(
+      'int64',
+      BigInt64Array.from(prevStateIds.map((id) => BigInt(id))),
+      [1, L],
+    );
+    const stepPosTensor = new ort.Tensor('int64', BigInt64Array.from([0n]), [1]);
+    const feeds = {
+      token_ids: tokenIdsTensor,
+      step_pos: stepPosTensor,
+    };
+    for (let i = 0; i < nLayers; i++) {
+      feeds[`past_k_${i}`] = pastK[i];
+      feeds[`past_v_${i}`] = pastV[i];
+      feeds[`cross_k_${i}`] = encOutputs[`cross_k_${i}`];
+      feeds[`cross_v_${i}`] = encOutputs[`cross_v_${i}`];
+    }
+
+    let out;
+    try {
+      out = await decoderSession.run(feeds);
+    } finally {
+      if (typeof tokenIdsTensor.dispose === 'function') tokenIdsTensor.dispose();
+      if (typeof stepPosTensor.dispose === 'function') stepPosTensor.dispose();
+    }
+
+    const nextPastK = [];
+    const nextPastV = [];
+    for (let i = 0; i < nLayers; i++) {
+      nextPastK.push(out[`present_k_${i}`]);
+      nextPastV.push(out[`present_v_${i}`]);
+    }
+    for (const t of pastK) if (t && typeof t.dispose === 'function') t.dispose();
+    for (const t of pastV) if (t && typeof t.dispose === 'function') t.dispose();
+    if (out.logits?.dispose) out.logits.dispose();
+    for (const k of ['mtp_logits_0', 'mtp_logits_1', 'mtp_logits_2']) {
+      if (out[k]?.dispose) out[k].dispose();
+    }
+    return { pastK: nextPastK, pastV: nextPastV, prefilledLen: L };
+  }
+
+  // Standard single-step WASM decoder fallback: step through prefix tokens
+  let curPastK = pastK;
+  let curPastV = pastV;
+  for (let p = 0; p < L; p++) {
+    const tokenIdTensor = new ort.Tensor(
+      'int64',
+      BigInt64Array.from([BigInt(prevStateIds[p])]),
+      [1, 1],
+    );
+    const stepPosTensor = new ort.Tensor('int64', BigInt64Array.from([BigInt(p)]), [1]);
+    const feeds = {
+      token_id: tokenIdTensor,
+      step_pos: stepPosTensor,
+    };
+    for (let i = 0; i < nLayers; i++) {
+      feeds[`past_k_${i}`] = curPastK[i];
+      feeds[`past_v_${i}`] = curPastV[i];
+      feeds[`cross_k_${i}`] = encOutputs[`cross_k_${i}`];
+      feeds[`cross_v_${i}`] = encOutputs[`cross_v_${i}`];
+    }
+    let out;
+    try {
+      out = await decoderSession.run(feeds);
+    } finally {
+      if (typeof tokenIdTensor.dispose === 'function') tokenIdTensor.dispose();
+      if (typeof stepPosTensor.dispose === 'function') stepPosTensor.dispose();
+    }
+    const nextPastK = [];
+    const nextPastV = [];
+    for (let i = 0; i < nLayers; i++) {
+      nextPastK.push(out[`present_k_${i}`]);
+      nextPastV.push(out[`present_v_${i}`]);
+    }
+    for (const t of curPastK) if (t && typeof t.dispose === 'function') t.dispose();
+    for (const t of curPastV) if (t && typeof t.dispose === 'function') t.dispose();
+    if (out.logits?.dispose) out.logits.dispose();
+    curPastK = nextPastK;
+    curPastV = nextPastV;
+  }
+  return { pastK: curPastK, pastV: curPastV, prefilledLen: L };
+}
+
 function splitSystemIntoHeaderAndMeasures(sysText) {
   const toks = sysText.split(/\s+/).filter(Boolean);
   const header = [];
@@ -1151,7 +1567,16 @@ export function formatOrtError(err, ctx = {}) {
 }
 
 async function handleRecognizePage(msg) {
-  const { requestId, nchwBuffer, width, height, pageIndex = 1, pageCount = 1 } = msg;
+  const {
+    requestId,
+    nchwBuffer,
+    width,
+    height,
+    pageIndex = 1,
+    pageCount = 1,
+    prevStateIds = null,
+    prevTailState = null,
+  } = msg;
   if (!state.modelsReady || !state.ort) {
     self.postMessage({ type: 'error', requestId, message: 'UniOMR models are not loaded yet.' });
     return;
@@ -1163,7 +1588,7 @@ async function handleRecognizePage(msg) {
   const nLayers = state.vocab.nDecLayers || state.modelIo.n_dec_layers || 6;
   const nHeads = state.vocab.nHeads || state.modelIo.n_heads || 6;
   const headDim = state.vocab.headDim || state.modelIo.head_dim || 64;
-  const { bosId, eosId, sysId, padId, idToToken, vocabSize } = state.vocab;
+  const { bosId, eosId, sysId, padId, idToToken, tokenToId, vocabSize } = state.vocab;
 
   const t0 = performance.now();
   let imgTensor = null;
@@ -1263,6 +1688,22 @@ async function handleRecognizePage(msg) {
         pageCount,
       });
     };
+
+    // Optional 1-shot KV-cache prefill for <prev_state> ... </prev_state>
+    const prefillRes = await prefillPrevStateKv({
+      ort,
+      decoderSession: state.decoderSession,
+      encOutputs,
+      pastK,
+      pastV,
+      nLayers,
+      prevStateIds,
+      tokenToId,
+      useMtp: state.useMtp,
+    });
+    pastK = prefillRes.pastK;
+    pastV = prefillRes.pastV;
+    const prefilledLen = prefillRes.prefilledLen;
 
     if (state.useMtp) {
       // 4-token FSA-verified MTP-4 speculative decoding (WebGPU native)
@@ -1402,7 +1843,7 @@ async function handleRecognizePage(msg) {
         }
 
         const tokenIdTensor = new ort.Tensor('int64', BigInt64Array.from([BigInt(curId)]), [1, 1]);
-        const stepPosTensor = new ort.Tensor('int64', BigInt64Array.from([BigInt(step)]), [1]);
+        const stepPosTensor = new ort.Tensor('int64', BigInt64Array.from([BigInt(prefilledLen + step)]), [1]);
         const feeds = {
           token_id: tokenIdTensor,
           step_pos: stepPosTensor,
@@ -1458,7 +1899,11 @@ async function handleRecognizePage(msg) {
     }
 
     const rawFinalTokens = stoppedByLoop ? trimToCleanBoundary(generatedTokens) : generatedTokens;
-    const sanitizedBekern = sanitizeBekernForMscz(rawFinalTokens.join(' '));
+    const sanitizedRaw = sanitizeBekernForMscz(rawFinalTokens.join(' '));
+    const sanitizedBekern = prevTailState
+      ? applyCrossPageHeaderCarryover(sanitizedRaw, prevTailState)
+      : sanitizedRaw;
+    const tailState = extractPageTailState(sanitizedBekern);
     const finalTokenCount = sanitizedBekern ? sanitizedBekern.split(/\s+/).length : 0;
     const decodeMs = performance.now() - decodeStart;
     const tokPerSec = finalTokenCount / Math.max(0.001, decodeMs / 1000);
@@ -1467,6 +1912,7 @@ async function handleRecognizePage(msg) {
       type: 'page-done',
       requestId,
       bekern: sanitizedBekern,
+      tailState,
       tokens: finalTokenCount,
       systems: systemCount,
       stoppedByLoop,

@@ -771,6 +771,138 @@ class TestUniDecodeCPU(unittest.TestCase):
         ns_mb = ap.parse_args(["--ckpt", "dummy.pt", "--measure-beam-size", "4"])
         self.assertEqual(ns_mb.measure_beam_size, 4)
 
+    def test_measure_beam_fix_a_only_triggers_on_plain_bar(self) -> None:
+        """Fix A: measure-beam triggers ONLY on plain 'bar', skipping repeat/double/final barlines."""
+        vocab_size = uni_omr.VOCAB_SIZE
+        _, _, eos_id, _, tok_to_id, _ = ev._vocab_spec(vocab_size)
+
+        class _ScriptedModel:
+            """Minimal deterministic stub emitting a fixed token script."""
+
+            def __init__(self, script_toks: list[str]) -> None:
+                self.cfg = uni_omr.UniOMRConfig(vocab_size=vocab_size, d_model=16, n_heads=2, n_enc_layers=1, n_dec_layers=1, mtp_k=1)
+                self.mtp_heads: list = []
+                self.script_ids = [tok_to_id[t] for t in script_toks] + [eos_id]
+
+            def encode_image(self, images: torch.Tensor, **kwargs):
+                return torch.zeros((images.shape[0], 4, 16)), None, {}
+
+            def decode_tokens(self, ids: torch.Tensor, memory=None, return_mtp=False, past_kvs=None, use_cache=True):
+                B, T = ids.shape
+                past_len = 0 if past_kvs is None else int(past_kvs[0][0][0].shape[2])
+                logits = torch.full((B, T, vocab_size), -10.0)
+                for t in range(T):
+                    pos = past_len + t
+                    nxt = self.script_ids[pos] if pos < len(self.script_ids) else eos_id
+                    logits[:, t, nxt] = 10.0
+                new_len = past_len + T
+                k_self = torch.zeros((B, 2, new_len, 8))
+                v_self = torch.zeros((B, 2, new_len, 8))
+                k_cross = torch.zeros((B, 2, 4, 8)) if past_kvs is None else past_kvs[0][1][0]
+                v_cross = torch.zeros((B, 2, 4, 8)) if past_kvs is None else past_kvs[0][1][1]
+                return logits, [], [((k_self, v_self), (k_cross, v_cross))]
+
+        # Bar 0 (complete 4/4), Bar 1 (incomplete: only 1 quarter note -> meter_err = 3.0)
+        base_prefix = ["clef-G-2", "key+0", "time-4-4", "whole", "C", "4", "bar", "quarter", "D", "4"]
+        img = torch.zeros((1, 3, 32, 32))
+
+        for non_plain_bar in ("bar-repeat-right", "bar-repeat-left", "bar-double", "bar-light-heavy"):
+            model_skip = _ScriptedModel(base_prefix + [non_plain_bar])
+            _, stats_skip = ev.generate_mtp_spec(
+                model_skip,  # type: ignore[arg-type]
+                img,
+                max_len=32,
+                use_grammar=True,
+                strict_grammar=False,
+                return_stats=True,
+                measure_beam_size=4,
+            )
+            self.assertEqual(
+                stats_skip["measure_beam_triggers"],
+                0,
+                f"Expected 0 triggers on {non_plain_bar!r}, got {stats_skip['measure_beam_triggers']}",
+            )
+
+        # Plain 'bar' on the exact same incomplete interior measure MUST trigger repair.
+        model_trig = _ScriptedModel(base_prefix + ["bar"])
+        _, stats_trig = ev.generate_mtp_spec(
+            model_trig,  # type: ignore[arg-type]
+            img,
+            max_len=32,
+            use_grammar=True,
+            strict_grammar=False,
+            return_stats=True,
+            measure_beam_size=4,
+        )
+        self.assertEqual(stats_trig["measure_beam_triggers"], 1)
+
+    def test_measure_beam_fix_b_forbids_sys_and_eos_escape(self) -> None:
+        """Fix B: _beam_repair_measure never emits sys_id or eos_id in grammar or non-grammar mode."""
+        vocab_size = uni_omr.VOCAB_SIZE
+        _, bos_id, eos_id, sys_id, tok_to_id, _ = ev._vocab_spec(vocab_size)
+        bar_id = tok_to_id["bar"]
+        whole_id = tok_to_id["whole"]
+        c_id = tok_to_id["C"]
+        oct4_id = tok_to_id["4"]
+
+        class _EscapeBiasModel:
+            """Assigns massive logits (+100) to <eos> and <sys>, with legal whole C 4 bar below."""
+
+            def decode_tokens(self, ids: torch.Tensor, memory=None, return_mtp=False, past_kvs=None, use_cache=True):
+                B, T = ids.shape
+                past_len = 0 if past_kvs is None else int(past_kvs[0][0][0].shape[2])
+                logits = torch.full((B, T, vocab_size), -10.0)
+                # Huge trap logits on eos_id and sys_id at every step!
+                logits[:, :, eos_id] = 100.0
+                logits[:, :, sys_id] = 99.0
+                # Step-dependent legal tokens to close a valid 4/4 bar: whole C 4 bar
+                seq_plan = [whole_id, c_id, oct4_id, bar_id]
+                for t in range(T):
+                    step_idx = max(0, (past_len + t) - 7)  # 7 tokens in prefix before trigger
+                    tok = seq_plan[min(step_idx, len(seq_plan) - 1)]
+                    logits[:, t, tok] = 5.0
+                new_len = past_len + T
+                k_self = torch.zeros((B, 2, new_len, 8))
+                v_self = torch.zeros((B, 2, new_len, 8))
+                k_cross = torch.zeros((B, 2, 4, 8)) if past_kvs is None else past_kvs[0][1][0]
+                v_cross = torch.zeros((B, 2, 4, 8)) if past_kvs is None else past_kvs[0][1][1]
+                return logits, [], [((k_self, v_self), (k_cross, v_cross))]
+
+        prefix_toks = ["clef-G-2", "key+0", "time-4-4", "whole", "C", "4"]
+        st_pre = grammar.PrefixState(strict=False)
+        for tok in prefix_toks + ["bar"]:
+            st_pre.step(tok)
+
+        kv_prefix = [
+            (
+                (torch.zeros((1, 2, 7, 8)), torch.zeros((1, 2, 7, 8))),
+                (torch.zeros((1, 2, 4, 8)), torch.zeros((1, 2, 4, 8))),
+            )
+        ]
+        base_cross = [(torch.zeros((4, 2, 4, 8)), torch.zeros((4, 2, 4, 8)))]
+        stub = _EscapeBiasModel()
+
+        for use_grammar in (True, False):
+            best_toks, best_st, _, _ = ev._beam_repair_measure(
+                model=stub,  # type: ignore[arg-type]
+                kv_prefix=kv_prefix,
+                base_cross_kvs=base_cross,
+                trigger_id=bar_id,
+                bar_start_state=st_pre,
+                beam_size=4,
+                max_bar_toks=12,
+                vocab_size=vocab_size,
+                use_grammar=use_grammar,
+                strict_grammar=False,
+                device=torch.device("cpu"),
+            )
+            self.assertIsNotNone(best_toks, f"use_grammar={use_grammar} failed to close bar")
+            self.assertIsNotNone(best_st)
+            assert best_toks is not None
+            self.assertNotIn(eos_id, best_toks, f"eos_id leaked (use_grammar={use_grammar})")
+            self.assertNotIn(sys_id, best_toks, f"sys_id leaked (use_grammar={use_grammar})")
+            self.assertEqual(best_toks[-1], bar_id)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -35,6 +35,9 @@ import {
   sanitizeBekernForMscz,
   compileBekernWithFallback,
   formatOrtError,
+  extractPageTailState,
+  applyCrossPageHeaderCarryover,
+  prefillPrevStateKv,
 } from './worker.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -380,6 +383,146 @@ WebAssembly.instantiateStreaming = origInstantiateStreaming;
   assert.deepEqual(verEos.acceptedIds.map((id) => idToToken[id]), ['C', '4', '<eos>']);
 
   console.log('[PASS] (f) BekernFsa.clone() + MTP-4 speculative drafting & verification (4/4, partial, EOS)');
+}
+
+// ---------------------------------------------------------------------------
+// 4. Multi-Page Streaming Symbolic State Prefix & Cross-Page Header Carryover
+// ---------------------------------------------------------------------------
+{
+  // (a) Single-staff multi-system tail state extraction (inherits time-*, tracks key change)
+  const page1 =
+    'clef-G-2 key+1 time-3-4 quarter G 4 quarter A 4 quarter B 4 bar <sys> ' +
+    'clef-G-2 key-2 half B 4 quarter C 5 bar';
+  assert.deepEqual(extractPageTailState(page1), ['clef-G-2', 'key-2', 'time-3-4']);
+
+  // (b) Grand-staff tail state extraction
+  const grandPage1 =
+    'clef-G-2 key-1 time-4-4 quarter F 4 quarter G 4 half A 4 bar <sys> ' +
+    'clef-F-4 key-1 time-4-4 whole F 2 bar <sys> ' +
+    'clef-G-2 key-1 whole A 4 bar <sys> ' +
+    'clef-F-4 key-1 half F 2 half C 3 bar';
+  const grandTail = extractPageTailState(grandPage1);
+  assert.deepEqual(grandTail, ['clef-G-2', 'key-1', 'time-4-4', '<sys>', 'clef-F-4', 'key-1', 'time-4-4']);
+
+  // (c) Open tie, slur, hairpin, repeat, and split bar (<partial_bar>)
+  const openTailPage =
+    'clef-G-2 key+0 time-6-8 bar-repeat-left hairpin-cresc-start ' +
+    'eighth C 4 slur-start eighth D 4 tie-start';
+  assert.deepEqual(extractPageTailState(openTailPage), [
+    'clef-G-2',
+    'key+0',
+    'time-6-8',
+    'tie-start',
+    'D',
+    '4',
+    'slur-start',
+    'hairpin-cresc-start',
+    'bar-repeat-left',
+    '<partial_bar>',
+  ]);
+
+  // (d) Cross-page header carryover: Page 2 omits time-3-4 (and Page 2 sys 2 omits key & time)
+  const page2Omitted =
+    'clef-G-2 key-2 quarter D 5 half E 5 bar <sys> ' +
+    'clef-G-2 quarter F 5 half G 5 bar-light-heavy';
+  const carried = applyCrossPageHeaderCarryover(page2Omitted, extractPageTailState(page1));
+  assert.equal(
+    carried,
+    'clef-G-2 key-2 time-3-4 quarter D 5 half E 5 bar <sys> ' +
+      'clef-G-2 key-2 time-3-4 quarter F 5 half G 5 bar-light-heavy',
+  );
+  // Carried-over Page 2 compiles cleanly through real mscz-rs WASM!
+  const compiledP2 = compileBekernWithFallback(carried, 'Page 2 Carried');
+  assertValidZip(compiledP2.msczBytes, 'carried Page 2');
+  assert.ok(compiledP2.musicXml.includes('<beats>3</beats>'), 'Page 2 MusicXML must inherit 3/4 meter');
+
+  // (e) Grand-staff cross-page carryover: Page 2 omits time-4-4 on both staves
+  const grandPage2 =
+    'clef-G-2 key-1 whole G 4 bar <sys> ' +
+    'clef-F-4 key-1 whole C 3 bar';
+  assert.equal(
+    applyCrossPageHeaderCarryover(grandPage2, grandTail),
+    'clef-G-2 key-1 time-4-4 whole G 4 bar <sys> clef-F-4 key-1 time-4-4 whole C 3 bar',
+  );
+
+  // (f) prefillPrevStateKv: complete no-op when prevStateIds omitted OR <prev_state> not in vocab
+  let runCalls = 0;
+  const mockOrt = {
+    Tensor: class MockTensor {
+      constructor(type, data, dims) {
+        this.type = type;
+        this.data = data;
+        this.dims = dims;
+        this.disposed = false;
+      }
+      dispose() {
+        this.disposed = true;
+      }
+    },
+  };
+  const mockSession = {
+    async run(feeds) {
+      runCalls += 1;
+      const L = feeds.token_ids.dims[1];
+      return {
+        logits: new mockOrt.Tensor('float32', new Float32Array(0), [1, L, 10]),
+        present_k_0: new mockOrt.Tensor('float32', new Float32Array(0), [1, 6, L, 64]),
+        present_v_0: new mockOrt.Tensor('float32', new Float32Array(0), [1, 6, L, 64]),
+      };
+    },
+  };
+  const initK = [new mockOrt.Tensor('float32', new Float32Array(0), [1, 6, 0, 64])];
+  const initV = [new mockOrt.Tensor('float32', new Float32Array(0), [1, 6, 0, 64])];
+  const encOut = { cross_k_0: initK[0], cross_v_0: initV[0] };
+
+  // No-op when prevStateIds is null
+  const noop1 = await prefillPrevStateKv({
+    ort: mockOrt,
+    decoderSession: mockSession,
+    encOutputs: encOut,
+    pastK: initK,
+    pastV: initV,
+    nLayers: 1,
+    prevStateIds: null,
+    tokenToId: { ...tokenToId, '<prev_state>': 237 },
+    useMtp: true,
+  });
+  assert.equal(noop1.prefilledLen, 0);
+  assert.equal(runCalls, 0);
+
+  // No-op when <prev_state> is absent from vocab.json (existing checkpoints)
+  const noop2 = await prefillPrevStateKv({
+    ort: mockOrt,
+    decoderSession: mockSession,
+    encOutputs: encOut,
+    pastK: initK,
+    pastV: initV,
+    nLayers: 1,
+    prevStateIds: [237, 33, 55, 63, 238],
+    tokenToId,
+    useMtp: true,
+  });
+  assert.equal(noop2.prefilledLen, 0);
+  assert.equal(runCalls, 0);
+
+  // Active 1-shot [1, L] WebGPU prefill when <prev_state> exists and prevStateIds provided
+  const active = await prefillPrevStateKv({
+    ort: mockOrt,
+    decoderSession: mockSession,
+    encOutputs: encOut,
+    pastK: initK,
+    pastV: initV,
+    nLayers: 1,
+    prevStateIds: [237, 33, 55, 63, 238],
+    tokenToId: { ...tokenToId, '<prev_state>': 237, '</prev_state>': 238 },
+    useMtp: true,
+  });
+  assert.equal(active.prefilledLen, 5);
+  assert.equal(runCalls, 1, 'WebGPU prefill must execute in a single [1, L] call');
+  assert.equal(active.pastK[0].dims[2], 5);
+  assert.equal(active.pastV[0].dims[2], 5);
+
+  console.log('[PASS] (g) Multi-page tail state extraction, cross-page header carryover & 1-shot KV prefill');
 }
 
 console.log('ALL TESTS PASSED');
