@@ -54,6 +54,12 @@ def main() -> int:
     ap.add_argument("--osmd", type=Path, default=Path(r"D:\tmp\uni-osmd-iter10\manifest.jsonl"))
     ap.add_argument("--verovio-spacing", type=Path, default=Path(r"D:\tmp\uni-verovio-spacing-iter10\manifest.jsonl"))
     ap.add_argument("--osmd-spacing", type=Path, default=Path(r"D:\tmp\uni-osmd-spacing-iter10\manifest.jsonl"))
+    ap.add_argument(
+        "--corpus100k-rendered",
+        type=Path,
+        default=Path(r"D:\tmp\corpus100k\rendered_iter10\manifest.jsonl"),
+    )
+    ap.add_argument("--corpus100k-upsample", type=int, default=1)
     ap.add_argument("--out", type=Path, default=Path(r"D:\tmp\uni_fullpage_iter10_rich.jsonl"))
     ap.add_argument("--verovio-upsample", type=int, default=1)
     ap.add_argument("--osmd-upsample", type=int, default=1)
@@ -68,6 +74,9 @@ def main() -> int:
     domain_counts = collections.Counter()
     source_counts = collections.Counter()
     font_counts = collections.Counter()
+    c100k_buckets = collections.Counter()
+    c100k_roles = collections.Counter()
+    c100k_sources = collections.Counter()
     skipped = collections.Counter()
     prefix_checked = 0
     prefix_passed = 0
@@ -137,6 +146,12 @@ def main() -> int:
             clean = {"image": img, "bekerns": bks, "domain": dom}
             if tag in ("verovio", "osmd", "verovio_spacing", "osmd_spacing"):
                 font_counts[f"{tag}/{row.get('font', 'unknown')}"] += copies
+            elif tag == "corpus100k":
+                rend = str(row.get("renderer", "unknown"))
+                font_counts[f"c100k_{rend}/{row.get('font', 'unknown')}"] += copies
+                c100k_buckets[str(row.get("primary_bucket", "unknown"))] += copies
+                c100k_roles[str(row.get("page_role", "unknown"))] += copies
+                c100k_sources[str(row.get("source_id", "unknown"))] += copies
             for _ in range(copies):
                 out_rows.append(clean)
                 domain_counts[dom] += 1
@@ -147,6 +162,7 @@ def main() -> int:
     _ingest(args.osmd, "osmd", "printed", args.osmd_upsample, check_prefix=True)
     _ingest(args.verovio_spacing, "verovio_spacing", "printed", 1, check_prefix=True)
     _ingest(args.osmd_spacing, "osmd_spacing", "printed", 1, check_prefix=True)
+    _ingest(args.corpus100k_rendered, "corpus100k", "printed", args.corpus100k_upsample, check_prefix=True)
 
     rng = random.Random(args.seed)
     rng.shuffle(out_rows)
@@ -167,7 +183,11 @@ def main() -> int:
     for k, v in source_counts.most_common():
         print(f"  source={k:12s}: {v:6d} ({100.0 * v / max(1, total):.1f}%)", flush=True)
     for k, v in sorted(font_counts.items()):
-        print(f"  font={k:22s}: {v:6d}", flush=True)
+        print(f"  font={k:28s}: {v:6d}", flush=True)
+    if c100k_buckets:
+        print("  [corpus100k] page_roles:", dict(c100k_roles), flush=True)
+        print("  [corpus100k] sources:", dict(sorted(c100k_sources.items())), flush=True)
+        print("  [corpus100k] primary_buckets:", dict(sorted(c100k_buckets.items())), flush=True)
     return 0
 
 
