@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
-"""Pure static LAN file server for the 100% client-side Sheet Music Converter web app.
+"""Pure static LAN file server (HTTP + HTTPS) for the 100% client-side Sheet Music Converter.
 
 ZERO backend inference or conversion endpoints — strictly serves static assets
-from ``web/`` with Cross-Origin Isolation headers (COOP/COEP) required for
-multi-threaded ``onnxruntime-web`` WASM + WebGPU, plus proper ``.wasm`` / ``.onnx``
-MIME types.
+from ``web/`` with Cross-Origin Isolation headers (COOP/COEP/CORP) required for
+multi-threaded ``onnxruntime-web`` WASM, SharedArrayBuffer, WebGPU, and mobile
+camera access over LAN HTTPS.
 
 Usage:
-    python web/serve_lan.py              # serves web/ on http://0.0.0.0:8080
-    python web/serve_lan.py --port 8088
+    python web/serve_lan.py                              # HTTP :8080 + HTTPS :8443
+    python web/serve_lan.py --port 8081 --https-port 8444
 """
 
 from __future__ import annotations
@@ -16,13 +16,16 @@ from __future__ import annotations
 import argparse
 import os
 import socket
+import ssl
 import sys
+import threading
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from urllib.parse import unquote
 
 
 class StaticIsolatedHandler(SimpleHTTPRequestHandler):
-    """Static-only handler with COOP/COEP headers and WASM/ONNX MIME types."""
+    """Static-only handler with COOP/COEP/CORP headers and WASM/ONNX MIME types."""
 
     extensions_map = {
         **SimpleHTTPRequestHandler.extensions_map,
@@ -37,6 +40,27 @@ class StaticIsolatedHandler(SimpleHTTPRequestHandler):
         ".musicxml": "application/vnd.recordare.musicxml+xml; charset=utf-8",
     }
 
+    def _is_forbidden_path(self) -> bool:
+        raw_path = unquote(self.path.split("?", 1)[0]).replace("\\", "/").lower()
+        parts = [p for p in raw_path.split("/") if p]
+        if "certs" in parts:
+            return True
+        if raw_path.endswith((".key", ".pem", ".pfx", ".p12")):
+            return True
+        return False
+
+    def do_GET(self) -> None:
+        if self._is_forbidden_path():
+            self.send_error(403, "Forbidden")
+            return
+        super().do_GET()
+
+    def do_HEAD(self) -> None:
+        if self._is_forbidden_path():
+            self.send_error(403, "Forbidden")
+            return
+        super().do_HEAD()
+
     def end_headers(self) -> None:
         # Required for SharedArrayBuffer (multi-threaded ORT WASM) + WebGPU isolation.
         self.send_header("Cross-Origin-Opener-Policy", "same-origin")
@@ -48,6 +72,11 @@ class StaticIsolatedHandler(SimpleHTTPRequestHandler):
         else:
             self.send_header("Cache-Control", "no-cache")
         super().end_headers()
+
+
+class ReusableThreadingHTTPServer(ThreadingHTTPServer):
+    allow_reuse_address = True
+    daemon_threads = True
 
 
 def detect_lan_ip() -> str:
@@ -65,15 +94,33 @@ def detect_lan_ip() -> str:
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Serve the 100% client-side Sheet Music Converter web app over LAN."
+        description="Serve the 100% client-side Sheet Music Converter web app over LAN (HTTP + HTTPS)."
     )
     parser.add_argument("--host", default="0.0.0.0", help="Bind address (default: 0.0.0.0)")
-    parser.add_argument("--port", type=int, default=8080, help="Port (default: 8080)")
+    parser.add_argument("--port", type=int, default=8080, help="HTTP port (default: 8080)")
+    parser.add_argument(
+        "--https-port",
+        type=int,
+        default=8443,
+        help="HTTPS port (default: 8443; set 0 to disable HTTPS)",
+    )
     parser.add_argument(
         "--dir",
         type=Path,
         default=Path(__file__).resolve().parent,
         help="Static directory to serve (default: web/)",
+    )
+    parser.add_argument(
+        "--cert",
+        type=Path,
+        default=None,
+        help="TLS certificate PEM path (default: <dir>/certs/telkutaga.crt)",
+    )
+    parser.add_argument(
+        "--key",
+        type=Path,
+        default=None,
+        help="TLS private key PEM path (default: <dir>/certs/telkutaga.key)",
     )
     args = parser.parse_args()
 
@@ -82,22 +129,62 @@ def main() -> None:
         print(f"Error: directory does not exist: {serve_dir}", file=sys.stderr)
         sys.exit(1)
 
+    cert_path = (args.cert or (serve_dir / "certs" / "telkutaga.crt")).resolve()
+    key_path = (args.key or (serve_dir / "certs" / "telkutaga.key")).resolve()
+
     os.chdir(serve_dir)
     lan_ip = detect_lan_ip()
 
-    server = ThreadingHTTPServer((args.host, args.port), StaticIsolatedHandler)
-    print("Sheet Music Converter — 100% Client-Side Static Server")
-    print(f"  Serving:   {serve_dir}")
-    print(f"  Local URL: http://127.0.0.1:{args.port}/")
-    print(f"  LAN URL:   http://{lan_ip}:{args.port}/")
-    print("  Headers:   COOP=same-origin, COEP=require-corp (WebGPU + threaded WASM)")
-    print("  Press Ctrl+C to stop.")
+    servers: list[tuple[str, ThreadingHTTPServer]] = []
+    threads: list[threading.Thread] = []
+
+    http_server = ReusableThreadingHTTPServer((args.host, args.port), StaticIsolatedHandler)
+    servers.append(("HTTP", http_server))
+
+    https_server: ThreadingHTTPServer | None = None
+    if args.https_port > 0:
+        if cert_path.is_file() and key_path.is_file():
+            ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+            ctx.minimum_version = ssl.TLSVersion.TLSv1_2
+            ctx.load_cert_chain(certfile=str(cert_path), keyfile=str(key_path))
+            https_server = ReusableThreadingHTTPServer(
+                (args.host, args.https_port), StaticIsolatedHandler
+            )
+            https_server.socket = ctx.wrap_socket(https_server.socket, server_side=True)
+            servers.append(("HTTPS", https_server))
+        else:
+            print(
+                f"Warning: TLS cert/key not found ({cert_path}, {key_path}); HTTPS disabled.",
+                file=sys.stderr,
+            )
+
+    for label, srv in servers:
+        t = threading.Thread(target=srv.serve_forever, name=f"serve-{label}", daemon=True)
+        t.start()
+        threads.append(t)
+
+    print("Sheet Music Converter — 100% Client-Side Static Server", flush=True)
+    print(f"  Serving:     {serve_dir}", flush=True)
+    if https_server is not None:
+        print(f"  HTTPS (LAN): https://telkutaga.local:{args.https_port}/", flush=True)
+        print(f"  HTTPS (IP):  https://{lan_ip}:{args.https_port}/", flush=True)
+        print(f"  TLS Cert:    {cert_path}", flush=True)
+    print(f"  HTTP  (LAN): http://telkutaga.local:{args.port}/", flush=True)
+    print(f"  HTTP  (IP):  http://{lan_ip}:{args.port}/", flush=True)
+    print("  Headers:     COOP=same-origin, COEP=require-corp, CORP=same-origin", flush=True)
+    print("  Press Ctrl+C to stop.", flush=True)
+
     try:
-        server.serve_forever()
+        while any(t.is_alive() for t in threads):
+            for t in threads:
+                t.join(timeout=0.5)
     except KeyboardInterrupt:
-        print("\nStopped.")
+        print("\nStopping...", flush=True)
     finally:
-        server.server_close()
+        for _, srv in servers:
+            srv.shutdown()
+            srv.server_close()
+        print("Stopped.", flush=True)
 
 
 if __name__ == "__main__":

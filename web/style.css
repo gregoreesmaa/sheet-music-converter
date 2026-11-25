@@ -240,6 +240,57 @@ html, body {
   background: #ffffff;
 }
 
+.pdf-thumbs {
+  display: flex;
+  gap: 8px;
+  overflow-x: auto;
+  padding: 6px 2px 4px;
+}
+
+.pdf-thumb {
+  position: relative;
+  flex: 0 0 auto;
+  width: 68px;
+  border-radius: 8px;
+  border: 2px solid var(--border);
+  background: #ffffff;
+  overflow: hidden;
+  cursor: pointer;
+  padding: 0;
+  transition: border-color 0.15s ease, transform 0.1s ease;
+}
+
+.pdf-thumb:hover {
+  border-color: var(--accent);
+}
+
+.pdf-thumb.active {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 2px rgba(79, 140, 255, 0.3);
+}
+
+.pdf-thumb.done {
+  border-color: var(--ok);
+}
+
+.pdf-thumb img {
+  display: block;
+  width: 100%;
+  height: 86px;
+  object-fit: cover;
+  background: #ffffff;
+}
+
+.pdf-thumb-label {
+  display: block;
+  background: var(--surface-2);
+  color: var(--text);
+  font-size: 0.7rem;
+  font-weight: 600;
+  text-align: center;
+  padding: 2px 4px;
+}
+
 .upload-actions {
   display: flex;
   flex-wrap: wrap;

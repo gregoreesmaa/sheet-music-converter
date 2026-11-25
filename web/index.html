@@ -6,11 +6,6 @@
   <title>Sheet Music Converter — 100% Client-Side UniOMR + MuseScore (.mscz)</title>
   <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'><rect width='64' height='64' rx='14' fill='%232563eb'/><text x='50%25' y='54%25' dominant-baseline='middle' text-anchor='middle' font-size='38' fill='white'>%E2%99%AB</text></svg>" />
   <link rel="stylesheet" href="./style.css" />
-  <script
-    src="https://cdn.jsdelivr.net/npm/onnxruntime-web@1.20.1/dist/ort.webgpu.min.js"
-    crossorigin="anonymous"
-    defer
-  ></script>
 </head>
 <body>
   <div class="app-shell">
@@ -19,7 +14,7 @@
         <span class="brand-mark" aria-hidden="true">&#119070;</span>
         <div>
           <h1>Sheet Music Converter</h1>
-          <p class="subtitle">100% in-browser UniOMR (ONNX) + <code>mscz-rs</code> WASM — zero server compute</p>
+          <p class="subtitle">100% in-browser UniOMR (ONNX Worker) + <code>mscz-rs</code> WASM — zero server compute</p>
         </div>
       </div>
       <div class="badges" aria-label="Runtime status">
@@ -35,23 +30,25 @@
       <!-- Left column: Upload & Preview -->
       <section class="card upload-card">
         <div class="card-header">
-          <h2>1. Sheet Music Image</h2>
+          <h2>1. Sheet Music Image or PDF</h2>
           <span id="img-meta" class="meta-pill hidden"></span>
         </div>
 
-        <div id="drop-zone" class="drop-zone" tabindex="0" role="button" aria-label="Upload sheet music image">
+        <div id="drop-zone" class="drop-zone" tabindex="0" role="button" aria-label="Upload sheet music image or PDF">
           <div id="drop-placeholder" class="drop-placeholder">
             <div class="drop-icon" aria-hidden="true">&#128196;</div>
-            <p class="drop-title">Drop a sheet music photo or scan here</p>
-            <p class="drop-hint">PNG, JPEG, or WebP — stays 100% on your device</p>
+            <p class="drop-title">Drop a sheet music photo, scan, or PDF here</p>
+            <p class="drop-hint">PNG, JPEG, WebP, or PDF — stays 100% on your device</p>
           </div>
           <img id="preview-img" class="preview-img hidden" alt="Uploaded sheet music preview" />
         </div>
 
+        <div id="pdf-thumbs" class="pdf-thumbs hidden" aria-label="PDF pages"></div>
+
         <div class="upload-actions">
           <label class="btn btn-secondary">
-            <span>Choose Image</span>
-            <input id="file-input" type="file" accept="image/*" hidden />
+            <span>Choose Image / PDF</span>
+            <input id="file-input" type="file" accept="image/*,application/pdf,.pdf" hidden />
           </label>
           <label class="btn btn-secondary">
             <span>Take Photo</span>
@@ -82,7 +79,7 @@
           <div class="progress-track" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0">
             <div id="progress-fill" class="progress-fill" style="width: 0%"></div>
           </div>
-          <p id="status-text" class="status-text">Upload or photograph a page of sheet music to begin.</p>
+          <p id="status-text" class="status-text">Upload a sheet music image or PDF to begin.</p>
         </div>
 
         <div class="stats-grid">
@@ -138,7 +135,7 @@
     </main>
 
     <footer class="footer">
-      <span>All neural inference (ONNX Runtime Web) and engraving compilation (<code>mscz-rs</code> WebAssembly) run locally in your browser.</span>
+      <span>All neural inference (ONNX Runtime Web Worker) and engraving compilation (<code>mscz-rs</code> WebAssembly) run locally in your browser.</span>
     </footer>
   </div>
 
