@@ -1,24 +1,20 @@
 [package]
 name = "photo-degrade"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
-description = "Degrade clean sheet-music PNGs into realistic phone photos (curl, perspective, blur, glare, shadow, noise, JPEG, paper texture) with a seeded RNG; writes paired output + params.json."
+description = "Thin facade over published doc-photo-degrade crate for sheet-music-converter."
+license = "MIT OR Apache-2.0"
+
+[lib]
+name = "photo_degrade"
+path = "src/lib.rs"
 
 [[bin]]
 name = "photo-degrade"
 path = "src/main.rs"
 
 [dependencies]
-image = { version = "0.25", features = ["png", "jpeg"] }
-rand = "0.8"
-rand_chacha = "0.3"
+doc-photo-degrade = "0.2"
 clap = { version = "4", features = ["derive"] }
-serde = { version = "1", features = ["derive"] }
+image = { version = "0.25", default-features = false, features = ["png"] }
 serde_json = "1"
-degrade-gpu = { path = "../degrade-gpu" }
-pollster = "0.3"
-zune-jpeg = "0.5.15"
-zune-png = "0.5.2"
-jpeg-encoder = { version = "0.7.1", features = ["simd"] }
-jpeg-nv = { path = "../jpeg-nv" }
-fast_image_resize = "6.1.0"

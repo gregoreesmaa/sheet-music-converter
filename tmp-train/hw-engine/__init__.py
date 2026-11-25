@@ -1,6 +1,6 @@
-"""Handwritten sheet-music rendering engine (`tmp-train/hw-engine`)."""
+"""Handwritten sheet-music rendering engine facade (delegates to published `hw-score-sim`)."""
 
-from .render_mvp import (
+from hw_score_sim import (
     MeasureData,
     NoteEvent,
     ParsedScore,

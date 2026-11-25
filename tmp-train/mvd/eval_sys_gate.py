@@ -618,6 +618,8 @@ def main():
                      key=lambda s: (s['id'], s['sys_idx']))
 
     state = torch.load(args.ckpt, map_location='cpu', weights_only=True)
+    if isinstance(state, dict) and 'model' in state and isinstance(state['model'], dict):
+        state = state['model']
     ckpt_extra = detect_ckpt_extra_chans(state)
     if args.extra_chans is not None:
         extra = int(args.extra_chans)

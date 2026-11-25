@@ -5,6 +5,20 @@ This guide documents every real handwritten and unlabeled sheet-music corpus sta
 > **Standing Quality Rules:**
 > 1. **Never** train Stage 2 (`MvdNet`) on raw single-model pseudo-labels from an inferior OMR model. All supervised transcriptions must be **human-authored** (CC0/CC-BY symbolic scores or verified 3-edition 100%-consensus prints).
 > 2. **Never count RISM as labeled data** (RISM only has 2–5 bar monophonic opening incipits, not full-page/full-work transcriptions). All RISM manuscripts are grouped under **`D:\tmp\unlabeled-10k-real\rism_hw\`** as **unlabeled** data.
+> 3. **CRITICAL `hw-sim-v03-clean` Warning:** Forensic audit proved `80.8%` of Stage-2 `hw-sim-v03-clean` strips had **barline corruption** and **`0%` `bekern+` expressive tokens**. Never ingest legacy `hw-sim-v03-clean` strips as-is — all synthetic HW strips must be exported **directly from source MusicXML** with a strict **`n_bar == m_end - m_start`** barline gate and restricted to **historical-only iron-gall / landscape / parchment styles**.
+> 4. **Strict License Quarantine:** `cvc-muscima` is **`CC-BY-NC`** and is strictly quarantined from commercial training/data pipelines.
+
+---
+
+## Verified Real-HW & Unlabeled Inventory (On Disk)
+
+- **Debussy archival full pages (uncomposed):** `84` pages in `D:\tmp\debussy-omr\train_pages\` *(research-only, BnF Gallica scan caveat)*
+- **Debussy labeled system strips:** `440` strips (`D:\tmp\real-hw-train-debussy\`, research-only)
+- **Mozart SQ labeled strips:** `36` strips (`D:\tmp\real-hw-corpus\`, commercial-safe)
+- **`rism-pdm-hw-intl` (`PDM 1.0`):** `497` verified pages
+- **Multi-page real HW works:** `258` works staged across our real-HW corpora
+- **Unlabeled RISM / NIFC / intl HW pages:** `7,142` pages
+- **Quarantined (`CC-BY-NC`):** `cvc-muscima` (excluded from commercial training)
 
 ---
 
@@ -33,8 +47,10 @@ This guide documents every real handwritten and unlabeled sheet-music corpus sta
 ## Detailed Workflows
 
 ### A. Stage 1 (`StaffUNet2D`) — Unsupervised Equivariance on `unlabeled-10k-real` + `rism-pdm-hw`
-1. Co-train `1:2` unlabeled:labeled pages.
-2. Run slow EMA teacher (`τ=0.999`, `no_grad`) on clean unlabeled page `I`; run student on warped/degraded `Warp(I)`.
+> **Verified 2×2 Stage-1 Ablation Verdict:** Unsupervised EMA **hurt Printed Clean** (`-4.7%` to `-8.0%`) while clean-paper Hero HW **helped** (`+6.3%` to `0.7482`). Therefore, keep EMA **OFF** during supervised warmup and only gate it on after **real-HW F1 > `0.35`**.
+
+1. During supervised warmup, keep EMA **OFF** and lean on clean-paper Hero HW + supervised labeled pages.
+2. Once **real-HW F1 > `0.35`**, optionally enable EMA co-training (`1:2` unlabeled:labeled pages): run slow EMA teacher (`τ=0.999`, `no_grad`) on clean unlabeled page `I`; run student on warped/degraded `Warp(I)`.
 3. Enforce `Student(Warp(I)) == Warp(Teacher(I))` on `ch0–2` (confidence `>0.85`, OOB masked) + exact scale law `log_hm(Scale_s(I)) == log_hm(I) + log(s)` on `ch3` + horizontal flip consistency on `ch2`.
 4. Optionally add **Differentiable 5-Line Ribbon Comb-Energy** through `BezierRibbonSampler` on high-confidence unlabeled staves.
 

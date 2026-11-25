@@ -44,7 +44,7 @@ def test_note_skeleton():
     assert allow == ids('A', 'B', 'C', 'D', 'E', 'F', 'G'), allow
     assert not eos_ok
     allow, eos_ok = grammar.allowed_next(q + [_T['C']])
-    assert allow == ids('0', '1', '2', '3', '4', '5', '6', '7', '8'), allow
+    assert allow == ids('-1', '0', '1', '2', '3', '4', '5', '6', '7', '8'), allow
     assert not eos_ok
     allow, eos_ok = grammar.allowed_next(q + [_T['C'], _T['4']])
     assert _T['a1'] in allow and _T['dot'] in allow
@@ -284,7 +284,7 @@ class StrictBarDurationTest(unittest.TestCase):
         allow, _ = st.allowed()
         self.assertNotIn(_T['quarter'], allow)
         self.assertIn(_T['bar'], allow)
-        self.assertIn(_T['bar-rest'], allow)
+        self.assertNotIn(_T['bar-rest'], allow)
         with self.assertRaisesRegex(ValueError, 'overshoots bar'):
             st.step('quarter')
 
@@ -306,12 +306,18 @@ class StrictBarDurationTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'overshoots bar'):
             st.step('quarter')
 
-    def test_bar_rest_always_legal(self):
+    def test_bar_rest_blocked_at_full_or_nonempty_bar(self):
+        # Empty bar allows bar-rest.
+        st0 = self._walk('clef-G-2 key+0 time-4-4')
+        self.assertIn(_T['bar-rest'], st0.allowed()[0])
+        # Non-empty or full bar forbids bar-rest in strict mode (anti-loop).
         st = self._walk('clef-G-2 key+0 time-4-4 quarter C 4 quarter D 4 '
                         'quarter E 4 quarter F 4')
         allow, _ = st.allowed()
         self.assertNotIn(_T['quarter'], allow)
-        self.assertIn(_T['bar-rest'], allow)
+        self.assertNotIn(_T['bar-rest'], allow)
+        with self.assertRaises(ValueError):
+            st.step('bar-rest')
 
     def test_chord_tone_adds_zero(self):
         self._walk('clef-G-2 key+0 time-4-4 quarter C 4 chord quarter E 4 '
@@ -593,19 +599,18 @@ class TestFullBarRestMasking(unittest.TestCase):
         allow, _ = st.allowed()
         self.assertNotIn(_T['rest'], allow)
         self.assertIn(_T['bar'], allow)
-        self.assertIn(_T['bar-rest'], allow)
+        self.assertNotIn(_T['bar-rest'], allow)
         allow_leg, _ = self._walk(full, False).allowed()
         self.assertIn(_T['rest'], allow_leg)
 
     def test_rest_masked_after_bar_rest_fills_bar(self):
         # Post-bar-rest boundary: cursor itself sits exactly on the bar.
-        st = self._walk('clef-G-2 key+0 time-4-4 quarter C 4 bar-rest',
-                        True)
+        st = self._walk('clef-G-2 key+0 time-4-4 bar-rest', True)
         self.assertEqual(st.vcurs[st.seg], st.tsig)
         allow, _ = st.allowed()
         self.assertNotIn(_T['rest'], allow)
         self.assertIn(_T['bar'], allow)
-        self.assertIn(_T['bar-rest'], allow)
+        self.assertNotIn(_T['bar-rest'], allow)
 
     def test_rest_mode_durations_empty_at_full_bar_strict(self):
         st = self._walk('clef-G-2 key+0 time-4-4 quarter C 4 quarter D 4 '

@@ -31,9 +31,11 @@ from PIL import Image
 __all__ = [
     "VOCAB",
     "TOKEN_TO_ID",
+    "ID_TO_TOKEN",
     "PAD_ID",
     "BOS_ID",
     "EOS_ID",
+    "VOCAB_SIZE",
     "EXT_DYNAMICS_VOCAB",
     "EXT_LYRIC_MARKERS_VOCAB",
     "EXT_PERCUSSION_TAB_VOCAB",
@@ -228,13 +230,42 @@ assert all(
     ) for t in _OCTAVE_CLEF_ADD
 ), "octave clef add must be append-only (id stability)"
 
-VOCAB: List[str] = (
+# Option D1 Iter-7 vocab expansion (2026-11-25, full PDMX/Debussy/corpus
+# census): 15 missing voices (voice-13..voice-27), 2 missing clefs
+# (clef-T-2, clef-F-4-8vb), 1 missing octave (-1), 26 real meters, and
+# 11 Debussy/PDMX tuplet ratios. Appended strictly AFTER _OCTAVE_CLEF_ADD
+# so all pre-existing IDs 0..177 stay 100% verbatim under saved checkpoints.
+_BASE_PRE_ITER7 = (
     _STEPS + _OCTAVES + _DURATIONS + _MARKS + _ALTERS + _SYMBOLS
     + _CLEFS + _KEYS + _TIMES + _TUPLETS + _BAR_REST + _BREVE + _CHORD
     + _VOICES + _SQ_ADD + _BEKERNPLUS + _T32_ADD + _LELAND_ADD
     + _OCTAVE_CLEF_ADD
 )
+_ITER7_D1_RAW = (
+    ["voice-%d" % i for i in range(13, 28)]
+    + ["clef-T-2", "clef-F-4-8vb"]
+    + ["-1"]
+    + ["time-%s" % t for t in (
+        "2-1", "3-1", "1-8", "8-4", "11-8", "13-8", "13-16", "15-16",
+        "16-4", "17-16", "3-16", "5-16", "7-16", "10-8", "10-4", "14-4",
+        "18-4", "19-16", "2-16", "6-2", "22-8", "17-8", "11-16", "19-32",
+        "21-16", "35-32",
+    )]
+    + ["tuplet-start-%d-%d" % r for r in (
+        (12, 16), (17, 16), (17, 2), (18, 16), (8, 4), (9, 6), (3, 6),
+        (6, 2), (9, 1), (10, 3), (12, 2),
+    )]
+)
+_ITER7_D1_ADD: List[str] = list(
+    dict.fromkeys(t for t in _ITER7_D1_RAW if t not in set(_BASE_PRE_ITER7))
+)
+assert all(
+    t not in _BASE_PRE_ITER7 for t in _ITER7_D1_ADD
+), "iter7 D1 add must be append-only (id stability)"
+
+VOCAB: List[str] = _BASE_PRE_ITER7 + _ITER7_D1_ADD
 TOKEN_TO_ID: Dict[str, int] = {t: i for i, t in enumerate(VOCAB)}
+ID_TO_TOKEN: Dict[int, str] = {i: t for i, t in enumerate(VOCAB)}
 
 # Special ids live after the vocabulary so appended vocab tokens never
 # shift them relative to each other (model.py derives the same ids
@@ -242,6 +273,7 @@ TOKEN_TO_ID: Dict[str, int] = {t: i for i, t in enumerate(VOCAB)}
 PAD_ID: int = len(VOCAB)
 BOS_ID: int = len(VOCAB) + 1
 EOS_ID: int = len(VOCAB) + 2
+VOCAB_SIZE: int = len(VOCAB) + 3
 
 # ---------------------------------------------------------------------------
 # Opt-in extension vocabularies (NOT appended to default VOCAB).

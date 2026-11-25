@@ -145,3 +145,56 @@ Sources: file-backed workflow findings (`D:/tmp/omr-trimmed/*.md`); public numbe
 - [ ] **C1 — Lean-tree policy (ongoing).** Delete only on zero live references + proven regenerability; untracked user files never touched; last-5-commit protection. Suites green after every removal. (Landed 2026-11-22: `7669e93` + `55fe9bf` + `3eb7886`, ~1,930 files, 22 tests green.)
 - [ ] **X1 — Docker black-box evals of oemer + Audiveris on suite31.** Run both engines as black-box containers over `suite31/clean` + `suite31/photo`, score with our `strict-f1` + `notation-f1` harness for directly comparable numbers. AGPL Audiveris stays container-black-box only — never linked, vendored, forked, or placed in the inference/training path (fork/augmentation/restorer-hybrid explicitly CLOSED 2026-11-22). Recorded public baselines: oemer 38.45/9.81, Audiveris 88.43/50.43.
 - [x] **X2 — Write `bets+v2.md`.** Best-directions doc fusing the 10 workflow levers with spike evidence (S1–S10 DROP/PASS record): what to do, what to kill, and the named gaps that must be re-read before citing. DONE 2026-11-22 (`bets+v2.md`, 108 lines, content-checked).
+
+---
+
+### UniOMR Full-Page Track & Iter 7 Workstream (2026-11-24 / 2026-11-25)
+
+#### Completed Milestones
+- [x] **4-Repo Optimization Sweep & Pushes** — DONE 2026-11-24/25: `mscz-rs` (`ec51183`, 146/146 + WASM), `hw-score-sim` (`80708c0`, 111/111, `6.2–9.7×` faster `clean_paper=True`), `doc-photo-degrade` (`2305fd8` / `v0.3.0`, all 6 gates), `sheet-music-converter` (`staff_unet2d.py` OOM + `--sp-mode auto` fix, `score-render` European metric `--musescore-page-sizes`, 17/17 tests).
+- [x] **Stage-1 Controlled 2×2 Ablation (`D:\tmp\ablation-stage1-2x2\summary.json`)** — DONE 2026-11-24: Arm C (`Printed + 1,153 Hero HW`, Unsup OFF) hit new best 2-stage Printed Clean `0.7482` (`+6.3%` vs base); Unsup EMA hurt `-4.7%` to `-8.0%`.
+- [x] **UniOMR Iter 1 → Iter 6 (`D:\tmp\mvd-runs\uni-omr-iter6-clean\`)** — DONE 2026-11-25: Fixed inverted `InkTokenRouter` (`23.8% → 95.2%`), `128×` `_sinusoidal_pos2d` aliasing, dark-desk/perspective/1-bit aug, `24,577`-page balanced 1/2/3/4-staff manifest, `max_seq_len=2560`, `4×8` stride, `MixStyle2d`, `CASS`, `SWAD`, CUTLASS `EFFICIENT_ATTENTION` (`11.5–14.7×`), 6-thread async prefetcher. `suite31_hw` (`1280px`, `3072` tok, `FSA + MTP-4`, `447 tok/s`, `100%` printed DecOK): **Printed Clean `0.7014` (`+0.415`) | Printed Photo `0.7213` (`+0.681`, beats best 2-stage `0.6949`!)** | HW Clean `0.0101` | HW Photo `0.0023`.
+- [x] **UniOMR Evaluator (`eval_uni_suite31.py`) & Post-Eval Forensic Skill (`.agents/skills/learn-from-suite31/SKILL.md`)** — DONE 2026-11-25: Standardized `suite31_hw` apples-to-apples Strict Note F1 eval + 9-scout forensic audit workflow.
+
+#### Ranked Iter 7 Workstream (Post-Iter-6 9-Scout Audit)
+1. [ ] **U7.1 — Fix `grammar.py` `CHORD` loop bug** (eliminate infinite/spurious chord-loop emissions in FSA decoding).
+2. [ ] **U7.2 — Upgrade `InkTokenRouter` (`0.50` cap + border-ring mask)** (raise keep cap from `0.25 → 0.50` and mask border-ring leak tokens on dense/5–7 staff pages).
+3. [ ] **U7.3 — Calibration & Domain Generalization (`aug_prob=0.50` + domain-mixed `MixStyle`)** (ensure printed & HW features mix across domains during `MixStyle2d` and raise online photo/paper aug rate).
+4. [ ] **U7.4 — Option D1 Vocab Expansion (`182 → 204`)** (add missing `bekern+` expressive/meter tokens while keeping base IDs stable).
+5. [ ] **U7.5 — Quarantine & Fix `hw-sim-v03` Barline Corruption (`80.8%` affected)** (purge corrupted synthetic HW barlines and regenerate clean `hw-score-sim` pages with valid barlines + expressive `bekern+` tokens).
+6. [ ] **U7.6 — Upsample Real Handwritten Data to `15–18%` of Training Steps** (up from `1.17%`: compose and wire `84` uncomposed Debussy full pages + `497` `rism-pdm-hw-intl` + `440` Debussy strips + landscape OpenScore string quartets, `0` eval overlap).
+7. [ ] **U7.7 — Rebalance 5–7 Staff Systems & Rare Meters (`4/2`, `3/2`, `1/32`)** (close remaining printed `suite31` tail errors).
+8. [ ] **U7.8 — Train & Evaluate UniOMR Iter 7 on `suite31_hw`** (run `eval_uni_suite31.py` + `.agents/skills/learn-from-suite31` forensic loop).
+9. [ ] **U7.9 — Future Browser Student (`~20M` Distilled Model)** (post-Iter-7 distillation of UniOMR teacher into a `~20M` WASM/WebGPU browser-deployable student).
+
+---
+
+### Fresh-Session Handoff, `D:\tmp` Map & Windows/GPU Gotchas (2026-11-25)
+
+**Primary Goal (User-Specified):** **`UniOMR` Strict Note F1 `>= 0.90` across ALL scores** on the modified 45-piece `suite31_hw` benchmark (`printed_clean`, `printed_photo`, `hw_clean`, `hw_photo`).
+
+**Already implemented & CPU-tested in working tree (uncommitted):**
+- `tmp-train/mvd/data.py`: Option D1 vocab appended (`182 -> 237`, IDs `0..177` intact).
+- `tmp-train/mvd/grammar.py`: `CHORD` & `grace` capped at `<= 8`, `BAR_REST` blocked on full/non-empty bar, `cycle_forbidden()` extended to period `1..24`.
+- `tmp-train/mvd/eval_uni_suite31.py`: backward-compat `cfg.vocab_size`-aware special IDs (`182` & `237`), `cycle_forbidden()` enabled in both `strict=False` & `strict=True`, clean event-boundary trim on `max_len`.
+- `tmp-train/mvd/uni_omr.py`: lossless tail-relocating `load_uni_weights_compat`, border-cliff-proof relative-contrast `InkTokenRouter` (`local_bg > 0.35`, `quantile(0.99)`), clean-page scale jitter + archival parchment/iron-gall/verso-bleed/colorbar/blank-staff aug, domain-mixed `MixStyle2d`.
+- Verified: `test_uni_omr.py` (`21/21`), `test_uni_decode.py` (`11/11`), `test_grammar_splitbar.py` (`9/9`).
+
+**Immediate Next Sequence (in order):**
+1. **Approved Hybrid B+C Repo Restructure:** Root `Cargo.toml` (only the 4 active crates: `runtime/assembly-serialize`, `eval/eval-harness`, `datagen/score-render`, `datagen/photo-degrade`) + root `pyproject.toml`; shallow workflow slices `uniomr/`, `eval/`, `datagen/`, `runtime/`, `web/`, `benchmarks/` (frozen `suite31/` & `gate20/`), `docs/` (`UNIOMR.md`, `architecture/`, `runbooks/`, `phases/`, `archive/`), and `legacy/` (quarantined 2-stage MVD + 8 retired crates, read-only). Verify `cargo test --workspace` + Python tests green.
+2. **Git commit & push** (per `AGENTS.md` rule: `Gregor Eesmaa <6941817+gregoreesmaa@users.noreply.github.com>`) BEFORE launching GPU training.
+3. **5-second GPU preflight + Launch UniOMR Iter 7** warm-started from `D:\tmp\mvd-runs\uni-omr-iter6-clean\uni_omr_best.pt` using `D:\tmp\uni_fullpage_iter7.jsonl`, `--max-keep-ratio 0.45`, `--aug-prob 0.50`, `--fullpage-frac 0.65`, `--bf16`, `python -u`.
+4. When Iter 7 finishes, `.agents/skills/learn-from-suite31/SKILL.md` triggers automatically (Step 0: run 45-piece `suite31_hw`!).
+
+**Active `D:\tmp` Map (external to git — NEVER delete):**
+- Latest best checkpoint: `D:\tmp\mvd-runs\uni-omr-iter6-clean\uni_omr_best.pt` (`0.7014` PR clean / `0.7213` PR photo Note F1)
+- Suite31 OOD JSON reports: `D:\tmp\uni-omr-suite31-ood\`
+- Iter-7 clean/balanced/real-HW manifest: `D:\tmp\uni_fullpage_iter7.jsonl` (`24,392` rows: `83.9%` printed w/ 5–7st & rare-meter upsampling, `15.3%` real HW incl. `84` uncomposed Debussy archival full pages + `180` landscape 4-staff real HW, `0.8%` bar-clean `hw-sim`; `0` OOV, `0` eval overlap)
+- Iter-7 clean HW strip dir (`--hw-strip-dirs`): `D:\tmp\real-hw-strips-iter7\` (`6,213` strips: `35.3%` real HW + `4,021` bar-clean `hw-sim`, `0` corrupted, `0` `mozart-k458`)
+- Real HW assets: `D:\tmp\debussy-omr\train_pages\` (84 uncomposed archival full pages), `D:\tmp\real-hw-train-debussy` (440 strips), `D:\tmp\real-hw-train` (36 Mozart SQ strips; exclude `hw-mozart-k458`), `D:\tmp\rism-pdm-hw-intl` (497 PDM-1.0 **opening-staff incipits only** — DO NOT use for full-page!), `D:\tmp\unlabeled-10k-real\rism_hw` (5,707 unlabeled RISM).
+- **QUARANTINED (DO NOT USE):** `D:\tmp\corpus10x-NC\cvc-muscima` (CC-BY-NC), and the 80.8% barline-corrupted strips in `D:\tmp\hw-sim-train-v03-clean\stage2_strips\`.
+
+**Windows + RTX 4080 SUPER (16 GB) Hard-Won Gotchas:**
+- **SDPA:** Keep **CUTLASS `EFFICIENT_ATTENTION`** (NEVER `CUDNN_ATTENTION` on variable `(mem, T)` batches — cuDNN 9.10 recompiles a CPU plan ~640 ms/shape = 49× slower).
+- **Prefetcher:** NEVER call `.pin_memory()` inside `ThreadPoolExecutor` background threads on Windows WDDM (global `cudaHostAlloc` lock stalls GPU).
+- **VRAM / Logging:** Always run `.\.venv\Scripts\python.exe -u` (unbuffered), keep VRAM `< 14 GB` (Windows WDDM silently swaps instead of OOMing), and use PowerShell `;` (never `&&`).

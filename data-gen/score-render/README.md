@@ -38,12 +38,14 @@ cargo run --release -- --input ./input/scores --out ./output/renders \
 cargo run --release -- --renderer musescore \
   --musescore-fonts "Bravura,Emmentaler,Gonville,Leland,MuseJazz,Petaluma" \
   --musescore-text-fonts "Edwin,Times New Roman" \
+  --musescore-page-sizes "a4,a4_land,b4,folio" \
   --input ./input/scores --out ./output/renders-fonts
 ```
 
 Flags: `-i/--input`, `-o/--out/--output`, `-r/--renderer
 (auto|stub|verovio|lilypond|musescore)`, `--musescore-bin PATH`,
 `--musescore-fonts A,B,C`, `--musescore-text-fonts X,Y`,
+`--musescore-page-sizes S1,S2,...`,
 `--no-batch`, `--musescore-dpi N` (default 300 ≈ final training size),
 `--width`, `--height`, `-h/--help`.
 
@@ -86,6 +88,25 @@ all apply distinctly; "Emmentaler Text"/"Gonville Text" do not resolve
 (byte-identical to a bogus control). One-command driver for the sample
 corpus matrix: `bash scripts/run-font-matrix.sh`
 (see that script's header for the verified lists).
+
+### Page sizes (`--musescore-page-sizes`)
+
+`--musescore-page-sizes` accepts a comma-separated list of European metric page
+sizes (in millimetres) applied via the generated `.mss` style (`pageWidth` /
+`pageHeight`), forming a cross product with the font axes:
+
+| Preset | Dimensions (mm) | Orientation |
+|---|---|---|
+| `a4` | 210 × 297 | Portrait |
+| `a4_land` | 297 × 210 | Landscape |
+| `a5` | 148 × 210 | Portrait |
+| `a5_land` | 210 × 148 | Landscape |
+| `b4` | 250 × 353 | Portrait |
+| `folio` | 240 × 355 | Portrait |
+| `WxH` | custom width × height (mm) | Custom |
+
+Run `cargo test -p score-render` to verify parsing, `.mss` emission, slugs, and
+batch job generation (`17/17` tests passing).
 
 ## Renderer trait
 

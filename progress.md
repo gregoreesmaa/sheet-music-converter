@@ -2589,3 +2589,20 @@ All numbers below are measured on disk, never projected.
   - **49-Style Complete MuseScore Handwriting Simulator (`tmp-train/hw-engine/`, `36/36` tests pass, `master dd25a85`):** Full `.mscx`/`.mscz`/`.musicxml` polyphony/slurs/tuplets/lyrics/dynamics/`bekern` export + 20 built-in + 29 researched styles across 5 auto-loaded JSON packs + `sample_random_scribe`; `render_gallery.py` rendered **100/100 pages in `23.3 s`** (`0` fails, `0.23 s/page`).
   - **OpenScore StringQuartets × PDM 1.0 (`harvest_openscore_sq_hw.py`, `D:/tmp/pdm-openscore-sq-hw/`):** `+8` verified commercial-safe 4-staff string quartet works / `96` pages (`60` portrait / `36` landscape, `8/8` `bekern-decode` rc=0, `100%` `PDM 1.0 × CC0`, `0` eval overlap).
   - **Suite31 Protocol & Eval Hygiene (`suite31/README.md`, `eval_sys_gate.py`, `measure_decode.py`, `test_suite31_protocol.py`, `62/62` pass):** Uncapped silent `max_len=564` truncation bug, added per-stratum summary metrics (`typeset`, `hw_landscape`, `hw_portrait_debussy`, `hw_portrait_pdm`, `hw_all`) + `suite31_manifest_sha256` provenance; frozen `suite31_manifest.json` unchanged (`b58b4a36...`).
+
+- **4-REPO OPTIMIZATION SWEEP, STAGE-1 2×2 ABLATION, UNIOMR ITER 1→6 BREAKTHROUGH & 9-SCOUT FORENSIC AUDIT (2026-11-24 / 2026-11-25):**
+  - **4-Repo Optimization Sweep & Pushes:**
+    - `mscz-rs` (`ec51183`): `146/146` tests green + WASM build verified.
+    - `hw-score-sim` (`80708c0`): `111/111` tests green, `6.2–9.7×` faster `clean_paper=True` rendering.
+    - `doc-photo-degrade` (`2305fd8` / `v0.3.0`): all 6 release gates passed.
+    - `sheet-music-converter`: fixed `staff_unet2d.py` OOM + `--sp-mode auto` bug; added European metric `--musescore-page-sizes` to `score-render` (`17/17` tests green).
+  - **Stage-1 Controlled 2×2 Ablation (`D:\tmp\ablation-stage1-2x2\summary.json`):**
+    - Arm C (`Printed + 1,153 Hero HW`, Unsup OFF) hit **new best 2-stage Printed Clean `0.7482`** (`+6.3%` vs base), while Unsup EMA hurt `-4.7%` to `-8.0%`.
+  - **UniOMR Iter 1 → Iter 6 Breakthrough (`D:\tmp\mvd-runs\uni-omr-iter6-clean\`, `D:\tmp\uni-omr-suite31-ood\iter6_best_1280_fsa_mtp.json`):**
+    - **Iter 5 `suite31_hw` baseline:** Printed Clean `0.2863` | Printed Photo `0.0407` | HW Clean `0.0255` | HW Photo `0.0077` (FSA + MTP-4 `2.3×` decode speedup).
+    - **5-Scout Forensic Fixes Landed for Iter 6:** Fixed inverted `InkTokenRouter` (`ink_recall` `23.8% → 95.2%`), fixed `128×` `_sinusoidal_pos2d` aliasing, added dark-desk/perspective/1-bit aug, built `24,577`-page balanced 1/2/3/4-staff manifest, raised `max_seq_len=2560` with `4×8` stride, added `MixStyle2d`, `CASS`, `SWAD`, plus CUTLASS `EFFICIENT_ATTENTION` (`11.5–14.7×` faster than cuDNN on variable shapes) + 6-thread async prefetcher.
+    - **Iter 6 `suite31_hw` (`1280px`, `3072` tok, `FSA + MTP-4`, `447 tok/s`, `100%` printed DecOK):** **Printed Clean `0.7014` (`+0.415`) | Printed Photo `0.7213` (`+0.681`, BEATS best 2-stage `0.6949`!)** | HW Clean `0.0101` | HW Photo `0.0023`. Standouts: **`1.000`** on `repeats-melody`, `mozart-k458-1`, `airds-air`, `foster-leadsheet`; **`0.91–0.97`** on `bach`, `schumann`, `haydn`, `joplin`, `chopin`.
+  - **9-Scout Post-Iter-6 Forensic Audit & New Skill (`.agents/skills/learn-from-suite31/SKILL.md`):**
+    - Created reusable post-eval forensic learning skill `.agents/skills/learn-from-suite31/SKILL.md`.
+    - **Remaining printed error sources:** rare meters (`4/2`, `3/2`, `1/32`), 5–7 staff systems, router `0.25` keep-ratio cap + border-ring token leak, and `grammar.py` `CHORD` loop bug.
+    - **Real-HW collapse root causes:** **`80.8%` `hw-sim-v03` barline corruption**, `0%` `bekern+` expressive tokens in HW targets, only `1.17%` real-HW training steps, and unused real HW data (`84` uncomposed Debussy full pages + `497` `rism-pdm-hw-intl`).

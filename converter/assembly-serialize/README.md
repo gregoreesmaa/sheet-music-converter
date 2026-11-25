@@ -1,5 +1,11 @@
 # assembly-serialize
 
+> **Upstream engine repo:** Core MusicXML/MSCX/MSCZ serialization and `bekern`
+> engine code has been extracted into the standalone companion repository
+> **`mscz-rs`** (`C:\Users\grego\projects\mscz-rs`). Engine fixes, new notation
+> features, and optimizations belong upstream there rather than being
+> duplicated here.
+
 Rust lib + CLI that turns a flat note list into **MusicXML 3.1-first**
 notation plus a **loss table**, stage **validators**, and a **`.mscz`**
 (MuseScore) zip.

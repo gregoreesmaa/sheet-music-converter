@@ -8,7 +8,7 @@ Everything is Rust, split into small single-purpose crates.
 
 | Path | What it does |
 |---|---|
-| `data-gen/score-render` | MusicXML/MEI/ABC/MSCX/MSZ → clean PNG + ground-truth JSON. Prefers the `musescore` backend (headless export, real engraving, plus `.musicxml` ground truth), then `verovio`/`lilypond`, else built-in `StubRenderer`. Zero-dep. `--renderer`, `--musescore-bin`, `--musescore-fonts A,B` (engraving fonts), `--musescore-text-fonts X,Y` (full cross product; sets all 60 `*FontFace` keys). JSON records `font` + `text_font`. |
+| `data-gen/score-render` | MusicXML/MEI/ABC/MSCX/MSZ → clean PNG + ground-truth JSON. Prefers the `musescore` backend (headless export, real engraving, plus `.musicxml` ground truth), then `verovio`/`lilypond`, else built-in `StubRenderer`. Zero-dep. `--renderer`, `--musescore-bin`, `--musescore-fonts A,B` (engraving fonts), `--musescore-text-fonts X,Y` (full cross product; sets all 60 `*FontFace` keys), `--musescore-page-sizes` (European metric mm: `a4`, `a4_land`, `a5`, `a5_land`, `b4`, `folio`, `WxH`). JSON records `font` + `text_font`. |
 | `data-gen/notation-vary` | Transpose/respace variants + copy-paste rare symbols (dots, staccato). |
 | `data-gen/photo-degrade` | Clean PNG → degraded phone-photo PNG/JPEG (`--format png\|jpeg`, `--max-width` default 2480). Stages: paper grain → `degrade_paper` (foxing, mottling, fibers, water damage) → `degrade_ink` (fading, dropout, bleed-through, toner) → page bend (edge/spine/ripple, tear-free) → perspective → ink-aware artifacts (tears, coffee, pencil, folds, highlighter) → `degrade_wear` (heavy ink loss, printer banding/streaks/toner/misregistration, eraser swirl+smudge, water/oil stains) → lens distortion → tilt-shift/uniform focus → lighting → chromatic aberration → `degrade_capture` (motion blur, prints, tape, holes, exposure) → grain → JPEG round-trip. Seeded ChaCha8 RNG; every output paired with a JSON param record. |
 | `data-gen/hand-ink` | Clean render PNG → handwritten-ink-variant PNG + per-file JSON params. Deterministic Rust port of `tmp-train/hw-synth/v3` level `v3_high` (seeded smooth wobble ≤5 px, ink jitter, paper grain; topology-preserving, labels still apply). SplitMix64 per-file streams, tmp+rename, `--resume`. Sits between `render` and `vary` (`render → hand-ink → vary → degrade → pack`); run the binary directly, the orchestrator does not sequence it. |
@@ -72,6 +72,32 @@ resolves to the WSL stub and fails. Each crate also runs standalone —
   explicit loss table. `assembly-serialize pack` is the reference for
   `.mscz` output. Fixes-per-page vs manual-entry time is the correction-UX
   gate; `fixes-per-page` beats raw SER for product decisions.
+- **Development loop (`train -> learn -> change -> repeat`):** The core
+  engineering loop of this repo is **train → evaluate on `suite31_hw`
+  (our modified 45-piece Suite31 benchmark: 31 printed + 14 real historical
+  handwritten manuscript additions, `clean` + `photo` = 90 pages via
+  `suite31_hw_manifest.json` — never the legacy 31-piece printed-only
+  manifest) → forensic learn (`.agents/skills/learn-from-suite31/SKILL.md`:
+  eyeball worst vs best printed & HW, run CPU ablations, diagnose root
+  causes) → change (fix code/data/tests, commit & push) → repeat**. Never
+  launch a new training run without completing the forensic learn step
+  first.
+- **Git checkpoint before training:** Always run tests, commit, and push
+  (using `Gregor Eesmaa <6941817+gregoreesmaa@users.noreply.github.com>`)
+  after every set of code/doc changes **before** launching a new GPU
+  training run, so every run maps cleanly to an exact pushed commit.
+
+## Split-off companion repos
+
+- The three sibling repos split off from this project are **OK to edit
+  directly from within tasks in this repo** whenever engine fixes, new
+  features, or optimizations belong upstream (never duplicate their engine
+  code back into `sheet-music-converter`):
+  - `C:\Users\grego\projects\mscz-rs` (Rust MusicXML/MSCX/MSCZ + `bekern` crate)
+  - `C:\Users\grego\projects\hw-score-sim` (Python handwritten score simulator)
+  - `C:\Users\grego\projects\doc-photo-degrade` (Rust phone-photo degradation engine)
+- Run the companion repo's test suite before committing/pushing, and use
+  git attribution `Gregor Eesmaa <6941817+gregoreesmaa@users.noreply.github.com>`.
 
 ## Session docs (read these first, keep them current)
 
@@ -80,11 +106,14 @@ resolves to the WSL stub and fails. Each crate also runs standalone —
 - `progress.md` — the current measured state: what is done and verified
   on disk, what is queued, what is next. Numbers there are measured, not
   projected.
-- Read all three at the start of any session or goal continuation before
-  touching code. Update `progress.md` whenever a worker result is verified
-  on disk (files changed, test counts, metric values, open gaps). Update
-  `todo.md` when a workstream changes state. Never edit `goal.md` gates
-  without an explicit user decision.
+- `docs/UNIOMR.md` — UniOMR neural OMR architecture, training, and eval reference.
+- `.agents/skills/learn-from-suite31/SKILL.md` — workspace skill for the
+  post-evaluation forensic learning loop on `suite31_hw` runs.
+- Read `todo.md`, `goal.md`, and `progress.md` at the start of any session or
+  goal continuation before touching code. Update `progress.md` whenever a worker
+  result is verified on disk (files changed, test counts, metric values, open
+  gaps). Update `todo.md` when a workstream changes state. Never edit `goal.md`
+  gates without an explicit user decision.
 
 ## External consultation
 
@@ -104,7 +133,7 @@ resolves to the WSL stub and fails. Each crate also runs standalone —
   photo-degrade` covers determinism + bend-mode recording + warp-fit/rotation
   bounds + GPU-backend parity (21 main tests, 9 `gpu_backend` tests);
   `cargo test -p score-render` covers fonts/style/combo/
-  slug/job-file/stem-clearing (6 tests); `cargo test -p
+  slug/job-file/stem-clearing/page-sizes (17 tests); `cargo test -p
   pipeline-orchestrator` covers JPEG magic/dims + determinism.
   `cargo test -p degrade-gpu` covers the 7 WGPU kernels + light+CA and
   bend+perspective fusions + fused bench, plus three test-verified but
@@ -154,8 +183,38 @@ resolves to the WSL stub and fails. Each crate also runs standalone —
   `test-musicxml.toml` are local run scaffolding from earlier verification,
   not fixtures — don't treat 1×1 PNGs or `.page` files as real data.
 - Dev machine: Windows 11, Ryzen 7 7800X3D, 64 GB RAM, RTX 4080 SUPER 16 GB.
-  Train head-only fine-tunes with AMP locally; CPU inference is the default,
-  GPU optional. Python is not installed — prefer Rust or install Python first.
+  Python is installed in `.venv\Scripts\python.exe` (Python 3.12 + PyTorch
+  2.14.1 CUDA 12.6 on RTX 4080 SUPER) and used for neural OMR training/eval
+  (`tmp-train/mvd/uni_omr.py`, `eval_uni_suite31.py`; see `docs/UNIOMR.md` and
+  `.agents/skills/learn-from-suite31/SKILL.md`). CPU inference is the default,
+  GPU optional.
+- **Windows + RTX 4080 SUPER GPU gotchas (do not regress):**
+  - Keep **CUTLASS `EFFICIENT_ATTENTION`** for SDPA on variable `(mem, T)`
+    batches — NEVER force `CUDNN_ATTENTION` (cuDNN 9.10 recompiles a CPU
+    execution plan ~640 ms/shape, causing a 49× slowdown under dynamic routing
+    + multi-scale + variable sequence lengths).
+  - NEVER call `.pin_memory()` inside `ThreadPoolExecutor` background threads
+    on Windows WDDM (`cudaHostAlloc` takes a global CUDA driver lock and stalls
+    the main GPU thread).
+  - Always launch background GPU runs with `.\.venv\Scripts\python.exe -u`
+    (unbuffered stdout), keep VRAM `< 14 GB` (Windows WDDM silently swaps to
+    system RAM instead of throwing OOM), and use PowerShell `;` (never `&&`).
+- **Active external `D:\tmp` data & checkpoint map (outside git — never delete):**
+  - Best checkpoint: `D:\tmp\mvd-runs\uni-omr-iter6-clean\uni_omr_best.pt`
+    (`0.7014` PR clean / `0.7213` PR photo Note F1 on `suite31_hw`).
+  - `suite31_hw` OOD reports: `D:\tmp\uni-omr-suite31-ood\`.
+  - Clean Iter-7 full-page manifest: `D:\tmp\uni_fullpage_iter7.jsonl`
+    (`24,392` rows, `15.3%` real HW, `0` OOV, `0` eval overlap).
+  - Clean Iter-7 HW strips: `D:\tmp\real-hw-strips-iter7\` (`6,213` strips,
+    `35.3%` real HW, `0` barline corruption, `0` `mozart-k458`).
+  - Real HW sources: `D:\tmp\debussy-omr\train_pages\` (`84` uncomposed
+    archival full pages), `D:\tmp\real-hw-train-debussy` (`440` strips),
+    `D:\tmp\real-hw-train` (`36` Mozart SQ strips; exclude `hw-mozart-k458`),
+    `D:\tmp\unlabeled-10k-real\rism_hw` (`5,707` unlabeled RISM pages).
+  - **QUARANTINED (DO NOT USE FOR FULL-PAGE / TRAINING):**
+    `D:\tmp\corpus10x-NC\cvc-muscima` (`CC-BY-NC`), `D:\tmp\rism-pdm-hw-intl`
+    (opening-staff incipits only, NOT full-page aligned), and the `80.8%`
+    barline-corrupted strips in `D:\tmp\hw-sim-train-v03-clean\stage2_strips\`.
 - photo-degrade `--gpu` (off by default) runs the dense stages
   (paper grain, page bend, defocus blur, perspective, rotation,
   lighting + chromatic aberration fused in one round-trip, noise) on the

@@ -1,9 +1,0 @@
-[package]
-name = "jpeg-nv"
-version = "0.1.0"
-edition = "2021"
-description = "nvJPEG GPU JPEG encoding behind a tiny safe API, with a CPU-unavailable fallback so builds work without CUDA."
-
-[lib]
-name = "jpeg_nv"
-path = "src/lib.rs"

@@ -3138,6 +3138,9 @@ def main():
             posterm = _pos_acc
             ctcterm = _ctc_acc
         else:
+            need_action = (args.action_weight > 0 and step % max(
+                1, args.action_every) == 0)
+            need_logits = (need_jsd or need_action)
             with torch.amp.autocast('cuda', enabled=amp, dtype=amp_dtype):
                 shared_out = net.loss_shared(
                     imgs, tgt, sample_p=args.sample_p,
@@ -3147,7 +3150,7 @@ def main():
                     content_ids=CONTENT_IDS,
                     need_aux=need_aux, need_coord=need_coord,
                     augment=aug, return_hidden=need_hidden,
-                    return_logits=need_jsd, need_gdcm=need_gdcm,
+                    return_logits=need_logits, need_gdcm=need_gdcm,
                     need_ctc=need_ctc)
                 ce_loss, apred_shared, xc_shared = (
                     shared_out[0], shared_out[1], shared_out[2])
@@ -3155,8 +3158,8 @@ def main():
                 h_shared = shared_out[_si] if need_hidden else None
                 if need_hidden:
                     _si += 1
-                logits_shared = shared_out[_si] if need_jsd else None
-                if need_jsd:
+                logits_shared = shared_out[_si] if need_logits else None
+                if need_logits:
                     _si += 1
                 gdcm_shared = shared_out[_si] if need_gdcm else None
                 if need_gdcm:
@@ -3256,18 +3259,14 @@ def main():
                     wterm = mwer_loss(wbeam_lps, wrisks)
                     loss = loss + args.mwer_weight * wterm / K
                 aterm = None
-                if args.action_weight > 0 and step % max(
-                        1, args.action_every) == 0:
+                if need_action:
                     # Spike S7: token-level expected keystroke risk on the
-                    # batch (one extra forward, no beams). Cost matrix is
-                    # a pure function of ids; build once per run.
+                    # batch (reuses shared logits, zero extra forward). Cost
+                    # matrix is a pure function of ids; build once per run.
                     if acost is None:
                         acost = keystroke_cost_matrix(
                             net.vocab, model.MODIFIER_IDS).to(imgs.device)
-                    abos = torch.full_like(tgt[:, :1], net.bos_id)
-                    alogits = net(imgs, torch.cat([abos, tgt[:, :-1]],
-                                                  dim=1), key_mask)
-                    aterm = expected_keystroke_risk(alogits, tgt, acost)
+                    aterm = expected_keystroke_risk(logits_shared, tgt, acost)
                     loss = loss + args.action_weight * aterm / K
                 auxterm = None
                 if need_aux:
@@ -3396,39 +3395,39 @@ def main():
                         - m1.mean(dim=1).reshape(-1)).norm().item()
                 hyp = net.greedy_kv(eimgs, max_len=etgt.shape[1] + 16,
                                     constrain=False)
-            ref = etgt[0].tolist()
-            ref = [x for x in ref if x != data.PAD_ID]
-            hyp = hyp[0].tolist()
-            eos_hit = data.EOS_ID in hyp
-            if eos_hit:
-                hyp = hyp[:hyp.index(data.EOS_ID)]
-            ter = edit_distance(hyp, ref) / max(1, len(ref))
-            exact = 'EXACT' if hyp == ref else ''
-            # Blank-image grounding probe: a white page through encode()
-            # with the same standardization as load_image. blankd ~0
-            # while memd > 0 means the decoder keys off page identity
-            # but not pixels; blankd ~ memd ~ 0 is full collapse.
-            _mean = torch.tensor([0.485, 0.456, 0.406]).view(3, 1, 1)
-            _std = torch.tensor([0.229, 0.224, 0.225]).view(3, 1, 1)
-            _blank = torch.full((3, args.height, args.height), 1.0)
-            _blank = _blank.sub_(_mean).div_(_std).unsqueeze(0).to(device)
-            if args.extra_chans > 0:
-                # White page carries no staff lines and no keypoints:
-                # the extra channels are exact zeros.
-                _blank = torch.cat(
-                    [_blank, torch.zeros(1, args.extra_chans,
-                                         args.height, args.height,
-                                         device=device)], dim=1)
-            _mb = net.encode(_blank)
-            blankd = (m0.mean(dim=1).reshape(-1)
-                      - _mb.mean(dim=1).reshape(-1)).norm().item()
-            hyp_real, ter_real, ter_blank, blank_diff = grounding_probe(
-                net, eimgs, ref)
-            _tfbos = torch.full_like(etgt[:, :1], data.BOS_ID,
-                                           device=device)
-            _tflogits = net(eimgs, torch.cat(
-                [_tfbos, etgt[:, :-1].to(device)], dim=1))[0]
-            _tfcls = tf_top1_by_class(_tflogits, etgt[0].tolist())
+                ref = etgt[0].tolist()
+                ref = [x for x in ref if x != data.PAD_ID]
+                hyp = hyp[0].tolist()
+                eos_hit = data.EOS_ID in hyp
+                if eos_hit:
+                    hyp = hyp[:hyp.index(data.EOS_ID)]
+                ter = edit_distance(hyp, ref) / max(1, len(ref))
+                exact = 'EXACT' if hyp == ref else ''
+                # Blank-image grounding probe: a white page through encode()
+                # with the same standardization as load_image. blankd ~0
+                # while memd > 0 means the decoder keys off page identity
+                # but not pixels; blankd ~ memd ~ 0 is full collapse.
+                _mean = torch.tensor([0.485, 0.456, 0.406]).view(3, 1, 1)
+                _std = torch.tensor([0.229, 0.224, 0.225]).view(3, 1, 1)
+                _blank = torch.full((3, args.height, args.height), 1.0)
+                _blank = _blank.sub_(_mean).div_(_std).unsqueeze(0).to(device)
+                if args.extra_chans > 0:
+                    # White page carries no staff lines and no keypoints:
+                    # the extra channels are exact zeros.
+                    _blank = torch.cat(
+                        [_blank, torch.zeros(1, args.extra_chans,
+                                             args.height, args.height,
+                                             device=device)], dim=1)
+                _mb = net.encode(_blank)
+                blankd = (m0.mean(dim=1).reshape(-1)
+                          - _mb.mean(dim=1).reshape(-1)).norm().item()
+                hyp_real, ter_real, ter_blank, blank_diff = grounding_probe(
+                    net, eimgs, ref)
+                _tfbos = torch.full_like(etgt[:, :1], data.BOS_ID,
+                                         device=device)
+                _tflogits = net(eimgs, torch.cat(
+                    [_tfbos, etgt[:, :-1].to(device)], dim=1))[0]
+                _tfcls = tf_top1_by_class(_tflogits, etgt[0].tolist())
             _tfacc = {k: v[0] / max(1, v[1]) for k, v in _tfcls.items()}
             print('  eval page=%s len(ref)=%d len(hyp)=%d TER=%.4f '
                   'memd=%.1f blankd=%.1f ter_blank=%.4f blank_diff=%.4f '

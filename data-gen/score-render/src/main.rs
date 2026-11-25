@@ -79,6 +79,8 @@ struct Config {
     /// Score-text fonts to render with (musescore backend only); empty = paired "<music> Text" or as-is.
     /// Combined with musescore_fonts as a full cross product.
     musescore_text_fonts: Vec<String>,
+    /// Paper sizes in European metric presets (`a4`, `a4_land`, `a5`, `a5_land`, `b4`, `folio`, or `WxH` in mm).
+    musescore_page_sizes: Vec<String>,
     /// Disable `-j` job-file batching (one MuseScore launch per group).
     no_batch: bool,
     /// Fail loudly instead of falling back to the stub renderer.
@@ -101,6 +103,7 @@ impl Config {
             symbox_bin: None,
             musescore_fonts: Vec::new(),
             musescore_text_fonts: Vec::new(),
+            musescore_page_sizes: Vec::new(),
             require_backend: false,
         no_batch: false,
             musescore_dpi: 300,
@@ -163,6 +166,10 @@ fn parse_args() -> Result<Config, String> {
             "--musescore-text-fonts" => {
                 i += 1;
                 cfg.musescore_text_fonts = split_fonts(raw.get(i).ok_or("--musescore-text-fonts needs a value")?);
+            }
+            "--musescore-page-sizes" => {
+                i += 1;
+                cfg.musescore_page_sizes = split_fonts(raw.get(i).ok_or("--musescore-page-sizes needs a value")?);
             }
             "--no-batch" => {
                 cfg.no_batch = true;
@@ -563,8 +570,47 @@ const TEXT_FONT_KEYS: &[&str] = &[
 /// the score default. Text fonts apply to musicalTextFont plus every text
 /// style key; a missing music font keeps "<music> Text" pairing off and the
 /// text font carries dynamics/lyrics/titles on its own.
-fn combo_style_mss(music: Option<&str>, text: Option<&str>) -> String {
+/// European metric paper-size preset (dimensions in mm; converted to inches in `.mss`).
+#[derive(Debug, Clone, PartialEq)]
+struct PageSizeSpec {
+    name: String,
+    width_mm: f64,
+    height_mm: f64,
+    spatium_mm: Option<f64>,
+}
+
+fn parse_page_size(spec: &str) -> Result<PageSizeSpec, String> {
+    let key = spec.trim().to_ascii_lowercase();
+    match key.as_str() {
+        "a4" => Ok(PageSizeSpec { name: "a4".into(), width_mm: 210.0, height_mm: 297.0, spatium_mm: None }),
+        "a4_land" | "a4-land" => Ok(PageSizeSpec { name: "a4_land".into(), width_mm: 297.0, height_mm: 210.0, spatium_mm: None }),
+        "a5" | "pocket" => Ok(PageSizeSpec { name: "a5".into(), width_mm: 148.0, height_mm: 210.0, spatium_mm: Some(1.45) }),
+        "a5_land" | "a5-land" | "excerpt" => Ok(PageSizeSpec { name: "a5_land".into(), width_mm: 210.0, height_mm: 148.0, spatium_mm: None }),
+        "b4" => Ok(PageSizeSpec { name: "b4".into(), width_mm: 250.0, height_mm: 353.0, spatium_mm: Some(1.55) }),
+        "folio" => Ok(PageSizeSpec { name: "folio".into(), width_mm: 240.0, height_mm: 355.0, spatium_mm: Some(1.55) }),
+        other => {
+            let parts: Vec<&str> = other.split('x').collect();
+            if parts.len() == 2 {
+                let w: f64 = parts[0].parse().map_err(|_| format!("invalid page size width in {spec:?}"))?;
+                let h: f64 = parts[1].parse().map_err(|_| format!("invalid page size height in {spec:?}"))?;
+                if (80.0..=600.0).contains(&w) && (80.0..=600.0).contains(&h) {
+                    return Ok(PageSizeSpec { name: format!("{}x{}mm", w.round() as u32, h.round() as u32), width_mm: w, height_mm: h, spatium_mm: None });
+                }
+            }
+            Err(format!("unknown --musescore-page-sizes spec {spec:?} (use a4, a4_land, a5, a5_land, b4, folio, or WxH in mm)"))
+        }
+    }
+}
+
+fn combo_style_mss_with_page(music: Option<&str>, text: Option<&str>, page: Option<&PageSizeSpec>) -> String {
     let mut s = String::from("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<museScore version=\"4.00\">\n  <Style>\n");
+    if let Some(p) = page {
+        s.push_str(&format!("    <pageWidth>{:.4}</pageWidth>\n", p.width_mm / 25.4));
+        s.push_str(&format!("    <pageHeight>{:.4}</pageHeight>\n", p.height_mm / 25.4));
+        if let Some(sp) = p.spatium_mm {
+            s.push_str(&format!("    <Spatium>{:.3}</Spatium>\n", sp));
+        }
+    }
     if let Some(m) = music {
         s.push_str(&format!("    <musicalSymbolFont>{m}</musicalSymbolFont>\n"));
         s.push_str(&format!("    <musicalTextFont>{}</musicalTextFont>\n", text.unwrap_or(&format!("{m} Text"))));
@@ -580,24 +626,37 @@ fn combo_style_mss(music: Option<&str>, text: Option<&str>) -> String {
     s
 }
 
+fn combo_style_mss(music: Option<&str>, text: Option<&str>) -> String {
+    combo_style_mss_with_page(music, text, None)
+}
+
 /// Filename-safe slug: alphanumerics kept, everything else dropped.
 fn slug(s: &str) -> String {
     s.chars().filter(|c| c.is_alphanumeric()).collect()
 }
 
-/// Write `<out>/.styles/<combo>.mss` for a music/text font combo.
-fn write_combo_style(out_dir: &Path, music: Option<&str>, text: Option<&str>) -> Result<PathBuf, String> {
+/// Write `<out>/.styles/<combo>.mss` for a music/text font + optional metric page-size combo.
+fn write_combo_style_with_page(out_dir: &Path, music: Option<&str>, text: Option<&str>, page: Option<&PageSizeSpec>) -> Result<PathBuf, String> {
     let dir = out_dir.join(".styles");
     fs::create_dir_all(&dir).map_err(|e| format!("create {}: {e}", dir.display()))?;
-    let name = match (music, text) {
+    let mut name = match (music, text) {
         (Some(m), Some(t)) => format!("{}_{}", slug(m), slug(t)),
         (Some(m), None) => slug(m),
         (None, Some(t)) => format!("text_{}", slug(t)),
         (None, None) => "default".to_string(),
     };
+    if let Some(p) = page {
+        name.push('_');
+        name.push_str(&slug(&p.name));
+    }
     let path = dir.join(format!("{name}.mss"));
-    fs::write(&path, combo_style_mss(music, text)).map_err(|e| format!("write {}: {e}", path.display()))?;
+    fs::write(&path, combo_style_mss_with_page(music, text, page)).map_err(|e| format!("write {}: {e}", path.display()))?;
     Ok(path)
+}
+
+/// Write `<out>/.styles/<combo>.mss` for a music/text font combo.
+fn write_combo_style(out_dir: &Path, music: Option<&str>, text: Option<&str>) -> Result<PathBuf, String> {
+    write_combo_style_with_page(out_dir, music, text, None)
 }
 
 /// Locate a MuseScore binary: explicit flag, then PATH names, then the
@@ -1507,10 +1566,10 @@ fn main() {
         let stem = src.file_stem().and_then(|s| s.to_str()).unwrap_or("score").to_string();
         // One render per requested music font (musescore backend only);
         // everything else renders once, as-is.
-        // One render per music-font x text-font combo (musescore only).
-        let mut units: Vec<(Option<String>, Option<String>, Option<PathBuf>)> = Vec::new();
+        // One render per music-font x text-font x page-size combo (musescore only).
+        let mut units: Vec<(Option<String>, Option<String>, Option<String>, Option<PathBuf>)> = Vec::new();
         if renderer.name() == "musescore"
-            && (!cfg.musescore_fonts.is_empty() || !cfg.musescore_text_fonts.is_empty())
+            && (!cfg.musescore_fonts.is_empty() || !cfg.musescore_text_fonts.is_empty() || !cfg.musescore_page_sizes.is_empty())
         {
             let musics: Vec<Option<String>> = if cfg.musescore_fonts.is_empty() {
                 vec![None]
@@ -1522,21 +1581,38 @@ fn main() {
             } else {
                 cfg.musescore_text_fonts.iter().map(|f| Some(f.clone())).collect()
             };
+            let pages: Vec<Option<PageSizeSpec>> = if cfg.musescore_page_sizes.is_empty() {
+                vec![None]
+            } else {
+                let mut v = Vec::new();
+                for ps in &cfg.musescore_page_sizes {
+                    match parse_page_size(ps) {
+                        Ok(spec) => v.push(Some(spec)),
+                        Err(e) => {
+                            eprintln!("  FAIL {stem}: {e}");
+                            failed += 1;
+                        }
+                    }
+                }
+                v
+            };
             for m in &musics {
                 for t in &texts {
-                    match write_combo_style(&cfg.out, m.as_deref(), t.as_deref()) {
-                        Ok(p) => units.push((m.clone(), t.clone(), Some(p))),
-                        Err(e) => {
-                            eprintln!("  FAIL {stem}: style {m:?}/{t:?}: {e}");
-                            failed += 1;
+                    for p in &pages {
+                        match write_combo_style_with_page(&cfg.out, m.as_deref(), t.as_deref(), p.as_ref()) {
+                            Ok(path) => units.push((m.clone(), t.clone(), p.as_ref().map(|x| x.name.clone()), Some(path))),
+                            Err(e) => {
+                                eprintln!("  FAIL {stem}: style {m:?}/{t:?}/{p:?}: {e}");
+                                failed += 1;
+                            }
                         }
                     }
                 }
             }
         } else {
-            units.push((None, None, None));
+            units.push((None, None, None, None));
         }
-        for (music, text, style) in &units {
+        for (music, text, page_name, style) in &units {
             let mut stem = stem.clone();
             if let Some(m) = music {
                 stem.push('_');
@@ -1545,6 +1621,10 @@ fn main() {
             if let Some(t) = text {
                 stem.push('_');
                 stem.push_str(&slug(t));
+            }
+            if let Some(pn) = page_name {
+                stem.push('_');
+                stem.push_str(&slug(pn));
             }
             let job = RenderJob { source: src.clone(), format, stem, style: style.clone() };
             let png_name = format!("{}.png", job.stem);
@@ -1663,6 +1743,24 @@ mod tests {
         let t = combo_style_mss(None, Some("Edwin"));
         assert!(!t.contains("musicalSymbolFont"));
         assert!(t.contains("<dynamicsFontFace>Edwin</dynamicsFontFace>"));
+    }
+
+    #[test]
+    fn metric_page_sizes_emit_correct_mss_dimensions() {
+        let a4 = parse_page_size("a4").unwrap();
+        let s = combo_style_mss_with_page(Some("Bravura"), None, Some(&a4));
+        assert!(s.contains("<pageWidth>8.2677</pageWidth>"));
+        assert!(s.contains("<pageHeight>11.6929</pageHeight>"));
+        assert!(!s.contains("<Spatium>"));
+
+        let b4 = parse_page_size("b4").unwrap();
+        let sb = combo_style_mss_with_page(None, None, Some(&b4));
+        assert!(sb.contains("<pageWidth>9.8425</pageWidth>"));
+        assert!(sb.contains("<pageHeight>13.8976</pageHeight>"));
+        assert!(sb.contains("<Spatium>1.550</Spatium>"));
+
+        let custom = parse_page_size("210x148").unwrap();
+        assert_eq!(custom.name, "210x148mm");
     }
 
     #[test]

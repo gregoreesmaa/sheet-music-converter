@@ -1,5 +1,11 @@
 # photo-degrade
 
+> **Upstream engine repo:** Core phone-photo degradation engine code has been
+> extracted into the standalone companion repository **`doc-photo-degrade`**
+> (`C:\Users\grego\projects\doc-photo-degrade`). Engine fixes, new degradation
+> stages, and optimizations belong upstream there rather than being duplicated
+> here.
+
 Rust CLI that turns a **clean PNG** (e.g. rendered sheet music) into a
 realistic degraded **"phone photo" PNG**, for training data generation.
 

@@ -50,14 +50,14 @@ def _assert_stream_allowed(tc: unittest.TestCase, tokens: list[str], *, strict: 
 
 class TestOctaveClefVocab(unittest.TestCase):
     def test_append_only_ids(self):
-        self.assertEqual(len(data.VOCAB), 178)
+        self.assertGreaterEqual(len(data.VOCAB), 178)
         self.assertEqual(data.VOCAB[176], "clef-G-2-8vb")
         self.assertEqual(data.VOCAB[177], "clef-G-2-8va")
         self.assertEqual(data.TOKEN_TO_ID["clef-G-2-8vb"], 176)
         self.assertEqual(data.TOKEN_TO_ID["clef-G-2-8va"], 177)
-        self.assertEqual(data.PAD_ID, 178)
-        self.assertEqual(data.BOS_ID, 179)
-        self.assertEqual(data.EOS_ID, 180)
+        self.assertEqual(data.PAD_ID, len(data.VOCAB))
+        self.assertEqual(data.BOS_ID, len(data.VOCAB) + 1)
+        self.assertEqual(data.EOS_ID, len(data.VOCAB) + 2)
         # Verify prior IDs 0..175 did not shift.
         self.assertEqual(data.VOCAB[175], "128th")
         self.assertLess(data.TOKEN_TO_ID["clef-G-2"], 133)

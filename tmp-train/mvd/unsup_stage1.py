@@ -273,11 +273,8 @@ def stage1_equivariance_loss(
     # Confidence-gated consistency on ch0..2.
     conf_02 = torch.maximum(w_t_02, 1.0 - w_t_02)
     mask_02 = (conf_02 > float(conf_thresh)).float() * valid_mask
-    denom_02 = mask_02.sum()
-    if float(denom_02.item()) > 0.0:
-        loss_02 = ((s_probs_02 - w_t_02).pow(2) * mask_02).sum() / denom_02
-    else:
-        loss_02 = s_raw.sum() * 0.0
+    denom_02 = mask_02.sum().clamp_min(1.0)
+    loss_02 = ((s_probs_02 - w_t_02).pow(2) * mask_02).sum() / denom_02
 
     # Exact scale equivariance on ch3: log_hm(Scale_s(I)) == log_hm(I) + log(s).
     if sp_mode == "log_hm":
@@ -288,12 +285,9 @@ def stage1_equivariance_loss(
         sp_beta = 0.005
 
     sp_mask = (w_t_02[:, 0:1] > 0.5).float() * valid_mask
-    denom_sp = sp_mask.sum()
-    if float(denom_sp.item()) > 0.0:
-        sp_elem = F.smooth_l1_loss(s_sp, target_sp, beta=sp_beta, reduction="none")
-        loss_sp = (sp_elem * sp_mask).sum() / denom_sp
-    else:
-        loss_sp = s_raw.sum() * 0.0
+    denom_sp = sp_mask.sum().clamp_min(1.0)
+    sp_elem = F.smooth_l1_loss(s_sp, target_sp, beta=sp_beta, reduction="none")
+    loss_sp = (sp_elem * sp_mask).sum() / denom_sp
 
     # Optional horizontal-flip consistency on ch2 (system span).
     loss_hflip = s_raw.sum() * 0.0
@@ -305,11 +299,8 @@ def stage1_equivariance_loss(
         s_flip_ch2 = torch.flip(torch.sigmoid(s_flip_raw[:, 2:3]).float(), dims=[3])
         t_ch2 = t_probs_02[:, 2:3]
         conf_ch2 = (torch.maximum(t_ch2, 1.0 - t_ch2) > float(conf_thresh)).float()
-        denom_hf = conf_ch2.sum()
-        if float(denom_hf.item()) > 0.0:
-            loss_hflip = ((s_flip_ch2 - t_ch2).pow(2) * conf_ch2).sum() / denom_hf
-        else:
-            loss_hflip = s_flip_raw.sum() * 0.0
+        denom_hf = conf_ch2.sum().clamp_min(1.0)
+        loss_hflip = ((s_flip_ch2 - t_ch2).pow(2) * conf_ch2).sum() / denom_hf
 
     total = float(w_ch02) * loss_02 + float(w_sp) * loss_sp + float(hflip_weight) * loss_hflip
 
@@ -670,8 +661,8 @@ def run_unsup_round(
         batch_tensors = []
         for idx in idxs:
             try:
-                im = Image.open(image_paths[int(idx)]).convert("RGB")
-                im = im.resize((in_w, in_h), Image.BOX)
+                with Image.open(image_paths[int(idx)]) as _im:
+                    im = _im.convert("RGB").resize((in_w, in_h), Image.BOX)
                 arr = np.asarray(im, dtype=np.float32) / 255.0
                 batch_tensors.append(torch.from_numpy(arr).permute(2, 0, 1))
             except Exception:

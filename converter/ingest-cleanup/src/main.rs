@@ -240,51 +240,68 @@ fn laplacian_variance(gray: &GrayImage) -> f64 {
     if w < 3 || h < 3 {
         return 0.0;
     }
-    // Welford online variance over the 4-neighbour Laplacian.
-    let mut mean = 0.0f64;
-    let mut m2 = 0.0f64;
-    let mut n = 0u64;
-    for y in 1..h - 1 {
-        for x in 1..w - 1 {
-            let c = gray.get_pixel(x, y)[0] as f64;
-            let lap = gray.get_pixel(x - 1, y)[0] as f64
-                + gray.get_pixel(x + 1, y)[0] as f64
-                + gray.get_pixel(x, y - 1)[0] as f64
-                + gray.get_pixel(x, y + 1)[0] as f64
-                - 4.0 * c;
-            n += 1;
-            let delta = lap - mean;
-            mean += delta / n as f64;
-            m2 += delta * (lap - mean);
+    let raw = gray.as_raw();
+    let wu = w as usize;
+    let hu = h as usize;
+    // Exact integer sum / sum-of-squares over the 4-neighbour Laplacian
+    // (|lap| <= 1020, lap^2 <= 1_040_400; fits i64 for images up to >8T px).
+    let mut sum = 0i64;
+    let mut sum_sq = 0i64;
+    for y in 1..hu - 1 {
+        let row = y * wu;
+        let prev = row - wu;
+        let next = row + wu;
+        for x in 1..wu - 1 {
+            let lap = raw[row + x - 1] as i64
+                + raw[row + x + 1] as i64
+                + raw[prev + x] as i64
+                + raw[next + x] as i64
+                - 4 * raw[row + x] as i64;
+            sum += lap;
+            sum_sq += lap * lap;
         }
     }
+    let n = ((wu - 2) as u64) * ((hu - 2) as u64);
     if n > 1 {
-        m2 / (n as f64 - 1.0)
+        let nf = n as f64;
+        let mean = sum as f64 / nf;
+        ((sum_sq as f64 - nf * mean * mean) / (nf - 1.0)).max(0.0)
     } else {
         0.0
     }
 }
 
+/// 256-bin grayscale histogram in one linear pass over raw bytes.
+fn luma_histogram(gray: &GrayImage) -> [u64; 256] {
+    let mut hist = [0u64; 256];
+    for &v in gray.as_raw() {
+        hist[v as usize] += 1;
+    }
+    hist
+}
+
 /// Fraction of pixels at/above `level`: blown-out specular highlights.
 /// A clean scan has almost none; a phone photo with flash glare has blobs.
+#[cfg_attr(not(test), allow(dead_code))]
 fn glare_fraction(gray: &GrayImage, level: u8) -> f64 {
-    let total = gray.width() as u64 * gray.height() as u64;
+    let total = gray.as_raw().len() as u64;
     if total == 0 {
         return 0.0;
     }
-    let hot = gray.pixels().filter(|p| p[0] >= level).count() as u64;
+    let hot = gray.as_raw().iter().filter(|&&v| v >= level).count() as u64;
     hot as f64 / total as f64
 }
 
 /// Median of 16x16-tile mean lumas: the page's overall exposure level,
 /// robust to staff lines, margins, and small highlights.
 fn tile_median_luma(gray: &GrayImage) -> f64 {
-    const TILE: u32 = 16;
-    let (w, h) = gray.dimensions();
+    const TILE: usize = 16;
+    let (w, h) = (gray.width() as usize, gray.height() as usize);
     if w == 0 || h == 0 {
         return 0.0;
     }
-    let mut means = Vec::new();
+    let raw = gray.as_raw();
+    let mut means = Vec::with_capacity(w.div_ceil(TILE) * h.div_ceil(TILE));
     let mut y = 0;
     while y < h {
         let y1 = (y + TILE).min(h);
@@ -292,11 +309,11 @@ fn tile_median_luma(gray: &GrayImage) -> f64 {
         while x < w {
             let x1 = (x + TILE).min(w);
             let mut sum = 0u64;
-            let mut n = 0u64;
+            let n = ((y1 - y) * (x1 - x)) as u64;
             for yy in y..y1 {
-                for xx in x..x1 {
-                    sum += gray.get_pixel(xx, yy)[0] as u64;
-                    n += 1;
+                let row = &raw[yy * w + x..yy * w + x1];
+                for &v in row {
+                    sum += v as u64;
                 }
             }
             means.push(sum as f64 / n as f64);
@@ -306,16 +323,6 @@ fn tile_median_luma(gray: &GrayImage) -> f64 {
     }
     means.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
     means[means.len() / 2]
-}
-
-/// Fraction of pixels at/below `threshold`: surviving ink coverage.
-fn dark_fraction(gray: &GrayImage, threshold: u8) -> f64 {
-    let total = gray.width() as u64 * gray.height() as u64;
-    if total == 0 {
-        return 0.0;
-    }
-    let dark = gray.pixels().filter(|p| p[0] <= threshold).count() as u64;
-    dark as f64 / total as f64
 }
 
 /// Outcome of the glare / overexposure gate.
@@ -336,8 +343,17 @@ fn assess_glare(gray: &GrayImage, level: u8, threshold: f64) -> GlareReport {
     const UNIFORM_MARGIN: f64 = 20.0;
     const MIN_INK: f64 = 0.002;
     let median = tile_median_luma(gray);
-    let hot = glare_fraction(gray, level);
-    let ink = dark_fraction(gray, otsu_threshold(gray));
+    let total = gray.as_raw().len() as u64;
+    let (hot, ink) = if total == 0 {
+        (0.0, 0.0)
+    } else {
+        // Single 256-bin histogram pass feeds glare_fraction, otsu, and dark_fraction.
+        let hist = luma_histogram(gray);
+        let hot_cnt: u64 = hist[level as usize..].iter().sum();
+        let otsu_t = otsu_from_hist(&hist, total);
+        let dark_cnt: u64 = hist[..=otsu_t as usize].iter().sum();
+        (hot_cnt as f64 / total as f64, dark_cnt as f64 / total as f64)
+    };
     let effective_hot = if median >= level as f64 - UNIFORM_MARGIN {
         0.0
     } else {
@@ -359,13 +375,8 @@ fn assess_glare(gray: &GrayImage, level: u8, threshold: f64) -> GlareReport {
     }
 }
 
-/// Otsu's threshold: the histogram split maximizing between-class variance.
-fn otsu_threshold(gray: &GrayImage) -> u8 {
-    let mut hist = [0u64; 256];
-    for p in gray.pixels() {
-        hist[p[0] as usize] += 1;
-    }
-    let total = gray.width() as u64 * gray.height() as u64;
+/// Otsu's threshold from a precomputed 256-bin histogram.
+fn otsu_from_hist(hist: &[u64; 256], total: u64) -> u8 {
     if total == 0 {
         return 127;
     }
@@ -397,6 +408,16 @@ fn otsu_threshold(gray: &GrayImage) -> u8 {
         }
     }
     threshold
+}
+
+/// Otsu's threshold: the histogram split maximizing between-class variance.
+fn otsu_threshold(gray: &GrayImage) -> u8 {
+    let total = gray.as_raw().len() as u64;
+    if total == 0 {
+        return 127;
+    }
+    let hist = luma_histogram(gray);
+    otsu_from_hist(&hist, total)
 }
 
 /// Threshold to pure black/white (paper stays white).
@@ -440,32 +461,64 @@ fn rotate_white(src: &GrayImage, angle_deg: f32) -> GrayImage {
     dst
 }
 
-/// Estimate the deskew correction angle: binarize a downscaled copy (max
-/// 400 px) with Otsu, rotate it through `-max_deg..=+max_deg`, and keep the
+/// Estimate the deskew correction angle: threshold a downscaled copy (max
+/// 400 px) with Otsu, extract dark-pixel coordinates once, and project them
+/// onto the rotated Y axis for each angle in `-max_deg..=+max_deg`. Keeps the
 /// angle with the largest variance of per-row dark-pixel counts — staff and
 /// text lines stack horizontally when the page is upright.
 fn estimate_skew_angle(gray: &GrayImage, max_deg: f32, step_deg: f32) -> f32 {
     let (w, h) = gray.dimensions();
+    if w == 0 || h == 0 {
+        return 0.0;
+    }
     let scale = (400.0 / w.max(h) as f32).min(1.0);
-    let small = if scale < 1.0 {
-        image::imageops::resize(
+    let resized;
+    let small: &GrayImage = if scale < 1.0 {
+        resized = image::imageops::resize(
             gray,
             ((w as f32 * scale).ceil() as u32).max(1),
             ((h as f32 * scale).ceil() as u32).max(1),
             image::imageops::FilterType::Triangle,
-        )
+        );
+        &resized
     } else {
-        gray.clone()
+        gray
     };
-    let binary = {
-        let t = otsu_threshold(&small);
-        binarize(&small, t)
-    };
+    let t = otsu_threshold(small);
+    let (sw, sh) = (small.width() as usize, small.height() as usize);
+    let (cx, cy) = (sw as f32 * 0.5, sh as f32 * 0.5);
+    let raw = small.as_raw();
+    let mut dark_pts: Vec<(f32, f32)> = Vec::new();
+    for y in 0..sh {
+        let dy = y as f32 - cy;
+        let row = &raw[y * sw..(y + 1) * sw];
+        for (x, &v) in row.iter().enumerate() {
+            if v <= t {
+                dark_pts.push((x as f32 - cx, dy));
+            }
+        }
+    }
+    if dark_pts.is_empty() {
+        return 0.0;
+    }
+
+    let mut counts: Vec<u32> = Vec::new();
     let mut best_angle = 0.0f32;
     let mut best_score = f64::NEG_INFINITY;
     let mut a = -max_deg;
     while a <= max_deg + 1e-6 {
-        let score = projection_score(&rotate_white(&binary, a));
+        let (sin, cos) = a.to_radians().sin_cos();
+        let nh = ((sw as f32 * sin.abs() + sh as f32 * cos.abs()).ceil() as usize).max(1);
+        let ncy = nh as f32 * 0.5;
+        counts.clear();
+        counts.resize(nh, 0);
+        for &(dx, dy) in &dark_pts {
+            let y_dst = (sin * dx + cos * dy + ncy).round() as isize;
+            if y_dst >= 0 && (y_dst as usize) < nh {
+                counts[y_dst as usize] += 1;
+            }
+        }
+        let score = projection_variance(&counts);
         if score > best_score {
             best_score = score;
             best_angle = a;
@@ -481,28 +534,21 @@ fn estimate_skew_angle(gray: &GrayImage, max_deg: f32, step_deg: f32) -> f32 {
 }
 
 /// Variance of per-row dark-pixel counts: high when lines are horizontal.
-fn projection_score(binary: &GrayImage) -> f64 {
-    let (w, h) = binary.dimensions();
-    let mut mean = 0.0f64;
-    let mut m2 = 0.0f64;
-    let mut n = 0u64;
-    for y in 0..h {
-        let mut dark = 0u64;
-        for x in 0..w {
-            if binary.get_pixel(x, y)[0] < 128 {
-                dark += 1;
-            }
-        }
-        n += 1;
-        let delta = dark as f64 - mean;
-        mean += delta / n as f64;
-        m2 += delta * (dark as f64 - mean);
+fn projection_variance(counts: &[u32]) -> f64 {
+    let n = counts.len();
+    if n <= 1 {
+        return 0.0;
     }
-    if n > 1 {
-        m2 / (n as f64 - 1.0)
-    } else {
-        0.0
+    let mut sum = 0u64;
+    let mut sum_sq = 0u64;
+    for &c in counts {
+        let v = c as u64;
+        sum += v;
+        sum_sq += v * v;
     }
+    let nf = n as f64;
+    let mean = sum as f64 / nf;
+    ((sum_sq as f64 - nf * mean * mean) / (nf - 1.0)).max(0.0)
 }
 
 #[cfg(test)]

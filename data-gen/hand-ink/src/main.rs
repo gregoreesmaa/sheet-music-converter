@@ -25,6 +25,8 @@
 use clap::{Parser, ValueEnum};
 use image::{Rgb, RgbImage};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::Mutex;
 
 /// Paper tint applied around mid-grey (warm paper), from the v3 reference.
 const TINT: [f32; 3] = [1.0, 0.986, 0.945];
@@ -162,25 +164,48 @@ fn gauss_blur(field: &[f32], w: usize, h: usize, sigma: f32) -> Vec<f32> {
     let k = gauss_kernel(sigma);
     let r = k.len() / 2;
     let mut tmp = vec![0.0f32; w * h];
+    let inner_start = r.min(w);
+    let inner_end = w.saturating_sub(r);
     for y in 0..h {
-        for x in 0..w {
+        let src_row = &field[y * w..(y + 1) * w];
+        let dst_row = &mut tmp[y * w..(y + 1) * w];
+        for x in 0..inner_start {
             let mut acc = 0.0f32;
             for (ki, &kv) in k.iter().enumerate() {
                 let sx = (x as i64 + ki as i64 - r as i64).clamp(0, w as i64 - 1) as usize;
-                acc += field[y * w + sx] * kv;
+                acc += src_row[sx] * kv;
             }
-            tmp[y * w + x] = acc;
+            dst_row[x] = acc;
         }
-    }
-    let mut out = vec![0.0f32; w * h];
-    for y in 0..h {
-        for x in 0..w {
+        if inner_start < inner_end {
+            for x in inner_start..inner_end {
+                let mut acc = 0.0f32;
+                let base = x - r;
+                for (ki, &kv) in k.iter().enumerate() {
+                    acc += src_row[base + ki] * kv;
+                }
+                dst_row[x] = acc;
+            }
+        }
+        for x in inner_end.max(inner_start)..w {
             let mut acc = 0.0f32;
             for (ki, &kv) in k.iter().enumerate() {
-                let sy = (y as i64 + ki as i64 - r as i64).clamp(0, h as i64 - 1) as usize;
-                acc += tmp[sy * w + x] * kv;
+                let sx = (x as i64 + ki as i64 - r as i64).clamp(0, w as i64 - 1) as usize;
+                acc += src_row[sx] * kv;
             }
-            out[y * w + x] = acc;
+            dst_row[x] = acc;
+        }
+    }
+    // Cache-friendly y -> ki -> x vertical pass: sequential row reads + vectorizable FMA.
+    let mut out = vec![0.0f32; w * h];
+    for y in 0..h {
+        let dst_row = &mut out[y * w..(y + 1) * w];
+        for (ki, &kv) in k.iter().enumerate() {
+            let sy = (y as i64 + ki as i64 - r as i64).clamp(0, h as i64 - 1) as usize;
+            let src_row = &tmp[sy * w..(sy + 1) * w];
+            for x in 0..w {
+                dst_row[x] += src_row[x] * kv;
+            }
         }
     }
     out
@@ -387,7 +412,11 @@ fn hand_file(
         .to_rgb8();
     let (out, ratio) = ink.apply(&img, file_seed);
     let mut png = Vec::new();
-    let enc = image::codecs::png::PngEncoder::new(&mut png);
+    let enc = image::codecs::png::PngEncoder::new_with_quality(
+        &mut png,
+        image::codecs::png::CompressionType::Fast,
+        image::codecs::png::FilterType::Sub,
+    );
     use image::ImageEncoder as _;
     enc.write_image(out.as_raw(), out.width(), out.height(), image::ExtendedColorType::Rgb8)
         .map_err(|e| format!("PNG encode failed for {}: {e}", out_path.display()))?;
@@ -424,11 +453,11 @@ fn run(args: &Args) -> Result<i32, String> {
     std::fs::create_dir_all(&args.out_dir)
         .map_err(|e| format!("cannot create {}: {e}", args.out_dir.display()))?;
     let ink = HandInk::for_level(args.level);
-    let mut done = 0usize;
-    let mut skipped = 0usize;
+    let mut work: Vec<(usize, &PathBuf, u64, PathBuf, PathBuf)> = Vec::new();
+    let mut pre_skipped = 0usize;
     for (i, path) in inputs.iter().enumerate() {
         if !selected(i, args.fraction) {
-            skipped += 1;
+            pre_skipped += 1;
             continue;
         }
         let file_seed = args.seed.wrapping_add((i as u64).wrapping_mul(SEED_STRIDE));
@@ -438,21 +467,114 @@ fn run(args: &Args) -> Result<i32, String> {
             .ok_or_else(|| format!("bad file name: {}", path.display()))?;
         let out_path = args.out_dir.join(format!("{stem}{}.png", args.suffix));
         let params_path = args.out_dir.join(format!("{stem}{}_params.json", args.suffix));
-        let ratio = hand_file(path, file_seed, &ink, args.level, args.seed, &out_path, &params_path, args.resume)?;
-        if ratio.is_nan() {
-            skipped += 1;
-        } else {
-            done += 1;
-            println!("{} -> {} (dark-count ratio {:.4})", path.display(), out_path.display(), ratio);
-        }
-        if let Some(limit) = args.fail_after {
-            if done >= limit {
-                eprintln!("--fail-after {limit} reached; rerun with --resume");
-                return Ok(2);
+        work.push((i, path, file_seed, out_path, params_path));
+    }
+
+    let mut done = 0usize;
+    let mut skipped = pre_skipped;
+
+    if args.fail_after.is_some() || work.len() <= 1 {
+        for &(_i, path, file_seed, ref out_path, ref params_path) in &work {
+            let ratio = hand_file(
+                path,
+                file_seed,
+                &ink,
+                args.level,
+                args.seed,
+                out_path,
+                params_path,
+                args.resume,
+            )?;
+            if ratio.is_nan() {
+                skipped += 1;
+            } else {
+                done += 1;
+                println!(
+                    "{} -> {} (dark-count ratio {:.4})",
+                    path.display(),
+                    out_path.display(),
+                    ratio
+                );
+            }
+            if let Some(limit) = args.fail_after {
+                if done >= limit {
+                    eprintln!("--fail-after {limit} reached; rerun with --resume");
+                    return Ok(2);
+                }
             }
         }
+    } else {
+        let next_idx = AtomicUsize::new(0);
+        let done_cnt = AtomicUsize::new(0);
+        let skip_cnt = AtomicUsize::new(0);
+        let failed = AtomicBool::new(false);
+        let first_err: Mutex<Option<String>> = Mutex::new(None);
+        let n_threads = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1)
+            .min(work.len());
+        let work_ref = &work;
+        let ink_ref = &ink;
+        std::thread::scope(|s| {
+            for _ in 0..n_threads {
+                s.spawn(|| loop {
+                    if failed.load(Ordering::Relaxed) {
+                        break;
+                    }
+                    let wi = next_idx.fetch_add(1, Ordering::Relaxed);
+                    if wi >= work_ref.len() {
+                        break;
+                    }
+                    let (_, path, file_seed, ref out_path, ref params_path) = work_ref[wi];
+                    match hand_file(
+                        path,
+                        file_seed,
+                        ink_ref,
+                        args.level,
+                        args.seed,
+                        out_path,
+                        params_path,
+                        args.resume,
+                    ) {
+                        Ok(ratio) => {
+                            if ratio.is_nan() {
+                                skip_cnt.fetch_add(1, Ordering::Relaxed);
+                            } else {
+                                done_cnt.fetch_add(1, Ordering::Relaxed);
+                                println!(
+                                    "{} -> {} (dark-count ratio {:.4})",
+                                    path.display(),
+                                    out_path.display(),
+                                    ratio
+                                );
+                            }
+                        }
+                        Err(e) => {
+                            failed.store(true, Ordering::Relaxed);
+                            if let Ok(mut guard) = first_err.lock() {
+                                if guard.is_none() {
+                                    *guard = Some(e);
+                                }
+                            }
+                            break;
+                        }
+                    }
+                });
+            }
+        });
+        if let Some(e) = first_err.into_inner().unwrap_or(None) {
+            return Err(e);
+        }
+        done += done_cnt.load(Ordering::Relaxed);
+        skipped += skip_cnt.load(Ordering::Relaxed);
     }
-    println!("done: {done} file(s) inked, {skipped} skipped, fraction={}, seed={}, out={}", args.fraction, args.seed, args.out_dir.display());
+
+    println!(
+        "done: {done} file(s) inked, {skipped} skipped, fraction={}, seed={}, out={}",
+        args.fraction,
+        args.seed,
+        args.out_dir.display()
+    );
     Ok(0)
 }
 

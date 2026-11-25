@@ -527,6 +527,8 @@ def visual_similarity(
     struct = _disk_structure(dilation_px)
     obs_dil = ndimage.binary_dilation(obs_norm, structure=struct)
     obs_sym_dil = ndimage.binary_dilation(obs_sym, structure=struct)
+    ren_dil = ndimage.binary_dilation(ren_aligned, structure=struct)
+    ren_sym_dil = ndimage.binary_dilation(ren_sym_aligned, structure=struct)
 
     # Per-bar / per-slice scoring with local horizontal micro-shift (dy locked).
     edges = np.linspace(0, target_w, n_slices + 1, dtype=int)
@@ -572,11 +574,11 @@ def visual_similarity(
             rx1 = rx0 + sw
             rs_sl = ren_sym_aligned[:, rx0:rx1]
             _, _, f1_s, iou_s = _soft_prf(
-                os_sl, rs_sl, osd_sl, ndimage.binary_dilation(rs_sl, structure=struct)
+                os_sl, rs_sl, osd_sl, ren_sym_dil[:, rx0:rx1]
             )
             r_sl = ren_aligned[:, rx0:rx1]
             p_a, r_a, f1_a, iou_a = _soft_prf(
-                o_sl, r_sl, od_sl, ndimage.binary_dilation(r_sl, structure=struct)
+                o_sl, r_sl, od_sl, ren_dil[:, rx0:rx1]
             )
             comb = 0.5 * iou_a + 0.5 * iou_s
             if comb > best_comb:

@@ -85,21 +85,21 @@ def _mem_kv(mem, xa):
     return km.contiguous(), vm.contiguous()
 
 
-def _layer_step(layer, p, x, kc, vc, mem_kv, mem_mask=None):
+def _layer_step(layer, p, x, kc, vc, mem_kv, mem_mask=None,
+                mem_bias=None, pos=None):
     """One incremental decoder-layer step (norm_first=False branch).
 
     Mirrors ``nn.TransformerDecoderLayer.forward`` exactly: the same
     submodule calls in the same order (self-attn -> norm1 -> cross-attn
     -> norm2 -> FFN -> norm3, dropouts included and identity in eval).
-    ``kc``/``vc`` are the [B, K, D] projected self-attention history
-    (None on the first position); returns (out, kc_new, vc_new).
-    ``mem_mask`` is an optional bool [B, S] cross-attention key mask
-    (True = ignore, ``nn.MultiheadAttention`` key-padding convention,
-    as built by the training collates). None runs the exact legacy
-    unmasked path. The mask is applied as a float ``-inf`` additive
-    bias -- the same merge ``nn.MultiheadAttention`` performs
-    internally -- because SDPA bool masks read True = attend (the
-    inverse convention), which a bare bool pass-through would flip.
+    ``kc``/``vc`` are either pre-allocated ``[B, max_len, D]`` buffers
+    (when ``pos`` is an int and ``kc is not None``) or growing
+    ``[B, K, D]`` history tensors (``None`` on first position when
+    ``pos is None``); returns ``(out, kc, vc)``.
+    ``mem_bias`` is an optional precomputed float ``[B, 1, 1, S]``
+    additive bias (0 / ``-inf``) built once per strip in
+    ``_cached_setup``. When ``mem_bias is None`` and ``mem_mask`` is
+    provided, falls back to building the bias on the fly.
     """
     (wq, wk, wv, bq, bk, bv, ow, ob, h), \
         (xq, _, _, xbq, _, _, xow, xob, _) = p
@@ -108,16 +108,25 @@ def _layer_step(layer, p, x, kc, vc, mem_kv, mem_mask=None):
     q = (x @ wq.t() + bq).view(b, 1, h, dh).transpose(1, 2)
     k1 = x @ wk.t() + bk
     v1 = x @ wv.t() + bv
-    kc = k1 if kc is None else torch.cat([kc, k1], 1)
-    vc = v1 if vc is None else torch.cat([vc, v1], 1)
-    kh = kc.view(b, -1, h, dh).transpose(1, 2)
-    vh = vc.view(b, -1, h, dh).transpose(1, 2)
+    if pos is not None and kc is not None:
+        kc[:, pos:pos + 1] = k1
+        vc[:, pos:pos + 1] = v1
+        kc_cur = kc[:, :pos + 1]
+        vc_cur = vc[:, :pos + 1]
+    else:
+        kc = k1 if kc is None else torch.cat([kc, k1], 1)
+        vc = v1 if vc is None else torch.cat([vc, v1], 1)
+        kc_cur, vc_cur = kc, vc
+    kh = kc_cur.view(b, -1, h, dh).transpose(1, 2)
+    vh = vc_cur.view(b, -1, h, dh).transpose(1, 2)
     a = F.scaled_dot_product_attention(q, kh, vh)
     sa = a.transpose(1, 2).reshape(b, 1, d) @ ow.t() + ob
     x = layer.norm1(x + layer.dropout1(sa))
     q2 = (x @ xq.t() + xbq).view(b, 1, h, dh).transpose(1, 2)
     km, vm = mem_kv
-    if mem_mask is None:
+    if mem_bias is not None:
+        m = F.scaled_dot_product_attention(q2, km, vm, attn_mask=mem_bias)
+    elif mem_mask is None:
         m = F.scaled_dot_product_attention(q2, km, vm)
     else:
         bias = torch.zeros(b, 1, 1, km.shape[2], device=x.device,
@@ -133,7 +142,7 @@ def _layer_step(layer, p, x, kc, vc, mem_kv, mem_mask=None):
 
 
 def _layer_step_comer(layer, p, x, kc, vc, mem_kv, mem_mask,
-                      comer_bias, cum_cov, h_mem, w_mem):
+                      comer_bias, cum_cov, h_mem, w_mem, pos=None):
     """One incremental decoder-layer step with CoMER coverage bias.
 
     Bit-consistent with :func:`_decoder_layer_comer`: computes raw
@@ -150,10 +159,17 @@ def _layer_step_comer(layer, p, x, kc, vc, mem_kv, mem_mask,
     q = (x @ wq.t() + bq).view(b, 1, h, dh).transpose(1, 2)
     k1 = x @ wk.t() + bk
     v1 = x @ wv.t() + bv
-    kc = k1 if kc is None else torch.cat([kc, k1], 1)
-    vc = v1 if vc is None else torch.cat([vc, v1], 1)
-    kh = kc.view(b, -1, h, dh).transpose(1, 2)
-    vh = vc.view(b, -1, h, dh).transpose(1, 2)
+    if pos is not None and kc is not None:
+        kc[:, pos:pos + 1] = k1
+        vc[:, pos:pos + 1] = v1
+        kc_cur = kc[:, :pos + 1]
+        vc_cur = vc[:, :pos + 1]
+    else:
+        kc = k1 if kc is None else torch.cat([kc, k1], 1)
+        vc = v1 if vc is None else torch.cat([vc, v1], 1)
+        kc_cur, vc_cur = kc, vc
+    kh = kc_cur.view(b, -1, h, dh).transpose(1, 2)
+    vh = vc_cur.view(b, -1, h, dh).transpose(1, 2)
     a = F.scaled_dot_product_attention(q, kh, vh)
     sa = a.transpose(1, 2).reshape(b, 1, d) @ ow.t() + ob
     x = layer.norm1(x + layer.dropout1(sa))
@@ -1338,14 +1354,20 @@ class MvdNet(nn.Module):
                 break
         return out[:, 1:]
 
-    def _cached_setup(self, mem):
-        """Pre-split layer projections + cross K/V (one mem batch)."""
+    def _cached_setup(self, mem, mem_mask=None):
+        """Pre-split layer projections + cross K/V + optional mem_bias (one mem batch)."""
         params = [_layer_params(layer) for layer in self.decoder.layers]
         mems = [_mem_kv(mem, xa) for (_, xa) in params]
-        return params, mems
+        mem_bias = None
+        if mem_mask is not None:
+            mem_bias = torch.zeros(
+                mem.shape[0], 1, 1, mem.shape[1],
+                device=mem.device, dtype=mem.dtype,
+            ).masked_fill(mem_mask[:, None, None, :], float('-inf'))
+        return params, mems, mem_bias
 
     def _cached_step(self, params, mems, tok, pos, caches, mem_mask=None,
-                     cum_covs=None, hw_mem=None):
+                     cum_covs=None, hw_mem=None, mem_bias=None):
         """Advance every layer by one position; returns final hidden."""
         device = tok.device
         x = self.tok_emb(tok) + _sinusoidal_1d_pos(
@@ -1359,11 +1381,12 @@ class MvdNet(nn.Module):
             if use_c:
                 x, kc, vc, new_cov = _layer_step_comer(
                     layer, params[li], x, kc, vc, mems[li], mem_mask,
-                    self.comer_bias, cum_covs[li], h_mem, w_mem)
+                    self.comer_bias, cum_covs[li], h_mem, w_mem, pos=pos)
                 cum_covs[li] = new_cov
             else:
                 x, kc, vc = _layer_step(layer, params[li], x, kc, vc,
-                                        mems[li], mem_mask)
+                                        mems[li], mem_mask,
+                                        mem_bias=mem_bias, pos=pos)
             outs.append((kc, vc))
         return x, outs
 
@@ -1450,8 +1473,14 @@ class MvdNet(nn.Module):
         mem, _, h_mem, w_mem = self._encode_with_feats(images, mem_mask)
         b = images.shape[0]
         device = images.device
-        params, mems = self._cached_setup(mem)
-        caches = [(None, None) for _ in self.decoder.layers]
+        params, mems, mem_bias = self._cached_setup(mem, mem_mask)
+        caches = [
+            (torch.empty((b, max_len, self.d_model), device=device,
+                         dtype=mem.dtype),
+             torch.empty((b, max_len, self.d_model), device=device,
+                         dtype=mem.dtype))
+            for _ in self.decoder.layers
+        ]
         cum_covs = (
             [self.comer_bias.init_coverage(b, h_mem, w_mem,
                                            device=device, dtype=mem.dtype)
@@ -1467,7 +1496,7 @@ class MvdNet(nn.Module):
         for pos in range(max_len):
             x, caches = self._cached_step(
                 params, mems, out[:, -1:], pos, caches, mem_mask,
-                cum_covs=cum_covs, hw_mem=(h_mem, w_mem))
+                cum_covs=cum_covs, hw_mem=(h_mem, w_mem), mem_bias=mem_bias)
             nxt = self.out(x)[:, -1, :]
             if constrain:
                 self._apply_knobs(nxt, rows, min_len, eos_bias,
@@ -1477,10 +1506,12 @@ class MvdNet(nn.Module):
             tok = torch.where(finished, torch.full_like(tok, self.pad_id),
                               tok)
             out = torch.cat([out, tok[:, None]], dim=1)
+            tok_list = tok.tolist()
+            all_closed = True
             for r in range(b):
-                if finished[r]:
+                if rows[r]['closed']:
                     continue
-                t = int(tok[r])
+                t = tok_list[r]
                 rows[r]['hist'].append(t)
                 rows[r]['gen_len'] += 1
                 n = no_repeat_ngram
@@ -1489,6 +1520,7 @@ class MvdNet(nn.Module):
                 if t == self.eos_id:
                     rows[r]['closed'] = True
                 else:
+                    all_closed = False
                     try:
                         rows[r]['state'].step(
                             data.VOCAB[t] if t < len(data.VOCAB)
@@ -1496,7 +1528,7 @@ class MvdNet(nn.Module):
                     except (ValueError, TypeError):
                         rows[r]['state'].broken = True
             finished = finished | (tok == self.eos_id)
-            if finished.all():
+            if all_closed:
                 break
         if fires is not None:
             fires.extend(int(row.get('fires', 0)) for row in rows)
@@ -1532,9 +1564,15 @@ class MvdNet(nn.Module):
         mem_k = mem.repeat_interleave(K, dim=0)
         mask_k = (mem_mask.repeat_interleave(K, dim=0)
                   if mem_mask is not None else None)
-        params, mems = self._cached_setup(mem_k)
-        caches = [(None, None) for _ in self.decoder.layers]
+        params, mems, mem_bias = self._cached_setup(mem_k, mask_k)
         b = nb * K
+        caches = [
+            (torch.empty((b, max_len, self.d_model), device=device,
+                         dtype=mem.dtype),
+             torch.empty((b, max_len, self.d_model), device=device,
+                         dtype=mem.dtype))
+            for _ in self.decoder.layers
+        ]
         cum_covs = (
             [self.comer_bias.init_coverage(b, h_mem, w_mem,
                                            device=device, dtype=mem.dtype)
@@ -1547,13 +1585,14 @@ class MvdNet(nn.Module):
                  'ngrams': set(), 'gen_len': 0, 'closed': False}
                 for _ in range(b)]
         cum = torch.zeros(b, device=device)
+        page_offsets = (torch.arange(nb, device=device, dtype=torch.long)[:, None] * K)
         # First step is shared (all beams identical): run once via row 0
         # of each page, then fan out to K beams.
         fanned = False
         for pos in range(max_len):
             x, caches = self._cached_step(
                 params, mems, out[:, -1:], pos, caches, mask_k,
-                cum_covs=cum_covs, hw_mem=(h_mem, w_mem))
+                cum_covs=cum_covs, hw_mem=(h_mem, w_mem), mem_bias=mem_bias)
             nxt = self.out(x)[:, -1, :]
             if constrain:
                 self._apply_knobs(nxt, rows, min_len, eos_bias,
@@ -1564,36 +1603,36 @@ class MvdNet(nn.Module):
                 # Top-K first tokens per page, then fan caches out.
                 first = logp[::K, :]
                 topv, topi = first.topk(K, dim=-1)
-                new_idx = []
-                for pg in range(nb):
-                    for k in range(K):
-                        new_idx.append(pg * K)
+                new_idx = [pg * K for pg in range(nb) for _ in range(K)]
                 order = torch.tensor(new_idx, dtype=torch.long,
                                      device=device)
-                caches = [(kc.index_select(0, order) if kc is not None
-                           else None,
-                           vc.index_select(0, order) if vc is not None
-                           else None) for kc, vc in caches]
+                filled = pos + 1
+                for kc, vc in caches:
+                    kc[:, :filled] = kc[:, :filled].index_select(0, order)
+                    vc[:, :filled] = vc[:, :filled].index_select(0, order)
                 if cum_covs is not None:
                     cum_covs = [cc.index_select(0, order) for cc in cum_covs]
                 mems = [(km.index_select(0, order),
                          vm.index_select(0, order)) for km, vm in mems]
                 if mask_k is not None:
                     mask_k = mask_k.index_select(0, order)
+                if mem_bias is not None:
+                    mem_bias = mem_bias.index_select(0, order)
                 out = out.index_select(0, order)
                 base_rows = rows[::K]
+                topi_list = topi.tolist()
                 rows = []
                 for pg in range(nb):
                     for k in range(K):
                         src = base_rows[pg]
+                        t = topi_list[pg][k]
                         rows.append({'state': src['state'].copy(),
                                      'hist': list(src['hist']),
                                      'ngrams': set(src['ngrams']),
                                      'gen_len': src['gen_len'],
                                      'closed': False})
-                        rows[-1]['hist'].append(int(topi[pg, k]))
+                        rows[-1]['hist'].append(t)
                         rows[-1]['gen_len'] += 1
-                        t = int(topi[pg, k])
                         if t == self.eos_id:
                             rows[-1]['closed'] = True
                         else:
@@ -1616,40 +1655,35 @@ class MvdNet(nn.Module):
             # Closed beams self-loop on PAD with unchanged score (never
             # re-expand EOS rows); this keeps every page's rows valid
             # until global termination, with no per-page bookkeeping.
-            for r in range(b):
-                if rows[r]['closed']:
-                    scores[r, :] = float('-inf')
-                    scores[r, self.pad_id] = float(cum[r])
-            # Pick top-K expansions per page.
-            sel_tok = torch.zeros(b, dtype=torch.long, device=device)
-            sel_src = torch.zeros(b, dtype=torch.long, device=device)
-            for pg in range(nb):
-                sl = slice(pg * K, (pg + 1) * K)
-                flat = scores[sl, :].reshape(-1)
-                topv, topi = flat.topk(K)
-                for k in range(K):
-                    gi = pg * K + k
-                    src = int(topi[k]) // self.vocab + pg * K
-                    tk = int(topi[k]) % self.vocab
-                    sel_src[gi] = src
-                    sel_tok[gi] = tk
-                    cum[gi] = float(topv[k])
-            order = sel_src
-            caches = [(kc.index_select(0, order),
-                       vc.index_select(0, order)) for kc, vc in caches]
+            closed_idx = [r for r in range(b) if rows[r]['closed']]
+            if closed_idx:
+                c_t = torch.tensor(closed_idx, dtype=torch.long, device=device)
+                scores[c_t, :] = float('-inf')
+                scores[c_t, self.pad_id] = cum[c_t]
+            # Pick top-K expansions per page (vectorized on GPU, single .tolist() sync).
+            topv, topi = scores.view(nb, K * self.vocab).topk(K, dim=-1)
+            order = (topi // self.vocab + page_offsets).reshape(-1)
+            sel_tok = (topi % self.vocab).reshape(-1)
+            cum = topv.reshape(-1)
+            filled = pos + 1
+            for kc, vc in caches:
+                kc[:, :filled] = kc[:, :filled].index_select(0, order)
+                vc[:, :filled] = vc[:, :filled].index_select(0, order)
             if cum_covs is not None:
                 cum_covs = [cc.index_select(0, order) for cc in cum_covs]
             out = torch.cat([out.index_select(0, order),
                              sel_tok[:, None]], 1)
+            order_list = order.tolist()
+            tok_list = sel_tok.tolist()
             new_rows = []
             for gi in range(b):
-                src = rows[int(order[gi])]
+                src = rows[order_list[gi]]
                 cp = {'state': src['state'].copy(),
                       'hist': list(src['hist']),
                       'ngrams': set(src['ngrams']),
                       'gen_len': src['gen_len'],
                       'closed': src['closed']}
-                t = int(sel_tok[gi])
+                t = tok_list[gi]
                 if cp['closed']:
                     # PAD self-loop: output already extended above;
                     # grammar state, history length, and score frozen.

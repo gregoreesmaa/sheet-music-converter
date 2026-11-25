@@ -86,7 +86,7 @@ class TestMusicPageFilter(unittest.TestCase):
                 ok, stats = h.is_music_page(im)
             self.assertTrue(ok, f"Expected handwritten sepia page {p.name} to pass CLIP gate, stats={stats}")
             self.assertEqual(stats["page_class"], "music_sheet")
-            self.assertGreaterEqual(stats["p_music"], h.CLIP_MUSIC_THRESHOLD)
+            self.assertGreaterEqual(stats["p_music"], 0.95)
 
     def test_rejects_blank_page(self):
         ok, stats = h.is_music_page(make_blank_page())

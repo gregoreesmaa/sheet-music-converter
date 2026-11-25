@@ -32,6 +32,7 @@ import importlib
 import io
 import json
 import math
+import multiprocessing
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -2043,7 +2044,7 @@ class StaffUNetDataset(Dataset):
         self.sp_mode = str(sp_mode)
         self.hw_hard_neg_prob = max(0.0, min(1.0, float(hw_hard_neg_prob)))
         self.clean_frac = max(0.0, min(1.0, float(clean_frac)))
-        self.epoch = 0
+        self._epoch = multiprocessing.Value("i", 0)
         self.rows: list[dict[str, Any]] = []
         with open(self.manifest_path, "r", encoding="utf-8") as f:
             for line in f:
@@ -2073,9 +2074,17 @@ class StaffUNetDataset(Dataset):
                         sizes.append((int(im.size[0]), int(im.size[1])))
             self.sizes = sizes
 
+    @property
+    def epoch(self) -> int:
+        return int(self._epoch.value)
+
+    @epoch.setter
+    def epoch(self, value: int) -> None:
+        self._epoch.value = int(value)
+
     def set_epoch(self, epoch: int) -> None:
         """Advance the deterministic augmentation stream for a new training epoch."""
-        self.epoch = int(epoch)
+        self._epoch.value = int(epoch)
 
     def __len__(self) -> int:
         return len(self.rows)
@@ -2085,8 +2094,9 @@ class StaffUNetDataset(Dataset):
         img_path = Path(row.get("image", row.get("path", "")))
         if not img_path.is_absolute():
             img_path = self.manifest_path.parent / img_path
-        img = Image.open(img_path)
-        orig_w, orig_h = img.size
+        with Image.open(img_path) as _im:
+            orig_w, orig_h = _im.size
+            img = _im.convert("RGB")
 
         staves_raw = row.get("staves", [])
         systems_raw = row.get("systems", None)
@@ -2345,11 +2355,28 @@ def train_staff_unet2d(
     dev = torch.device(device if device else ("cuda" if torch.cuda.is_available() else "cpu"))
     use_cuda = dev.type == "cuda"
     if use_cuda:
-        torch.backends.cudnn.benchmark = True
+        torch.backends.cudnn.benchmark = not dynamic_res
         torch.backends.cuda.matmul.allow_tf32 = True
         torch.backends.cudnn.allow_tf32 = True
     out_path = Path(out_dir)
     out_path.mkdir(parents=True, exist_ok=True)
+
+    init_sd = None
+    init_sp_mode = "rel_h"
+    if init_from is not None:
+        init_state = torch.load(str(init_from), map_location="cpu", weights_only=True)
+        if isinstance(init_state, dict) and ("state_dict" in init_state or "model" in init_state):
+            init_sd = init_state.get("state_dict", init_state.get("model"))
+            init_sp_mode = str(init_state.get("sp_mode", "rel_h"))
+            if "base_channels" in init_state:
+                base_channels = int(init_state["base_channels"])
+        else:
+            init_sd = init_state
+        if sp_mode == "auto":
+            sp_mode = init_sp_mode
+            print(f"[init-from] auto-inherited sp_mode={sp_mode!r}, base_channels={base_channels} from {init_from}", flush=True)
+    elif sp_mode == "auto":
+        sp_mode = "rel_h"
 
     ds = StaffUNetDataset(
         manifest,
@@ -2403,14 +2430,7 @@ def train_staff_unet2d(
         out_stride=out_stride, row_ctx=row_ctx, strip_conv=strip_conv,
         efdm_prob=efdm_prob,
     ).to(dev)
-    if init_from is not None:
-        init_state = torch.load(str(init_from), map_location="cpu", weights_only=True)
-        if isinstance(init_state, dict) and ("state_dict" in init_state or "model" in init_state):
-            init_sd = init_state.get("state_dict", init_state.get("model"))
-            init_sp_mode = str(init_state.get("sp_mode", "rel_h"))
-        else:
-            init_sd = init_state
-            init_sp_mode = "rel_h"
+    if init_sd is not None:
         if strip_conv:
             incompatible = model.load_state_dict(init_sd, strict=False)
             bad_missing = [
@@ -2529,11 +2549,15 @@ def train_staff_unet2d(
         if unsup_epoch_round_due(ep, unsup_round_every) and (
             unlabeled_images or unsup_round_fn is not None
         ):
+            if use_cuda:
+                torch.cuda.empty_cache()
             if ema_model is None:
                 ema_model = copy.deepcopy(model).to(dev)
                 ema_model.eval()
                 for p_ema in ema_model.parameters():
                     p_ema.requires_grad_(False)
+            elif use_cuda:
+                ema_model.to(dev)
             u_res = run_stage1_unsup_round(
                 model=model,
                 ema_model=ema_model,
@@ -2553,6 +2577,9 @@ def train_staff_unet2d(
                 bf16=bf16,
                 unsup_round_fn=unsup_round_fn,
             )
+            if use_cuda:
+                ema_model.to("cpu")
+                torch.cuda.empty_cache()
             print(
                 f"  [unsup-stage1 ep {ep:03d}] ran={u_res['ran']} "
                 f"steps={u_res['steps']} images={u_res['n_images']}",
@@ -2607,7 +2634,7 @@ def _main() -> None:
     p.add_argument("--dynamic-res", action="store_true", help="Enable aspect-bucketed dynamic-resolution training")
     p.add_argument("--pixel-budget", type=int, default=1536 * 1152, help="Dynamic-res inference pixel budget")
     p.add_argument("--max-side", type=int, default=2048, help="Dynamic-res max side length")
-    p.add_argument("--sp-mode", default="rel_h", choices=["rel_h", "log_hm"], help="ch3 staff-space parameterization")
+    p.add_argument("--sp-mode", default="auto", choices=["auto", "rel_h", "log_hm"], help="ch3 staff-space parameterization ('auto' inherits from --init-from or defaults to 'rel_h')")
     p.add_argument("--init-from", default=None, help="Optional checkpoint path to warm-start from")
     p.add_argument("--row-ctx", action="store_true", help="Enable global horizontal row-context + (2,4) bottleneck dilation")
     p.add_argument(

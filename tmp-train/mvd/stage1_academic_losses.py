@@ -16,6 +16,8 @@ Includes:
 
 from __future__ import annotations
 
+import random
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -41,10 +43,9 @@ def skeleton_recall_loss(
     )
     inter = (probs * tubed).sum(dim=(1, 2))
     denom = tubed.sum(dim=(1, 2))
-    valid = denom > 0.0
-    if not valid.any():
-        return logits.new_zeros(())
-    return (1.0 - (inter[valid] + eps) / (denom[valid] + eps)).mean()
+    valid = (denom > 0.0).float()
+    per_sample = (1.0 - (inter + eps) / (denom + eps)) * valid
+    return per_sample.sum() / valid.sum().clamp_min(1.0)
 
 
 def silog_loss(
@@ -64,14 +65,13 @@ def silog_loss(
     """
     m = (mask > 0.5).float()
     n = m.sum(dim=(1, 2))
-    valid = n > 0.0
-    if not valid.any():
-        return pred.new_zeros(())
+    valid = (n > 0.0).float()
     d = (pred.float() - target.float()) * m
-    nv = n[valid].clamp_min(1.0)
-    mean_sq = (d[valid] * d[valid]).sum(dim=(1, 2)) / nv
-    sq_mean = (d[valid].sum(dim=(1, 2)) / nv) ** 2
-    return torch.sqrt((mean_sq - float(lam) * sq_mean).clamp_min(eps)).mean()
+    nv = n.clamp_min(1.0)
+    mean_sq = (d * d).sum(dim=(1, 2)) / nv
+    sq_mean = (d.sum(dim=(1, 2)) / nv) ** 2
+    per_sample = torch.sqrt((mean_sq - float(lam) * sq_mean).clamp_min(eps)) * valid
+    return per_sample.sum() / valid.sum().clamp_min(1.0)
 
 
 def boundary_dou_loss(
@@ -97,10 +97,9 @@ def boundary_dou_loss(
     gb = tgt * band
     inter = (pb * gb).sum(dim=(1, 2))
     union = pb.sum(dim=(1, 2)) + gb.sum(dim=(1, 2)) - inter
-    valid = union > 0.0
-    if not valid.any():
-        return logits.new_zeros(())
-    return (1.0 - (inter[valid] + eps) / (union[valid] + eps)).mean()
+    valid = (union > 0.0).float()
+    per_sample = (1.0 - (inter + eps) / (union + eps)) * valid
+    return per_sample.sum() / valid.sum().clamp_min(1.0)
 
 
 @torch.no_grad()
@@ -159,15 +158,15 @@ class EFDMix(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if (not self.training) or x.size(0) < 2 or self.p <= 0.0:
             return x
-        if float(torch.rand(1).item()) > self.p:
+        if random.random() > self.p:
             return x
         B, C, H, W = x.shape
         xf = x.float().reshape(B, C, -1)
         perm = torch.randperm(B, device=x.device)
         _, idx_x = torch.sort(xf, dim=-1)
         val_y, _ = torch.sort(xf[perm], dim=-1)
-        inv_idx = idx_x.argsort(dim=-1)
-        matched = val_y.gather(-1, inv_idx)
+        matched = torch.empty_like(xf)
+        matched.scatter_(-1, idx_x, val_y)
         beta_dist = torch.distributions.Beta(self.alpha, self.alpha)
         lam = beta_dist.sample((B, 1, 1)).to(device=x.device, dtype=torch.float32)
         out = xf + lam * (matched - xf.detach())

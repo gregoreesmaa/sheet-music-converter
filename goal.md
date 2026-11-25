@@ -1,5 +1,9 @@
-# Session Goal — System-Level Hybrid OMR Decoder at 10× Sheetly (Active)
+# Session Goal — UniOMR `>= 0.90` F1 Across All Scores + 10× Sheetly (Active)
 
+> [!IMPORTANT]
+> **Active UniOMR Primary Goal (User-Specified, 2026-11-25):** Reach **`Strict Note F1 >= 0.90` across ALL scores** on our modified 45-piece **`suite31_hw`** benchmark (`suite31_hw_manifest.json`: 31 printed + 14 real historical handwritten manuscripts, both `clean` and `photo` = 90 pages — i.e., `>= 0.90` across `printed_clean`, `printed_photo`, `hw_clean`, and `hw_photo`, not just printed!) using the single-stage `UniOMR` architecture (`< 55 MB` browser-deployable) via the `train -> learn -> change -> commit & push -> repeat` loop.
+
+### Legacy 2-Stage Reference Goal (10× Sheetly Printed Track)
 Earn our way from `0.356` photo strict-F1 to **surpassing Sheetly 10× in all metrics except time-per-page**, on the 31-piece head-to-head benchmark (`suite31` clean + photo) and the frozen `gate20` benchmark. 10× means 10× error reduction on every bounded accuracy metric (error complement ÷ 10), and Sheetly's baseline ÷ 10 on unbounded effort metrics:
 - **End state (Gate D):** `suite31` photo **`Strict-F1 >= 0.9973`** (≤0.27% error vs Sheetly's 2.7%) and clean **`>= 0.9974`** (vs Sheetly's `0.974`); mean **`OMR-NED <= 0.0185`** (vs Sheetly's `0.185`); **median fixes/page `= 0`, mean `<= 0.60`, max `<= 3`** (Sheetly: median ~2, mean ~5.8, max 47 — ours are residual errors in shipped output, NOT human corrections: no human ever reviews); **measure-exact rate `>= 0.988`** (≤7 non-exact measures of ~580); usable rate `31/31` with **zero skipped pages** (the 2/31 grouping-ambiguous skips score as `0.0` until fixed, never excluded).
 - **Time-per-page is explicitly NOT a 10× target** (bound, not race): fast path `<= 0.50 s/page` GPU, verifier ceiling `<= 2.0 s/page` median and `<= 5.0 s/page` p95 — reserving ~1.5 s/page of compute for closed-loop visual re-decoding without hurting interactive UX.

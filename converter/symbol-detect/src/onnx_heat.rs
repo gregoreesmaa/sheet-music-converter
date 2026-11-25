@@ -62,6 +62,16 @@ fn sigmoid(x: f32) -> f32 {
     1.0 / (1.0 + (-x).exp())
 }
 
+fn logit(p: f32) -> f32 {
+    if p <= 0.0 {
+        f32::NEG_INFINITY
+    } else if p >= 1.0 {
+        f32::INFINITY
+    } else {
+        (p / (1.0 - p)).ln()
+    }
+}
+
 /// Extract peak detections from one tile's heat/wh heads.
 ///
 /// `heat` is [7,H,W] sigmoid logits in row-major order, `wh` is [14,H,W]
@@ -79,45 +89,59 @@ pub fn decode_tile(
     beam_thr: f32,
 ) -> Vec<HeatBox> {
     let mut out = Vec::new();
+    let plane = out_w * out_h;
+    // Compare in raw logit space (sigmoid is strictly monotonic) and only
+    // evaluate exp/sigmoid on surviving 3x3 peaks.
+    let logit_thr = logit(thr);
+    let beam_logit_thr = logit(beam_thr);
     for c in 0..HEAT_CLASSES.len() {
         // Beam peaks run an order of magnitude colder than noteheads
         // (tile gate: Beam R 0.51 at 0.5, 0.00 at 0.85); they keep their
         // own floor so duration cues survive the page operating point.
-        let t = if c == 2 { beam_thr } else { thr };
-        let base = c * out_w * out_h;
+        let (t, t_logit) = if c == 2 {
+            (beam_thr, beam_logit_thr)
+        } else {
+            (thr, logit_thr)
+        };
+        let base = c * plane;
+        let ch = &heat[base..base + plane];
+        let wh_w = &wh[(2 * c) * plane..(2 * c + 1) * plane];
+        let wh_h = &wh[(2 * c + 1) * plane..(2 * c + 2) * plane];
         for yy in 0..out_h {
+            let row = yy * out_w;
+            let y0 = yy.saturating_sub(1);
+            let y1 = (yy + 1).min(out_h - 1);
             for xx in 0..out_w {
-                let p = sigmoid(heat[base + yy * out_w + xx]);
-                if p < t {
+                let idx = row + xx;
+                let v = ch[idx];
+                if v < t_logit {
                     continue;
                 }
-                // 3x3 max-pool peak check; strictly greater neighbor kills.
+                // 3x3 max-pool peak check on raw logits; strictly greater neighbor kills.
+                let x0 = xx.saturating_sub(1);
+                let x1 = (xx + 1).min(out_w - 1);
                 let mut is_peak = true;
-                for dy in -1i32..=1 {
-                    for dx in -1i32..=1 {
-                        if dx == 0 && dy == 0 {
+                'nbr: for ny in y0..=y1 {
+                    let nrow = ny * out_w;
+                    for nx in x0..=x1 {
+                        if nx == xx && ny == yy {
                             continue;
                         }
-                        let nx = xx as i32 + dx;
-                        let ny = yy as i32 + dy;
-                        if nx < 0 || ny < 0 || nx >= out_w as i32 || ny >= out_h as i32 {
-                            continue;
-                        }
-                        let np = sigmoid(heat[base + ny as usize * out_w + nx as usize]);
-                        if np > p {
+                        if ch[nrow + nx] > v {
                             is_peak = false;
-                            break;
+                            break 'nbr;
                         }
-                    }
-                    if !is_peak {
-                        break;
                     }
                 }
                 if !is_peak {
                     continue;
                 }
-                let wb = wh[(2 * c) * out_w * out_h + yy * out_w + xx] * TILE as f32;
-                let hb = wh[(2 * c + 1) * out_w * out_h + yy * out_w + xx] * TILE as f32;
+                let p = sigmoid(v);
+                if p < t {
+                    continue;
+                }
+                let wb = wh_w[idx] * TILE as f32;
+                let hb = wh_h[idx] * TILE as f32;
                 if wb <= 0.0 || hb <= 0.0 {
                     continue;
                 }
@@ -229,18 +253,27 @@ impl OnnxHeatModel {
         let xs = tile_origins(w);
         let ys = tile_origins(h);
         let n = xs.len() * ys.len();
-        let mut flat = vec![0f32; n * (TILE as usize) * (TILE as usize)];
+        let raw = gray.as_raw();
+        let w_us = w as usize;
+        let h_us = h as usize;
+        let tile_us = TILE as usize;
+        let inv255 = 1.0f32 / 255.0;
+        let mut flat = vec![0f32; n * tile_us * tile_us];
         for (ti, (tx, ty)) in xs
             .iter()
             .flat_map(|&tx| ys.iter().map(move |&ty| (tx, ty)))
             .enumerate()
         {
-            let base = ti * (TILE as usize) * (TILE as usize);
-            for y in 0..TILE {
-                for x in 0..TILE {
-                    let px = gray.get_pixel((tx + x).min(w - 1), (ty + y).min(h - 1)).0[0] as f32
-                        / 255.0;
-                    flat[base + (y as usize) * (TILE as usize) + (x as usize)] = px;
+            let base = ti * tile_us * tile_us;
+            let tx_us = tx as usize;
+            let ty_us = ty as usize;
+            for y in 0..tile_us {
+                let sy = (ty_us + y).min(h_us - 1);
+                let src_row = &raw[sy * w_us..(sy + 1) * w_us];
+                let dst_row = &mut flat[base + y * tile_us..base + (y + 1) * tile_us];
+                for x in 0..tile_us {
+                    let sx = (tx_us + x).min(w_us - 1);
+                    dst_row[x] = src_row[sx] as f32 * inv255;
                 }
             }
         }

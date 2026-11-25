@@ -24,7 +24,9 @@ DURATIONS = frozenset(
     ['whole', 'half', 'quarter', 'eighth', '16th', '32nd', '64th',
      '128th', 'breve'])
 STEPS = frozenset(['A', 'B', 'C', 'D', 'E', 'F', 'G'])
-OCTAVES = frozenset([str(n) for n in range(9)])
+OCTAVES = frozenset(
+    [str(n) for n in range(9)] + (['-1'] if '-1' in data.TOKEN_TO_ID else [])
+)
 ALTERS = frozenset(['a-2', 'a-1', 'a1', 'a2'])
 DOT = 'dot'
 TIE_START = 'tie-start'
@@ -66,6 +68,8 @@ _WRITTEN = {'breve': 8.0, 'whole': 4.0, 'half': 2.0, 'quarter': 1.0,
             'eighth': 0.5, '16th': 0.25, '32nd': 0.125, '64th': 0.0625,
             '128th': 0.03125}
 _BAR_EPS = 1e-6
+MAX_CHORDS_PER_ONSET = 8
+MAX_CONSECUTIVE_GRACE = 8
 
 
 def _beats_of(time_tok):
@@ -126,6 +130,7 @@ class PrefixState:
                  'tsig', 'pending_tsig', 'vcurs', 'vscales',
                  'pend_spans',
                  'ev_base', 'ev_dots', 'ev_chord', 'ev_grace',
+                 'chords_on_onset', 'grace_run',
                  'allow_percussion_tab', 'vocab_map')
 
     def __init__(self, strict=False, allow_percussion_tab=False, vocab_map=None):
@@ -161,6 +166,8 @@ class PrefixState:
         self.ev_dots = 0
         self.ev_chord = False
         self.ev_grace = False
+        self.chords_on_onset = 0
+        self.grace_run = 0
         # Gate-D opt-in: percussion/tab grammar transitions (OFF by default).
         self.allow_percussion_tab = bool(allow_percussion_tab)
         if vocab_map is not None:
@@ -196,6 +203,8 @@ class PrefixState:
         c.ev_dots = self.ev_dots
         c.ev_chord = self.ev_chord
         c.ev_grace = self.ev_grace
+        c.chords_on_onset = self.chords_on_onset
+        c.grace_run = self.grace_run
         c.allow_percussion_tab = self.allow_percussion_tab
         c.vocab_map = self.vocab_map
         return c
@@ -321,6 +330,8 @@ class PrefixState:
             self.ev_dots = 0
             self.ev_chord = False
             self.ev_grace = False
+            self.chords_on_onset = 0
+            self.grace_run = 0
             return 'bound'
         if t in VOICES:
             n = int(t.split('-')[1])
@@ -335,6 +346,8 @@ class PrefixState:
             self._grow(n)
             self.seg = n - 1
             self.opened.add(n)
+            self.chords_on_onset = 0
+            self.grace_run = 0
             return 'bound'
         if t in TUPLET_STARTS:
             if self.strict and (self.depth[self.seg] + self.pending >= 1
@@ -352,6 +365,10 @@ class PrefixState:
                 self.vscales[self.seg].pop()
             return 'bound'
         if t == GRACE:
+            if self.grace_run >= MAX_CONSECUTIVE_GRACE:
+                raise ValueError('grace run cap exceeded (%d)' % MAX_CONSECUTIVE_GRACE)
+            self.grace_run += 1
+            self.chords_on_onset = 0
             return 'grace'
         if t in DYNS or t in HAIRS or t in BAR_LEFT or (
                 self.allow_percussion_tab and t in SLASH_MARKS):
@@ -363,6 +380,9 @@ class PrefixState:
         if t == CHORD:
             if not self.seg_last[self.seg]:
                 raise ValueError('dangling chord marker')
+            if self.chords_on_onset >= MAX_CHORDS_PER_ONSET:
+                raise ValueError('chord cap exceeded (%d)' % MAX_CHORDS_PER_ONSET)
+            self.chords_on_onset += 1
             self.ev_chord = True
             return 'chord'
         if t in DURATIONS or t == REST or t == BAR_REST:
@@ -378,11 +398,17 @@ class PrefixState:
                 self.ev_base = _WRITTEN[t]
                 self.ev_dots = 0
                 self.ev_grace = False
+                self.chords_on_onset = 0
+                self.grace_run = 0
                 return 'dur'
             if t == REST:
                 self.ev_base = None
                 self.ev_dots = 0
+                self.chords_on_onset = 0
+                self.grace_run = 0
                 return 'rest'
+            if self.strict and (self._bar_is_full() or self.vcurs[self.seg] > _BAR_EPS):
+                raise ValueError('bar-rest blocked in non-empty/full bar')
             self._drained_scale()
             if self.tsig is not None:
                 self.vcurs[self.seg] = max(self.vcurs[self.seg],
@@ -390,6 +416,8 @@ class PrefixState:
             self.ev_base = None
             self.ev_dots = 0
             self.seg_last[self.seg] = False
+            self.chords_on_onset = 0
+            self.grace_run = 0
             return 'bound'
         raise ValueError('unexpected token %r' % t)
 
@@ -405,8 +433,8 @@ class PrefixState:
             self.run_tok = t
             self.run_len = 1
         self.recent.append(t)
-        if len(self.recent) > 104:
-            del self.recent[:8]
+        if len(self.recent) > 320:
+            del self.recent[:32]
         if self.mode == 'bound':
             self.mode = self._bound(t)
         elif self.mode == 'chord':
@@ -549,7 +577,7 @@ class PrefixState:
         """Token STRING that would extend a tight cycle past ``max_repeats``.
 
         Returns the single forbidden continuation token, or None. Only
-        exact adjacent repeats of a short period (<= 8 tokens, >=
+        exact adjacent repeats of a short period (<= 24 tokens, >=
         ``max_repeats`` back-to-back repeats) count — musical repeats
         separated by other material, and bounded ostinati (corpus max
         10 adjacent repeats), never trigger. Suspended while the header
@@ -559,7 +587,7 @@ class PrefixState:
             return None
         r = self.recent
         n = len(r)
-        for p in range(1, 9):
+        for p in range(1, 25):
             if n < max_repeats * p:
                 continue
             base = r[n - p:]
@@ -587,9 +615,11 @@ class PrefixState:
             # legacy unconditional set.
             if not (self.strict and self.recent
                     and self.recent[-1] in BAR_LIKES):
-                allow.add(_T[BAR])
-                allow.update(_T[t] for t in BAR_RIGHT)
+                allow.add(vm[BAR])
+                allow.update(vm[t] for t in BAR_RIGHT if t in vm)
             for _vt in VOICES:
+                if _vt not in vm:
+                    continue
                 if self.strict:
                     _vn = int(_vt.split('-')[1])
                     if _vn != 1 and (_vn - 1) not in self.opened \
@@ -597,27 +627,32 @@ class PrefixState:
                         continue
                     if self.recent and self.recent[-1] == _vt:
                         continue
-                allow.add(_T[_vt])
+                allow.add(vm[_vt])
             if not (self.strict and (self.depth[self.seg] + self.pending >= 1
                     or self._bar_is_full())):
-                allow.update(_T[t] for t in TUPLET_STARTS)
+                allow.update(vm[t] for t in TUPLET_STARTS if t in vm)
             for t in DURATIONS:
-                if not self._blocks_duration(_WRITTEN[t]):
-                    allow.add(_T[t])
+                if t in vm and not self._blocks_duration(_WRITTEN[t]):
+                    allow.add(vm[t])
             # T2.4b: a full bar must not offer REST -- entering
             # rest-mode with every duration overshooting traps the
-            # decoder with all logits -inf. BAR_REST stays (it jumps
-            # to the barline).
+            # decoder with all logits -inf.
             if not self._bar_is_full():
-                allow.add(_T[REST])
-            allow.add(_T[BAR_REST])
+                allow.add(vm[REST])
+            # Iter-7 anti-loop: forbid BAR_REST when the bar is full or
+            # notes/rests have already been placed in the current voice/bar.
+            cur_used = self.vcurs[self.seg] + self._pending_value()
+            if not (self.strict and (self._bar_is_full() or cur_used > _BAR_EPS)):
+                allow.add(vm[BAR_REST])
             if self.depth[self.seg] > 0:
-                allow.add(_T[TUPLET_STOP])
-            if placed if placed is not None else self.seg_last[self.seg]:
-                allow.add(_T[CHORD])
-            allow.update(vm[t] for t in CLEFS | KEYS | TIMES)
-            allow.add(vm[GRACE])
-            allow.update(vm[t] for t in DYNS | HAIRS | BAR_LEFT)
+                allow.add(vm[TUPLET_STOP])
+            if (placed if placed is not None else self.seg_last[self.seg]) \
+                    and self.chords_on_onset < MAX_CHORDS_PER_ONSET:
+                allow.add(vm[CHORD])
+            allow.update(vm[t] for t in CLEFS | KEYS | TIMES if t in vm)
+            if self.grace_run < MAX_CONSECUTIVE_GRACE:
+                allow.add(vm[GRACE])
+            allow.update(vm[t] for t in DYNS | HAIRS | BAR_LEFT if t in vm)
             if self.allow_percussion_tab:
                 allow.update(vm[t] for t in TAB_CLEFS if t in vm)
                 allow.update(vm[t] for t in SLASH_MARKS if t in vm)
@@ -630,23 +665,23 @@ class PrefixState:
         if self.mode == 'grace':
             # Display-only duration follows a grace marker (never
             # strict-gated: grace steals no time).
-            allow.update(vm[t] for t in DURATIONS)
+            allow.update(vm[t] for t in DURATIONS if t in vm)
             if self.allow_percussion_tab and UNPITCHED in vm:
                 allow.add(vm[UNPITCHED])
             return allow, False
         if self.mode == 'unpitched':
             for t in DURATIONS:
-                if self.ev_grace or not self._blocks_duration(_WRITTEN[t]):
+                if t in vm and (self.ev_grace or not self._blocks_duration(_WRITTEN[t])):
                     allow.add(vm[t])
             return allow, False
         if self.mode == 'chord':
-            allow.update(vm[t] for t in DURATIONS)
+            allow.update(vm[t] for t in DURATIONS if t in vm)
             return allow, False
         if self.mode == 'dur':
-            allow.update(vm[t] for t in STEPS)
+            allow.update(vm[t] for t in STEPS if t in vm)
             return allow, False
         if self.mode == 'step':
-            allow.update(vm[t] for t in OCTAVES)
+            allow.update(vm[t] for t in OCTAVES if t in vm)
             return allow, False
         if self.mode == 'pitch-tail':
             # decode.rs consumes a single optional alter BEFORE the dot

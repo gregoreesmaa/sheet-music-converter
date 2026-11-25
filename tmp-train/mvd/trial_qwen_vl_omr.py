@@ -640,8 +640,9 @@ def load_qwen_vl_model_and_processor(
     min_pixels: int = DEFAULT_MIN_PIXELS,
     max_pixels: int = DEFAULT_MAX_PIXELS,
     use_bf16: bool = True,
+    load_in_4bit: bool = False,
 ):
-    """Load Qwen2.5-VL-3B-Instruct and its AutoProcessor in BF16."""
+    """Load Qwen2.5-VL (3B BF16 or 7B/larger 4-bit NF4 QLoRA) and its AutoProcessor."""
     import torch
     from transformers import AutoProcessor, Qwen2_5_VLForConditionalGeneration
 
@@ -652,11 +653,20 @@ def load_qwen_vl_model_and_processor(
         min_pixels=min_pixels,
         max_pixels=max_pixels,
     )
-    model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
-        model_id,
-        torch_dtype=dtype,
-        device_map="auto" if torch.cuda.is_available() else None,
-    )
+    kwargs: Dict[str, Any] = {
+        "torch_dtype": dtype,
+        "device_map": "auto" if torch.cuda.is_available() else None,
+    }
+    if load_in_4bit and torch.cuda.is_available():
+        from transformers import BitsAndBytesConfig
+
+        kwargs["quantization_config"] = BitsAndBytesConfig(
+            load_in_4bit=True,
+            bnb_4bit_quant_type="nf4",
+            bnb_4bit_use_double_quant=True,
+            bnb_4bit_compute_dtype=dtype,
+        )
+    model = Qwen2_5_VLForConditionalGeneration.from_pretrained(model_id, **kwargs)
     return model, processor
 
 
@@ -667,14 +677,20 @@ def attach_lora_adapters(
     alpha: int = 32,
     dropout: float = 0.05,
     target_modules: Sequence[str] = DEFAULT_LORA_TARGETS,
+    is_kbit: bool = False,
 ):
-    """Wrap Qwen2.5-VL with lightweight BF16 LoRA + gradient checkpointing."""
+    """Wrap Qwen2.5-VL with lightweight BF16 LoRA / 4-bit QLoRA + gradient checkpointing."""
     from peft import LoraConfig, get_peft_model
 
-    if hasattr(model, "gradient_checkpointing_enable"):
-        model.gradient_checkpointing_enable()
-    if hasattr(model, "enable_input_require_grads"):
-        model.enable_input_require_grads()
+    if is_kbit:
+        from peft import prepare_model_for_kbit_training
+
+        model = prepare_model_for_kbit_training(model, use_gradient_checkpointing=True)
+    else:
+        if hasattr(model, "gradient_checkpointing_enable"):
+            model.gradient_checkpointing_enable()
+        if hasattr(model, "enable_input_require_grads"):
+            model.enable_input_require_grads()
 
     cfg = LoraConfig(
         r=int(r),
@@ -938,6 +954,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Trial mode: zero_shot on suite31_hw slice or lora_sft + held-out probe.",
     )
     ap.add_argument("--model-id", default=DEFAULT_MODEL_ID)
+    ap.add_argument(
+        "--load-in-4bit",
+        action="store_true",
+        help="Load model in 4-bit NF4 QLoRA (enables Qwen2.5-VL-7B-Instruct on 16GB VRAM).",
+    )
     ap.add_argument("--steps", type=int, default=300)
     ap.add_argument("--lr", type=float, default=2e-4)
     ap.add_argument("--grad-accum", type=int, default=4)
@@ -1001,6 +1022,7 @@ def run_trial(args: argparse.Namespace) -> Dict[str, Any]:
             model, processor = load_qwen_vl_model_and_processor(
                 args.model_id,
                 max_pixels=args.max_pixels,
+                load_in_4bit=bool(getattr(args, "load_in_4bit", False)),
             )
             train_pool, eval_probe = [], []
 
@@ -1093,6 +1115,7 @@ def run_trial(args: argparse.Namespace) -> Dict[str, Any]:
                     model,
                     r=args.lora_r,
                     alpha=args.lora_alpha,
+                    is_kbit=bool(getattr(args, "load_in_4bit", False)),
                 )
 
             train_stats = run_lora_sft_loop(

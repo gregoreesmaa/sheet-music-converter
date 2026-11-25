@@ -1,6 +1,9 @@
 # suite31 & suite31+hw — Frozen Printed & Companion Handwritten OMR Eval Suite
 
-This directory holds the **frozen 31-piece head-to-head printed OMR benchmark** (`suite31_manifest.json`) and its **companion 14-piece real handwritten manuscript manifests** (`suite31_hw_manifest.json`, `suite31_hw_only_manifest.json`).
+This directory holds the **frozen 31-piece head-to-head printed OMR benchmark** (`suite31_manifest.json`) and its **modified 45-piece handwritten-expanded benchmark** (`suite31_hw_manifest.json`, adding 14 real historical handwritten manuscripts; `suite31_hw_only_manifest.json` for the 14 HW pieces alone).
+
+> [!IMPORTANT]
+> **Active `UniOMR` Goal:** Reach **`Strict Note F1 >= 0.90` across ALL 45 pieces in `suite31_hw`** (`printed_clean`, `printed_photo`, `hw_clean`, and `hw_photo` via `suite31_hw_manifest.json`).
 
 ---
 
