@@ -43,6 +43,10 @@ from typing import Any, Dict, Iterator, List, Optional, Sequence, Tuple, Union
 
 import numpy as np
 from PIL import Image, ImageDraw, ImageEnhance, ImageFilter
+try:
+    import cv2 as _cv2
+except Exception:
+    _cv2 = None  # type: ignore[assignment]
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -160,6 +164,8 @@ class UniOMRConfig:
     max_dec_len: int = 4096
     rope_base: float = 10000.0
     grad_checkpoint: bool = False
+    ckpt_enc_tokens: int = 20000
+    ckpt_dec_tokens: int = 8000
 
     def __post_init__(self) -> None:
         self.backbone_stride = normalize_backbone_stride(self.backbone_stride)
@@ -333,6 +339,14 @@ class MixStyle2d(nn.Module):
         self.p = float(max(0.0, min(1.0, p)))
         self.alpha = float(alpha)
         self.eps = float(eps)
+        self._alpha_cache: Dict[torch.device, torch.Tensor] = {}
+
+    def _sample_beta(self, shape: Tuple[int, ...], device: torch.device, dtype: torch.dtype) -> torch.Tensor:
+        alpha_t = self._alpha_cache.get(device)
+        if alpha_t is None:
+            alpha_t = torch.tensor(self.alpha, device=device, dtype=torch.float32)
+            self._alpha_cache[device] = alpha_t
+        return torch.distributions.Beta(alpha_t, alpha_t).sample(shape).to(dtype=dtype)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if (not self.training) or self.p <= 0.0:
@@ -353,11 +367,7 @@ class MixStyle2d(nn.Module):
             cache[c] = (mu_d.clone(), sig_d.clone())
             if prev is None or prev[0].device != mu_d.device or random.random() >= self.p:
                 return x
-            lmda = (
-                torch.distributions.Beta(self.alpha, self.alpha)
-                .sample((1, 1, 1, 1))
-                .to(device=x.device, dtype=x.dtype)
-            )
+            lmda = self._sample_beta((1, 1, 1, 1), device=x.device, dtype=x.dtype)
             mu_mix = mu_d * lmda + prev[0].to(dtype=x.dtype) * (1.0 - lmda)
             sig_mix = sig_d * lmda + prev[1].to(dtype=x.dtype) * (1.0 - lmda)
             return ((x - mu_d) / sig_d) * sig_mix + mu_mix
@@ -367,11 +377,7 @@ class MixStyle2d(nn.Module):
 
         x_normed = (x - mu_d) / sig_d
 
-        lmda = (
-            torch.distributions.Beta(self.alpha, self.alpha)
-            .sample((B, 1, 1, 1))
-            .to(device=x.device, dtype=x.dtype)
-        )
+        lmda = self._sample_beta((B, 1, 1, 1), device=x.device, dtype=x.dtype)
         perm = torch.randperm(B, device=x.device)
         mu_mix = mu_d * lmda + mu_d[perm] * (1.0 - lmda)
         sig_mix = sig_d * lmda + sig_d[perm] * (1.0 - lmda)
@@ -562,8 +568,10 @@ class InkTokenRouter(nn.Module):
             ink_target = ((local_ink_grid > 0.04) & paper_mask_grid).to(saliency_logits.dtype)
             if self.use_ink_prior:
                 flat = local_ink_grid.flatten(1)
+                k_q99 = max(1, flat.shape[-1] // 100)
                 denom = (
-                    torch.quantile(flat.float(), 0.99, dim=-1)
+                    torch.topk(flat.float(), k=k_q99, dim=-1, sorted=False)
+                    .values.amin(dim=-1)
                     .clamp(min=1e-4)
                     .view(B, 1, 1, 1)
                     .to(local_ink_grid.dtype)
@@ -1009,6 +1017,24 @@ def fake_quant_int4_ste(w: torch.Tensor, block_size: int = 32) -> torch.Tensor:
     return w + (w_dq - w).detach()
 
 
+@torch.no_grad()
+def _fake_quant_int4_delta(w: torch.Tensor, block_size: int = 32) -> torch.Tensor:
+    """Compute detached quantization residual ``(w_dq - w)`` for cached STE forward."""
+    orig_shape = w.shape
+    in_f = orig_shape[-1]
+    pad = (block_size - (in_f % block_size)) % block_size
+    w_f = w.detach().float()
+    if pad:
+        w_f = F.pad(w_f, (0, pad))
+    w_g = w_f.reshape(-1, block_size)
+    scale = (w_g.abs().amax(dim=-1, keepdim=True) / 7.0).clamp(min=1e-8)
+    q = torch.round(w_g / scale).clamp(-8.0, 7.0)
+    w_dq = (q * scale).reshape(*orig_shape[:-1], -1)
+    if pad:
+        w_dq = w_dq[..., :in_f]
+    return (w_dq.to(w.dtype) - w.detach()).detach()
+
+
 class QATInt4Controller:
     """Zero-schema-change symmetric group-wise INT4 QAT controller for ``UniOMRNet``.
 
@@ -1016,7 +1042,9 @@ class QATInt4Controller:
     ``enc_layers``, ``dec_layers``, ``mtp_heads``, and ``lm_head`` (skipping
     ``backbone``, ``router``, ``tok_emb``, ``pos2d_proj``, and norms) without
     adding parameters or buffers, preserving 100% ``state_dict()`` compatibility
-    (``strict=True``).
+    (``strict=True``). Caches detached fake-quantization deltas per optimizer
+    step so repeated micro-batches / CASS passes / grad-checkpoint recomputes
+    cost only a single elementwise add (bit-identical STE gradients).
     """
 
     TARGET_ROOTS: Tuple[str, ...] = ("enc_layers", "dec_layers", "mtp_heads", "lm_head")
@@ -1028,8 +1056,11 @@ class QATInt4Controller:
         self.block_size = int(block_size)
         self.enabled = bool(enabled)
         self._orig_forwards: Dict[nn.Linear, Any] = {}
+        self._cached_deltas: Dict[nn.Linear, Tuple[int, torch.Tensor]] = {}
         self.target_names: List[str] = []
         self._attach()
+        if self.enabled:
+            self.refresh_cache()
 
     def _attach(self) -> None:
         for root_name in self.TARGET_ROOTS:
@@ -1048,8 +1079,19 @@ class QATInt4Controller:
 
         def _qat_forward(x: torch.Tensor) -> torch.Tensor:
             if controller.enabled:
-                w_q = fake_quant_int4_ste(mod.weight, block_size=controller.block_size)
-                return F.linear(x, w_q, mod.bias)
+                w = mod.weight
+                entry = controller._cached_deltas.get(mod)
+                if (
+                    entry is None
+                    or entry[0] != w._version
+                    or entry[1].device != w.device
+                    or entry[1].dtype != w.dtype
+                ):
+                    delta = _fake_quant_int4_delta(w, block_size=controller.block_size)
+                    controller._cached_deltas[mod] = (w._version, delta)
+                else:
+                    delta = entry[1]
+                return F.linear(x, w + delta, mod.bias)
             return F.linear(x, mod.weight, mod.bias)
 
         mod.forward = _qat_forward  # type: ignore[method-assign]
@@ -1058,17 +1100,34 @@ class QATInt4Controller:
     def num_layers(self) -> int:
         return len(self.target_names)
 
+    def refresh_cache(self) -> None:
+        """Recompute cached detached INT4 deltas for all patched Linear weights."""
+        self._cached_deltas.clear()
+        for mod in self._orig_forwards:
+            w = mod.weight
+            self._cached_deltas[mod] = (
+                w._version,
+                _fake_quant_int4_delta(w, block_size=self.block_size),
+            )
+
+    def invalidate_cache(self) -> None:
+        """Clear cached INT4 deltas so the next forward recomputes them."""
+        self._cached_deltas.clear()
+
     def enable(self) -> None:
         self.enabled = True
+        self.refresh_cache()
 
     def disable(self) -> None:
         self.enabled = False
+        self.invalidate_cache()
 
     def detach(self) -> None:
         """Restore original ``forward`` methods on all patched ``nn.Linear`` modules."""
         for mod, orig_fwd in self._orig_forwards.items():
             mod.forward = orig_fwd  # type: ignore[method-assign]
         self._orig_forwards.clear()
+        self._cached_deltas.clear()
         self.target_names.clear()
 
 
@@ -1201,7 +1260,7 @@ class UniOMRNet(nn.Module):
             self.training
             and self.cfg.grad_checkpoint
             and torch.is_grad_enabled()
-            and (mem.shape[0] * mem.shape[1] > 8000)
+            and (mem.shape[0] * mem.shape[1] > self.cfg.ckpt_enc_tokens)
         ):
             for layer in self.enc_layers:
                 mem = _grad_ckpt(
@@ -1267,7 +1326,7 @@ class UniOMRNet(nn.Module):
             self.training
             and self.cfg.grad_checkpoint
             and torch.is_grad_enabled()
-            and (x.shape[0] * x.shape[1] > 2000)
+            and (x.shape[0] * x.shape[1] > self.cfg.ckpt_dec_tokens)
         )
         new_past_kvs: List[Any] = []
         for idx, layer in enumerate(self.dec_layers):
@@ -1994,6 +2053,67 @@ def _apply_corner_sticky_note(img: Image.Image, rng: Any) -> Image.Image:
     return out
 
 
+def _fast_gaussian_blur(img: Image.Image, radius: float) -> Image.Image:
+    """Fast Gaussian blur using OpenCV when available, falling back to PIL."""
+    if _cv2 is not None:
+        arr = np.asarray(img if img.mode == "RGB" else img.convert("RGB"), dtype=np.uint8)
+        sig = max(1e-3, float(radius))
+        blurred = _cv2.GaussianBlur(arr, (0, 0), sigmaX=sig, sigmaY=sig)
+        return Image.fromarray(blurred, mode="RGB")
+    return img.filter(ImageFilter.GaussianBlur(radius=radius))
+
+
+def _fast_rotate(img: Image.Image, angle: float, fillcolor: Tuple[int, int, int]) -> Image.Image:
+    """Fast bilinear rotation using OpenCV warpAffine when available, falling back to PIL."""
+    if _cv2 is not None:
+        arr = np.asarray(img if img.mode == "RGB" else img.convert("RGB"), dtype=np.uint8)
+        h, w = arr.shape[:2]
+        M = _cv2.getRotationMatrix2D((w * 0.5, h * 0.5), float(angle), 1.0)
+        warped = _cv2.warpAffine(
+            arr,
+            M,
+            (w, h),
+            flags=_cv2.INTER_LINEAR,
+            borderMode=_cv2.BORDER_CONSTANT,
+            borderValue=(int(fillcolor[0]), int(fillcolor[1]), int(fillcolor[2])),
+        )
+        return Image.fromarray(warped, mode="RGB")
+    return img.rotate(angle, resample=Image.Resampling.BILINEAR, expand=False, fillcolor=fillcolor)
+
+
+def _fast_perspective(
+    img: Image.Image,
+    src_pts: Sequence[Tuple[float, float]],
+    dst_pts: Sequence[Tuple[float, float]],
+    fillcolor: Tuple[int, int, int],
+) -> Image.Image:
+    """Fast bilinear perspective warp using OpenCV warpPerspective when available, falling back to PIL."""
+    if _cv2 is not None:
+        arr = np.asarray(img if img.mode == "RGB" else img.convert("RGB"), dtype=np.uint8)
+        h, w = arr.shape[:2]
+        M = _cv2.getPerspectiveTransform(
+            np.asarray(src_pts, dtype=np.float32),
+            np.asarray(dst_pts, dtype=np.float32),
+        )
+        warped = _cv2.warpPerspective(
+            arr,
+            M,
+            (w, h),
+            flags=_cv2.INTER_LINEAR,
+            borderMode=_cv2.BORDER_CONSTANT,
+            borderValue=(int(fillcolor[0]), int(fillcolor[1]), int(fillcolor[2])),
+        )
+        return Image.fromarray(warped, mode="RGB")
+    coeffs = _find_perspective_coeffs(dst_pts, src_pts)
+    return img.transform(
+        img.size,
+        Image.Transform.PERSPECTIVE,
+        coeffs,
+        resample=Image.Resampling.BILINEAR,
+        fillcolor=fillcolor,
+    )
+
+
 def _apply_hw_lowres_defocus_compress(img: Image.Image, rng: Any) -> Image.Image:
     """Low-res downscale (800-1150px round-trip) + mild defocus blur + contrast compression."""
     out = img if img.mode == "RGB" else img.convert("RGB")
@@ -2008,18 +2128,36 @@ def _apply_hw_lowres_defocus_compress(img: Image.Image, rng: Any) -> Image.Image
         scale = rng.uniform(0.65, 0.85)
     dw = max(32, int(round(orig_w * scale)))
     dh = max(32, int(round(orig_h * scale)))
+    sigma = float(rng.uniform(0.5, 1.1))
+    c_fac = float(rng.uniform(0.48, 0.74))
+    if _cv2 is not None:
+        arr = np.asarray(out, dtype=np.uint8)
+        if (dw, dh) != (orig_w, orig_h):
+            arr = _cv2.resize(arr, (dw, dh), interpolation=_cv2.INTER_LINEAR)
+            arr = _cv2.resize(arr, (orig_w, orig_h), interpolation=_cv2.INTER_LINEAR)
+        arr = _cv2.GaussianBlur(arr, (0, 0), sigmaX=sigma, sigmaY=sigma)
+        sub = arr[::8, ::8].reshape(-1, 3)
+        if sub.shape[0] < 16:
+            sub = arr.reshape(-1, 3)
+        paper_ref = np.percentile(sub, 85.0, axis=0).astype(np.float32)  # (3,)
+        vals = np.arange(256, dtype=np.float32)[:, None]
+        lut = np.clip(paper_ref[None, :] + (vals - paper_ref[None, :]) * c_fac, 0.0, 255.0).astype(np.uint8)
+        arr = _cv2.LUT(arr, lut.reshape(256, 1, 3))
+        return Image.fromarray(arr, mode="RGB")
     if (dw, dh) != (orig_w, orig_h):
         out = out.resize((dw, dh), Image.Resampling.BILINEAR).resize(
             (orig_w, orig_h), Image.Resampling.BILINEAR
         )
-    out = out.filter(ImageFilter.GaussianBlur(radius=rng.uniform(0.5, 1.1)))
+    out = out.filter(ImageFilter.GaussianBlur(radius=sigma))
     # Compress ink-to-paper contrast toward page paper tone (targeting faint InkMn ~ 0.06-0.10)
-    arr = np.asarray(out, dtype=np.float32) * (1.0 / 255.0)
-    paper_ref = np.percentile(arr.reshape(-1, 3), 85.0, axis=0).reshape(1, 1, 3)
-    c_fac = rng.uniform(0.48, 0.74)
-    arr = paper_ref + (arr - paper_ref) * c_fac
-    np.clip(arr, 0.0, 1.0, out=arr)
-    return Image.fromarray((arr * 255.0).astype(np.uint8), mode="RGB")
+    arr_f = np.asarray(out, dtype=np.float32) * (1.0 / 255.0)
+    sub_f = arr_f[::8, ::8].reshape(-1, 3)
+    if sub_f.shape[0] < 16:
+        sub_f = arr_f.reshape(-1, 3)
+    paper_ref_f = np.percentile(sub_f, 85.0, axis=0).reshape(1, 1, 3)
+    arr_f = paper_ref_f + (arr_f - paper_ref_f) * c_fac
+    np.clip(arr_f, 0.0, 1.0, out=arr_f)
+    return Image.fromarray((arr_f * 255.0).astype(np.uint8), mode="RGB")
 
 
 def _apply_archival_border_and_colorbar(
@@ -2607,14 +2745,14 @@ def apply_online_augment(
                 if has_dark_border
                 else (int(round(pr)), int(round(max(190.0, pg))), int(round(max(155.0, pb))))
             )
-            out = out.rotate(angle, resample=Image.Resampling.BILINEAR, expand=False, fillcolor=rot_fill)
+            out = _fast_rotate(out, angle, rot_fill)
 
         # Low-res round-trip downscale + defocus blur + contrast compression (dense/landscape HW)
         lowres_p = 0.25 if orig_w > orig_h else 0.15
         if r.random() < lowres_p and orig_w >= 48 and orig_h >= 48:
             out = _apply_hw_lowres_defocus_compress(out, r)
         elif r.random() < 0.25:
-            out = out.filter(ImageFilter.GaussianBlur(radius=r.uniform(0.3, 0.8)))
+            out = _fast_gaussian_blur(out, r.uniform(0.3, 0.8))
         if r.random() < 0.40:
             buf = io.BytesIO()
             out.save(buf, format="JPEG", quality=r.randint(45, 88))
@@ -2668,15 +2806,8 @@ def apply_online_augment(
             (w_f * (1.0 - r.uniform(0.01, 0.04)), h_f * (1.0 - r.uniform(0.01, 0.04))),
             (w_f * r.uniform(0.01, 0.04), h_f * (1.0 - r.uniform(0.01, 0.04))),
         ]
-        coeffs = _find_perspective_coeffs(dst_pts, src_pts)
         p_fill = dark_fill if (has_dark_border or r.random() < 0.50) else _sample_paper_fill()
-        out = out.transform(
-            (orig_w, orig_h),
-            Image.Transform.PERSPECTIVE,
-            coeffs,
-            resample=Image.Resampling.BILINEAR,
-            fillcolor=p_fill,
-        )
+        out = _fast_perspective(out, src_pts, dst_pts, p_fill)
 
     # 3. Rotation +/- 6 deg (p=0.50): dark desk fill half the time when dark-bordered, else paper tone
     if r.random() < 0.50:
@@ -2685,12 +2816,7 @@ def apply_online_augment(
             rot_fill = (r.randint(0, 55), r.randint(0, 55), r.randint(0, 55))
         else:
             rot_fill = _sample_paper_fill()
-        out = out.rotate(
-            angle,
-            resample=Image.Resampling.BILINEAR,
-            expand=False,
-            fillcolor=rot_fill,
-        )
+        out = _fast_rotate(out, angle, rot_fill)
 
     # 4. Photometric pass (fused numpy for speed): uneven shadows/vignette/parchment + brightness/contrast
     illum_roll = r.random()
@@ -2751,7 +2877,7 @@ def apply_online_augment(
     if is_hw and r.random() < (0.25 if orig_w > orig_h else 0.15) and orig_w >= 48 and orig_h >= 48:
         out = _apply_hw_lowres_defocus_compress(out, r)
     elif r.random() < 0.30:
-        out = out.filter(ImageFilter.GaussianBlur(radius=r.uniform(0.3, 1.0)))
+        out = _fast_gaussian_blur(out, r.uniform(0.3, 1.0))
 
     # 7. JPEG compression artifacts
     if r.random() < 0.35:
@@ -2973,6 +3099,110 @@ class UniFullPageDataset(Dataset):
         }
 
 
+STRATIFIED_FULLPAGE_WEIGHTS: Dict[str, float] = {
+    "legacy_printed": 0.26,
+    "multi_renderer_printed": 0.22,
+    "rare_printed": 0.07,
+    "synth_hw": 0.27,
+    "real_hw": 0.18,
+}
+
+
+def classify_fullpage_bucket(img_path: Any, domain: str = "") -> str:
+    """Classify a full-page sample into one of the 5 domain/renderer stratification buckets."""
+    dom = str(domain or "").strip().lower()
+    p_str = str(img_path).replace("\\", "/").lower()
+    if dom == "real_hw" or "real_hw" in p_str or "debussy" in p_str:
+        return "real_hw"
+    if (
+        dom in ("hw", "synth_hw")
+        or "hw-sim-v04" in p_str
+        or "hw-sim-v05" in p_str
+        or "hw-sim" in p_str
+        or "hw_sim" in p_str
+    ):
+        return "synth_hw"
+    if "c-8vb" in p_str or "c_8vb" in p_str or "rare" in p_str or dom == "rare_printed":
+        return "rare_printed"
+    if (
+        "verovio" in p_str
+        or "osmd" in p_str
+        or "spacing" in p_str
+        or "corpus100k" in p_str
+        or dom == "multi_renderer_printed"
+    ):
+        return "multi_renderer_printed"
+    return "legacy_printed"
+
+
+class StratifiedFullPageSampler:
+    """5-bucket domain/renderer-stratified epoch index sampler for ``UniFullPageDataset``."""
+
+    def __init__(
+        self,
+        pairs: Sequence[Tuple[Any, ...]],
+        weights: Optional[Dict[str, float]] = None,
+        epoch_size: Optional[int] = None,
+    ) -> None:
+        self.num_samples = len(pairs)
+        self.epoch_size = int(epoch_size) if epoch_size is not None else self.num_samples
+        raw_weights = dict(STRATIFIED_FULLPAGE_WEIGHTS if weights is None else weights)
+        self.buckets: Dict[str, List[int]] = {k: [] for k in raw_weights}
+        for idx, entry in enumerate(pairs):
+            dom = str(entry[2]) if len(entry) > 2 else ""
+            bname = classify_fullpage_bucket(entry[0], dom)
+            self.buckets.setdefault(bname, []).append(idx)
+        active = {k: raw_weights.get(k, 0.0) for k, idxs in self.buckets.items() if idxs and raw_weights.get(k, 0.0) > 0.0}
+        w_sum = sum(active.values())
+        if w_sum <= 0.0:
+            non_empty = [k for k, idxs in self.buckets.items() if idxs]
+            self.active_weights: Dict[str, float] = {k: 1.0 / max(1, len(non_empty)) for k in non_empty}
+        else:
+            self.active_weights = {k: v / w_sum for k, v in active.items()}
+
+    def bucket_counts(self) -> Dict[str, int]:
+        return {k: len(v) for k, v in self.buckets.items()}
+
+    def sample_epoch(self, rng: random.Random) -> List[int]:
+        if self.epoch_size <= 0 or not self.active_weights:
+            return []
+        quotas: Dict[str, int] = {}
+        for k, w in self.active_weights.items():
+            quotas[k] = max(1, int(round(self.epoch_size * w))) if self.epoch_size >= len(self.active_weights) else 0
+        diff = self.epoch_size - sum(quotas.values())
+        if diff != 0:
+            order = sorted(self.active_weights.keys(), key=lambda b: self.active_weights[b], reverse=True)
+            step = 1 if diff > 0 else -1
+            rem = abs(diff)
+            i = 0
+            while rem > 0:
+                bk = order[i % len(order)]
+                if step > 0 or quotas[bk] > 1:
+                    quotas[bk] += step
+                    rem -= 1
+                i += 1
+                if i > len(order) * (rem + 2):
+                    break
+
+        out: List[int] = []
+        for k, q in quotas.items():
+            if q <= 0:
+                continue
+            pool = self.buckets[k]
+            n_pool = len(pool)
+            if n_pool == 0:
+                continue
+            full_cycles, rem_n = divmod(q, n_pool)
+            for _ in range(full_cycles):
+                cyc = list(pool)
+                rng.shuffle(cyc)
+                out.extend(cyc)
+            if rem_n > 0:
+                out.extend(rng.sample(pool, rem_n))
+        rng.shuffle(out)
+        return out
+
+
 class MultiScaleBatchSampler:
     """Batch sampler that assigns one shared ``target_dim`` to every item in a batch.
 
@@ -2988,24 +3218,31 @@ class MultiScaleBatchSampler:
         base_dim: int,
         shuffle: bool = True,
         seed: Optional[int] = None,
+        stratified_sampler: Optional[StratifiedFullPageSampler] = None,
     ) -> None:
         self.num_samples = int(num_samples)
         self.batch_size = max(1, int(batch_size))
         self.base_dim = int(base_dim)
         self.shuffle = bool(shuffle)
         self._rng = random.Random(seed) if seed is not None else None
+        self.stratified_sampler = stratified_sampler
 
     def __len__(self) -> int:
-        return (self.num_samples + self.batch_size - 1) // self.batch_size
+        n = self.stratified_sampler.epoch_size if self.stratified_sampler is not None else self.num_samples
+        return (n + self.batch_size - 1) // self.batch_size
 
     def __iter__(self) -> Iterator[List[Tuple[int, int]]]:
-        indices = list(range(self.num_samples))
-        if self.shuffle:
-            if self._rng is not None:
-                self._rng.shuffle(indices)
-            else:
-                random.shuffle(indices)
-        for i in range(0, self.num_samples, self.batch_size):
+        if self.stratified_sampler is not None:
+            r = self._rng if self._rng is not None else random.Random()
+            indices = self.stratified_sampler.sample_epoch(r)
+        else:
+            indices = list(range(self.num_samples))
+            if self.shuffle:
+                if self._rng is not None:
+                    self._rng.shuffle(indices)
+                else:
+                    random.shuffle(indices)
+        for i in range(0, len(indices), self.batch_size):
             batch_idx = indices[i : i + self.batch_size]
             batch_dim = _sample_weighted_fullpage_dim(self.base_dim, rng=self._rng)
             yield [(idx, batch_dim) for idx in batch_idx]
@@ -3025,43 +3262,97 @@ def collate_uni_batch(samples: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
         images = torch.ones((B, 3, max_h, max_w), dtype=torch.float32)
     seqs = torch.full((B, max_t), PAD_ID, dtype=torch.long)
     sample_ids: List[str] = []
+    orig_hw: List[Tuple[int, int]] = []
+    orig_seq_len: List[int] = []
     for i, s in enumerate(samples):
         im = s["image"]
         _, h, w = im.shape
         images[i, :, :h, :w] = im
+        orig_hw.append((int(h), int(w)))
         sq = s["seq"]
-        seqs[i, : sq.shape[0]] = sq
+        t_len = int(sq.shape[0])
+        seqs[i, :t_len] = sq
+        orig_seq_len.append(t_len)
         sample_ids.append(str(s.get("sample_id", i)))
 
     return {
         "images": images,
         "seq": seqs,
         "sample_ids": sample_ids,
+        "orig_hw": orig_hw,
+        "orig_seq_len": orig_seq_len,
         "kind": samples[0].get("kind", "unknown") if B > 0 else "empty",
     }
 
 
-def _fast_image_is_landscape(path: Any) -> Optional[bool]:
-    """Header-only orientation probe (True if W > H, False if H >= W, None on failure)."""
+def unpack_collated_batch(batch: Dict[str, Any], fallback_kind: str) -> List[Dict[str, Any]]:
+    """Unpack a collated batch back into unpadded per-sample dicts (prevents double-padding)."""
+    B_loc = int(batch["images"].shape[0])
+    orig_hw = batch.get("orig_hw")
+    orig_seq_len = batch.get("orig_seq_len")
+    out: List[Dict[str, Any]] = []
+    for i in range(B_loc):
+        im = batch["images"][i]
+        if orig_hw is not None and i < len(orig_hw):
+            oh, ow = orig_hw[i]
+            im = im[:, : int(oh), : int(ow)]
+        sq = batch["seq"][i]
+        if orig_seq_len is not None and i < len(orig_seq_len):
+            sq = sq[: int(orig_seq_len[i])]
+        else:
+            non_pad = (sq != PAD_ID).nonzero(as_tuple=False)
+            if non_pad.numel() > 0:
+                sq = sq[: int(non_pad[-1].item()) + 1]
+        out.append({
+            "image": im,
+            "seq": sq,
+            "sample_id": batch["sample_ids"][i],
+            "kind": fallback_kind,
+        })
+    return out
+
+
+def _fast_image_size(path: Any) -> Optional[Tuple[int, int]]:
+    """Header-only ``(W, H)`` image dimension probe (None on failure)."""
     try:
         with Image.open(path) as im:
             w, h = im.size
-            return bool(w > h)
+            return int(w), int(h)
     except Exception:
         return None
+
+
+def _fast_image_is_landscape(path: Any) -> Optional[bool]:
+    """Header-only orientation probe (True if W > H, False if H >= W, None on failure)."""
+    sz = _fast_image_size(path)
+    if sz is None:
+        return None
+    return bool(sz[0] > sz[1])
+
+
+def _fast_bekern_bytes(bek_part: Any) -> int:
+    """Fast stat-only total byte size of a sample's bekern file(s) for sequence-length bucketing."""
+    total = 0
+    paths = bek_part if isinstance(bek_part, (list, tuple)) else (bek_part,)
+    for p in paths:
+        try:
+            total += int(os.path.getsize(p))
+        except OSError:
+            pass
+    return total
 
 
 class AsyncThreadPrefetcher:
     """Lightweight infinite multi-threaded batch prefetcher (zero Windows spawn overhead).
 
     Prefetches ``prefetch_batches`` (default 3) batches ahead using a background
-    ``ThreadPoolExecutor``. Because PIL image decode/resize and NumPy augmentation
+    ``ThreadPoolExecutor``. Because PIL/OpenCV image decode/resize and NumPy augmentation
     release the Python GIL, this overlaps CPU I/O + augmentation with GPU compute
     without duplicating dataset state across spawned processes. For ``multi_scale``
     ``UniFullPageDataset``, samples a single shared ``target_dim`` per batch.
-    When ``batch_size >= 2`` on ``UniFullPageDataset``, partitions shuffled indices
-    into portrait (``H >= W``) and landscape (``W > H``) buckets so batches never
-    mix orientations into a giant padded square.
+    When ``batch_size >= 2`` on ``UniFullPageDataset``, uses 2D Aspect (up to 4
+    quantile bins per orientation) + ``bekern_bytes`` length-sorted mega-batches
+    (``window=64``) to minimize both image and decoder token padding waste.
     """
 
     def __init__(
@@ -3074,6 +3365,8 @@ class AsyncThreadPrefetcher:
         prefetch_batches: int = 3,
         collate_fn: Any = collate_uni_batch,
         seed: Optional[int] = None,
+        stratified_sampler: Optional[StratifiedFullPageSampler] = None,
+        length_window: int = 64,
     ) -> None:
         self.dataset = dataset
         self.n_samples = len(dataset)  # type: ignore[arg-type]
@@ -3086,27 +3379,55 @@ class AsyncThreadPrefetcher:
         self.prefetch_batches = max(6, min(16, max(int(prefetch_batches), self.max_workers * 2)))
         self.collate_fn = collate_fn
         self._rng = random.Random(seed) if seed is not None else random.Random()
+        self._stratified_sampler = stratified_sampler
+        self._length_window = max(self.batch_size, int(length_window))
         self._is_multiscale_fp = bool(
             getattr(dataset, "multi_scale", False)
             and hasattr(dataset, "fullpage_max_dim")
         )
-        self._use_orient_buckets = bool(
+        self._use_2d_buckets = bool(
             self.batch_size >= 2
             and isinstance(dataset, UniFullPageDataset)
             and hasattr(dataset, "pairs")
+            and len(dataset.pairs) >= 2  # type: ignore[attr-defined]
         )
-        self._portrait_indices: List[int] = []
-        self._landscape_indices: List[int] = []
+        self._sample_bucket_id: List[int] = [0] * self.n_samples
+        self._sample_bytes: List[int] = [0] * self.n_samples
+        self._n_buckets: int = 1
         self._batches: List[List[int]] = []
         self._batch_pos: int = 0
-        if self._use_orient_buckets:
+        if self._use_2d_buckets:
+            portrait_items: List[Tuple[float, int]] = []
+            landscape_items: List[Tuple[float, int]] = []
             for i, entry in enumerate(dataset.pairs):  # type: ignore[attr-defined]
-                if _fast_image_is_landscape(entry[0]):
-                    self._landscape_indices.append(i)
+                sz = _fast_image_size(entry[0])
+                if sz is not None and sz[1] > 0:
+                    w_i, h_i = sz
+                    aspect = float(w_i) / float(h_i)
+                    is_land = w_i > h_i
                 else:
-                    self._portrait_indices.append(i)
-            if not self._portrait_indices or not self._landscape_indices:
-                self._use_orient_buckets = False
+                    aspect = 0.75
+                    is_land = False
+                self._sample_bytes[i] = _fast_bekern_bytes(entry[1])
+                if is_land:
+                    landscape_items.append((aspect, i))
+                else:
+                    portrait_items.append((aspect, i))
+
+            next_bid = 0
+            for group in (portrait_items, landscape_items):
+                if not group:
+                    continue
+                group.sort(key=lambda t: t[0])
+                n_g = len(group)
+                n_q = min(4, max(1, n_g // max(1, self.batch_size)))
+                for q in range(n_q):
+                    lo = (q * n_g) // n_q
+                    hi = ((q + 1) * n_g) // n_q
+                    for _, sample_idx in group[lo:hi]:
+                        self._sample_bucket_id[sample_idx] = next_bid
+                    next_bid += 1
+            self._n_buckets = max(1, next_bid)
         self._order: List[int] = []
         self._pos: int = 0
         self._closed: bool = False
@@ -3118,30 +3439,45 @@ class AsyncThreadPrefetcher:
         for _ in range(self.prefetch_batches):
             self._enqueue_one()
 
+    def _build_2d_batches(self, epoch_indices: List[int]) -> List[List[int]]:
+        per_bucket: List[List[int]] = [[] for _ in range(self._n_buckets)]
+        for idx in epoch_indices:
+            per_bucket[self._sample_bucket_id[idx]].append(idx)
+        batches: List[List[int]] = []
+        mega_w = self._length_window
+        for b_idx in per_bucket:
+            if not b_idx:
+                continue
+            if self.shuffle:
+                self._rng.shuffle(b_idx)
+            for start in range(0, len(b_idx), mega_w):
+                chunk = b_idx[start : start + mega_w]
+                chunk.sort(key=lambda i: self._sample_bytes[i])
+                for j in range(0, len(chunk), self.batch_size):
+                    batches.append(chunk[j : j + self.batch_size])
+        if self.shuffle:
+            self._rng.shuffle(batches)
+        return batches
+
     def _next_batch_spec(self) -> List[Any]:
-        if self._use_orient_buckets:
+        if self._use_2d_buckets:
             if self._batch_pos >= len(self._batches):
-                p_idx = list(self._portrait_indices)
-                l_idx = list(self._landscape_indices)
-                if self.shuffle:
-                    self._rng.shuffle(p_idx)
-                    self._rng.shuffle(l_idx)
-                batches: List[List[int]] = []
-                for i in range(0, len(p_idx), self.batch_size):
-                    batches.append(p_idx[i : i + self.batch_size])
-                for i in range(0, len(l_idx), self.batch_size):
-                    batches.append(l_idx[i : i + self.batch_size])
-                if self.shuffle:
-                    self._rng.shuffle(batches)
-                self._batches = batches
+                if self._stratified_sampler is not None:
+                    epoch_indices = self._stratified_sampler.sample_epoch(self._rng)
+                else:
+                    epoch_indices = list(range(self.n_samples))
+                self._batches = self._build_2d_batches(epoch_indices)
                 self._batch_pos = 0
             idxs = self._batches[self._batch_pos]
             self._batch_pos += 1
         else:
             if self._pos >= len(self._order):
-                self._order = list(range(self.n_samples))
-                if self.shuffle:
-                    self._rng.shuffle(self._order)
+                if self._stratified_sampler is not None:
+                    self._order = self._stratified_sampler.sample_epoch(self._rng)
+                else:
+                    self._order = list(range(self.n_samples))
+                    if self.shuffle:
+                        self._rng.shuffle(self._order)
                 self._pos = 0
             end = min(self._pos + self.batch_size, len(self._order))
             idxs = self._order[self._pos : end]
@@ -3549,9 +3885,29 @@ def run_bench_browser(
 # Training Loop (Real Data + Cosine Schedule + Eval + --dry-run)
 # ---------------------------------------------------------------------------
 
-def _lr_for_step(step: int, total_steps: int, base_lr: float, warmup_steps: int, min_lr_ratio: float = 0.05) -> float:
+def _lr_for_step(
+    step: int,
+    total_steps: int,
+    base_lr: float,
+    warmup_steps: int,
+    min_lr_ratio: float = 0.05,
+    schedule: str = "cosine",
+    wsd_decay_frac: float = 0.25,
+) -> float:
     if warmup_steps > 0 and step <= warmup_steps:
         return base_lr * (float(step) / float(max(1, warmup_steps)))
+    if str(schedule).lower() == "wsd":
+        decay_frac = max(0.0, min(1.0, float(wsd_decay_frac)))
+        post_warmup = max(1, total_steps - warmup_steps)
+        decay_steps = max(1, int(round(total_steps * decay_frac)))
+        decay_steps = min(decay_steps, post_warmup)
+        decay_start = total_steps - decay_steps
+        if step <= decay_start:
+            return base_lr
+        d_prog = float(step - decay_start) / float(max(1, decay_steps))
+        d_prog = min(1.0, max(0.0, d_prog))
+        decay_factor = 0.5 * (1.0 + math.cos(math.pi * d_prog))
+        return base_lr * (min_lr_ratio + (1.0 - min_lr_ratio) * decay_factor)
     progress = float(step - warmup_steps) / float(max(1, total_steps - warmup_steps))
     progress = min(1.0, max(0.0, progress))
     cosine = 0.5 * (1.0 + math.cos(math.pi * progress))
@@ -3636,32 +3992,57 @@ class GPUEmaShadow:
             k: v.detach().clone()
             for k, v in model.state_dict().items()
         }
+        self._model_id: int = -1
+        self._float_shadow: List[torch.Tensor] = []
+        self._float_model: List[torch.Tensor] = []
+        self._nonfloat_pairs: List[Tuple[torch.Tensor, torch.Tensor]] = []
+        self._bind_model(model)
 
-    @torch.no_grad()
-    def update(self, model: nn.Module, step: int) -> bool:
-        if step % self.update_every != 0:
-            return False
-        d = self.decay_eff
+    def _bind_model(self, model: nn.Module) -> None:
+        self._model_id = id(model)
+        self._float_shadow.clear()
+        self._float_model.clear()
+        self._nonfloat_pairs.clear()
         for k, v in model.state_dict().items():
             if k not in self.shadow:
                 continue
             tgt = self.shadow[k]
             src = v.detach()
+            if tgt.is_floating_point() and src.dtype == tgt.dtype and src.device == tgt.device:
+                self._float_shadow.append(tgt)
+                self._float_model.append(src)
+            else:
+                self._nonfloat_pairs.append((tgt, src))
+
+    @torch.no_grad()
+    def update(self, model: nn.Module, step: int) -> bool:
+        if step % self.update_every != 0:
+            return False
+        if id(model) != self._model_id:
+            self._bind_model(model)
+        d = self.decay_eff
+        if self._float_shadow:
+            torch._foreach_lerp_(self._float_shadow, self._float_model, 1.0 - d)
+        for tgt, src in self._nonfloat_pairs:
             if tgt.is_floating_point():
-                tgt.mul_(d).add_(src.to(dtype=tgt.dtype), alpha=1.0 - d)
+                tgt.mul_(d).add_(src.to(device=tgt.device, dtype=tgt.dtype), alpha=1.0 - d)
             else:
                 tgt.copy_(src)
         return True
 
     @contextlib.contextmanager
-    def swap_into(self, model: nn.Module) -> Iterator[None]:
+    def swap_into(self, model: nn.Module, qat_ctrl: Optional[QATInt4Controller] = None) -> Iterator[None]:
         """Temporarily swap EMA weights into ``model`` for evaluation (0 extra GPU VRAM)."""
         backup = {k: v.detach().to("cpu", copy=True) for k, v in model.state_dict().items()}
         model.load_state_dict(self.shadow, strict=True)
+        if qat_ctrl is not None and qat_ctrl.enabled:
+            qat_ctrl.refresh_cache()
         try:
             yield
         finally:
             model.load_state_dict(backup, strict=True)
+            if qat_ctrl is not None and qat_ctrl.enabled:
+                qat_ctrl.refresh_cache()
 
 
 def run_unsup_ema_round(
@@ -4155,6 +4536,10 @@ def run_train(args: argparse.Namespace, cfg: UniOMRConfig) -> Dict[str, Any]:
 
         if fp_tr or fp_va:
             fp_multi_scale = bool(getattr(args, "multi_scale", False))
+            fp_stratified = bool(getattr(args, "stratified_fullpage", False))
+            fp_strat_sampler: Optional[StratifiedFullPageSampler] = (
+                StratifiedFullPageSampler(fp_tr) if (fp_stratified and len(fp_tr) > 0) else None
+            )
             fp_train_ds = UniFullPageDataset(
                 fp_tr,
                 fullpage_max_dim=args.fullpage_max_dim,
@@ -4181,6 +4566,7 @@ def run_train(args: argparse.Namespace, cfg: UniOMRConfig) -> Dict[str, Any]:
                     prefetch_batches=3,
                     collate_fn=collate_uni_batch,
                     seed=args.seed + 303,
+                    stratified_sampler=fp_strat_sampler,
                 )
                 prefetchers.append(pf_fp)
                 fullpage_train_iter = pf_fp
@@ -4191,6 +4577,7 @@ def run_train(args: argparse.Namespace, cfg: UniOMRConfig) -> Dict[str, Any]:
                     base_dim=args.fullpage_max_dim,
                     shuffle=True,
                     seed=args.seed + 303,
+                    stratified_sampler=fp_strat_sampler,
                 )
                 fp_loader = DataLoader(
                     fp_train_ds,
@@ -4198,6 +4585,28 @@ def run_train(args: argparse.Namespace, cfg: UniOMRConfig) -> Dict[str, Any]:
                     num_workers=args.num_workers,
                     collate_fn=collate_uni_batch,
                     pin_memory=(device.type == "cuda"),
+                )
+                fullpage_train_iter = _infinite_loader(fp_loader)
+            elif fp_strat_sampler is not None and len(fp_tr) > 0:
+                class _StratifiedEpochSampler(torch.utils.data.Sampler[int]):
+                    def __init__(self, strat: StratifiedFullPageSampler, seed: int) -> None:
+                        self._strat = strat
+                        self._rng = random.Random(seed)
+
+                    def __iter__(self) -> Iterator[int]:
+                        return iter(self._strat.sample_epoch(self._rng))
+
+                    def __len__(self) -> int:
+                        return self._strat.epoch_size
+
+                fp_loader = DataLoader(
+                    fp_train_ds,
+                    batch_size=args.batch_size,
+                    sampler=_StratifiedEpochSampler(fp_strat_sampler, args.seed + 303),
+                    num_workers=args.num_workers,
+                    collate_fn=collate_uni_batch,
+                    pin_memory=(device.type == "cuda"),
+                    drop_last=False,
                 )
                 fullpage_train_iter = _infinite_loader(fp_loader)
             else:
@@ -4211,10 +4620,16 @@ def run_train(args: argparse.Namespace, cfg: UniOMRConfig) -> Dict[str, Any]:
                     drop_last=False,
                 )
                 fullpage_train_iter = _infinite_loader(fp_loader)
+            strat_msg = (
+                f" | stratified={fp_strat_sampler.bucket_counts()} "
+                f"weights={ {k: round(v, 3) for k, v in fp_strat_sampler.active_weights.items()} }"
+                if fp_strat_sampler is not None
+                else ""
+            )
             print(
                 f"[UniOMR data] fullpage: {len(fp_tr)} train / {len(fp_va)} val "
                 f"(maxDim={args.fullpage_max_dim}, maxSeq={args.max_seq_len}, "
-                f"aug={args.augment}, aug_prob={aug_prob:.2f})"
+                f"aug={args.augment}, aug_prob={aug_prob:.2f}){strat_msg}"
             )
 
         if strip_train_iter is None and hw_strip_train_iter is None and fullpage_train_iter is None:
@@ -4251,14 +4666,8 @@ def run_train(args: argparse.Namespace, cfg: UniOMRConfig) -> Dict[str, Any]:
     def _pop_strip_sample(pool: deque[Dict[str, Any]], it: Any, fallback_kind: str) -> Dict[str, Any]:
         if not pool:
             b = next(it)
-            B_loc = int(b["images"].shape[0])
-            for i in range(B_loc):
-                pool.append({
-                    "image": b["images"][i],
-                    "seq": b["seq"][i],
-                    "sample_id": b["sample_ids"][i],
-                    "kind": fallback_kind,
-                })
+            for item in unpack_collated_batch(b, fallback_kind):
+                pool.append(item)
         return pool.popleft()
 
     def _step_is_fullpage(step_idx: int) -> bool:
@@ -4385,7 +4794,7 @@ def run_train(args: argparse.Namespace, cfg: UniOMRConfig) -> Dict[str, Any]:
                 fullpage_val_ds,
                 device=device,
                 max_len=args.eval_max_len,
-                batch_size=eval_batch_size,
+                batch_size=min(eval_batch_size, 2),
                 use_bf16=use_bf16,
             )
             eval_rec["fullpage_val"] = fp_metrics
@@ -4440,6 +4849,12 @@ def run_train(args: argparse.Namespace, cfg: UniOMRConfig) -> Dict[str, Any]:
                 f"tokens {last_row['n_in']}->{last_row['n_out']}"
             )
 
+    ema_only_eval = bool(getattr(args, "ema_only_eval", False))
+    lr_schedule = str(getattr(args, "lr_schedule", "cosine"))
+    wsd_decay_frac = float(getattr(args, "wsd_decay_frac", 0.25))
+    min_lr_ratio = float(getattr(args, "min_lr_ratio", 0.05))
+    last_empty_cache_step = -25
+
     try:
         for step in range(1, steps + 1):
             if qat_ctrl is not None and (not qat_ctrl.enabled) and step >= qat_start_step:
@@ -4450,7 +4865,15 @@ def run_train(args: argparse.Namespace, cfg: UniOMRConfig) -> Dict[str, Any]:
                     flush=True,
                 )
 
-            cur_lr = _lr_for_step(step, steps, args.lr, args.warmup_steps)
+            cur_lr = _lr_for_step(
+                step,
+                steps,
+                args.lr,
+                args.warmup_steps,
+                min_lr_ratio=min_lr_ratio,
+                schedule=lr_schedule,
+                wsd_decay_frac=wsd_decay_frac,
+            )
             for pg in opt.param_groups:
                 pg["lr"] = cur_lr
 
@@ -4554,8 +4977,15 @@ def run_train(args: argparse.Namespace, cfg: UniOMRConfig) -> Dict[str, Any]:
 
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             opt.step()
-            if device.type == "cuda" and torch.cuda.memory_reserved(device) > 13 * (1024 ** 3):
+            if qat_ctrl is not None and qat_ctrl.enabled:
+                qat_ctrl.refresh_cache()
+            if (
+                device.type == "cuda"
+                and (step - last_empty_cache_step) >= 25
+                and torch.cuda.memory_reserved(device) > int(13.8 * (1024 ** 3))
+            ):
                 torch.cuda.empty_cache()
+                last_empty_cache_step = step
 
             if ema_teacher is not None:
                 ema_teacher.update(model)
@@ -4620,14 +5050,18 @@ def run_train(args: argparse.Namespace, cfg: UniOMRConfig) -> Dict[str, Any]:
                 and (strip_val_ds is not None or hw_strip_val_ds is not None or fullpage_val_ds is not None)
             )
             if should_eval:
-                eval_rec = _run_eval_suite(step)
-                mean_ser = float(eval_rec["mean_val_ser"])
-
-                if gpu_ema is not None:
-                    with gpu_ema.swap_into(model):
+                if device.type == "cuda":
+                    torch.cuda.empty_cache()
+                if ema_only_eval and gpu_ema is not None and step < steps:
+                    with gpu_ema.swap_into(model, qat_ctrl=qat_ctrl):
                         ema_eval_rec = _run_eval_suite(f"{step} EMA")
                     ema_mean_ser = float(ema_eval_rec["mean_val_ser"])
-                    eval_rec["ema_eval"] = ema_eval_rec
+                    eval_rec = {
+                        "step": step,
+                        "ema_only": True,
+                        "mean_val_ser": ema_mean_ser,
+                        "ema_eval": ema_eval_rec,
+                    }
                     ema_eval_history.append(ema_eval_rec)
                     if out_dir is not None and ema_mean_ser < best_ema_ser:
                         best_ema_ser = ema_mean_ser
@@ -4642,8 +5076,35 @@ def run_train(args: argparse.Namespace, cfg: UniOMRConfig) -> Dict[str, Any]:
                             },
                             out_dir / "uni_omr_ema_best.pt",
                         )
+                    eval_history.append(eval_rec)
+                    mean_ser = float("inf")
+                else:
+                    eval_rec = _run_eval_suite(step)
+                    mean_ser = float(eval_rec["mean_val_ser"])
 
-                eval_history.append(eval_rec)
+                    if gpu_ema is not None:
+                        with gpu_ema.swap_into(model, qat_ctrl=qat_ctrl):
+                            ema_eval_rec = _run_eval_suite(f"{step} EMA")
+                        ema_mean_ser = float(ema_eval_rec["mean_val_ser"])
+                        eval_rec["ema_eval"] = ema_eval_rec
+                        ema_eval_history.append(ema_eval_rec)
+                        if out_dir is not None and ema_mean_ser < best_ema_ser:
+                            best_ema_ser = ema_mean_ser
+                            torch.save(
+                                {
+                                    "step": step,
+                                    "val_ser": best_ema_ser,
+                                    "ema_decay": gpu_ema_decay,
+                                    "config": asdict(cfg),
+                                    "vocab": list(data.VOCAB),
+                                    "model": {k: v.detach().cpu() for k, v in gpu_ema.shadow.items()},
+                                },
+                                out_dir / "uni_omr_ema_best.pt",
+                            )
+
+                    eval_history.append(eval_rec)
+                if device.type == "cuda":
+                    torch.cuda.empty_cache()
 
                 if out_dir is not None and mean_ser < best_val_ser:
                     best_val_ser = mean_ser
@@ -4774,6 +5235,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--fullpage-frac", type=float, default=0.65, help="Fraction of mixed-curriculum steps sampled from fullpage data when both strips and fullpage exist (default: 0.65)")
     p.add_argument("--fullpage-dirs", nargs="*", default=[], help="Directories of full-page training pairs")
     p.add_argument("--fullpage-manifest", type=str, default=None, help="Path to full-page manifest.jsonl")
+    p.add_argument("--stratified-fullpage", action="store_true", help="Enable 5-bucket domain/renderer-stratified full-page sampling (legacy_printed 26%%, multi_renderer_printed 22%%, rare_printed 7%%, synth_hw 27%%, real_hw 18%%)")
     p.add_argument("--uv-mask-dir", type=str, default=None, help="Directory of photo-degrade UV flow masks")
 
     # Data preprocessing & augmentation
@@ -4826,6 +5288,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--qat-int4-block-size", type=int, default=32, help="Group block size for symmetric INT4 QAT weight quantization (default: 32, matching MatMulNBits)")
     p.add_argument("--channels-last", action="store_true", help="Convert DynamicConvBackbone to channels_last (NHWC) memory format for faster Conv2d")
     p.add_argument("--grad-checkpoint", action="store_true", help="Enable selective gradient checkpointing on large encoder/decoder transformer tensors")
+    p.add_argument("--ckpt-enc-tokens", type=int, default=20000, help="Encoder B*L token threshold above which --grad-checkpoint activates (default: 20000)")
+    p.add_argument("--ckpt-dec-tokens", type=int, default=8000, help="Decoder B*T token threshold above which --grad-checkpoint activates (default: 8000)")
     p.add_argument("--steps", type=int, default=100)
     p.add_argument("--batch-size", type=int, default=2)
     p.add_argument("--strip-batch-size", type=int, default=None, help="Optional separate batch size for strip steps (default: --batch-size); auto-scales strip grad-accum to preserve effective batch size")
@@ -4833,7 +5297,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--grad-accum", type=int, default=1, help="Gradient accumulation micro-steps")
     p.add_argument("--log-every", type=int, default=10, help="Sync GPU scalars and print training log every N steps (default: 10; always logs step 1 and final step)")
     p.add_argument("--gpu-ema-decay", type=float, default=0.0, help="Always-on device-resident EMA shadow decay updated every 5 steps (default: 0.0 = off; e.g. 0.997); saves uni_omr_ema_best.pt")
+    p.add_argument("--ema-only-eval", action="store_true", help="Skip redundant student eval during mid-run when --gpu-ema-decay > 0 (evaluates EMA only mid-run, both on final step)")
     p.add_argument("--warmup-steps", type=int, default=100, help="Linear LR warmup steps")
+    p.add_argument("--lr-schedule", choices=["cosine", "wsd"], default="cosine", help="Learning rate schedule: cosine (default) or wsd (Warmup-Stable-Decay)")
+    p.add_argument("--wsd-decay-frac", type=float, default=0.25, help="Final fraction of steps spent decaying under --lr-schedule wsd (default: 0.25)")
+    p.add_argument("--min-lr-ratio", type=float, default=0.05, help="Minimum LR ratio relative to --lr at end of schedule (default: 0.05)")
     p.add_argument("--eval-every", type=int, default=250, help="Evaluate on held-out val every N steps")
     p.add_argument("--eval-max-len", type=int, default=256, help="Max autoregressive decode tokens during eval")
     p.add_argument("--seq-len", type=int, default=32, help="Synthetic sequence length for --dry-run")
@@ -4868,6 +5336,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         tok_dropout=args.tok_dropout,
         mtp_k=args.mtp_k,
         grad_checkpoint=bool(args.grad_checkpoint),
+        ckpt_enc_tokens=args.ckpt_enc_tokens,
+        ckpt_dec_tokens=args.ckpt_dec_tokens,
     )
 
     if args.mode == "bench_browser":

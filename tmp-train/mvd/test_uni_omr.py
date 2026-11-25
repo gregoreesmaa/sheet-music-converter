@@ -1894,6 +1894,329 @@ class TestUniOMR(unittest.TestCase):
         out_txt = buf.getvalue()
         self.assertIn("[UniOMR QAT-INT4] enabled on 18 Linear layers (block_size=32) at step 1/2", out_txt)
 
+    def test_zf_qat_int4_cached_delta_bit_exact_ste_parity(self) -> None:
+        """(zf) Iter-10: QATInt4Controller cached deltas match uncached fake_quant_int4_ste bit-identically (fwd + STE grad)."""
+        cfg = _small_cfg(d_model=64, n_enc_layers=1, n_dec_layers=1, n_heads=4, mtp_k=2, dropout=0.0)
+        torch.manual_seed(2026)
+        m_cached = uni_omr.UniOMRNet(cfg)
+        m_ref = uni_omr.UniOMRNet(cfg)
+        m_ref.load_state_dict(m_cached.state_dict(), strict=True)
+
+        # Reference: uncached fake_quant_int4_ste on every target Linear
+        ctrl_cached = uni_omr.QATInt4Controller(m_cached, block_size=32, enabled=True)
+        for root_name in uni_omr.QATInt4Controller.TARGET_ROOTS:
+            root_mod = getattr(m_ref, root_name, None)
+            if root_mod is None:
+                continue
+            for mod in root_mod.modules():
+                if isinstance(mod, torch.nn.Linear):
+                    def _uncached_fwd(x: torch.Tensor, _m=mod) -> torch.Tensor:
+                        w_q = uni_omr.fake_quant_int4_ste(_m.weight, block_size=32)
+                        return torch.nn.functional.linear(x, w_q, _m.bias)
+                    mod.forward = _uncached_fwd  # type: ignore[method-assign]
+
+        img = torch.rand(2, 3, 128, 192)
+        tgt_in = torch.randint(0, len(data.VOCAB), (2, 10))
+        tgt_out = torch.randint(0, len(data.VOCAB), (2, 10))
+
+        m_cached.train()
+        m_ref.train()
+        out_c = m_cached(img, tgt_in, return_aux=False, return_mtp=True)
+        out_r = m_ref(img, tgt_in, return_aux=False, return_mtp=True)
+        self.assertTrue(torch.equal(out_c["logits"], out_r["logits"]), "Cached QAT forward must be bit-identical")
+
+        loss_c = m_cached.compute_loss(out_c, tgt_out, mtp_loss_weight=0.30, uv_loss_weight=0.0)["loss"]
+        loss_r = m_ref.compute_loss(out_r, tgt_out, mtp_loss_weight=0.30, uv_loss_weight=0.0)["loss"]
+        self.assertTrue(torch.equal(loss_c, loss_r))
+        loss_c.backward()
+        loss_r.backward()
+
+        for (n_c, p_c), (n_r, p_r) in zip(m_cached.named_parameters(), m_ref.named_parameters()):
+            self.assertEqual(n_c, n_r)
+            if p_c.grad is None:
+                self.assertIsNone(p_r.grad)
+            else:
+                self.assertTrue(
+                    torch.equal(p_c.grad, p_r.grad),
+                    f"STE grad mismatch on {n_c}: max diff={(p_c.grad - p_r.grad).abs().max().item()}",
+                )
+
+        # Verify cache updates cleanly after opt.step() + refresh_cache() and across gpu_ema.swap_into()
+        opt_c = torch.optim.SGD(m_cached.parameters(), lr=0.1)
+        opt_r = torch.optim.SGD(m_ref.parameters(), lr=0.1)
+        opt_c.step()
+        opt_r.step()
+        ctrl_cached.refresh_cache()
+        self.assertEqual(len(ctrl_cached._cached_deltas), ctrl_cached.num_layers)
+        with torch.no_grad():
+            o2_c = m_cached(img, tgt_in, return_aux=False, return_mtp=False)["logits"]
+            o2_r = m_ref(img, tgt_in, return_aux=False, return_mtp=False)["logits"]
+        self.assertTrue(torch.equal(o2_c, o2_r))
+
+        ema = uni_omr.GPUEmaShadow(m_cached, decay=0.9, update_every=1)
+        with torch.no_grad():
+            m_cached.lm_head.weight.add_(0.25)
+        ctrl_cached.refresh_cache()
+        with ema.swap_into(m_cached, qat_ctrl=ctrl_cached):
+            with torch.no_grad():
+                o_ema = m_cached(img, tgt_in, return_aux=False, return_mtp=False)["logits"]
+            self.assertTrue(torch.equal(o_ema, o2_c))
+        ctrl_cached.invalidate_cache()
+        self.assertEqual(len(ctrl_cached._cached_deltas), 0)
+        ctrl_cached.detach()
+
+    def test_zg_gpu_ema_foreach_lerp_parity_and_ema_only_eval(self) -> None:
+        """(zg) Iter-10: GPUEmaShadow _foreach_lerp_ parity + --ema-only-eval + fullpage_val bs cap."""
+        import json
+
+        cfg = _small_cfg(d_model=64, n_enc_layers=1, n_dec_layers=1, n_heads=4, mtp_k=2, dropout=0.0)
+        torch.manual_seed(11)
+        model = uni_omr.UniOMRNet(cfg)
+        model.backbone.to(memory_format=torch.channels_last)
+        ema = uni_omr.GPUEmaShadow(model, decay=0.95, update_every=2)
+        manual_shadow = {k: v.detach().clone() for k, v in model.state_dict().items()}
+        d_eff = 0.95 ** 2
+
+        for step in range(1, 7):
+            with torch.no_grad():
+                for p in model.parameters():
+                    p.add_(torch.randn_like(p) * 0.05)
+            updated = ema.update(model, step)
+            self.assertEqual(updated, (step % 2 == 0))
+            if step % 2 == 0:
+                for k, v in model.state_dict().items():
+                    if manual_shadow[k].is_floating_point():
+                        manual_shadow[k].mul_(d_eff).add_(v.detach(), alpha=1.0 - d_eff)
+                    else:
+                        manual_shadow[k].copy_(v.detach())
+
+        for k in manual_shadow:
+            self.assertTrue(
+                torch.allclose(ema.shadow[k], manual_shadow[k], atol=1e-6),
+                f"_foreach_lerp_ mismatch on {k}: max diff={(ema.shadow[k] - manual_shadow[k]).abs().max().item()}",
+            )
+
+        # CLI test for --ema-only-eval (mid-run EMA-only at step 2, both student+EMA at final step 4)
+        with tempfile.TemporaryDirectory() as td:
+            td_path = Path(td)
+            pr_dir = td_path / "printed"
+            out_dir = td_path / "out"
+            pr_dir.mkdir()
+            bek_txt = "clef-G-2\nquarter\nC\n4\nbar\n"
+            for i in range(4):
+                arr = np.full((64, 128, 3), 245, dtype=np.uint8)
+                arr[20:44, 15:110, :] = 30
+                Image.fromarray(arr, mode="RGB").save(pr_dir / f"s{i}_p1_s0.png")
+                (pr_dir / f"s{i}_p1_s0-bekern.txt").write_text(bek_txt, encoding="utf-8")
+
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                rc = uni_omr.main([
+                    "--mode", "train",
+                    "--curriculum", "strip",
+                    "--strip-dirs", str(pr_dir),
+                    "--strip-height", "64",
+                    "--max-strip-width", "128",
+                    "--max-seq-len", "32",
+                    "--d-model", "64",
+                    "--n-enc-layers", "1",
+                    "--n-dec-layers", "1",
+                    "--n-heads", "4",
+                    "--steps", "4",
+                    "--warmup-steps", "1",
+                    "--batch-size", "1",
+                    "--val-count", "1",
+                    "--eval-every", "2",
+                    "--eval-max-len", "8",
+                    "--gpu-ema-decay", "0.99",
+                    "--ema-only-eval",
+                    "--ckpt-enc-tokens", "20000",
+                    "--ckpt-dec-tokens", "8000",
+                    "--device", "cpu",
+                    "--out-dir", str(out_dir),
+                ])
+            self.assertEqual(rc, 0)
+            out_txt = buf.getvalue()
+            self.assertNotIn("[eval strip_val @ 2]", out_txt)
+            self.assertIn("[eval strip_val @ 2 EMA]", out_txt)
+            self.assertIn("[eval strip_val @ 4]", out_txt)
+            self.assertIn("[eval strip_val @ 4 EMA]", out_txt)
+            ev = json.loads((out_dir / "eval_summary.json").read_text(encoding="utf-8"))
+            self.assertTrue(ev["evals"][0].get("ema_only", False))
+            self.assertFalse(ev["evals"][1].get("ema_only", False))
+
+    def test_zh_wsd_lr_schedule_and_stratified_fullpage_weights(self) -> None:
+        """(zh) Iter-10: WSD LR schedule + 5-bucket domain/renderer-stratified full-page sampler."""
+        import random as _py_random
+
+        base_lr = 1e-3
+        total = 100
+        warmup = 10
+        # Warmup: linear ramp
+        self.assertAlmostEqual(uni_omr._lr_for_step(5, total, base_lr, warmup, min_lr_ratio=0.05, schedule="wsd", wsd_decay_frac=0.25), 5e-4, places=7)
+        self.assertAlmostEqual(uni_omr._lr_for_step(10, total, base_lr, warmup, min_lr_ratio=0.05, schedule="wsd", wsd_decay_frac=0.25), base_lr, places=7)
+        # Stable plateau: steps 11..75 stay at base_lr
+        for st in (11, 40, 75):
+            self.assertAlmostEqual(uni_omr._lr_for_step(st, total, base_lr, warmup, min_lr_ratio=0.05, schedule="wsd", wsd_decay_frac=0.25), base_lr, places=7)
+        # Decay phase: steps 76..100 decrease monotonically down to base_lr * 0.05
+        lr_mid = uni_omr._lr_for_step(88, total, base_lr, warmup, min_lr_ratio=0.05, schedule="wsd", wsd_decay_frac=0.25)
+        lr_end = uni_omr._lr_for_step(100, total, base_lr, warmup, min_lr_ratio=0.05, schedule="wsd", wsd_decay_frac=0.25)
+        self.assertLess(lr_mid, base_lr)
+        self.assertGreater(lr_mid, lr_end)
+        self.assertAlmostEqual(lr_end, base_lr * 0.05, places=7)
+
+        # 5-bucket classifier
+        self.assertEqual(uni_omr.classify_fullpage_bucket("D:/tmp/t32farm/sq1_Leland.png", "printed"), "legacy_printed")
+        self.assertEqual(uni_omr.classify_fullpage_bucket("D:/tmp/verovio_pages/p1.png", "printed"), "multi_renderer_printed")
+        self.assertEqual(uni_omr.classify_fullpage_bucket("D:/tmp/osmd_spacing/p2.png", "printed"), "multi_renderer_printed")
+        self.assertEqual(uni_omr.classify_fullpage_bucket("D:/tmp/corpus100k/p3.png", "printed"), "multi_renderer_printed")
+        self.assertEqual(uni_omr.classify_fullpage_bucket("D:/tmp/c-8vb_rare/p4.png", "printed"), "rare_printed")
+        self.assertEqual(uni_omr.classify_fullpage_bucket("D:/tmp/hw-sim-v05/p5.png", "hw"), "synth_hw")
+        self.assertEqual(uni_omr.classify_fullpage_bucket("D:/tmp/debussy-omr/p6.png", "real_hw"), "real_hw")
+
+        # StratifiedFullPageSampler quotas match target weights (26/22/7/27/18%) even under imbalanced counts
+        pairs = []
+        for i in range(500):
+            pairs.append((Path(f"D:/tmp/t32farm/leg_{i}.png"), [], "printed"))
+        for i in range(100):
+            pairs.append((Path(f"D:/tmp/verovio/mr_{i}.png"), [], "printed"))
+        for i in range(20):
+            pairs.append((Path(f"D:/tmp/c-8vb/rare_{i}.png"), [], "printed"))
+        for i in range(200):
+            pairs.append((Path(f"D:/tmp/hw-sim-v05/shw_{i}.png"), [], "hw"))
+        for i in range(30):
+            pairs.append((Path(f"D:/tmp/debussy/rhw_{i}.png"), [], "real_hw"))
+
+        sampler = uni_omr.StratifiedFullPageSampler(pairs, epoch_size=1000)
+        ep = sampler.sample_epoch(_py_random.Random(42))
+        self.assertEqual(len(ep), 1000)
+        from collections import Counter as _Counter
+        counts = _Counter(uni_omr.classify_fullpage_bucket(pairs[i][0], pairs[i][2]) for i in ep)
+        for bname, target_w in uni_omr.STRATIFIED_FULLPAGE_WEIGHTS.items():
+            self.assertAlmostEqual(counts[bname] / 1000.0, target_w, delta=0.01, msg=f"Bucket {bname} quota drift: {counts}")
+
+    def test_zi_2d_aspect_length_bucketing_and_double_pad_fix(self) -> None:
+        """(zi) Iter-10: 2D aspect + bekern_bytes mega-batch bucketing & strip double-padding fix."""
+        # 1. Double-padding fix in collate_uni_batch + unpack_collated_batch
+        s_short = {
+            "image": torch.zeros(3, 64, 128, dtype=torch.uint8),
+            "seq": torch.tensor([uni_omr.BOS_ID, 1, 2, uni_omr.EOS_ID], dtype=torch.long),
+            "sample_id": "short",
+            "kind": "strip",
+        }
+        s_long = {
+            "image": torch.zeros(3, 64, 384, dtype=torch.uint8),
+            "seq": torch.tensor([uni_omr.BOS_ID, 1, 2, 3, 4, 5, 6, 7, 8, uni_omr.EOS_ID], dtype=torch.long),
+            "sample_id": "long",
+            "kind": "strip",
+        }
+        collated = uni_omr.collate_uni_batch([s_short, s_long])
+        self.assertEqual(tuple(collated["images"].shape), (2, 3, 64, 384))
+        self.assertEqual(tuple(collated["seq"].shape), (2, 10))
+        unpacked = uni_omr.unpack_collated_batch(collated, "strip")
+        self.assertEqual(tuple(unpacked[0]["image"].shape), (3, 64, 128))
+        self.assertEqual(tuple(unpacked[0]["seq"].shape), (4,))
+        self.assertNotIn(uni_omr.PAD_ID, unpacked[0]["seq"].tolist())
+        # Re-collating two short strips unpacked from larger batches must stay compact (width 128, len 4)
+        re_collated = uni_omr.collate_uni_batch([unpacked[0], unpacked[0]])
+        self.assertEqual(tuple(re_collated["images"].shape), (2, 3, 64, 128))
+        self.assertEqual(tuple(re_collated["seq"].shape), (2, 4))
+
+        # 2. 2D aspect + bekern_bytes mega-batch bucketing in AsyncThreadPrefetcher
+        with tempfile.TemporaryDirectory() as td:
+            td_path = Path(td)
+            fp_pages = td_path / "pages"
+            fp_strips = td_path / "stage2_strips"
+            fp_pages.mkdir()
+            fp_strips.mkdir()
+
+            # 16 portrait (narrow & wide aspect, short & long bekern) + 16 landscape
+            for i in range(16):
+                w_p = 64 if (i < 8) else 112
+                arr_p = np.full((128, w_p, 3), 245, dtype=np.uint8)
+                Image.fromarray(arr_p, mode="RGB").save(fp_pages / f"port{i:02d}_p1.png")
+                n_rep = 2 if (i % 2 == 0) else 30
+                (fp_strips / f"port{i:02d}_p1_s0-bekern.txt").write_text(
+                    "clef-G-2\n" + ("quarter\nC\n4\n" * n_rep) + "bar\n", encoding="utf-8"
+                )
+
+                h_l = 64 if (i < 8) else 112
+                arr_l = np.full((h_l, 128, 3), 245, dtype=np.uint8)
+                Image.fromarray(arr_l, mode="RGB").save(fp_pages / f"land{i:02d}_p1.png")
+                (fp_strips / f"land{i:02d}_p1_s0-bekern.txt").write_text(
+                    "clef-G-2\n" + ("quarter\nC\n4\n" * n_rep) + "bar\n", encoding="utf-8"
+                )
+
+            fp_pairs = uni_omr.discover_fullpage_pairs([td_path])
+            fp_ds = uni_omr.UniFullPageDataset(
+                fp_pairs, fullpage_max_dim=128, max_seq_len=256, augment=False, return_uint8=True
+            )
+            pf = uni_omr.AsyncThreadPrefetcher(
+                fp_ds, batch_size=2, shuffle=True, pin_memory=False, max_workers=2, prefetch_batches=2, seed=42
+            )
+            try:
+                pad_toks = 0
+                total_toks = 0
+                for _ in range(16):
+                    b = next(pf)
+                    _, _, bh, bw = b["images"].shape
+                    self.assertNotEqual((bh, bw), (128, 128), "Portrait & landscape mixed in 2D bucket")
+                    seq = b["seq"]
+                    pad_toks += int((seq == uni_omr.PAD_ID).sum().item())
+                    total_toks += int(seq.numel())
+                # Because short & long bekerns are sorted within each aspect bucket, pad waste must be ~0%!
+                self.assertLess(pad_toks / max(1, total_toks), 0.05)
+            finally:
+                pf.close()
+
+    def test_zj_cv2_aug_speed_and_output_sanity(self) -> None:
+        """(zj) Iter-10: OpenCV fast augs match shape/bounds/determinism and fall back cleanly when _cv2 is None."""
+        import random as _py_random
+        import time as _time
+        from unittest import mock
+
+        arr = np.full((384, 288, 3), 246, dtype=np.uint8)
+        arr[40:340:12, 24:264, :] = 22
+        base = Image.fromarray(arr, mode="RGB")
+
+        # 1. cv2 path (if installed) sanity + determinism + speed
+        t0 = _time.perf_counter()
+        out_lr1 = uni_omr._apply_hw_lowres_defocus_compress(base, _py_random.Random(123))
+        out_lr2 = uni_omr._apply_hw_lowres_defocus_compress(base, _py_random.Random(123))
+        out_blur = uni_omr._fast_gaussian_blur(base, 0.8)
+        out_rot = uni_omr._fast_rotate(base, 3.0, (240, 240, 240))
+        out_persp = uni_omr._fast_perspective(
+            base,
+            [(0.0, 0.0), (288.0, 0.0), (288.0, 384.0), (0.0, 384.0)],
+            [(6.0, 8.0), (280.0, 6.0), (282.0, 376.0), (8.0, 378.0)],
+            (25, 25, 25),
+        )
+        out_full = uni_omr.apply_online_augment(base, rng=_py_random.Random(99), is_hw=True)
+        elapsed_ms = (_time.perf_counter() - t0) * 1000.0
+
+        for im in (out_lr1, out_blur, out_rot, out_persp, out_full):
+            self.assertEqual(im.size, base.size)
+            self.assertEqual(im.mode, "RGB")
+        np.testing.assert_array_equal(np.asarray(out_lr1), np.asarray(out_lr2))
+        self.assertGreater(float(np.asarray(out_lr1).min()), 30.0)
+        self.assertLess(elapsed_ms, 2000.0)
+
+        # 2. Graceful PIL fallback when _cv2 is None
+        with mock.patch.object(uni_omr, "_cv2", None):
+            fb_lr = uni_omr._apply_hw_lowres_defocus_compress(base, _py_random.Random(123))
+            fb_blur = uni_omr._fast_gaussian_blur(base, 0.8)
+            fb_rot = uni_omr._fast_rotate(base, 3.0, (240, 240, 240))
+            fb_persp = uni_omr._fast_perspective(
+                base,
+                [(0.0, 0.0), (288.0, 0.0), (288.0, 384.0), (0.0, 384.0)],
+                [(6.0, 8.0), (280.0, 6.0), (282.0, 376.0), (8.0, 378.0)],
+                (25, 25, 25),
+            )
+            for im in (fb_lr, fb_blur, fb_rot, fb_persp):
+                self.assertEqual(im.size, base.size)
+                self.assertEqual(im.mode, "RGB")
+            self.assertGreater(float(np.asarray(fb_lr).min()), 30.0)
+
 
 if __name__ == "__main__":
     unittest.main()
