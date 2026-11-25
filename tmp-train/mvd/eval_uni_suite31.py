@@ -167,7 +167,7 @@ def _allowed_ids_for_state(state: grammar.PrefixState, vocab_size: int) -> List[
     can_end_sys = bool(eos_ok or after_bar)
     if can_end_sys:
         allow_ids.add(eos_id)
-        if state.recent:
+        if state.can_emit_sys():
             allow_ids.add(sys_id)
 
     # Never emit PAD or BOS as generated tokens.
@@ -207,7 +207,9 @@ def _advance_grammar_state(
     if tok_id in (pad_id, bos_id, eos_id):
         return state
     if tok_id == sys_id:
-        return grammar.PrefixState(strict=strict, vocab_map=tok_to_id)
+        nxt = state.copy()
+        nxt.reset_system()
+        return nxt
     tok_str = id_to_tok.get(tok_id)
     if tok_str is None:
         state.broken = True

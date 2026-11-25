@@ -81,6 +81,7 @@ _BAR_EPS = 1e-6
 MAX_CHORDS_PER_ONSET = 8
 MAX_CONSECUTIVE_GRACE = 8
 MAX_CONSECUTIVE_BAR_REST = 24
+MAX_SYSTEMS = 24
 LAX_BAR_MULT = 2.5
 LAX_BAR_MIN_BEATS = 8.0
 SHORT_PICKUP_TIMES = frozenset(['time-1-32', 'time-1-16'])
@@ -146,6 +147,7 @@ class PrefixState:
                  'ev_base', 'ev_dots', 'ev_chord', 'ev_grace',
                  'chords_on_onset', 'grace_run',
                  'consec_bar_rest_bars', 'bar_has_pitched', 'bar_has_bar_rest',
+                 'sys_count', 'sys_has_event',
                  'comp_num', 'comp_digits', 'comp_val',
                  'allow_percussion_tab', 'vocab_map')
 
@@ -188,6 +190,8 @@ class PrefixState:
         self.consec_bar_rest_bars = 0
         self.bar_has_pitched = False
         self.bar_has_bar_rest = False
+        self.sys_count = 0
+        self.sys_has_event = False
         # bekern v2 compositional sub-state counters (flat ints for cheap copy())
         self.comp_num = 0
         self.comp_digits = 0
@@ -232,12 +236,52 @@ class PrefixState:
         c.consec_bar_rest_bars = self.consec_bar_rest_bars
         c.bar_has_pitched = self.bar_has_pitched
         c.bar_has_bar_rest = self.bar_has_bar_rest
+        c.sys_count = self.sys_count
+        c.sys_has_event = self.sys_has_event
         c.comp_num = self.comp_num
         c.comp_digits = self.comp_digits
         c.comp_val = self.comp_val
         c.allow_percussion_tab = self.allow_percussion_tab
         c.vocab_map = self.vocab_map
         return c
+
+    def can_emit_sys(self):
+        """Return True iff the current system has >=1 musical event and page is under MAX_SYSTEMS."""
+        return bool(self.sys_has_event) and (self.sys_count < MAX_SYSTEMS - 1)
+
+    def reset_system(self):
+        """Advance to a new system on ``<sys>`` while preserving cross-system cycle history."""
+        self.sys_count += 1
+        self.sys_has_event = False
+        self.mode = 'bound'
+        self.header_open = True
+        self.seg_last = [False]
+        self.seg = 0
+        self.depth = [0]
+        self.pending = 0
+        self.broken = False
+        self.run_tok = None
+        self.run_len = 0
+        self.alter_seen = False
+        self.dot_seen = False
+        self.opened = set()
+        self.vcurs = [0.0]
+        self.vscales = [[]]
+        self.pend_spans = []
+        self.ev_base = None
+        self.ev_dots = 0
+        self.ev_chord = False
+        self.ev_grace = False
+        self.chords_on_onset = 0
+        self.grace_run = 0
+        self.bar_has_pitched = False
+        self.bar_has_bar_rest = False
+        self.comp_num = 0
+        self.comp_digits = 0
+        self.comp_val = 0
+        self.recent.append('<sys>')
+        if len(self.recent) > 128:
+            del self.recent[:-128]
 
     def _grow(self, n):
         while len(self.seg_last) < n:
@@ -466,6 +510,7 @@ class PrefixState:
             self.comp_val = 0
             return 'tuplet-a'
         if t == MULTIREST_KW:
+            self.sys_has_event = True
             self._drain()
             self._drained_scale()
             self.ev_base = None
@@ -506,6 +551,7 @@ class PrefixState:
             self.ev_chord = True
             return 'chord'
         if t in DURATIONS or t == REST or t == BAR_REST:
+            self.sys_has_event = True
             self._drain()
             if t in DURATIONS:
                 if self._blocks_duration(_WRITTEN[t]):
@@ -1155,6 +1201,7 @@ class _State:
                 raise ValueError('dangling chord marker')
             return 'chord'
         if t in DURATIONS or t == REST or t == BAR_REST:
+            self.sys_has_event = True
             self._drain()
             if t in DURATIONS:
                 return 'dur'

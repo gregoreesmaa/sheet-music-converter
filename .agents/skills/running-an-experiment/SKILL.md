@@ -29,6 +29,7 @@ experiments/YYYY-MM-DDTHH-MM-<kebab-slug>/
   `YYYY-MM-DDTHH-MM-<short-slug>` — e.g., `2026-11-26T00-39-cut-rism-real-ink`.
 - **1 variable per experiment:** Isolate a single architectural, optimizer, loss, or data hypothesis against a named baseline commit SHA (`git rev-parse --short HEAD`).
 - **Never commit weights, logs >1 MB, or secrets** into `experiments/` — store weights/shards on Hugging Face (`gregoreesmaa/sheet-music-converter-omr`) or `D:\tmp\`, and link them from `PLAN.md` and `OUTCOME.md`.
+- **Zero-Prior-Context Handoff Rule (MANDATORY):** Every experiment folder MUST be 100% self-contained so a fresh agent or human with **zero prior conversation context** can walk into `experiments/YYYY-MM-DDTHH-MM-<slug>/`, read `README.md` + `PLAN.md`, and immediately monitor, cancel, resume, evaluate, or take over the run without notice. Always place the experiment's exact launcher script (e.g., `run_modal.py` or `kaggle_kernel/`), exact status/log/resume/eval copy-paste commands, exact live cloud IDs (`app_id`, URL, kernel slug, HF repo paths), and exact baseline numbers directly inside the folder!
 
 ---
 
