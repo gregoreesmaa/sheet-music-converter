@@ -24,6 +24,7 @@ import re
 import shutil
 import sys
 import time
+import zipfile
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
@@ -320,6 +321,153 @@ def discover_score_pool(
     return interleaved, blocked_count
 
 
+# Target staff-count bucket weights for --dense-hw-mode:
+# ~45% 4-staff (SQ/SATB), ~25% 1-2 staff (piano-prioritized), ~25% 3-staff, ~5% 5-6 staff.
+DENSE_HW_BUCKET_WEIGHTS: Tuple[Tuple[str, float], ...] = (
+    ("4", 0.45),
+    ("1-2", 0.25),
+    ("3", 0.25),
+    ("5-6", 0.05),
+)
+
+
+def _fast_part_count(path: Path) -> int:
+    """Fast header-only staff/part counter matching `hw_score_sim.parse_score(path).parts`."""
+    suf = path.suffix.lower()
+    try:
+        if suf in (".mscz", ".mscx"):
+            if suf == ".mscz":
+                with zipfile.ZipFile(path, "r") as zf:
+                    mscx = next((n for n in zf.namelist() if n.lower().endswith(".mscx")), None)
+                    if not mscx:
+                        return 0
+                    with zf.open(mscx) as fh:
+                        head = fh.read(65536).decode("utf-8", errors="ignore")
+            else:
+                with open(path, "rb") as fh:
+                    head = fh.read(65536).decode("utf-8", errors="ignore")
+            m_pos = head.find("<Measure")
+            hdr = head[:m_pos] if m_pos > 0 else head
+            ids = set(re.findall(r'<Staff\s+id=["\'](\d+)["\']', hdr))
+            if not ids and m_pos < 0:
+                # Fallback if header exceeded 64 KB
+                if suf == ".mscz":
+                    with zipfile.ZipFile(path, "r") as zf:
+                        mscx = next((n for n in zf.namelist() if n.lower().endswith(".mscx")), None)
+                        full = zf.read(mscx).decode("utf-8", errors="ignore") if mscx else ""
+                else:
+                    full = path.read_text(encoding="utf-8", errors="ignore")
+                m_pos = full.find("<Measure")
+                hdr = full[:m_pos] if m_pos > 0 else full
+                ids = set(re.findall(r'<Staff\s+id=["\'](\d+)["\']', hdr))
+            return len(ids)
+        if suf == ".musicxml":
+            with open(path, "rb") as fh:
+                head = fh.read(65536).decode("utf-8", errors="ignore")
+            n_sp = len(re.findall(r"<score-part\s+id=", head))
+            if n_sp == 0:
+                return 0
+            parts = re.split(r"<part\s+id=", head)[1:]
+            if len(parts) < n_sp:
+                full = path.read_text(encoding="utf-8", errors="ignore")
+                parts = re.split(r"<part\s+id=", full)[1:]
+            total = 0
+            for pb in parts:
+                m = re.search(r"<staves>(\d+)</staves>", pb[:4096])
+                total += int(m.group(1)) if m else 1
+            return total
+    except Exception:
+        return 0
+    return 0
+
+
+def _part_count_to_bucket(n_parts: int) -> Optional[str]:
+    if n_parts in (1, 2):
+        return "1-2"
+    if n_parts == 3:
+        return "3"
+    if n_parts == 4:
+        return "4"
+    if n_parts in (5, 6):
+        return "5-6"
+    return None
+
+
+def bucket_pool_by_parts(
+    pool: Sequence[Tuple[str, Path]],
+    max_parts: int,
+    seed: int = 20261124,
+) -> Dict[str, List[Tuple[str, Path]]]:
+    """Bucket discovered leak-free scores by part count (`1-2`, `3`, `4`, `5-6`).
+
+    Within bucket `1-2`, 2-staff piano scores are prioritized (~85%) over 1-staff solo (~15%)
+    whenever both are available.
+    """
+    rng = np.random.default_rng(seed + 313)
+    raw_by_n: Dict[int, List[Tuple[str, Path]]] = {}
+    for item in pool:
+        n = _fast_part_count(item[1])
+        if 1 <= n <= max_parts:
+            raw_by_n.setdefault(n, []).append(item)
+
+    def _shuffle(items: List[Tuple[str, Path]]) -> List[Tuple[str, Path]]:
+        if len(items) <= 1:
+            return list(items)
+        idx = rng.permutation(len(items))
+        return [items[int(i)] for i in idx]
+
+    buckets: Dict[str, List[Tuple[str, Path]]] = {}
+    # Bucket 1-2: interleave 2-staff piano (~85%) with 1-staff solo (~15%)
+    s2 = _shuffle(raw_by_n.get(2, []))
+    s1 = _shuffle(raw_by_n.get(1, []))
+    if s2 and s1:
+        b12: List[Tuple[str, Path]] = []
+        i2, i1 = 0, 0
+        # Build a balanced list where ~5 out of every 6 entries are 2-staff piano
+        target_len = max(len(s2), min(len(s1), len(s2) * 2))
+        while len(b12) < target_len:
+            for _ in range(5):
+                b12.append(s2[i2 % len(s2)])
+                i2 += 1
+                if len(b12) >= target_len:
+                    break
+            if len(b12) < target_len:
+                b12.append(s1[i1 % len(s1)])
+                i1 += 1
+        buckets["1-2"] = b12
+    elif s2:
+        buckets["1-2"] = s2
+    elif s1:
+        buckets["1-2"] = s1
+
+    if raw_by_n.get(3):
+        buckets["3"] = _shuffle(raw_by_n[3])
+    if raw_by_n.get(4):
+        buckets["4"] = _shuffle(raw_by_n[4])
+    b56 = raw_by_n.get(5, []) + raw_by_n.get(6, [])
+    if b56:
+        buckets["5-6"] = _shuffle(b56)
+    return buckets
+
+
+def _allocate_bucket_counts(
+    target_count: int,
+    available_buckets: Sequence[str],
+) -> Dict[str, int]:
+    """Largest-remainder allocation of `target_count` slots across available dense-hw buckets."""
+    active = [(b, w) for b, w in DENSE_HW_BUCKET_WEIGHTS if b in available_buckets]
+    if not active:
+        return {}
+    w_sum = sum(w for _, w in active)
+    exact = [(b, target_count * (w / w_sum)) for b, w in active]
+    counts = {b: int(val) for b, val in exact}
+    rem = target_count - sum(counts.values())
+    remainders = sorted(exact, key=lambda kv: kv[1] - int(kv[1]), reverse=True)
+    for i in range(rem):
+        counts[remainders[i % len(remainders)][0]] += 1
+    return counts
+
+
 # ---------------------------------------------------------------------------
 # Stage-1 Bezier -> Exact manifest.jsonl row conversion
 # ---------------------------------------------------------------------------
@@ -398,27 +546,112 @@ LANDSCAPE_PAGE_SIZES: Tuple[Tuple[int, int], ...] = (
     (2200, 1550),
 )
 
+DENSE_PAGE_SIZES: Tuple[Tuple[int, int], ...] = (
+    (1900, 2600),
+    (1950, 2650),
+    (2000, 2700),
+)
+
+DENSE_LANDSCAPE_PAGE_SIZES: Tuple[Tuple[int, int], ...] = (
+    (2600, 1900),
+    (2650, 1950),
+    (2700, 2000),
+)
+
+
+def _apply_dense_hw_style_overrides(
+    style_dict: Dict[str, Any],
+    n_parts: int,
+    is_landscape: bool,
+    rng: np.random.Generator,
+) -> Dict[str, Any]:
+    """Calibrate staff spacing & margins so pages naturally pack 4-6 systems and 20-45 bars/page."""
+    out = dict(style_dict)
+    out["margin_top_frac"] = float(rng.uniform(0.045, 0.065))
+    out["margin_bottom_frac"] = float(rng.uniform(0.040, 0.060))
+    out["margin_left_frac"] = float(rng.uniform(0.040, 0.062))
+    out["margin_right_frac"] = float(rng.uniform(0.035, 0.055))
+    out["blank_prerule_prob"] = 0.0
+    # Avoid large decorative title header eating a full system on dense pages
+    if str(out.get("page_furniture_mode", "none")).lower() != "none":
+        out["page_furniture_mode"] = "none"
+
+    if n_parts <= 1:
+        if is_landscape:
+            out["sp"] = 12.5
+            out["sp_scale_mult"] = float(rng.uniform(0.80, 0.96))
+            out["inter_system_gap_mult"] = float(rng.uniform(0.68, 0.85))
+        else:
+            out["sp"] = 14.0
+            out["sp_scale_mult"] = float(rng.uniform(0.85, 1.05))
+            out["inter_system_gap_mult"] = float(rng.uniform(0.75, 0.95))
+    elif n_parts == 2:
+        if is_landscape:
+            out["sp"] = 13.5
+            out["sp_scale_mult"] = float(rng.uniform(0.82, 0.96))
+            out["intra_gap_mult"] = float(rng.uniform(0.68, 0.82))
+            out["inter_system_gap_mult"] = float(rng.uniform(0.68, 0.84))
+        else:
+            out["sp"] = 15.0
+            out["sp_scale_mult"] = float(rng.uniform(0.92, 1.08))
+            out["intra_gap_mult"] = float(rng.uniform(0.74, 0.88))
+            out["inter_system_gap_mult"] = float(rng.uniform(0.76, 0.94))
+    elif n_parts == 3:
+        if is_landscape:
+            out["sp"] = 10.5
+            out["sp_scale_mult"] = float(rng.uniform(0.82, 0.96))
+            out["intra_gap_mult"] = float(rng.uniform(0.58, 0.72))
+            out["inter_system_gap_mult"] = float(rng.uniform(0.55, 0.68))
+        else:
+            out["sp"] = 12.2
+            out["sp_scale_mult"] = float(rng.uniform(0.88, 1.04))
+            out["intra_gap_mult"] = float(rng.uniform(0.65, 0.78))
+            out["inter_system_gap_mult"] = float(rng.uniform(0.62, 0.76))
+    elif n_parts == 4:
+        if is_landscape:
+            out["sp"] = 9.2
+            out["sp_scale_mult"] = float(rng.uniform(0.87, 0.98))
+            out["intra_gap_mult"] = float(rng.uniform(0.56, 0.66))
+            out["inter_system_gap_mult"] = float(rng.uniform(0.50, 0.62))
+        else:
+            out["sp"] = 11.2
+            out["sp_scale_mult"] = float(rng.uniform(0.86, 1.00))
+            out["intra_gap_mult"] = float(rng.uniform(0.62, 0.74))
+            out["inter_system_gap_mult"] = float(rng.uniform(0.58, 0.72))
+    else:
+        if is_landscape:
+            out["sp"] = 8.5
+            out["sp_scale_mult"] = float(rng.uniform(0.94, 1.00))
+            out["intra_gap_mult"] = float(rng.uniform(0.52, 0.60))
+            out["inter_system_gap_mult"] = float(rng.uniform(0.45, 0.55))
+        else:
+            out["sp"] = 9.6
+            out["sp_scale_mult"] = float(rng.uniform(0.85, 0.98))
+            out["intra_gap_mult"] = float(rng.uniform(0.56, 0.66))
+            out["inter_system_gap_mult"] = float(rng.uniform(0.52, 0.64))
+    return out
+
 
 def _validate_strip_bekern(
     bek_path: Path,
     expected_n_meas: int,
     mvd_data: Any,
-) -> Tuple[bool, str, int]:
+) -> Tuple[bool, str, int, int]:
     """Strict inline hard gate: verify 0 OOV against closed VOCAB (237) and n_bar_toks == expected_n_meas."""
     try:
         toks = mvd_data.load_bekern(bek_path)
     except Exception as exc:
-        return False, f"load_bekern_failed: {exc}", 0
+        return False, f"load_bekern_failed: {exc}", 0, 0
     if len(toks) < 4:
-        return False, "too_few_tokens", 0
+        return False, "too_few_tokens", 0, len(toks)
     try:
         mvd_data.encode(toks)
     except Exception as exc:
-        return False, f"oov_token: {exc}", 0
+        return False, f"oov_token: {exc}", 0, len(toks)
     n_bar_toks = sum(1 for t in toks if t == "bar")
     if n_bar_toks != expected_n_meas:
-        return False, f"barline_mismatch:{n_bar_toks}!={expected_n_meas}", n_bar_toks
-    return True, "ok", n_bar_toks
+        return False, f"barline_mismatch:{n_bar_toks}!={expected_n_meas}", n_bar_toks, len(toks)
+    return True, "ok", n_bar_toks, len(toks)
 
 
 def _worker_render_one(job: Dict[str, Any]) -> Dict[str, Any]:
@@ -470,6 +703,7 @@ def _worker_render_one(job: Dict[str, Any]) -> Dict[str, Any]:
     page_w, page_h = int(job["page_w"]), int(job["page_h"])
     is_landscape = bool(page_w > page_h)
     clean_paper = bool(job.get("clean_paper", False))
+    dense_hw_mode = bool(job.get("dense_hw_mode", False))
     max_parts = int(job.get("max_parts", 6))
     pages_dir = Path(job["pages_dir"])
     strips_dir = Path(job["strips_dir"])
@@ -489,16 +723,20 @@ def _worker_render_one(job: Dict[str, Any]) -> Dict[str, Any]:
                 n_bar_ok = 0
                 n_bar_fail = 0
                 n_oov_fail = 0
+                n_bars_page = 0
+                n_tokens_page = 0
                 for sys_obj in nonblank_sys:
                     k = int(sys_obj["system_index"])
                     n_meas = int(sys_obj["measure_end"]) - int(sys_obj["measure_start"])
+                    n_bars_page += n_meas
                     bek_p = strips_dir / f"{stem}_s{k}-bekern.txt"
                     png_p = strips_dir / f"{stem}_s{k}.png"
                     if bek_p.exists() and png_p.exists():
-                        ok_s, reason, _ = _validate_strip_bekern(bek_p, n_meas, mvd_data)
+                        ok_s, reason, _, n_toks = _validate_strip_bekern(bek_p, n_meas, mvd_data)
                         if ok_s:
                             valid_beks.append(str(bek_p.resolve()))
                             n_bar_ok += 1
+                            n_tokens_page += n_toks
                         elif reason.startswith("barline_mismatch"):
                             n_bar_fail += 1
                         elif reason.startswith("oov_token"):
@@ -526,9 +764,13 @@ def _worker_render_one(job: Dict[str, Any]) -> Dict[str, Any]:
                     "style": gt_payload.get("style", str(style_name_arg)),
                     "clean_paper": bool(gt_payload.get("clean_paper", clean_paper)),
                     "is_landscape": bool(int(gt_payload.get("page_w", page_w)) > int(gt_payload.get("page_h", page_h))),
+                    "page_w": int(gt_payload.get("page_w", page_w)),
+                    "page_h": int(gt_payload.get("page_h", page_h)),
                     "n_parts": len(nonblank_sys[0].get("staves", [])),
                     "n_systems": len(nonblank_sys),
                     "n_staves": len(s1_row["staves"]),
+                    "n_bars": n_bars_page,
+                    "n_tokens": n_tokens_page,
                     "n_strips_ok": len(valid_beks),
                     "n_strips_rejected": len(nonblank_sys) - len(valid_beks),
                     "n_bar_ok": n_bar_ok,
@@ -558,6 +800,12 @@ def _worker_render_one(job: Dict[str, Any]) -> Dict[str, Any]:
         style_arg: Any = sample_random_scribe(np_rng, jitter=0.25)
     else:
         style_arg = str(style_name_arg)
+
+    if dense_hw_mode:
+        resolved = dict(hw_styles.get_style(style_arg))
+        if isinstance(style_arg, str) and not resolved.get("name"):
+            resolved["name"] = style_arg
+        style_arg = _apply_dense_hw_style_overrides(resolved, n_parts=n_parts, is_landscape=is_landscape, rng=np_rng)
 
     work_strip_dir = tmp_export_dir / stem
     if work_strip_dir.exists():
@@ -599,6 +847,7 @@ def _worker_render_one(job: Dict[str, Any]) -> Dict[str, Any]:
         int(s["system_index"]): int(s["measure_end"]) - int(s["measure_start"])
         for s in nonblank_sys
     }
+    n_bars_page = sum(expected_meas_by_sys.values())
     exports_by_sys: Dict[int, Dict[str, Any]] = {
         int(exp["system_index"]): exp for exp in gt_payload.get("train_exports", [])
     }
@@ -609,6 +858,7 @@ def _worker_render_one(job: Dict[str, Any]) -> Dict[str, Any]:
     n_bar_ok = 0
     n_bar_fail = 0
     n_oov_fail = 0
+    n_tokens_page = 0
     ordered_valid_beks: List[str] = []
 
     if work_strip_dir.exists():
@@ -626,7 +876,7 @@ def _worker_render_one(job: Dict[str, Any]) -> Dict[str, Any]:
                 n_strips_rejected += 1
                 continue
 
-            ok_s, reason, _ = _validate_strip_bekern(src_bek, n_meas, mvd_data)
+            ok_s, reason, _, n_toks = _validate_strip_bekern(src_bek, n_meas, mvd_data)
             if not ok_s:
                 n_strips_rejected += 1
                 if reason.startswith("barline_mismatch"):
@@ -642,6 +892,7 @@ def _worker_render_one(job: Dict[str, Any]) -> Dict[str, Any]:
             ordered_valid_beks.append(str(dst_bek.resolve()))
             n_strips_ok += 1
             n_bar_ok += 1
+            n_tokens_page += n_toks
 
         shutil.rmtree(work_strip_dir, ignore_errors=True)
 
@@ -669,9 +920,13 @@ def _worker_render_one(job: Dict[str, Any]) -> Dict[str, Any]:
         "style": gt_payload.get("style", str(style_name_arg)),
         "clean_paper": clean_paper,
         "is_landscape": is_landscape,
+        "page_w": page_w,
+        "page_h": page_h,
         "n_parts": n_parts,
         "n_systems": len(nonblank_sys),
         "n_staves": len(s1_row["staves"]),
+        "n_bars": n_bars_page,
+        "n_tokens": n_tokens_page,
         "n_strips_ok": n_strips_ok,
         "n_strips_rejected": n_strips_rejected,
         "n_bar_ok": n_bar_ok,
@@ -811,14 +1066,20 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     parser.add_argument(
         "--landscape-frac",
         type=float,
-        default=0.45,
-        help="Fraction of pages rendered in landscape orientation (default 0.45)",
+        default=None,
+        help="Fraction of pages rendered in landscape orientation (default 0.50 in --dense-hw-mode, else 0.45)",
     )
     parser.add_argument(
         "--clean-paper-frac",
         type=float,
-        default=0.40,
-        help="Fraction of pages rendered with clean_paper=True vs native historical paper (default 0.40)",
+        default=None,
+        help="Fraction of pages rendered with clean_paper=True vs native historical paper (default 0.30 in --dense-hw-mode, else 0.40)",
+    )
+    parser.add_argument(
+        "--dense-hw-mode",
+        action="store_true",
+        default=False,
+        help="Enable suite31_hw-matched dense layout (4-6 systems, 20-45 bars/page), staff-count rebalancing (45%% 4-staff, 25%% 1-2, 25%% 3, 5%% 5-6), 50%% landscape, and 70%% native historical paper",
     )
     parser.add_argument(
         "--hero-frac",
@@ -884,8 +1145,15 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         t0 = time.time()
         target_count = int(args.count)
         max_parts = max(1, int(args.max_parts))
-        landscape_frac = float(np.clip(args.landscape_frac, 0.0, 1.0))
-        clean_paper_frac = 1.0 if bool(args.clean_paper) else float(np.clip(args.clean_paper_frac, 0.0, 1.0))
+        dense_hw_mode = bool(args.dense_hw_mode)
+        default_land = 0.50 if dense_hw_mode else 0.45
+        default_clean = 0.30 if dense_hw_mode else 0.40
+        landscape_frac = float(np.clip(default_land if args.landscape_frac is None else args.landscape_frac, 0.0, 1.0))
+        clean_paper_frac = (
+            1.0
+            if bool(args.clean_paper)
+            else float(np.clip(default_clean if args.clean_paper_frac is None else args.clean_paper_frac, 0.0, 1.0))
+        )
         hero_frac = float(np.clip(args.hero_frac, 0.0, 1.0)) if hero_style_names else 0.0
         rand_frac = float(np.clip(args.rand_frac, 0.0, 1.0 - hero_frac))
         n_hero_target = int(round(target_count * hero_frac))
@@ -894,7 +1162,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         n_land_target = int(round(target_count * landscape_frac))
         n_clean_target = int(round(target_count * clean_paper_frac))
         print(
-            f"[init] target mix ({target_count} pages, max_parts={max_parts}): "
+            f"[init] target mix ({target_count} pages, max_parts={max_parts}, dense_hw_mode={dense_hw_mode}): "
             f"hero={n_hero_target} ({100.0*n_hero_target/max(1,target_count):.1f}%), "
             f"other_named={n_other_target} ({100.0*n_other_target/max(1,target_count):.1f}%), "
             f"random_scribe={n_rand_target} ({100.0*n_rand_target/max(1,target_count):.1f}%), "
@@ -938,6 +1206,30 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         pool_pass = 0
         pool_order = list(pool)
 
+        # Optional staff-count bucketed pool for --dense-hw-mode
+        bucket_pools: Dict[str, List[Tuple[str, Path]]] = {}
+        bucket_cursors: Dict[str, int] = {}
+        bucket_passes: Dict[str, int] = {}
+        slot_buckets: List[Optional[str]] = [None] * target_count
+        if dense_hw_mode:
+            t_b = time.time()
+            bucket_pools = bucket_pool_by_parts(pool, max_parts=max_parts, seed=args.seed)
+            bucket_counts = _allocate_bucket_counts(target_count, sorted(bucket_pools.keys()))
+            bucket_cursors = {k: 0 for k in bucket_pools}
+            bucket_passes = {k: 0 for k in bucket_pools}
+            b_slots: List[str] = []
+            for b_name, _ in DENSE_HW_BUCKET_WEIGHTS:
+                b_slots.extend([b_name] * bucket_counts.get(b_name, 0))
+            if len(b_slots) == target_count:
+                perm_b = rng.permutation(target_count)
+                slot_buckets = [b_slots[int(i)] for i in perm_b]
+            print(
+                f"[init] dense-hw buckets scanned in {time.time() - t_b:.2f}s: "
+                f"available={{{', '.join(f'{k}:{len(v)}' for k, v in sorted(bucket_pools.items()))}}}, "
+                f"target_slots={bucket_counts}",
+                flush=True,
+            )
+
         # Submit in batches so if any score fails to parse/render, we immediately backfill from the pool
         # until we have exactly `target_count` successful pages. Wrap around pool deterministically
         # when target_count > len(pool) so scores render in fresh handwritten styles.
@@ -945,8 +1237,28 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         failed_attempts = 0
         max_failures = target_count * 5
 
-        def make_job(slot_idx: int) -> Optional[Dict[str, Any]]:
+        def _next_candidate_for_slot(slot_idx: int) -> Optional[Tuple[str, Path, int]]:
             nonlocal pool_cursor, pool_pass, pool_order
+            b_key = slot_buckets[slot_idx] if dense_hw_mode else None
+            if b_key and b_key in bucket_pools and bucket_pools[b_key]:
+                b_list = bucket_pools[b_key]
+                attempts = 0
+                while attempts < len(b_list) * 2:
+                    if bucket_cursors[b_key] >= len(b_list):
+                        bucket_passes[b_key] += 1
+                        bucket_cursors[b_key] = 0
+                        p_rng = np.random.default_rng(args.seed + 1009 * bucket_passes[b_key] + hash(b_key) % 997)
+                        perm = p_rng.permutation(len(b_list))
+                        bucket_pools[b_key] = [b_list[int(i)] for i in perm]
+                        b_list = bucket_pools[b_key]
+                    pool_name, score_path = b_list[bucket_cursors[b_key]]
+                    bucket_cursors[b_key] += 1
+                    attempts += 1
+                    if is_eval_blocked(score_path, raw_slugs, norm_tokens, gt_sha256s, check_sha=True):
+                        continue
+                    return pool_name, score_path, bucket_passes[b_key]
+                return None
+
             attempts = 0
             while attempts < len(pool_order) * 2:
                 if pool_cursor >= len(pool_order):
@@ -958,32 +1270,42 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 pool_name, score_path = pool_order[pool_cursor]
                 pool_cursor += 1
                 attempts += 1
-                # Full SHA check on actually selected score before rendering
                 if is_eval_blocked(score_path, raw_slugs, norm_tokens, gt_sha256s, check_sha=True):
                     continue
-                mode, sname = interleaved_assign[slot_idx]
-                sizes = LANDSCAPE_PAGE_SIZES if land_flags[slot_idx] else PAGE_SIZES
-                pw, ph = sizes[slot_idx % len(sizes)]
-                stem = f"hwsim_{slot_idx:05d}"
-                return {
-                    "idx": slot_idx,
-                    "stem": stem,
-                    "score_path": str(score_path),
-                    "pool_name": pool_name,
-                    "mode": mode,
-                    "style_name": sname,
-                    "seed": args.seed + slot_idx * 97 + failed_attempts * 13 + pool_pass * 7919,
-                    "page_w": pw,
-                    "page_h": ph,
-                    "max_parts": max_parts,
-                    "pages_dir": str(pages_dir),
-                    "strips_dir": str(strips_dir),
-                    "tmp_export_dir": str(tmp_export_dir),
-                    "clean_paper": bool(clean_flags[slot_idx]),
-                }
+                return pool_name, score_path, pool_pass
             return None
 
-        with ProcessPoolExecutor(max_workers=int(args.workers)) as ex:
+        def make_job(slot_idx: int) -> Optional[Dict[str, Any]]:
+            cand = _next_candidate_for_slot(slot_idx)
+            if cand is None:
+                return None
+            pool_name, score_path, pass_num = cand
+            mode, sname = interleaved_assign[slot_idx]
+            if dense_hw_mode:
+                sizes = DENSE_LANDSCAPE_PAGE_SIZES if land_flags[slot_idx] else DENSE_PAGE_SIZES
+            else:
+                sizes = LANDSCAPE_PAGE_SIZES if land_flags[slot_idx] else PAGE_SIZES
+            pw, ph = sizes[slot_idx % len(sizes)]
+            stem = f"hwsim_{slot_idx:05d}"
+            return {
+                "idx": slot_idx,
+                "stem": stem,
+                "score_path": str(score_path),
+                "pool_name": pool_name,
+                "mode": mode,
+                "style_name": sname,
+                "seed": args.seed + slot_idx * 97 + failed_attempts * 13 + pass_num * 7919,
+                "page_w": pw,
+                "page_h": ph,
+                "max_parts": max_parts,
+                "dense_hw_mode": dense_hw_mode,
+                "pages_dir": str(pages_dir),
+                "strips_dir": str(strips_dir),
+                "tmp_export_dir": str(tmp_export_dir),
+                "clean_paper": bool(clean_flags[slot_idx]),
+            }
+
+        with ProcessPoolExecutor(max_workers=int(args.workers), max_tasks_per_child=40) as ex:
             in_flight = {}
             while pending_slots or in_flight:
                 while pending_slots and len(in_flight) < int(args.workers) * 2:
@@ -1060,10 +1382,27 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         tot_oov_fail = sum(int(r.get("n_oov_fail", 0)) for r in ordered)
         pool_hist: Dict[str, int] = {}
         parts_hist: Dict[str, int] = {}
+        systems_hist: Dict[str, int] = {}
+        bars_list: List[int] = []
+        tokens_list: List[int] = []
+        sys_list: List[int] = []
+        px_per_staff_1280_list: List[float] = []
         for r in ordered:
             pool_hist[r["pool_name"]] = pool_hist.get(r["pool_name"], 0) + 1
             pk = str(r.get("n_parts", 0))
             parts_hist[pk] = parts_hist.get(pk, 0) + 1
+            sk = str(r.get("n_systems", 0))
+            systems_hist[sk] = systems_hist.get(sk, 0) + 1
+            bars_list.append(int(r.get("n_bars", 0)))
+            if r.get("fullpage_ok"):
+                tokens_list.append(int(r.get("n_tokens", 0)))
+            sys_list.append(int(r.get("n_systems", 0)))
+            n_st = int(r.get("n_staves", 0))
+            pw_r = int(r.get("page_w", 0))
+            ph_r = int(r.get("page_h", 0))
+            if n_st > 0 and pw_r > 0 and ph_r > 0:
+                h_at_1280 = ph_r * (1280.0 / float(pw_r))
+                px_per_staff_1280_list.append(h_at_1280 / float(n_st))
 
         ver = run_verification(
             stage1_manifest=stage1_manifest,
@@ -1077,6 +1416,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         assert ver["fullpage_oov_count"] == 0, f"OOV TOKENS DETECTED: {ver['fullpage_oov_count']}"
 
         summary = {
+            "dense_hw_mode": dense_hw_mode,
             "max_parts": max_parts,
             "landscape_frac_target": landscape_frac,
             "clean_paper_frac_target": clean_paper_frac,
@@ -1094,6 +1434,13 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             "barline_fail_strips": tot_bar_fail,
             "oov_fail_strips": tot_oov_fail,
             "parts_breakdown": parts_hist,
+            "systems_breakdown": systems_hist,
+            "median_systems_per_page": round(float(np.median(sys_list)), 2) if sys_list else 0.0,
+            "median_bars_per_page": round(float(np.median(bars_list)), 2) if bars_list else 0.0,
+            "median_tokens_per_page": round(float(np.median(tokens_list)), 1) if tokens_list else 0.0,
+            "median_px_per_staff_at_1280": round(float(np.median(px_per_staff_1280_list)), 1)
+            if px_per_staff_1280_list
+            else 0.0,
             "fullpage_manifest": str(fullpage_manifest),
             "stage1_manifest": str(stage1_manifest),
             "stage1_new_rows": len(ordered),
