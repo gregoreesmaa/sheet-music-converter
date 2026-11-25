@@ -790,6 +790,7 @@ def forward_and_loss_v2(
     sys_count_loss_weight: float = 0.15,
     staff_seg_loss_weight: float = 0.20,
     stroke_hog_weight: float = 0.15,
+    label_smoothing: float = 0.05,
     sys_y_target: Optional[torch.Tensor] = None,
     sys_y_mask: Optional[torch.Tensor] = None,
     staff_seg_target: Optional[torch.Tensor] = None,
@@ -824,6 +825,7 @@ def forward_and_loss_v2(
                     (torch.rand_like(tail_in, dtype=torch.float32) < cass_prob)
                     & (tail_in != PAD_ID)
                     & (tail_in != BOS_ID)
+                    & (pred_ids[:, :-1] != EOS_ID)
                 )
                 dec_in = torch.cat(
                     [tgt_in[:, :1], torch.where(cass_mask, pred_ids[:, :-1], tail_in)],
@@ -834,6 +836,7 @@ def forward_and_loss_v2(
                 mem_levels,
                 return_mtp=(model.cfg.mtp_k > 1),
                 return_aux=True,
+                apply_tok_dropout=False,
             )
             out: Dict[str, Any] = {
                 "logits": logits,
@@ -861,6 +864,7 @@ def forward_and_loss_v2(
             sys_count_loss_weight=sys_count_loss_weight,
             staff_seg_loss_weight=staff_seg_loss_weight,
             stroke_hog_loss_weight=stroke_hog_weight,
+            label_smoothing=label_smoothing,
         )
 
         # Hybrid KD: prefer offline Top-K cache hits, otherwise fall back to online frozen v1 teacher.
@@ -1571,6 +1575,7 @@ def run_train_v2(args: argparse.Namespace) -> Dict[str, Any]:
                         sys_count_loss_weight=float(args.sys_count_loss_weight),
                         staff_seg_loss_weight=float(args.staff_seg_loss_weight),
                         stroke_hog_weight=float(args.stroke_hog_weight),
+                        label_smoothing=float(args.label_smoothing),
                         use_bf16=use_bf16,
                         device=device,
                     )
@@ -1776,6 +1781,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--sys-count-loss-weight", type=float, default=0.15)
     p.add_argument("--staff-seg-loss-weight", type=float, default=0.20)
     p.add_argument("--stroke-hog-weight", type=float, default=0.15)
+    p.add_argument("--label-smoothing", type=float, default=0.05)
     p.add_argument("--cass-prob", type=float, default=0.0)
     p.add_argument("--qat-int4", action="store_true")
     p.add_argument("--qat-int4-last-frac", type=float, default=0.15)

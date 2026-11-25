@@ -1809,11 +1809,15 @@ class UniOMRv2Net(nn.Module):
         sys_count_loss_weight: float = 0.15,
         staff_seg_loss_weight: float = 0.20,
         stroke_hog_loss_weight: float = 0.15,
+        label_smoothing: float = 0.0,
     ) -> Dict[str, torch.Tensor]:
         """Compute combined CE + MTP-4 + router saliency + layout & stroke-HOG aux losses."""
         logits: torch.Tensor = out["logits"]
         V = logits.shape[-1]
-        ce_loss = F.cross_entropy(logits.reshape(-1, V), targets.reshape(-1), ignore_index=PAD_ID)
+        ls = float(max(0.0, min(0.5, label_smoothing)))
+        ce_loss = F.cross_entropy(
+            logits.reshape(-1, V), targets.reshape(-1), ignore_index=PAD_ID, label_smoothing=ls
+        )
 
         # MTP-4 auxiliary losses
         mtp_logits: List[torch.Tensor] = out.get("mtp_logits", [])
@@ -1824,7 +1828,7 @@ class UniOMRv2Net(nn.Module):
             if T > shift:
                 m_pred = m_logits[:, :-shift, :].reshape(-1, V)
                 m_tgt = targets[:, shift:].reshape(-1)
-                m_loss = F.cross_entropy(m_pred, m_tgt, ignore_index=PAD_ID)
+                m_loss = F.cross_entropy(m_pred, m_tgt, ignore_index=PAD_ID, label_smoothing=ls)
                 mtp_terms.append(torch.nan_to_num(m_loss, nan=0.0))
         mtp_loss = torch.stack(mtp_terms).mean() if mtp_terms else logits.new_zeros(())
 

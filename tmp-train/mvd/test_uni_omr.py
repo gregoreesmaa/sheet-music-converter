@@ -1441,7 +1441,7 @@ class TestUniOMR(unittest.TestCase):
         import random as _py_random
         import time as _time
 
-        arr = np.full((960, 1280, 3), 236, dtype=np.uint8)
+        arr = np.full((960, 1280, 3), 248, dtype=np.uint8)
         for sy in range(180, 720, 140):
             for k in range(5):
                 arr[sy + k * 8 : sy + k * 8 + 2, 100:1180, :] = 35
@@ -1692,14 +1692,13 @@ class TestUniOMR(unittest.TestCase):
             img[:, :, sy : sy + 2, 130:382] = 0.45
 
         local_ink_grid, paper_gate, eff_paper = uni_omr.InkTokenRouter._compute_ink_and_paper_gate(img, 32, 32)
-        # Transition ring (cells 4 and 5 adjacent to border cells 0..3) must be zeroed & gated to 0.05
-        self.assertEqual(float(local_ink_grid[0, 0, :6, :].max().item()), 0.0)
-        self.assertEqual(float(local_ink_grid[0, 0, -6:, :].max().item()), 0.0)
-        self.assertEqual(float(local_ink_grid[0, 0, :, :6].max().item()), 0.0)
-        self.assertEqual(float(local_ink_grid[0, 0, :, -6:].max().item()), 0.0)
+        # 64px border (cells 0..3) + 16px pixel-space dilation (cell 4) must be zeroed & gated to 0.05
+        self.assertEqual(float(local_ink_grid[0, 0, :5, :].max().item()), 0.0)
+        self.assertEqual(float(local_ink_grid[0, 0, -5:, :].max().item()), 0.0)
+        self.assertEqual(float(local_ink_grid[0, 0, :, :5].max().item()), 0.0)
+        self.assertEqual(float(local_ink_grid[0, 0, :, -5:].max().item()), 0.0)
         self.assertAlmostEqual(float(paper_gate[0, 0, 4, 16].item()), 0.05, places=5)
-        self.assertAlmostEqual(float(paper_gate[0, 0, 5, 16].item()), 0.05, places=5)
-        # Interior faint ink must remain strongly active
+        # Interior faint ink (cell 5+) must remain strongly active
         self.assertTrue(bool(eff_paper[0, 0, 12, 16].item()))
         self.assertGreater(float(local_ink_grid[0, 0, 11:15, 10:22].max().item()), 0.05)
 
@@ -1751,9 +1750,16 @@ class TestUniOMR(unittest.TestCase):
         np.testing.assert_array_equal(np.asarray(sn1), np.asarray(sn2))
         self.assertFalse(np.array_equal(np.asarray(sn1), arr))
 
-        lr1 = uni_omr._apply_hw_lowres_defocus_compress(base, _py_random.Random(99))
-        lr2 = uni_omr._apply_hw_lowres_defocus_compress(base, _py_random.Random(99))
-        self.assertEqual(lr1.size, base.size)
+        # Gated off below 1280px; active on >= 1280px
+        lr_small = uni_omr._apply_hw_lowres_defocus_compress(base, _py_random.Random(99))
+        np.testing.assert_array_equal(np.asarray(lr_small), arr)
+
+        arr_hi = np.full((1280, 960, 3), 248, dtype=np.uint8)
+        arr_hi[120:1160:24, 60:900, :] = 20
+        base_hi = Image.fromarray(arr_hi, mode="RGB")
+        lr1 = uni_omr._apply_hw_lowres_defocus_compress(base_hi, _py_random.Random(99))
+        lr2 = uni_omr._apply_hw_lowres_defocus_compress(base_hi, _py_random.Random(99))
+        self.assertEqual(lr1.size, base_hi.size)
         np.testing.assert_array_equal(np.asarray(lr1), np.asarray(lr2))
         # Contrast compression lifts darkest ink pixels upward from 20
         self.assertGreater(float(np.asarray(lr1).min()), 30.0)
@@ -1816,16 +1822,16 @@ class TestUniOMR(unittest.TestCase):
             logits_ref = model(img, tgt_in, return_aux=False, return_mtp=False)["logits"].clone()
 
         ctrl = uni_omr.QATInt4Controller(model, block_size=32, enabled=False)
-        # Expected count: 2*6 (enc) + 2*10 (dec) + 3 (mtp_heads) + 1 (lm_head) = 36
-        self.assertEqual(ctrl.num_layers, 36)
-        allowed_prefixes = ("enc_layers.", "dec_layers.", "mtp_heads.", "lm_head")
+        # Expected count: 2*6 (enc) + 2*10 (dec) + 3 (mtp_heads) = 35 (lm_head excluded!)
+        self.assertEqual(ctrl.num_layers, 35)
+        allowed_prefixes = ("enc_layers.", "dec_layers.", "mtp_heads.")
         for name in ctrl.target_names:
             self.assertTrue(
-                name == "lm_head" or name.startswith(allowed_prefixes[:3]),
+                name.startswith(allowed_prefixes),
                 f"Unexpected QAT target: {name}",
             )
-        # Ensure non-target modules are never patched
-        for forbidden in ("backbone", "router", "tok_emb", "pos2d_proj", "uv_head", "enc_norm", "dec_norm"):
+        # Ensure non-target modules (including lm_head) are never patched
+        for forbidden in ("lm_head", "backbone", "router", "tok_emb", "pos2d_proj", "uv_head", "enc_norm", "dec_norm"):
             self.assertFalse(
                 any(n == forbidden or n.startswith(f"{forbidden}.") for n in ctrl.target_names),
                 f"Forbidden module {forbidden} was patched by QATInt4Controller",
@@ -1892,7 +1898,7 @@ class TestUniOMR(unittest.TestCase):
             ])
         self.assertEqual(rc, 0)
         out_txt = buf.getvalue()
-        self.assertIn("[UniOMR QAT-INT4] enabled on 18 Linear layers (block_size=32) at step 1/2", out_txt)
+        self.assertIn("[UniOMR QAT-INT4] enabled on 17 Linear layers (block_size=32) at step 1/2", out_txt)
 
     def test_zf_qat_int4_cached_delta_bit_exact_ste_parity(self) -> None:
         """(zf) Iter-10: QATInt4Controller cached deltas match uncached fake_quant_int4_ste bit-identically (fwd + STE grad)."""
@@ -2179,12 +2185,16 @@ class TestUniOMR(unittest.TestCase):
         arr[40:340:12, 24:264, :] = 22
         base = Image.fromarray(arr, mode="RGB")
 
+        arr_hi = np.full((1280, 960, 3), 246, dtype=np.uint8)
+        arr_hi[120:1160:24, 60:900, :] = 22
+        base_hi = Image.fromarray(arr_hi, mode="RGB")
+
         # 1. cv2 path (if installed) sanity + determinism + speed
         t0 = _time.perf_counter()
-        out_lr1 = uni_omr._apply_hw_lowres_defocus_compress(base, _py_random.Random(123))
-        out_lr2 = uni_omr._apply_hw_lowres_defocus_compress(base, _py_random.Random(123))
+        out_lr1 = uni_omr._apply_hw_lowres_defocus_compress(base_hi, _py_random.Random(123))
+        out_lr2 = uni_omr._apply_hw_lowres_defocus_compress(base_hi, _py_random.Random(123))
         out_blur = uni_omr._fast_gaussian_blur(base, 0.8)
-        out_rot = uni_omr._fast_rotate(base, 3.0, (240, 240, 240))
+        out_rot = uni_omr._fast_rotate(base, 3.0, (240, 240, 240), expand=True)
         out_persp = uni_omr._fast_perspective(
             base,
             [(0.0, 0.0), (288.0, 0.0), (288.0, 384.0), (0.0, 384.0)],
@@ -2194,7 +2204,9 @@ class TestUniOMR(unittest.TestCase):
         out_full = uni_omr.apply_online_augment(base, rng=_py_random.Random(99), is_hw=True)
         elapsed_ms = (_time.perf_counter() - t0) * 1000.0
 
-        for im in (out_lr1, out_blur, out_rot, out_persp, out_full):
+        self.assertEqual(out_lr1.size, base_hi.size)
+        self.assertEqual(out_lr1.mode, "RGB")
+        for im in (out_blur, out_rot, out_persp, out_full):
             self.assertEqual(im.size, base.size)
             self.assertEqual(im.mode, "RGB")
         np.testing.assert_array_equal(np.asarray(out_lr1), np.asarray(out_lr2))
@@ -2203,19 +2215,83 @@ class TestUniOMR(unittest.TestCase):
 
         # 2. Graceful PIL fallback when _cv2 is None
         with mock.patch.object(uni_omr, "_cv2", None):
-            fb_lr = uni_omr._apply_hw_lowres_defocus_compress(base, _py_random.Random(123))
+            fb_lr = uni_omr._apply_hw_lowres_defocus_compress(base_hi, _py_random.Random(123))
             fb_blur = uni_omr._fast_gaussian_blur(base, 0.8)
-            fb_rot = uni_omr._fast_rotate(base, 3.0, (240, 240, 240))
+            fb_rot = uni_omr._fast_rotate(base, 3.0, (240, 240, 240), expand=True)
             fb_persp = uni_omr._fast_perspective(
                 base,
                 [(0.0, 0.0), (288.0, 0.0), (288.0, 384.0), (0.0, 384.0)],
                 [(6.0, 8.0), (280.0, 6.0), (282.0, 376.0), (8.0, 378.0)],
                 (25, 25, 25),
             )
-            for im in (fb_lr, fb_blur, fb_rot, fb_persp):
+            self.assertEqual(fb_lr.size, base_hi.size)
+            self.assertEqual(fb_lr.mode, "RGB")
+            for im in (fb_blur, fb_rot, fb_persp):
                 self.assertEqual(im.size, base.size)
                 self.assertEqual(im.mode, "RGB")
             self.assertGreater(float(np.asarray(fb_lr).min()), 30.0)
+
+    def test_zk_iter10_5_fixes(self) -> None:
+        """(zk) Iter-10.5: struct_tok_weight=1.0, label_smoothing, _cap_token_ids, multi-scale, split_train_val dedup, quiet-zone."""
+        import random as _py_random
+
+        # 1. struct_tok_weight <= 1.0 -> exact all-1.0 weights; label_smoothing wired
+        model = uni_omr.UniOMRNet(_small_cfg(d_model=64, n_enc_layers=1, n_dec_layers=1, n_heads=4, mtp_k=1))
+        w1 = model._get_struct_token_weights(uni_omr.VOCAB_SIZE, 1.0, torch.device("cpu"), torch.float32)
+        self.assertTrue(torch.equal(w1, torch.ones(uni_omr.VOCAB_SIZE, dtype=torch.float32)))
+        ap = uni_omr.build_arg_parser()
+        self.assertAlmostEqual(ap.parse_args([]).label_smoothing, 0.0)
+        self.assertAlmostEqual(ap.parse_args(["--label-smoothing", "0.05"]).label_smoothing, 0.05)
+
+        # 2. _cap_token_ids never appends EOS_ID on truncation
+        long_ids = [uni_omr.BOS_ID] + list(range(10, 60)) + [uni_omr.EOS_ID]
+        capped = uni_omr._cap_token_ids(long_ids, 20)
+        self.assertEqual(len(capped), 20)
+        self.assertNotIn(uni_omr.EOS_ID, capped)
+        self.assertEqual(capped, long_ids[:20])
+
+        # 3. _sample_weighted_fullpage_dim drops 512..768px and samples 1024..1536px
+        rng = _py_random.Random(1234)
+        dims = [uni_omr._sample_weighted_fullpage_dim(1536, rng=rng) for _ in range(500)]
+        self.assertGreaterEqual(min(dims), 1024)
+        self.assertLessEqual(max(dims), 1536)
+        frac_1536 = dims.count(1536) / len(dims)
+        self.assertGreater(frac_1536, 0.40)
+
+        # 4. split_train_val deduplicates by resolved image path & groups by underlying bekern stems
+        with tempfile.TemporaryDirectory() as td:
+            td_p = Path(td)
+            p_a = td_p / "degraded_001.jpg"
+            p_b = td_p / "clean_002.png"
+            p_c = td_p / "other_003.png"
+            b_shared = td_p / "mozart_p1_s0-bekern.txt"
+            b_other = td_p / "bach_p1_s0-bekern.txt"
+            for f in (p_a, p_b, p_c, b_shared, b_other):
+                f.write_text("x", encoding="utf-8")
+            items = [
+                (p_a, [b_shared]),
+                (p_a, [b_shared]),  # duplicate image path
+                (p_b, [b_shared]),  # different image name, same bekern source stem
+                (p_c, [b_other]),
+            ]
+            tr, va = uni_omr.split_train_val(items, key_fn=lambda x: x[0].stem, val_count=1, seed=7)
+            self.assertEqual(len(tr) + len(va), 3)  # duplicate removed
+            tr_beks = {b for x in tr for b in uni_omr._bekern_source_keys(x)}
+            va_beks = {b for x in va for b in uni_omr._bekern_source_keys(x)}
+            self.assertEqual(tr_beks & va_beks, set())
+
+        # 5. Quiet-zone check prevents occluding inked regions
+        inked = Image.fromarray(np.full((256, 256, 3), 100, dtype=np.uint8), mode="RGB")
+        inked_arr = np.asarray(inked)
+        np.testing.assert_array_equal(
+            np.asarray(uni_omr._apply_corner_sticky_note(inked, _py_random.Random(1))), inked_arr
+        )
+        np.testing.assert_array_equal(
+            np.asarray(uni_omr._apply_composer_scratchouts(inked, _py_random.Random(1))), inked_arr
+        )
+        np.testing.assert_array_equal(
+            np.asarray(uni_omr._apply_archival_verse_block(inked, _py_random.Random(1), (60, 50, 40))), inked_arr
+        )
 
 
 if __name__ == "__main__":

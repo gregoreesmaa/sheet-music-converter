@@ -80,7 +80,7 @@ _WRITTEN = {'breve': 8.0, 'whole': 4.0, 'half': 2.0, 'quarter': 1.0,
 _BAR_EPS = 1e-6
 MAX_CHORDS_PER_ONSET = 8
 MAX_CONSECUTIVE_GRACE = 8
-MAX_CONSECUTIVE_BAR_REST = 8
+MAX_CONSECUTIVE_BAR_REST = 24
 LAX_BAR_MULT = 2.5
 LAX_BAR_MIN_BEATS = 8.0
 SHORT_PICKUP_TIMES = frozenset(['time-1-32', 'time-1-16'])
@@ -336,20 +336,29 @@ class PrefixState:
         return (self.vcurs[self.seg] + self._pending_value()
                 + _WRITTEN['128th'] * self._open_scale() > limit + _BAR_EPS)
 
-    def _short_pickup_time_ok(self, prev_tok):
-        """Allow time-1-32 / time-1-16 only in header or immediately after a bar* token."""
+    def _short_pickup_time_ok(self, prev_tok=None, recent_before=None):
+        """Allow time-1-32 / time-1-16 in header, after a bar* token (allowing clef*/key* between), or when already in a short pickup bar."""
         if self.header_open:
+            return True
+        if self.tsig is not None and self.tsig <= 0.25 + _BAR_EPS:
+            return True
+        if recent_before is not None:
+            for tok in reversed(recent_before):
+                if tok in CLEFS or tok in KEYS:
+                    continue
+                return tok in BAR_LIKES or tok in BAR_LEFT
             return True
         return prev_tok is not None and (prev_tok in BAR_LIKES or prev_tok in BAR_LEFT)
 
     def _header_attr_ok(self):
         """Allow key*/time-* at system start, bar start, or full-bar end (courtesy change).
 
-        Forbids stray mid-bar key*/time-* emitted after a note/rest inside an
-        incomplete bar (0 < cur_used < tsig - eps), while preserving opening
-        headers, post-barline changes, and full-bar courtesy changes.
+        In lax mode (strict=False), also permits legitimate mid-bar key*/time-* changes.
+        In strict mode, forbids stray mid-bar key*/time-* emitted after a note/rest inside
+        an incomplete bar (0 < cur_used < tsig - eps), while preserving opening headers,
+        post-barline changes, and full-bar courtesy changes.
         """
-        if self.header_open:
+        if not self.strict or self.header_open:
             return True
         cur_used = self.vcurs[self.seg] + self._pending_value()
         if cur_used <= _BAR_EPS:
@@ -388,8 +397,7 @@ class PrefixState:
             if (t in KEYS or t in TIMES) and not self._header_attr_ok():
                 raise ValueError('spurious mid-bar header %r' % t)
             if t in SHORT_PICKUP_TIMES:
-                prev_tok = self.recent[-2] if len(self.recent) >= 2 else None
-                if not self._short_pickup_time_ok(prev_tok):
+                if not self._short_pickup_time_ok(recent_before=self.recent[:-1]):
                     raise ValueError('spurious mid-bar pickup time %r' % t)
             if t in TIMES:
                 self._apply_tsig(_beats_of(t))
@@ -809,14 +817,16 @@ class PrefixState:
         ngram_min=8,
         ngram_max=16,
         max_ngram_repeats=3,
+        non_bar_ngram_repeats=8,
         bar_ngram_max=64,
     ):
         """Token STRING that would extend a tight cycle or n-gram loop.
 
         Returns the single forbidden continuation token, or None. Checks:
-        1. Identical 8-to-16-token pattern repeated ``max_ngram_repeats`` (3)
-           consecutive times (blocks the 4th consecutive repeat while keeping
-           real musical ostinatos up to 3 repeats legal).
+        1. Identical 8-to-16-token pattern: requires a bar token (``BAR_LIKES``)
+           inside the pattern to trigger at ``max_ngram_repeats`` (3) consecutive
+           repeats; non-bar 8..16-token patterns (legitimate musical ostinatos /
+           arpeggios) require ``non_bar_ngram_repeats`` (8) consecutive repeats.
         2. Identical bar-containing pattern of length 17..64 repeated
            ``max_ngram_repeats`` (3) consecutive times (kills verbatim
            multi-bar loops without touching non-bar ostinatos).
@@ -830,15 +840,19 @@ class PrefixState:
             return None
         r = self.recent
         n = len(r)
-        # 1. Conservative 8..16-token n-gram loop guard (>3 consecutive repeats)
+        # 1. Conservative 8..16-token n-gram loop guard (bar: >3x, non-bar ostinato: >=8x)
         for p in range(ngram_min, ngram_max + 1):
             if n < max_ngram_repeats * p:
                 continue
             if r[n - p] != r[n - 2 * p]:
                 continue
             base = r[n - p:]
+            has_bar = any(tok in BAR_LIKES for tok in base)
+            req_reps = max_ngram_repeats if has_bar else non_bar_ngram_repeats
+            if n < req_reps * p:
+                continue
             ok = True
-            for k in range(1, max_ngram_repeats):
+            for k in range(1, req_reps):
                 if r[n - (k + 1) * p:n - k * p] != base:
                     ok = False
                     break
@@ -940,8 +954,7 @@ class PrefixState:
             hdr_ok = self._header_attr_ok()
             if hdr_ok:
                 allow.update(vm[t] for t in KEYS if t in vm)
-                prev_tok = self.recent[-1] if self.recent else None
-                short_ok = self._short_pickup_time_ok(prev_tok)
+                short_ok = self._short_pickup_time_ok(recent_before=self.recent)
                 for t in TIMES:
                     if t in vm and (short_ok or t not in SHORT_PICKUP_TIMES):
                         allow.add(vm[t])

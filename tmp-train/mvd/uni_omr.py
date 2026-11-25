@@ -433,6 +433,7 @@ class InkTokenRouter(nn.Module):
         min_keep_ratio: float = 0.15,
         max_keep_ratio: float = 0.75,
         saliency_thr: float = 0.05,
+        max_kept_tokens: int = 10240,
     ) -> None:
         super().__init__()
         if not (0.0 < keep_ratio <= 1.0):
@@ -443,6 +444,7 @@ class InkTokenRouter(nn.Module):
         self.min_keep_ratio = float(min_keep_ratio)
         self.max_keep_ratio = float(max_keep_ratio)
         self.saliency_thr = float(saliency_thr)
+        self.max_kept_tokens = int(max_kept_tokens)
         self.n_bg_summary = int(n_bg_summary)
         self.use_ink_prior = bool(use_ink_prior)
 
@@ -475,15 +477,14 @@ class InkTokenRouter(nn.Module):
     def _compute_ink_and_paper_gate(
         images: torch.Tensor, h_p: int, w_p: int
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Compute border-masked relative high-pass ink map, soft paper_gate, and effective_paper.
+        """Compute edge-connected dark-border-masked high-pass ink map and soft paper_gate.
 
-        Suppresses dark exterior desk/scanner border rings (``local_bg <= 0.35``)
-        and erodes ``paper_mask_grid`` by 2 patches (5x5 max-pool dilation of
-        non-paper) to eliminate the 2-patch (~32px) bright-paper-to-dark-desk
-        transition halo both in ``local_ink_grid`` (before ``q99`` normalization)
-        and via a detached soft ``paper_gate`` (``1.0`` on interior paper, ``0.05``
-        outside), while normalizing by local paper brightness so faint brown
-        iron-gall ink on warm parchment remains strongly salient.
+        Uses a fast vectorized 4-edge inward scan stopping at the first bright
+        pixel (``luma >= 0.45``) to isolate only dark exterior desk/scanner
+        borders (``luma < 0.30`` connected to the outer boundary), dilates that
+        outer border mask by 16px in pixel space (separable 1x33 + 33x1 max-pool)
+        to eliminate the paper-to-desk transition halo, and pools to the feature
+        grid. Interior shadows and dense dark ink are NEVER masked out.
         """
         # Standard Rec.601 luma for RGB in [0, 1], computed in float32 for precision.
         img_f = images.float()
@@ -495,6 +496,24 @@ class InkTokenRouter(nn.Module):
             )
         else:
             luma = img_f.mean(dim=1, keepdim=True)
+
+        # Edge-connected dark-border mask: 4-edge inward scan stopping at first bright pixel (luma >= 0.45)
+        bright_i = (luma >= 0.45).to(torch.int32)
+        top_dark = bright_i.cumsum(dim=2) == 0
+        bot_dark = bright_i.flip(dims=(2,)).cumsum(dim=2).flip(dims=(2,)) == 0
+        left_dark = bright_i.cumsum(dim=3) == 0
+        right_dark = bright_i.flip(dims=(3,)).cumsum(dim=3).flip(dims=(3,)) == 0
+        border_px = ((top_dark | bot_dark | left_dark | right_dark) & (luma < 0.30)).to(luma.dtype)
+
+        # Dilate ONLY the outer border mask by 16px in pixel space (separable 1x33 + 33x1)
+        border_dilated_px = F.max_pool2d(
+            F.max_pool2d(border_px, kernel_size=(1, 33), stride=1, padding=(0, 16)),
+            kernel_size=(33, 1),
+            stride=1,
+            padding=(16, 0),
+        )
+        paper_px = (1.0 - border_dilated_px).clamp(0.0, 1.0)
+
         local_bg = F.avg_pool2d(
             F.avg_pool2d(luma, kernel_size=(1, 31), stride=1, padding=(0, 15), count_include_pad=False),
             kernel_size=(31, 1),
@@ -502,26 +521,19 @@ class InkTokenRouter(nn.Module):
             padding=(15, 0),
             count_include_pad=False,
         )
-        paper_mask = (local_bg > 0.35).to(luma.dtype)
-        local_ink = ((local_bg - luma) / local_bg.clamp(min=0.15)).clamp(0.0, 1.0) * paper_mask
+        local_ink = ((local_bg - luma) / local_bg.clamp(min=0.15)).clamp(0.0, 1.0) * paper_px
         ink_max = F.adaptive_max_pool2d(local_ink, (h_p, w_p))
         ink_avg = F.adaptive_avg_pool2d(local_ink, (h_p, w_p))
         local_ink_grid = 0.5 * ink_max + 0.5 * ink_avg
 
-        local_bg_grid = F.adaptive_avg_pool2d(local_bg, (h_p, w_p))
-        paper_mask_grid = (local_bg_grid > 0.35).detach()
-        non_paper = (~paper_mask_grid).to(torch.float32)
-        border_dilated = F.max_pool2d(non_paper, kernel_size=5, stride=1, padding=2) > 0.5
-        interior_paper = paper_mask_grid & (~border_dilated)
-        # Fallback if entire image is dark/eroded away:
-        has_interior = interior_paper.flatten(1).any(dim=1).view(-1, 1, 1, 1)
-        effective_paper = torch.where(has_interior, interior_paper, paper_mask_grid).detach()
+        paper_grid_f = F.adaptive_avg_pool2d(paper_px, (h_p, w_p))
+        effective_paper = (paper_grid_f > 0.5).detach()
 
         local_ink_grid = local_ink_grid * effective_paper.to(local_ink_grid.dtype)
         paper_gate = torch.where(
             effective_paper,
-            torch.ones_like(local_bg_grid),
-            torch.full_like(local_bg_grid, 0.05),
+            torch.ones_like(paper_grid_f),
+            torch.full_like(paper_grid_f, 0.05),
         ).detach()
         return local_ink_grid, paper_gate, effective_paper
 
@@ -605,21 +617,26 @@ class InkTokenRouter(nn.Module):
         grid_coords = base_coords.expand(B, -1, -1)  # (B, N, 2)
 
         if self.dynamic_routing and keep_ratio_override is None:
+            # Strips are narrow and ink-dense; raise max_keep_ratio headroom cleanly so ink isn't dropped.
+            eff_max_keep = max(self.max_keep_ratio, 0.95) if (W_p >= 2 * H_p and N <= 4096) else self.max_keep_ratio
+            k_min = max(1, int(math.ceil(N * self.min_keep_ratio)))
+            k_max = max(k_min, min(N, int(math.ceil(N * eff_max_keep)), self.max_kept_tokens))
             if self.training:
-                # Zero-sync training fast path: sample target keep ratio on CPU across
-                # [min_keep_ratio, max_keep_ratio] to avoid mid-forward CUDA stream sync
-                # while keeping saliency_net gradients intact via saliency_loss & kept_gate.
-                r_dyn = random.uniform(self.min_keep_ratio, self.max_keep_ratio)
-                k = max(1, min(N, int(math.ceil(N * r_dyn))))
+                if ink_target is not None:
+                    with torch.no_grad():
+                        ink_n = float(ink_target.flatten(1).float().sum(dim=-1).max().item())
+                    k_ink = int(math.ceil(ink_n * random.uniform(1.15, 1.45)))
+                    k = max(k_min, min(k_max, k_ink))
+                else:
+                    r_dyn = random.uniform(self.min_keep_ratio, eff_max_keep)
+                    k = max(k_min, min(k_max, int(math.ceil(N * r_dyn))))
             else:
                 with torch.no_grad():
                     # Threshold relative to per-image paper baseline (median bounded score in [0, 2]) so
-                    # sparse pages drop to min_keep_ratio (~15%) while dense pages expand up to max_keep_ratio (~75%).
+                    # sparse pages drop to min_keep_ratio (~15%) while dense pages expand up to eff_max_keep.
                     med = score_flat.median(dim=1, keepdim=True).values
                     above = (score_flat > (med + self.saliency_thr)).sum(dim=1)
                     k_dyn = int(above.max().item())
-                    k_min = max(1, int(math.ceil(N * self.min_keep_ratio)))
-                    k_max = max(k_min, min(N, int(math.ceil(N * self.max_keep_ratio))))
                     k = max(k_min, min(k_max, k_dyn))
         else:
             k = max(1, min(N, int(math.ceil(N * ratio))))
@@ -1046,7 +1063,7 @@ class QATInt4Controller:
     """Zero-schema-change symmetric group-wise INT4 QAT controller for ``UniOMRNet``.
 
     Monkey-patches ``forward`` on Transformer ``nn.Linear`` layers inside
-    ``enc_layers``, ``dec_layers``, ``mtp_heads``, and ``lm_head`` (skipping
+    ``enc_layers``, ``dec_layers``, and ``mtp_heads`` (skipping ``lm_head``,
     ``backbone``, ``router``, ``tok_emb``, ``pos2d_proj``, and norms) without
     adding parameters or buffers, preserving 100% ``state_dict()`` compatibility
     (``strict=True``). Caches detached fake-quantization deltas per optimizer
@@ -1054,7 +1071,7 @@ class QATInt4Controller:
     cost only a single elementwise add (bit-identical STE gradients).
     """
 
-    TARGET_ROOTS: Tuple[str, ...] = ("enc_layers", "dec_layers", "mtp_heads", "lm_head")
+    TARGET_ROOTS: Tuple[str, ...] = ("enc_layers", "dec_layers", "mtp_heads")
 
     def __init__(self, model: nn.Module, block_size: int = 32, enabled: bool = False) -> None:
         if block_size <= 0:
@@ -1474,12 +1491,15 @@ class UniOMRNet(nn.Module):
     ) -> torch.Tensor:
         """Build and cache 1D per-token CE weights upweighting header/structural and micro-rhythm tokens."""
         w_val = float(weight)
-        micro_w = 0.5 * (1.0 + w_val)
         key = (int(vocab_size), w_val, device, dtype)
         cached = self._struct_weight_cache.get(key)
         if cached is not None:
             return cached
         tok_w = torch.ones(int(vocab_size), device=device, dtype=dtype)
+        if w_val <= 1.0:
+            self._struct_weight_cache[key] = tok_w
+            return tok_w
+        micro_w = 0.5 * (1.0 + w_val)
         for tok, tid in UNI_TOKEN_TO_ID.items():
             if tid >= vocab_size:
                 continue
@@ -1513,6 +1533,7 @@ class UniOMRNet(nn.Module):
         uv_loss_weight: float = 0.20,
         saliency_loss_weight: float = 0.10,
         struct_tok_weight: float = 1.0,
+        label_smoothing: float = 0.0,
     ) -> Dict[str, torch.Tensor]:
         """Compute combined CE + MTP-k + auxiliary UV-flow + router saliency BCE losses.
 
@@ -1524,6 +1545,7 @@ class UniOMRNet(nn.Module):
             saliency_loss_weight: weight on lightweight BCE supervision of ``saliency_logits``.
             struct_tok_weight: optional loss multiplier (> 1.0) on header/structural tokens
                 (``clef-*``, ``key*``, ``time-*``, ``<sys>``, ``grace``, ``bar*``).
+            label_smoothing: optional label smoothing factor in ``[0, 1)`` for main CE loss.
         """
         logits: torch.Tensor = out["logits"]
         V = logits.shape[-1]
@@ -1537,6 +1559,7 @@ class UniOMRNet(nn.Module):
             targets.reshape(-1),
             weight=ce_weight,
             ignore_index=PAD_ID,
+            label_smoothing=float(label_smoothing),
         )
 
         # Multi-Token Prediction auxiliary losses for offsets +2 .. +mtp_k
@@ -1776,21 +1799,82 @@ def discover_fullpage_pairs(
     return pairs
 
 
+def _bekern_source_keys(item: Any) -> List[str]:
+    """Extract normalized underlying bekern source piece keys if bekern Path(s) are present."""
+    if not (isinstance(item, (tuple, list)) and len(item) >= 2):
+        return []
+    bek = item[1]
+    paths: List[Path] = []
+    if isinstance(bek, Path):
+        paths = [bek]
+    elif isinstance(bek, (list, tuple)):
+        paths = [p for p in bek if isinstance(p, Path)]
+    out: List[str] = []
+    for bp in paths:
+        stem = bp.stem
+        if stem.endswith("-bekern"):
+            stem = stem[: -len("-bekern")]
+        out.append(_strip_group_key(stem))
+    return out
+
+
 def split_train_val(
     items: Sequence[Any],
     key_fn: Any,
     val_count: int = 100,
     seed: int = 42,
 ) -> Tuple[List[Any], List[Any]]:
-    """Deterministic group-aware train/val split."""
-    n = len(items)
+    """Deterministic group-aware train/val split with image-path dedup and bekern-stem grouping."""
+    # 1. Deduplicate pairs by resolved image path first (preserving order).
+    deduped: List[Any] = []
+    seen_paths: set[str] = set()
+    for item in items:
+        if isinstance(item, (tuple, list)) and len(item) >= 1 and isinstance(item[0], Path):
+            try:
+                norm_p = str(item[0].resolve()).lower()
+            except OSError:
+                norm_p = str(item[0]).lower()
+            if norm_p in seen_paths:
+                continue
+            seen_paths.add(norm_p)
+        deduped.append(item)
+
+    n = len(deduped)
     if n <= 1 or val_count <= 0:
-        return list(items), []
+        return list(deduped), []
 
     target_val = min(val_count, max(1, n // 5)) if n >= 2 else 0
+
+    # 2. Group by key_fn AND any underlying bekern source stems via union-find so
+    # items sharing either an image piece key or a bekern source stem never split.
+    parent: Dict[str, str] = {}
+
+    def _find(x: str) -> str:
+        while parent.get(x, x) != x:
+            parent[x] = parent.get(parent[x], parent[x])
+            x = parent[x]
+        return x
+
+    def _union(a: str, b: str) -> None:
+        ra, rb = _find(a), _find(b)
+        if ra != rb:
+            if ra < rb:
+                parent[rb] = ra
+            else:
+                parent[ra] = rb
+
+    item_primary_keys: List[str] = []
+    for item in deduped:
+        pk = str(key_fn(item))
+        parent.setdefault(pk, pk)
+        for bk in _bekern_source_keys(item):
+            parent.setdefault(bk, bk)
+            _union(pk, bk)
+        item_primary_keys.append(pk)
+
     groups: Dict[str, List[Any]] = {}
-    for item in items:
-        groups.setdefault(str(key_fn(item)), []).append(item)
+    for item, pk in zip(deduped, item_primary_keys):
+        groups.setdefault(_find(pk), []).append(item)
 
     keys = sorted(groups.keys())
     rng = random.Random(seed)
@@ -2026,8 +2110,29 @@ def _apply_system1_left_indent(
     return out
 
 
+def _is_region_quiet(
+    img: Image.Image,
+    x0: int,
+    y0: int,
+    x1: int,
+    y1: int,
+    min_luma: float = 0.95,
+) -> bool:
+    """Return True iff the candidate box has mean luma > min_luma (strict quiet zone)."""
+    w, h = img.size
+    cx0 = max(0, min(w - 1, int(x0)))
+    cy0 = max(0, min(h - 1, int(y0)))
+    cx1 = max(cx0 + 1, min(w, int(x1)))
+    cy1 = max(cy0 + 1, min(h, int(y1)))
+    crop = img.crop((cx0, cy0, cx1, cy1)).convert("L")
+    arr = np.asarray(crop, dtype=np.float32) * (1.0 / 255.0)
+    if arr.size == 0:
+        return False
+    return float(arr.mean()) > min_luma
+
+
 def _apply_corner_sticky_note(img: Image.Image, rng: Any) -> Image.Image:
-    """Draw a small opaque corner sticky-note / archival label occlusion (5-12% W x H)."""
+    """Draw a small opaque corner sticky-note / archival label occlusion (5-12% W x H) only on quiet corners."""
     out = img.copy() if img.mode == "RGB" else img.convert("RGB")
     w, h = out.size
     if w < 64 or h < 64:
@@ -2041,6 +2146,9 @@ def _apply_corner_sticky_note(img: Image.Image, rng: Any) -> Image.Image:
     y0 = margin_y if corner in (0, 1) else max(0, h - nh - margin_y)
     x1 = min(w - 1, x0 + nw)
     y1 = min(h - 1, y0 + nh)
+
+    if not _is_region_quiet(out, x0, y0, x1 + 1, y1 + 1, min_luma=0.95):
+        return out
 
     # Pale yellow, pale pink, or pale kraft/brown archival label
     palette = (
@@ -2070,8 +2178,41 @@ def _fast_gaussian_blur(img: Image.Image, radius: float) -> Image.Image:
     return img.filter(ImageFilter.GaussianBlur(radius=radius))
 
 
-def _fast_rotate(img: Image.Image, angle: float, fillcolor: Tuple[int, int, int]) -> Image.Image:
-    """Fast bilinear rotation using OpenCV warpAffine when available, falling back to PIL."""
+def _fast_rotate(
+    img: Image.Image,
+    angle: float,
+    fillcolor: Tuple[int, int, int],
+    expand: bool = False,
+) -> Image.Image:
+    """Fast rotation using OpenCV warpAffine when available, falling back to PIL.
+
+    When ``expand=True``, expands the canvas to avoid clipping corner notation
+    and resizes back to the original ``(W, H)``.
+    """
+    if expand:
+        orig_w, orig_h = img.size
+        if _cv2 is not None:
+            arr = np.asarray(img if img.mode == "RGB" else img.convert("RGB"), dtype=np.uint8)
+            h, w = arr.shape[:2]
+            M = _cv2.getRotationMatrix2D((w * 0.5, h * 0.5), float(angle), 1.0)
+            cos_a = abs(float(M[0, 0]))
+            sin_a = abs(float(M[0, 1]))
+            new_w = max(w, int(math.ceil(h * sin_a + w * cos_a)))
+            new_h = max(h, int(math.ceil(h * cos_a + w * sin_a)))
+            M[0, 2] += (new_w * 0.5) - (w * 0.5)
+            M[1, 2] += (new_h * 0.5) - (h * 0.5)
+            warped = _cv2.warpAffine(
+                arr,
+                M,
+                (new_w, new_h),
+                flags=_cv2.INTER_LINEAR,
+                borderMode=_cv2.BORDER_CONSTANT,
+                borderValue=(int(fillcolor[0]), int(fillcolor[1]), int(fillcolor[2])),
+            )
+            resized = _cv2.resize(warped, (orig_w, orig_h), interpolation=_cv2.INTER_AREA)
+            return Image.fromarray(resized, mode="RGB")
+        rot = img.rotate(angle, resample=Image.Resampling.BILINEAR, expand=True, fillcolor=fillcolor)
+        return rot.resize((orig_w, orig_h), Image.Resampling.LANCZOS)
     if _cv2 is not None:
         arr = np.asarray(img if img.mode == "RGB" else img.convert("RGB"), dtype=np.uint8)
         h, w = arr.shape[:2]
@@ -2122,17 +2263,14 @@ def _fast_perspective(
 
 
 def _apply_hw_lowres_defocus_compress(img: Image.Image, rng: Any) -> Image.Image:
-    """Low-res downscale (800-1150px round-trip) + mild defocus blur + contrast compression."""
+    """Low-res downscale (800-1150px round-trip) + mild defocus blur + contrast compression (gated to max(W,H) >= 1280)."""
     out = img if img.mode == "RGB" else img.convert("RGB")
     orig_w, orig_h = out.size
-    if orig_w < 48 or orig_h < 48:
-        return out
     max_side = max(orig_w, orig_h)
-    if max_side > 800:
-        rt_max = rng.randint(800, min(1150, max_side))
-        scale = float(rt_max) / float(max_side)
-    else:
-        scale = rng.uniform(0.65, 0.85)
+    if max_side < 1280 or orig_w < 48 or orig_h < 48:
+        return out
+    rt_max = rng.randint(800, min(1150, max_side))
+    scale = float(rt_max) / float(max_side)
     dw = max(32, int(round(orig_w * scale)))
     dh = max(32, int(round(orig_h * scale)))
     sigma = float(rng.uniform(0.5, 1.1))
@@ -2288,6 +2426,10 @@ def _apply_composer_scratchouts(
             y0 = rng.randint(max(2, int(h * 0.10)), max(3, h - bh - max(2, int(h * 0.10))))
         x1 = x0 + bw
         y1 = y0 + bh
+
+        # Strict quiet-zone check: never occlude real musical ink
+        if not _is_region_quiet(out, x0, y0, x1, y1, min_luma=0.95):
+            continue
 
         # 1. Phantom ink cluster: 1-3 tiny noteheads + stems + optional beam/scribble
         ink_phantom = _sample_ink(170, 230)
@@ -2522,6 +2664,8 @@ def _apply_archival_verse_block(
         y_start = max(4, int(h * rng.uniform(0.02, 0.06)))
     x_left = int(w * rng.uniform(0.10, 0.28))
     max_span = max(32, int(w * rng.uniform(0.30, 0.62)))
+    if not _is_region_quiet(out, x_left, y_start, min(w, x_left + max_span), min(h, y_start + block_h + 2), min_luma=0.95):
+        return out
     ir, ig, ib = ink_rgb_u8
     alpha = rng.randint(120, 195)
     col = (ir, ig, ib, alpha)
@@ -2602,6 +2746,7 @@ def apply_online_augment(
     rng: Optional[random.Random] = None,
     is_hw: bool = False,
     hw_archival_prob: Optional[float] = None,
+    is_strip: bool = False,
 ) -> Image.Image:
     """Online phone-photo, scanner, and historical manuscript degradation.
 
@@ -2726,37 +2871,38 @@ def apply_online_augment(
         if r.random() < (0.22 if is_hw else 0.06):
             out = _apply_composer_scratchouts(out, r, is_hw=True)
 
-        # Handwritten-style verse/prose text block in bottom/top margin quiet area (p=0.20)
-        if r.random() < 0.20 and orig_w >= 64 and orig_h >= 64:
+        # Handwritten-style verse/prose text block in bottom/top margin quiet area (p=0.20, disabled on strips)
+        if (not is_strip) and r.random() < 0.20 and orig_w >= 64 and orig_h >= 64:
             out = _apply_archival_verse_block(out, r, ink_rgb_u8)
 
         # Faint semi-transparent watermark or corner botanical/ink-stain blob (p=0.15)
         if r.random() < 0.15 and orig_w >= 64 and orig_h >= 64:
             out = _apply_archival_watermark_stain(out, r, ink_rgb_u8)
 
-        # Corner opaque sticky-note / archival label occlusion (p=0.12)
-        if r.random() < 0.12 and orig_w >= 64 and orig_h >= 64:
+        # Corner opaque sticky-note / archival label occlusion (p=0.12, disabled on strips)
+        if (not is_strip) and r.random() < 0.12 and orig_w >= 64 and orig_h >= 64:
             out = _apply_corner_sticky_note(out, r)
 
-        if r.random() < 0.40 and orig_w >= 48 and orig_h >= 48:
+        if r.random() < 0.25 and orig_w >= 48 and orig_h >= 48:
             has_dark_border = True
             base_d = r.randint(6, 36)
             dark_fill = (base_d, max(4, base_d - 1), max(4, base_d - 2))
             out = _apply_archival_border_and_colorbar(out, r, dark_fill)
 
-        # Mild rotation +/- 3.5 deg (p=0.35)
+        # Mild rotation: +/-1.5 deg on strips, +/-3.0 deg with expand=True on full pages (p=0.35)
         if r.random() < 0.35:
-            angle = r.uniform(-3.5, 3.5)
+            max_ang = 1.5 if is_strip else 3.0
+            angle = r.uniform(-max_ang, max_ang)
             rot_fill = (
                 dark_fill
                 if has_dark_border
                 else (int(round(pr)), int(round(max(190.0, pg))), int(round(max(155.0, pb))))
             )
-            out = _fast_rotate(out, angle, rot_fill)
+            out = _fast_rotate(out, angle, rot_fill, expand=(not is_strip))
 
-        # Low-res round-trip downscale + defocus blur + contrast compression (dense/landscape HW)
+        # Low-res round-trip downscale + defocus blur + contrast compression (dense/landscape HW, max(W,H) >= 1280)
         lowres_p = 0.25 if orig_w > orig_h else 0.15
-        if r.random() < lowres_p and orig_w >= 48 and orig_h >= 48:
+        if r.random() < lowres_p and max(orig_w, orig_h) >= 1280:
             out = _apply_hw_lowres_defocus_compress(out, r)
         elif r.random() < 0.25:
             out = _fast_gaussian_blur(out, r.uniform(0.3, 0.8))
@@ -2768,17 +2914,17 @@ def apply_online_augment(
         return out
 
     # 0. Pre-warp paper-surface manual corrections, HW layout/sticky-note, & performer markup
-    if is_hw and r.random() < 0.10 and orig_w >= 128 and orig_h >= 256:
+    if is_hw and (not is_strip) and r.random() < 0.10 and orig_w >= 128 and orig_h >= 256:
         out = _apply_system1_left_indent(out, r)
     if r.random() < (0.22 if is_hw else 0.06):
         out = _apply_composer_scratchouts(out, r, is_hw=is_hw)
-    if is_hw and r.random() < 0.12 and orig_w >= 64 and orig_h >= 64:
+    if is_hw and (not is_strip) and r.random() < 0.12 and orig_w >= 64 and orig_h >= 64:
         out = _apply_corner_sticky_note(out, r)
     if not is_hw and r.random() < 0.18:
         out = _apply_performer_pencil_markup(out, r)
 
-    # 1. Dark desk inset/border framing (p=0.50): pad 2-10% per side with dark desk RGB 0..70
-    if r.random() < 0.50 and orig_w >= 32 and orig_h >= 32:
+    # 1. Dark desk inset/border framing (p=0.25): pad 2-10% per side with dark desk RGB 0..70
+    if r.random() < 0.25 and orig_w >= 32 and orig_h >= 32:
         has_dark_border = True
         dark_fill = _sample_dark_desk()
         pad_l = max(1, int(round(orig_w * r.uniform(0.02, 0.10))))
@@ -2816,20 +2962,35 @@ def apply_online_augment(
         p_fill = dark_fill if (has_dark_border or r.random() < 0.50) else _sample_paper_fill()
         out = _fast_perspective(out, src_pts, dst_pts, p_fill)
 
-    # 3. Rotation +/- 6 deg (p=0.50): dark desk fill half the time when dark-bordered, else paper tone
+    # 3. Rotation (p=0.50): +/-1.5 deg on strips, +/-3.0 deg with expand=True on full pages
     if r.random() < 0.50:
-        angle = r.uniform(-6.0, 6.0)
+        max_ang = 1.5 if is_strip else 3.0
+        angle = r.uniform(-max_ang, max_ang)
         if has_dark_border and r.random() < 0.50:
             rot_fill = (r.randint(0, 55), r.randint(0, 55), r.randint(0, 55))
         else:
             rot_fill = _sample_paper_fill()
-        out = _fast_rotate(out, angle, rot_fill)
+        out = _fast_rotate(out, angle, rot_fill, expand=(not is_strip))
 
-    # 4. Photometric pass (fused numpy for speed): uneven shadows/vignette/parchment + brightness/contrast
+    # 4. 1-bit / clean scanner threshold (p=0.15) BEFORE shadow/vignette using local adaptive threshold
+    # so uneven illumination never turns clean pages solid black.
+    do_1bit = r.random() < 0.15
+    if do_1bit:
+        luma_u8 = np.asarray(out.convert("L"), dtype=np.float32) * (1.0 / 255.0)
+        if _cv2 is not None:
+            local_bg = _cv2.blur(luma_u8, (31, 31))
+        else:
+            local_bg = np.asarray(
+                out.convert("L").filter(ImageFilter.BoxBlur(15)), dtype=np.float32
+            ) * (1.0 / 255.0)
+        delta = r.uniform(0.10, 0.22)
+        bw = np.where(luma_u8 >= (local_bg - delta), np.uint8(255), np.uint8(0))
+        return Image.fromarray(np.repeat(bw[..., None], 3, axis=2), mode="RGB")
+
+    # 5. Photometric pass (fused numpy for speed): uneven shadows/vignette/parchment + brightness/contrast
     illum_roll = r.random()
     do_bright = r.random() < 0.70
     do_contrast = r.random() < 0.70
-    do_1bit = r.random() < 0.15
     if illum_roll < 0.70 or do_bright or do_contrast:
         arr = np.asarray(out, dtype=np.float32) * (1.0 / 255.0)
         h, w = arr.shape[:2]
@@ -2865,23 +3026,11 @@ def apply_online_augment(
             c_fac = r.uniform(0.75, 1.25)
             arr = (arr - 0.5) * c_fac + 0.5
 
-        if do_1bit:
-            # 5. 1-bit / clean scanner threshold (p=0.15) matching crisp binary scans (e.g. suite31/photo)
-            luma = 0.299 * arr[..., 0] + 0.587 * arr[..., 1] + 0.114 * arr[..., 2]
-            thr = r.uniform(0.47, 0.76)
-            bw = np.where(luma >= thr, np.uint8(255), np.uint8(0))
-            return Image.fromarray(np.repeat(bw[..., None], 3, axis=2), mode="RGB")
-
         np.clip(arr, 0.0, 1.0, out=arr)
         out = Image.fromarray((arr * 255.0).astype(np.uint8), mode="RGB")
-    elif do_1bit:
-        gray = out.convert("L")
-        thr = r.randint(120, 195)
-        bw = gray.point(lambda px, t=thr: 255 if px >= t else 0, mode="L")
-        return bw.convert("RGB")
 
-    # 6. Mild Gaussian blur (or HW low-res round-trip + defocus + contrast compression)
-    if is_hw and r.random() < (0.25 if orig_w > orig_h else 0.15) and orig_w >= 48 and orig_h >= 48:
+    # 6. Mild Gaussian blur (or HW low-res round-trip + defocus + contrast compression, max(W,H) >= 1280)
+    if is_hw and r.random() < (0.25 if orig_w > orig_h else 0.15) and max(orig_w, orig_h) >= 1280:
         out = _apply_hw_lowres_defocus_compress(out, r)
     elif r.random() < 0.30:
         out = _fast_gaussian_blur(out, r.uniform(0.3, 1.0))
@@ -2922,7 +3071,7 @@ def _resize_fullpage_pil(img: Image.Image, fullpage_max_dim: int = 768) -> Image
     target_w = _round_mult16(orig_w * scale, min_val=16, max_val=fullpage_max_dim)
     target_h = _round_mult16(orig_h * scale, min_val=16, max_val=fullpage_max_dim)
     if (orig_w, orig_h) != (target_w, target_h):
-        return img.resize((target_w, target_h), Image.Resampling.BILINEAR)
+        return img.resize((target_w, target_h), Image.Resampling.LANCZOS)
     return img
 
 
@@ -2952,7 +3101,15 @@ def _images_to_device_float(
 def _cap_token_ids(ids: List[int], max_seq_len: int) -> List[int]:
     if len(ids) <= max_seq_len:
         return ids
-    return ids[: max(2, max_seq_len) - 1] + [EOS_ID]
+    return ids[: max(2, max_seq_len)]
+
+
+_PRE_DEGRADED_RE = re.compile(r"(?:degraded|photo|_d\d+)", re.IGNORECASE)
+
+
+def _is_pre_degraded_path(path: Any) -> bool:
+    """Return True if path indicates an already photo-degraded image."""
+    return bool(_PRE_DEGRADED_RE.search(str(path)))
 
 
 class UniStripDataset(Dataset):
@@ -2992,8 +3149,8 @@ class UniStripDataset(Dataset):
                 raw.load()
                 img = raw.copy()
         if self.augment and self.aug_prob > 0.0:
-            if random.random() < self.aug_prob:
-                img = apply_online_augment(img, is_hw=self.is_hw)
+            if (not _is_pre_degraded_path(img_path)) and random.random() < self.aug_prob:
+                img = apply_online_augment(img, is_hw=self.is_hw, is_strip=True)
             elif random.random() < 0.25:
                 img = apply_clean_scale_jitter(img)
         toks = data.load_bekern(bekern_path)
@@ -3009,19 +3166,23 @@ class UniStripDataset(Dataset):
 
 def _sample_weighted_fullpage_dim(base_dim: int, rng: Optional[random.Random] = None) -> int:
     """Weighted realistic multi-scale max_dim (multiple of 16):
-    15% low-res (512..768px), 60% sweet-spot (896..1152px), 25% high-res (1280..1536px).
+    20% (1024..1152px), 30% (1280..1408px), 50% (1536px), capped by base_dim.
     """
     r = rng if rng is not None else random
     u = r.random()
-    if u < 0.15:
-        choices = (512, 576, 640, 704, 768)
-    elif u < 0.75:
-        choices = (896, 960, 1024, 1088, 1152)
+    if u < 0.20:
+        choices = (1024, 1088, 1152)
+    elif u < 0.50:
+        choices = (1280, 1344, 1408)
     else:
-        choices = (1280, 1344, 1408, 1536)
-    hi = max(512, int(base_dim))
+        choices = (1536,)
+    hi = max(16, int(base_dim))
     valid = [c for c in choices if c <= hi]
-    return int(r.choice(valid)) if valid else _round_mult16(hi, min_val=512)
+    if valid:
+        return int(r.choice(valid))
+    all_choices = (1024, 1088, 1152, 1280, 1344, 1408, 1536)
+    valid_all = [c for c in all_choices if c <= hi]
+    return int(r.choice(valid_all)) if valid_all else _round_mult16(hi, min_val=16)
 
 
 class UniFullPageDataset(Dataset):
@@ -3084,8 +3245,8 @@ class UniFullPageDataset(Dataset):
                 raw.load()
                 img = raw.copy()
         if self.augment and self.aug_prob > 0.0:
-            if random.random() < self.aug_prob:
-                img = apply_online_augment(img, is_hw=is_hw)
+            if (not _is_pre_degraded_path(img_path)) and random.random() < self.aug_prob:
+                img = apply_online_augment(img, is_hw=is_hw, is_strip=False)
             elif random.random() < 0.25:
                 img = apply_clean_scale_jitter(img)
 
@@ -3107,11 +3268,11 @@ class UniFullPageDataset(Dataset):
 
 
 STRATIFIED_FULLPAGE_WEIGHTS: Dict[str, float] = {
-    "legacy_printed": 0.26,
-    "multi_renderer_printed": 0.22,
-    "rare_printed": 0.07,
-    "synth_hw": 0.27,
-    "real_hw": 0.18,
+    "legacy_printed": 0.34,
+    "multi_renderer_printed": 0.28,
+    "rare_printed": 0.06,
+    "synth_hw": 0.26,
+    "real_hw": 0.06,
 }
 
 
@@ -4321,6 +4482,7 @@ def run_train(args: argparse.Namespace, cfg: UniOMRConfig) -> Dict[str, Any]:
     hw_frac = float(getattr(args, "hw_frac", 0.30))
     fullpage_frac = float(max(0.0, min(1.0, getattr(args, "fullpage_frac", 0.65))))
     saliency_loss_weight = float(getattr(args, "saliency_loss_weight", 0.10))
+    label_smoothing = float(max(0.0, min(0.5, getattr(args, "label_smoothing", 0.0))))
     hw_strip_dirs = list(getattr(args, "hw_strip_dirs", []) or [])
     unlabeled_dirs = list(getattr(args, "unlabeled_dirs", []) or [])
     unsup_every = int(getattr(args, "unsup_every", 250))
@@ -4414,29 +4576,48 @@ def run_train(args: argparse.Namespace, cfg: UniOMRConfig) -> Dict[str, Any]:
                 )
 
         # Shared piece-level val split: union of held-out val_keys across all modalities
-        # so NO piece held out in any val set can leak into any other modality's train set.
+        # (including underlying bekern source stems) so NO piece held out in any val set
+        # can leak into any other modality's train set.
         shared_val_keys: set[str] = set()
         for p in st_va:
             shared_val_keys.add(_strip_group_key(p[0].stem))
+            shared_val_keys.update(_bekern_source_keys(p))
         for p in hw_va:
             shared_val_keys.add(_strip_group_key(p[0].stem))
+            shared_val_keys.update(_bekern_source_keys(p))
         for p in fp_va:
             shared_val_keys.add(data.piece_key(p[0].stem))
+            shared_val_keys.update(_bekern_source_keys(p))
 
         if shared_val_keys:
             leaked_st = leaked_hw = leaked_fp = 0
             if st_tr:
-                filtered_st = [p for p in st_tr if _strip_group_key(p[0].stem) not in shared_val_keys]
+                filtered_st = [
+                    p
+                    for p in st_tr
+                    if _strip_group_key(p[0].stem) not in shared_val_keys
+                    and not any(bk in shared_val_keys for bk in _bekern_source_keys(p))
+                ]
                 if filtered_st:
                     leaked_st = len(st_tr) - len(filtered_st)
                     st_tr = filtered_st
             if hw_tr:
-                filtered_hw = [p for p in hw_tr if _strip_group_key(p[0].stem) not in shared_val_keys]
+                filtered_hw = [
+                    p
+                    for p in hw_tr
+                    if _strip_group_key(p[0].stem) not in shared_val_keys
+                    and not any(bk in shared_val_keys for bk in _bekern_source_keys(p))
+                ]
                 if filtered_hw:
                     leaked_hw = len(hw_tr) - len(filtered_hw)
                     hw_tr = filtered_hw
             if fp_tr:
-                filtered_fp = [p for p in fp_tr if data.piece_key(p[0].stem) not in shared_val_keys]
+                filtered_fp = [
+                    p
+                    for p in fp_tr
+                    if data.piece_key(p[0].stem) not in shared_val_keys
+                    and not any(bk in shared_val_keys for bk in _bekern_source_keys(p))
+                ]
                 if filtered_fp:
                     leaked_fp = len(fp_tr) - len(filtered_fp)
                     fp_tr = filtered_fp
@@ -4918,11 +5099,12 @@ def run_train(args: argparse.Namespace, cfg: UniOMRConfig) -> Dict[str, Any]:
                 )
                 try:
                     with amp_ctx:
-                        if cass_prob > 0.0 and kind != "strip" and tgt_in.shape[1] > 1:
+                        if cass_prob > 0.0 and kind == "fullpage" and tgt_in.shape[1] > 1:
                             # Two-pass parallel scheduled sampling (CASS): encode image ONCE,
                             # run a no-grad draft decode (without tok_dropout to avoid double-corruption),
-                            # replace cass_prob of non-BOS/non-PAD tgt_in[:, 1:] with pred_ids[:, :-1],
-                            # then run the real gradient-enabled decoder pass reusing mem.
+                            # replace cass_prob of non-BOS/non-PAD tgt_in[:, 1:] with non-EOS/non-PAD
+                            # pred_ids[:, :-1], then run the real gradient-enabled decoder pass reusing mem
+                            # with apply_tok_dropout=False (preventing double corruption).
                             mem, uv_pred, router_info = model.encode_image(images, return_aux=want_aux)
                             with torch.no_grad():
                                 draft_logits, _ = model.decode_tokens(
@@ -4930,16 +5112,21 @@ def run_train(args: argparse.Namespace, cfg: UniOMRConfig) -> Dict[str, Any]:
                                 )
                                 pred_ids = draft_logits.argmax(dim=-1)
                                 tail_in = tgt_in[:, 1:]
+                                pred_prev = pred_ids[:, :-1]
                                 cass_mask = (
                                     (torch.rand_like(tail_in, dtype=torch.float32) < cass_prob)
                                     & (tail_in != PAD_ID)
                                     & (tail_in != BOS_ID)
+                                    & (pred_prev != EOS_ID)
+                                    & (pred_prev != PAD_ID)
                                 )
                                 dec_in = torch.cat(
-                                    [tgt_in[:, :1], torch.where(cass_mask, pred_ids[:, :-1], tail_in)],
+                                    [tgt_in[:, :1], torch.where(cass_mask, pred_prev, tail_in)],
                                     dim=1,
                                 )
-                            logits, mtp_logits = model.decode_tokens(dec_in, mem, return_mtp=(cfg.mtp_k > 1))
+                            logits, mtp_logits = model.decode_tokens(
+                                dec_in, mem, return_mtp=(cfg.mtp_k > 1), apply_tok_dropout=False
+                            )
                             out = {
                                 "logits": logits,
                                 "mtp_logits": mtp_logits,
@@ -4956,6 +5143,7 @@ def run_train(args: argparse.Namespace, cfg: UniOMRConfig) -> Dict[str, Any]:
                             uv_loss_weight=args.uv_loss_weight,
                             saliency_loss_weight=saliency_loss_weight,
                             struct_tok_weight=args.struct_tok_weight,
+                            label_smoothing=label_smoothing,
                         )
 
                     (losses["loss"] * inv_ga).backward()
@@ -5096,6 +5284,7 @@ def run_train(args: argparse.Namespace, cfg: UniOMRConfig) -> Dict[str, Any]:
                 and (strip_val_ds is not None or hw_strip_val_ds is not None or fullpage_val_ds is not None)
             )
             if should_eval:
+                ema_mean_ser = float("inf")
                 if device.type == "cuda":
                     torch.cuda.empty_cache()
                 if ema_only_eval and gpu_ema is not None and step < steps:
@@ -5166,13 +5355,17 @@ def run_train(args: argparse.Namespace, cfg: UniOMRConfig) -> Dict[str, Any]:
                     )
                 if out_dir is not None and soup_last_k > 0:
                     step_ckpt = out_dir / f"uni_omr_step{step}.pt"
+                    use_ema_for_soup = bool(ema_only_eval and gpu_ema is not None)
+                    soup_step_sd = gpu_ema.cpu_state_dict(model) if use_ema_for_soup else model.state_dict()
+                    soup_step_ser = ema_mean_ser if use_ema_for_soup else mean_ser
                     torch.save(
                         {
                             "step": step,
-                            "val_ser": mean_ser,
+                            "val_ser": soup_step_ser,
+                            "ema": use_ema_for_soup,
                             "config": asdict(cfg),
                             "vocab": list(data.VOCAB),
-                            "model": model.state_dict(),
+                            "model": soup_step_sd,
                         },
                         step_ckpt,
                     )
@@ -5200,6 +5393,9 @@ def run_train(args: argparse.Namespace, cfg: UniOMRConfig) -> Dict[str, Any]:
         _flush_log_window(print_step=False)
         for pf in prefetchers:
             pf.close()
+
+    if qat_ctrl is not None:
+        qat_ctrl.detach()
 
     if out_dir is not None and not args.dry_run:
         ckpt_path = out_dir / "uni_omr_last.pt"
@@ -5251,9 +5447,6 @@ def run_train(args: argparse.Namespace, cfg: UniOMRConfig) -> Dict[str, Any]:
                 encoding="utf-8",
             )
 
-    if qat_ctrl is not None:
-        qat_ctrl.detach()
-
     return {
         "steps": steps,
         "history": history,
@@ -5288,7 +5481,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--strip-height", type=int, default=192, help="Target strip height (multiple of 16)")
     p.add_argument("--max-strip-width", type=int, default=1024, help="Max strip width cap (multiple of 16)")
     p.add_argument("--fullpage-max-dim", type=int, default=768, help="Max full-page dimension (multiple of 16)")
-    p.add_argument("--multi-scale", action="store_true", help="Weighted random full-page resolutions (15%% 512-768, 60%% 896-1152, 25%% 1280-1536, capped by --fullpage-max-dim)")
+    p.add_argument("--multi-scale", action="store_true", help="Weighted random full-page resolutions (20%% 1024-1152, 30%% 1280-1408, 50%% 1536, capped by --fullpage-max-dim)")
     p.add_argument("--max-seq-len", type=int, default=1024, help="Max token sequence length")
     p.add_argument("--augment", action="store_true", help="Enable online phone-photo degradation on train")
     p.add_argument("--aug-prob", type=float, default=0.75, help="Probability of applying online augmentation when --augment is set (default: 0.75)")
@@ -5325,6 +5518,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--uv-loss-weight", type=float, default=0.20)
     p.add_argument("--saliency-loss-weight", type=float, default=0.10, help="BCE auxiliary supervision weight on InkTokenRouter saliency_logits (default: 0.10)")
     p.add_argument("--struct-tok-weight", type=float, default=1.0, help="Main CE loss multiplier (>1.0) on header/structural tokens: clef-*, key*, time-*, <sys>, grace, bar* (default: 1.0)")
+    p.add_argument("--label-smoothing", type=float, default=0.0, help="Label smoothing factor for main CE loss (default: 0.0)")
     p.add_argument("--no-uv-aux", action="store_true", help="Disable auxiliary UV-flow head")
 
     # Runtime / training
