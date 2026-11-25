@@ -21,6 +21,7 @@ Usage (from repo root):
 from __future__ import annotations
 
 import argparse
+import contextlib
 from dataclasses import asdict, fields
 import json
 import statistics
@@ -28,10 +29,11 @@ import sys
 import tempfile
 import time
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, Iterator, List, Optional, Sequence, Tuple
 
 from PIL import Image
 import torch
+import torch.nn.functional as F
 
 REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 _THIS_DIR = Path(__file__).resolve().parent
@@ -231,6 +233,26 @@ def _truncate_past_kvs(
             )
         )
     return trimmed
+
+
+@contextlib.contextmanager
+def override_max_keep_ratio(
+    model: uni_omr.UniOMRNet,
+    max_keep_ratio: Optional[float],
+) -> Iterator[None]:
+    """Temporarily override ``model.router.max_keep_ratio`` for eval-time ablations."""
+    if max_keep_ratio is None:
+        yield
+        return
+    val = float(max_keep_ratio)
+    if not (0.0 < val <= 1.0):
+        raise ValueError(f"max_keep_ratio_override must be in (0, 1], got {val}")
+    orig = float(model.router.max_keep_ratio)
+    model.router.max_keep_ratio = val
+    try:
+        yield
+    finally:
+        model.router.max_keep_ratio = orig
 
 
 # ---------------------------------------------------------------------------
@@ -508,6 +530,266 @@ def generate_mtp_spec(
 
 
 # ---------------------------------------------------------------------------
+# 2b. KV-Cached, Length-Normalized, FSA-Grammar-Constrained Beam Search
+# ---------------------------------------------------------------------------
+
+def _reorder_beam_kvs(
+    past_kvs: List[Any],
+    parent_idx: torch.Tensor,
+    base_cross_kvs: List[Tuple[torch.Tensor, torch.Tensor]],
+) -> List[Any]:
+    """Gather decoder self-attention KV cache for surviving beam parents.
+
+    Reuses pre-expanded contiguous cross-attention K/V slices (zero re-projection).
+    """
+    n_active = int(parent_idx.shape[0])
+    reordered: List[Any] = []
+    for layer_idx, (self_kv, _) in enumerate(past_kvs):
+        k_self, v_self = self_kv
+        k_cross_base, v_cross_base = base_cross_kvs[layer_idx]
+        reordered.append(
+            (
+                (
+                    k_self.index_select(0, parent_idx),
+                    v_self.index_select(0, parent_idx),
+                ),
+                (
+                    k_cross_base[:n_active],
+                    v_cross_base[:n_active],
+                ),
+            )
+        )
+    return reordered
+
+
+def _beam_norm_score(raw_score: float, length: int, length_penalty: float) -> float:
+    if length_penalty == 0.0:
+        return raw_score
+    return raw_score / (float(max(1, length)) ** length_penalty)
+
+
+@torch.no_grad()
+def generate_beam(
+    model: uni_omr.UniOMRNet,
+    images: torch.Tensor,
+    max_len: int = 1024,
+    beam_size: int = 3,
+    length_penalty: float = 0.6,
+    use_grammar: bool = True,
+    strict_grammar: bool = False,
+    keep_ratio_override: Optional[float] = None,
+    return_info: bool = False,
+) -> Any:
+    """KV-cached, length-normalized, FSA-grammar-constrained beam search.
+
+    Encodes ``images`` once via ``model.encode_image``, pre-expands cross-attn
+    K/V caches once per item, and batches all active beams in a single
+    KV-cached ``model.decode_tokens`` pass per step.
+
+    When ``beam_size == 1`` and ``use_grammar=True``, matches
+    ``generate_constrained()`` token-for-token.
+    """
+    if beam_size < 1:
+        raise ValueError(f"beam_size must be >= 1, got {beam_size}")
+
+    mem, _, router_info = model.encode_image(
+        images,
+        keep_ratio_override=keep_ratio_override,
+        return_aux=False,
+    )
+    B = int(images.shape[0])
+    device = images.device
+    vocab_size = int(model.cfg.vocab_size)
+    pad_id, bos_id, eos_id, _, tok_to_id, _ = _vocab_spec(vocab_size)
+
+    if max_len <= 0:
+        seq = torch.full((B, 1), bos_id, dtype=torch.long, device=device)
+        return (seq, router_info) if return_info else seq
+
+    best_seqs: List[List[int]] = []
+    lp_exp = float(length_penalty)
+
+    for b in range(B):
+        mem_b = mem[b : b + 1]  # (1, L_mem, D)
+        bos_b = torch.full((1, 1), bos_id, dtype=torch.long, device=device)
+
+        # Prefill BOS once to populate cross-attn K/V cache.
+        logits0, _, past_kvs0 = model.decode_tokens(
+            bos_b,
+            memory=mem_b,
+            return_mtp=False,
+            past_kvs=None,
+            use_cache=True,
+        )
+
+        # Pre-expand cross-attn K/V once to (beam_size, H, L_mem, D_h) contiguous
+        # so slicing [:n_active] is zero-copy and safe on all SDPA backends.
+        base_cross_kvs: List[Tuple[torch.Tensor, torch.Tensor]] = []
+        for _, cross_kv in past_kvs0:
+            ck, cv = cross_kv
+            if beam_size > 1:
+                ck_exp = ck.expand(beam_size, -1, -1, -1).contiguous()
+                cv_exp = cv.expand(beam_size, -1, -1, -1).contiguous()
+            else:
+                ck_exp, cv_exp = ck, cv
+            base_cross_kvs.append((ck_exp, cv_exp))
+
+        # Active beam tuples: (tokens, raw_score, grammar_state)
+        init_state = (
+            grammar.PrefixState(strict=strict_grammar, vocab_map=tok_to_id)
+            if use_grammar
+            else None
+        )
+        active_beams: List[Tuple[List[int], float, Optional[grammar.PrefixState]]] = [
+            ([], 0.0, init_state)
+        ]
+        # Completed beam tuples: (norm_score, raw_score, tokens)
+        finished_beams: List[Tuple[float, float, List[int]]] = []
+
+        step_logits = logits0[:, -1, :]  # (1, V)
+        past_kvs: List[Any] = past_kvs0
+
+        for step_idx in range(max_len):
+            if step_idx > 0:
+                cur_ids = torch.tensor(
+                    [[beam_toks[-1]] for beam_toks, _, _ in active_beams],
+                    dtype=torch.long,
+                    device=device,
+                )
+                logits, _, past_kvs = model.decode_tokens(
+                    cur_ids,
+                    memory=None,
+                    return_mtp=False,
+                    past_kvs=past_kvs,
+                    use_cache=True,
+                )
+                step_logits = logits[:, -1, :]  # (n_active, V)
+
+            step_log_probs = F.log_softmax(step_logits.float(), dim=-1)  # (n_active, V)
+
+            # Collect top candidates across all active beams.
+            # Tuple: (norm_score, raw_score, parent_beam_idx, tok_id)
+            candidates: List[Tuple[float, float, int, int]] = []
+            k_per_beam = 1 if beam_size == 1 else min(vocab_size, beam_size + 1)
+
+            for i, (beam_toks, beam_score, beam_state) in enumerate(active_beams):
+                next_len = len(beam_toks) + 1
+                row_logits = step_logits[i]
+                row_lp = step_log_probs[i]
+
+                used_mask = False
+                if use_grammar and beam_state is not None:
+                    allowed = _allowed_ids_for_state(beam_state, vocab_size)
+                    if allowed:
+                        idx_t = torch.tensor(allowed, dtype=torch.long, device=device)
+                        sub_logits = row_logits.index_select(0, idx_t)
+                        if bool(torch.isfinite(sub_logits).any()):
+                            sub_lp = row_lp.index_select(0, idx_t)
+                            k_take = min(k_per_beam, len(allowed))
+                            top_vals, top_pos = torch.topk(sub_lp, k=k_take, dim=-1)
+                            for val_t, pos_t in zip(top_vals.tolist(), top_pos.tolist()):
+                                tok_id = int(allowed[int(pos_t)])
+                                raw_s = beam_score + float(val_t)
+                                norm_s = _beam_norm_score(raw_s, next_len, lp_exp)
+                                candidates.append((norm_s, raw_s, i, tok_id))
+                            used_mask = True
+
+                if not used_mask:
+                    k_take = min(k_per_beam, vocab_size)
+                    top_vals, top_ids = torch.topk(row_lp, k=k_take, dim=-1)
+                    for val_t, tid_t in zip(top_vals.tolist(), top_ids.tolist()):
+                        tok_id = int(tid_t)
+                        raw_s = beam_score + float(val_t)
+                        norm_s = _beam_norm_score(raw_s, next_len, lp_exp)
+                        candidates.append((norm_s, raw_s, i, tok_id))
+
+            if not candidates:
+                break
+
+            candidates.sort(key=lambda c: (c[0], c[1]), reverse=True)
+
+            next_active: List[Tuple[List[int], float, Optional[grammar.PrefixState]]] = []
+            next_parents: List[int] = []
+
+            if beam_size == 1:
+                norm_s, raw_s, parent_i, tok_id = candidates[0]
+                p_toks, _, p_state = active_beams[parent_i]
+                new_toks = p_toks + [tok_id]
+                if tok_id == eos_id:
+                    finished_beams.append((norm_s, raw_s, new_toks))
+                else:
+                    if use_grammar and p_state is not None:
+                        c_state = _advance_grammar_state(
+                            p_state.copy(), tok_id, strict=strict_grammar, vocab_size=vocab_size
+                        )
+                    else:
+                        c_state = None
+                    next_active.append((new_toks, raw_s, c_state))
+                    next_parents.append(parent_i)
+            else:
+                for rank, (norm_s, raw_s, parent_i, tok_id) in enumerate(candidates):
+                    p_toks, _, p_state = active_beams[parent_i]
+                    new_toks = p_toks + [tok_id]
+                    if tok_id == eos_id:
+                        if rank < beam_size:
+                            finished_beams.append((norm_s, raw_s, new_toks))
+                        continue
+                    if len(next_active) < beam_size:
+                        if use_grammar and p_state is not None:
+                            c_state = _advance_grammar_state(
+                                p_state.copy(), tok_id, strict=strict_grammar, vocab_size=vocab_size
+                            )
+                        else:
+                            c_state = None
+                        next_active.append((new_toks, raw_s, c_state))
+                        next_parents.append(parent_i)
+                    if len(next_active) >= beam_size and rank >= beam_size - 1:
+                        break
+
+            active_beams = next_active
+            if not active_beams:
+                break
+
+            # Early stop when we have >= beam_size finished hypotheses and even the
+            # highest-scoring active beam cannot beat the best finished hypothesis.
+            if len(finished_beams) >= beam_size:
+                best_fin_norm = max(f[0] for f in finished_beams)
+                best_act_raw = max(a[1] for a in active_beams)
+                # Since future log-probs <= 0, raw score can only stay <= best_act_raw,
+                # and dividing a negative score by max_len**lp_exp is an upper bound.
+                upper_bound = _beam_norm_score(best_act_raw, max_len, lp_exp)
+                if best_fin_norm >= upper_bound:
+                    break
+
+            if step_idx + 1 < max_len:
+                parent_idx_t = torch.tensor(next_parents, dtype=torch.long, device=device)
+                past_kvs = _reorder_beam_kvs(past_kvs, parent_idx_t, base_cross_kvs)
+
+        if finished_beams:
+            best_fin = max(finished_beams, key=lambda f: (f[0], f[1]))
+            best_toks = best_fin[2]
+        elif active_beams:
+            best_act = max(
+                active_beams,
+                key=lambda a: (_beam_norm_score(a[1], len(a[0]), lp_exp), a[1]),
+            )
+            best_toks = best_act[0]
+        else:
+            best_toks = []
+
+        best_seqs.append([bos_id] + best_toks)
+
+    max_out_len = max(len(s) for s in best_seqs)
+    seq_tensor = torch.full((B, max_out_len), pad_id, dtype=torch.long, device=device)
+    for b, s in enumerate(best_seqs):
+        seq_tensor[b, : len(s)] = torch.tensor(s, dtype=torch.long, device=device)
+
+    if return_info:
+        return seq_tensor, router_info
+    return seq_tensor
+
+
+# ---------------------------------------------------------------------------
 # 3. Manifest Resolution, Stitching, and Checkpoint Loading
 # ---------------------------------------------------------------------------
 
@@ -631,164 +913,193 @@ def evaluate_suite31(args: argparse.Namespace) -> Dict[str, Any]:
         pieces = pieces[: int(args.limit_pieces)]
 
     use_bf16 = bool(getattr(args, "bf16", False) and device.type == "cuda")
-    mode_tag = (
-        ("mtp-spec" if args.use_mtp_spec else "greedy")
-        + ("+grammar" if args.use_grammar else "")
-        + ("(strict)" if (args.use_grammar and args.strict_grammar) else "")
+    beam_size = int(getattr(args, "beam_size", 1))
+    if beam_size < 1:
+        raise ValueError(f"--beam-size must be >= 1, got {beam_size}")
+    beam_length_penalty = float(getattr(args, "beam_length_penalty", 0.6))
+    max_keep_ratio_override = getattr(args, "max_keep_ratio_override", None)
+
+    if beam_size > 1:
+        mode_tag = (
+            f"beam{beam_size}(lp={beam_length_penalty:g})"
+            + ("+grammar" if args.use_grammar else "")
+            + ("(strict)" if (args.use_grammar and args.strict_grammar) else "")
+        )
+    else:
+        mode_tag = (
+            ("mtp-spec" if args.use_mtp_spec else "greedy")
+            + ("+grammar" if args.use_grammar else "")
+            + ("(strict)" if (args.use_grammar and args.strict_grammar) else "")
+        )
+    mkr_str = (
+        f" | max_keep_ratio_override={float(max_keep_ratio_override):g}"
+        if max_keep_ratio_override is not None
+        else ""
     )
     print(
         f"[UniOMR suite31_hw] ckpt={args.ckpt} (step={ckpt_meta['step']}) | "
         f"device={device} | mode={mode_tag} | max_dim={args.max_dim} | "
-        f"max_len={args.max_len} | pieces={len(pieces)}",
+        f"max_len={args.max_len} | pieces={len(pieces)}{mkr_str}",
         flush=True,
     )
 
     workdir = Path(tempfile.mkdtemp(prefix="uni_s31_"))
     piece_rows: List[Dict[str, Any]] = []
 
-    for idx, piece in enumerate(pieces, start=1):
-        slug = piece["slug"]
-        is_hw = piece["handwritten"]
-        tag = "HW" if is_hw else "PR"
-        prow: Dict[str, Any] = {
-            "piece": slug,
-            "handwritten": is_hw,
-            "stratum": piece["stratum"],
-        }
-        try:
-            ref_page_toks, page_ref_notes = esg.suite31_page_refs(
-                piece["gt"], "uni-" + slug, workdir
-            )
-            prow["ref_tokens"] = len(ref_page_toks)
-        except Exception as e:  # noqa: BLE001
-            prow["skipped"] = True
-            prow["reason"] = f"ref-error: {str(e)[:160]}"
+    with override_max_keep_ratio(model, max_keep_ratio_override):
+        for idx, piece in enumerate(pieces, start=1):
+            slug = piece["slug"]
+            is_hw = piece["handwritten"]
+            tag = "HW" if is_hw else "PR"
+            prow: Dict[str, Any] = {
+                "piece": slug,
+                "handwritten": is_hw,
+                "stratum": piece["stratum"],
+            }
+            try:
+                ref_page_toks, page_ref_notes = esg.suite31_page_refs(
+                    piece["gt"], "uni-" + slug, workdir
+                )
+                prow["ref_tokens"] = len(ref_page_toks)
+            except Exception as e:  # noqa: BLE001
+                prow["skipped"] = True
+                prow["reason"] = f"ref-error: {str(e)[:160]}"
+                piece_rows.append(prow)
+                print(f"[{idx:02d}/{len(pieces):02d}] {slug:34s} [{tag}] SKIP ref-error: {e}", flush=True)
+                continue
+
+            for domain in ("clean", "photo"):
+                img_path: Path = piece[domain]
+                with Image.open(img_path) as raw_im:
+                    pil_im = uni_omr._resize_fullpage_pil(raw_im.convert("RGB"), args.max_dim)
+                img_t = uni_omr._pil_to_chw_tensor(pil_im).unsqueeze(0).to(device)
+
+                t0 = time.perf_counter()
+                mtp_stats: Optional[Dict[str, Any]] = None
+                with torch.no_grad():
+                    ctx = (
+                        torch.autocast(device_type="cuda", dtype=torch.bfloat16)
+                        if use_bf16
+                        else _nullcontext()
+                    )
+                    with ctx:
+                        if beam_size > 1:
+                            seq = generate_beam(
+                                model,
+                                img_t,
+                                max_len=args.max_len,
+                                beam_size=beam_size,
+                                length_penalty=beam_length_penalty,
+                                use_grammar=args.use_grammar,
+                                strict_grammar=args.strict_grammar,
+                            )
+                        elif args.use_mtp_spec:
+                            seq, mtp_stats = generate_mtp_spec(
+                                model,
+                                img_t,
+                                max_len=args.max_len,
+                                use_grammar=args.use_grammar,
+                                strict_grammar=args.strict_grammar,
+                                return_stats=True,
+                            )
+                        elif args.use_grammar:
+                            seq = generate_constrained(
+                                model,
+                                img_t,
+                                max_len=args.max_len,
+                                strict=args.strict_grammar,
+                            )
+                        elif int(cfg.vocab_size) != uni_omr.VOCAB_SIZE:
+                            seq = generate_mtp_spec(
+                                model,
+                                img_t,
+                                max_len=args.max_len,
+                                use_grammar=False,
+                                return_stats=False,
+                            )
+                        else:
+                            seq = model.generate(img_t, max_len=args.max_len)
+                if device.type == "cuda":
+                    torch.cuda.synchronize()
+                elapsed = max(1e-6, time.perf_counter() - t0)
+
+                seq_ids = seq[0].detach().cpu().tolist()
+                _, _, eos_id, _, _, _ = _vocab_spec(int(cfg.vocab_size))
+                pred_raw_toks = decode_uni_compat(
+                    seq_ids, vocab_size=int(cfg.vocab_size), skip_special=True
+                )
+                if eos_id not in seq_ids[1:]:
+                    pred_raw_toks = trim_truncated_tokens(pred_raw_toks)
+                hyp_page_toks, n_sys = stitch_uni_tokens(pred_raw_toks)
+
+                # 1. Token-level F1 & SER
+                tok_edits = uni_omr.levenshtein_distance(ref_page_toks, hyp_page_toks)
+                tok_ser = tok_edits / max(1, len(ref_page_toks))
+                _, _, tok_f1 = uni_omr.compute_token_f1(ref_page_toks, hyp_page_toks)
+
+                # 2. Note-level F1 & SER via assembly-serialize + eval-harness
+                hyp_txt = workdir / f"uni-{slug}-{domain}-hyp-bekern.txt"
+                hyp_txt.write_text(" ".join(hyp_page_toks) + "\n", encoding="utf-8")
+                hyp_notes = workdir / f"uni-{slug}-{domain}-hyp-notes.json"
+                p_dec = esg.run_cli([
+                    esg.ASER, "bekern-decode", "--input", str(hyp_txt), "--out", str(hyp_notes),
+                ])
+                if p_dec.returncode != 0 or not hyp_notes.exists():
+                    note_f1 = 0.0
+                    note_ser = 1.0
+                    proxy_fixes = None
+                    decode_ok = False
+                    zero_reason = f"bekern-decode-rc-{p_dec.returncode}"
+                else:
+                    sc = esg.score_notes_pair(
+                        page_ref_notes,
+                        hyp_notes,
+                        workdir,
+                        f"uni-{slug}-{domain}",
+                        esg.EHARNESS,
+                        esg.ASER,
+                    )
+                    note_f1 = float(sc.get("f1", 0.0))
+                    note_ser = float(sc.get("ser", 1.0))
+                    proxy_fixes = sc.get("proxy_fixes")
+                    decode_ok = not bool(sc.get("zeroed"))
+                    zero_reason = sc.get("zero_reason")
+
+                n_gen = max(1, len(pred_raw_toks) + 1)
+                tok_per_sec = n_gen / elapsed
+
+                pfx = domain + "_"
+                prow[pfx + "tok_f1"] = round(tok_f1, 6)
+                prow[pfx + "tok_ser"] = round(tok_ser, 6)
+                prow[pfx + "note_f1"] = round(note_f1, 6)
+                prow[pfx + "note_ser"] = round(note_ser, 6)
+                prow[pfx + "proxy_fixes"] = proxy_fixes
+                prow[pfx + "decode_ok"] = decode_ok
+                prow[pfx + "zero_reason"] = zero_reason
+                prow[pfx + "n_sys"] = n_sys
+                prow[pfx + "n_pred_toks"] = len(hyp_page_toks)
+                prow[pfx + "elapsed_secs"] = round(elapsed, 4)
+                prow[pfx + "tok_per_sec"] = round(tok_per_sec, 2)
+                if mtp_stats is not None:
+                    prow[pfx + "draft_proposed"] = mtp_stats["draft_proposed"]
+                    prow[pfx + "draft_accepted"] = mtp_stats["draft_accepted"]
+                    prow[pfx + "mtp_acceptance_rate"] = mtp_stats["acceptance_rate"]
+
+                mtp_str = (
+                    f" mtp_acc={mtp_stats['acceptance_rate']:.2f}"
+                    if mtp_stats is not None
+                    else ""
+                )
+                dec_str = "OK" if decode_ok else f"FAIL({zero_reason})"
+                print(
+                    f"[{idx:02d}/{len(pieces):02d}] {slug:34s} [{tag}|{domain:5s}] "
+                    f"tokF1={tok_f1:.3f} tokSER={tok_ser:.3f} | "
+                    f"noteF1={note_f1:.3f} noteSER={note_ser:.3f} ({dec_str}) | "
+                    f"sys={n_sys} tok={len(hyp_page_toks):4d} {tok_per_sec:5.1f}tok/s{mtp_str}",
+                    flush=True,
+                )
+
             piece_rows.append(prow)
-            print(f"[{idx:02d}/{len(pieces):02d}] {slug:34s} [{tag}] SKIP ref-error: {e}", flush=True)
-            continue
-
-        for domain in ("clean", "photo"):
-            img_path: Path = piece[domain]
-            with Image.open(img_path) as raw_im:
-                pil_im = uni_omr._resize_fullpage_pil(raw_im.convert("RGB"), args.max_dim)
-            img_t = uni_omr._pil_to_chw_tensor(pil_im).unsqueeze(0).to(device)
-
-            t0 = time.perf_counter()
-            mtp_stats: Optional[Dict[str, Any]] = None
-            with torch.no_grad():
-                ctx = (
-                    torch.autocast(device_type="cuda", dtype=torch.bfloat16)
-                    if use_bf16
-                    else _nullcontext()
-                )
-                with ctx:
-                    if args.use_mtp_spec:
-                        seq, mtp_stats = generate_mtp_spec(
-                            model,
-                            img_t,
-                            max_len=args.max_len,
-                            use_grammar=args.use_grammar,
-                            strict_grammar=args.strict_grammar,
-                            return_stats=True,
-                        )
-                    elif args.use_grammar:
-                        seq = generate_constrained(
-                            model,
-                            img_t,
-                            max_len=args.max_len,
-                            strict=args.strict_grammar,
-                        )
-                    elif int(cfg.vocab_size) != uni_omr.VOCAB_SIZE:
-                        seq = generate_mtp_spec(
-                            model,
-                            img_t,
-                            max_len=args.max_len,
-                            use_grammar=False,
-                            return_stats=False,
-                        )
-                    else:
-                        seq = model.generate(img_t, max_len=args.max_len)
-            if device.type == "cuda":
-                torch.cuda.synchronize()
-            elapsed = max(1e-6, time.perf_counter() - t0)
-
-            seq_ids = seq[0].detach().cpu().tolist()
-            _, _, eos_id, _, _, _ = _vocab_spec(int(cfg.vocab_size))
-            pred_raw_toks = decode_uni_compat(
-                seq_ids, vocab_size=int(cfg.vocab_size), skip_special=True
-            )
-            if eos_id not in seq_ids[1:]:
-                pred_raw_toks = trim_truncated_tokens(pred_raw_toks)
-            hyp_page_toks, n_sys = stitch_uni_tokens(pred_raw_toks)
-
-            # 1. Token-level F1 & SER
-            tok_edits = uni_omr.levenshtein_distance(ref_page_toks, hyp_page_toks)
-            tok_ser = tok_edits / max(1, len(ref_page_toks))
-            _, _, tok_f1 = uni_omr.compute_token_f1(ref_page_toks, hyp_page_toks)
-
-            # 2. Note-level F1 & SER via assembly-serialize + eval-harness
-            hyp_txt = workdir / f"uni-{slug}-{domain}-hyp-bekern.txt"
-            hyp_txt.write_text(" ".join(hyp_page_toks) + "\n", encoding="utf-8")
-            hyp_notes = workdir / f"uni-{slug}-{domain}-hyp-notes.json"
-            p_dec = esg.run_cli([
-                esg.ASER, "bekern-decode", "--input", str(hyp_txt), "--out", str(hyp_notes),
-            ])
-            if p_dec.returncode != 0 or not hyp_notes.exists():
-                note_f1 = 0.0
-                note_ser = 1.0
-                proxy_fixes = None
-                decode_ok = False
-                zero_reason = f"bekern-decode-rc-{p_dec.returncode}"
-            else:
-                sc = esg.score_notes_pair(
-                    page_ref_notes,
-                    hyp_notes,
-                    workdir,
-                    f"uni-{slug}-{domain}",
-                    esg.EHARNESS,
-                    esg.ASER,
-                )
-                note_f1 = float(sc.get("f1", 0.0))
-                note_ser = float(sc.get("ser", 1.0))
-                proxy_fixes = sc.get("proxy_fixes")
-                decode_ok = not bool(sc.get("zeroed"))
-                zero_reason = sc.get("zero_reason")
-
-            n_gen = max(1, len(pred_raw_toks) + 1)
-            tok_per_sec = n_gen / elapsed
-
-            pfx = domain + "_"
-            prow[pfx + "tok_f1"] = round(tok_f1, 6)
-            prow[pfx + "tok_ser"] = round(tok_ser, 6)
-            prow[pfx + "note_f1"] = round(note_f1, 6)
-            prow[pfx + "note_ser"] = round(note_ser, 6)
-            prow[pfx + "proxy_fixes"] = proxy_fixes
-            prow[pfx + "decode_ok"] = decode_ok
-            prow[pfx + "zero_reason"] = zero_reason
-            prow[pfx + "n_sys"] = n_sys
-            prow[pfx + "n_pred_toks"] = len(hyp_page_toks)
-            prow[pfx + "elapsed_secs"] = round(elapsed, 4)
-            prow[pfx + "tok_per_sec"] = round(tok_per_sec, 2)
-            if mtp_stats is not None:
-                prow[pfx + "draft_proposed"] = mtp_stats["draft_proposed"]
-                prow[pfx + "draft_accepted"] = mtp_stats["draft_accepted"]
-                prow[pfx + "mtp_acceptance_rate"] = mtp_stats["acceptance_rate"]
-
-            mtp_str = (
-                f" mtp_acc={mtp_stats['acceptance_rate']:.2f}"
-                if mtp_stats is not None
-                else ""
-            )
-            dec_str = "OK" if decode_ok else f"FAIL({zero_reason})"
-            print(
-                f"[{idx:02d}/{len(pieces):02d}] {slug:34s} [{tag}|{domain:5s}] "
-                f"tokF1={tok_f1:.3f} tokSER={tok_ser:.3f} | "
-                f"noteF1={note_f1:.3f} noteSER={note_ser:.3f} ({dec_str}) | "
-                f"sys={n_sys} tok={len(hyp_page_toks):4d} {tok_per_sec:5.1f}tok/s{mtp_str}",
-                flush=True,
-            )
-
-        piece_rows.append(prow)
 
     printed_rows = [r for r in piece_rows if not r["handwritten"]]
     hw_rows = [r for r in piece_rows if r["handwritten"]]
@@ -815,6 +1126,13 @@ def evaluate_suite31(args: argparse.Namespace) -> Dict[str, Any]:
             "use_grammar": bool(args.use_grammar),
             "strict_grammar": bool(args.strict_grammar),
             "use_mtp_spec": bool(args.use_mtp_spec),
+            "beam_size": beam_size,
+            "beam_length_penalty": beam_length_penalty,
+            "max_keep_ratio_override": (
+                float(max_keep_ratio_override)
+                if max_keep_ratio_override is not None
+                else None
+            ),
             "device": str(device),
         },
         "summary": summary,
@@ -885,6 +1203,24 @@ def build_arg_parser() -> argparse.ArgumentParser:
     ap.add_argument("--use-grammar", action="store_true", help="Enable FSA grammar-constrained decoding")
     ap.add_argument("--strict-grammar", action="store_true", help="Enable strict bar-duration grammar rules")
     ap.add_argument("--use-mtp-spec", action="store_true", help="Enable MTP-4 self-speculative decoding")
+    ap.add_argument(
+        "--beam-size",
+        type=int,
+        default=1,
+        help="Beam search width (1 = existing greedy/MTP-4 fast path; >1 = KV-cached beam search)",
+    )
+    ap.add_argument(
+        "--beam-length-penalty",
+        type=float,
+        default=0.6,
+        help="Length normalization exponent for beam search (score / len**alpha)",
+    )
+    ap.add_argument(
+        "--max-keep-ratio-override",
+        type=float,
+        default=None,
+        help="Temporarily override model.router.max_keep_ratio at eval time (e.g. 0.55 or 0.65)",
+    )
     ap.add_argument(
         "--device",
         default="cuda" if torch.cuda.is_available() else "cpu",

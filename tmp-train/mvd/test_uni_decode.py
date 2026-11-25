@@ -338,6 +338,157 @@ class TestUniDecodeCPU(unittest.TestCase):
             ["clef-G-2", "time-4-4", "quarter", "C", "4", "bar"],
         )
 
+    def test_beam_size_1_matches_generate_constrained_exactly(self) -> None:
+        """generate_beam(beam_size=1) matches generate_constrained() token-for-token."""
+        for seed, batch_size, strict, vocab_size in (
+            (17, 1, False, None),
+            (29, 2, False, None),
+            (41, 1, True, None),
+            (77, 1, False, 182),
+        ):
+            model = _make_tiny_model(seed=seed, mtp_k=4, vocab_size=vocab_size)
+            g = torch.Generator(device="cpu").manual_seed(seed + 500)
+            imgs = torch.rand((batch_size, 3, 64, 64), generator=g)
+
+            ref_seq = ev.generate_constrained(model, imgs, max_len=20, strict=strict)
+            beam1_seq = ev.generate_beam(
+                model,
+                imgs,
+                max_len=20,
+                beam_size=1,
+                length_penalty=0.6,
+                use_grammar=True,
+                strict_grammar=strict,
+            )
+            self.assertEqual(
+                ref_seq.tolist(),
+                beam1_seq.tolist(),
+                f"beam_size=1 diverged from generate_constrained (seed={seed}, B={batch_size}, strict={strict}, vocab={vocab_size})",
+            )
+
+    def test_beam_size_3_grammar_valid_encodes_once_and_beats_or_ties_greedy_logprob(self) -> None:
+        """beam_size=3 encodes once, emits valid FSA sequences, and achieves >= greedy log-prob."""
+        model = _make_tiny_model(seed=101, mtp_k=4)
+        g = torch.Generator(device="cpu").manual_seed(909)
+        imgs = torch.rand((1, 3, 64, 64), generator=g)
+
+        encode_calls = {"n": 0}
+        orig_encode = model.encode_image
+
+        def _spy_encode(*args, **kwargs):
+            encode_calls["n"] += 1
+            return orig_encode(*args, **kwargs)
+
+        model.encode_image = _spy_encode  # type: ignore[method-assign]
+        try:
+            seq_b1 = ev.generate_beam(
+                model, imgs, max_len=20, beam_size=1, length_penalty=0.6, use_grammar=True, strict_grammar=False
+            )
+            seq_b3 = ev.generate_beam(
+                model, imgs, max_len=20, beam_size=3, length_penalty=0.6, use_grammar=True, strict_grammar=False
+            )
+        finally:
+            model.encode_image = orig_encode  # type: ignore[method-assign]
+
+        # 1 encode_image call per generate_beam call (2 total)
+        self.assertEqual(encode_calls["n"], 2)
+
+        # Verify beam=3 sequence is 100% grammar-valid across <sys> boundaries
+        toks_b3 = ev.decode_uni_compat(seq_b3[0].tolist(), vocab_size=model.cfg.vocab_size, skip_special=True)
+        st = grammar.PrefixState(strict=False)
+        for tok in toks_b3:
+            if tok == uni_omr.SYS_TOKEN:
+                st = grammar.PrefixState(strict=False)
+            else:
+                st.step(tok)  # Must not raise ValueError
+
+        # Score both sequences with an independent uncached full-sequence forward pass
+        # to verify both KV-cache correctness and that beam=3 >= beam=1 log-prob.
+        def _seq_scores(seq_t: torch.Tensor) -> tuple[float, float]:
+            with torch.no_grad():
+                mem, _, _ = model.encode_image(imgs, return_aux=False)
+                logits, _ = model.decode_tokens(seq_t[:, :-1], mem, return_mtp=False)
+                lps = torch.nn.functional.log_softmax(logits.float(), dim=-1)
+                tgt = seq_t[:, 1:]
+                tok_lps = lps.gather(-1, tgt.unsqueeze(-1)).squeeze(-1)
+                raw = float(tok_lps.sum().item())
+                norm = ev._beam_norm_score(raw, int(tgt.shape[1]), 0.6)
+                return raw, norm
+
+        raw_b1, norm_b1 = _seq_scores(seq_b1)
+        raw_b3, norm_b3 = _seq_scores(seq_b3)
+        self.assertGreaterEqual(
+            norm_b3,
+            norm_b1 - 1e-5,
+            f"beam=3 norm log-prob ({norm_b3:.4f}) < beam=1 ({norm_b1:.4f})",
+        )
+        if seq_b1.shape[1] == seq_b3.shape[1]:
+            self.assertGreaterEqual(
+                raw_b3,
+                raw_b1 - 1e-5,
+                f"beam=3 raw log-prob ({raw_b3:.4f}) < beam=1 ({raw_b1:.4f})",
+            )
+
+    def test_max_keep_ratio_override_changes_routed_token_count_and_restores(self) -> None:
+        """override_max_keep_ratio changes dynamic-router k_kept cleanly and restores original value."""
+        torch.manual_seed(13)
+        cfg = uni_omr.UniOMRConfig(
+            d_model=64,
+            n_enc_layers=1,
+            n_dec_layers=1,
+            n_heads=4,
+            ffn_mult=2.0,
+            dropout=0.0,
+            keep_ratio=0.40,
+            dynamic_routing=True,
+            min_keep_ratio=0.10,
+            max_keep_ratio=0.30,
+            saliency_thr=-0.5,  # force dense routing so k_dyn hits max_keep_ratio cap
+            n_bg_summary=2,
+            use_uv_aux=False,
+            mtp_k=2,
+        )
+        model = uni_omr.UniOMRNet(cfg).to("cpu").eval()
+        # Synthetic high-contrast ink-dense image (128x128 -> 8x8 = 64 grid tokens)
+        img = torch.full((1, 3, 128, 128), 0.95)
+        img[:, :, 16:112, 16:112] = 0.05
+
+        with torch.no_grad():
+            _, _, info_default = model.encode_image(img, return_aux=False)
+            with ev.override_max_keep_ratio(model, 0.75):
+                self.assertAlmostEqual(model.router.max_keep_ratio, 0.75)
+                _, _, info_high = model.encode_image(img, return_aux=False)
+            # Original value restored cleanly on exit
+            self.assertAlmostEqual(model.router.max_keep_ratio, 0.30)
+
+        self.assertGreater(info_high["k_kept"], info_default["k_kept"])
+        self.assertGreater(info_high["n_out"], info_default["n_out"])
+
+        # Invalid override rejected cleanly
+        with self.assertRaises(ValueError):
+            with ev.override_max_keep_ratio(model, 0.0):
+                pass
+        with self.assertRaises(ValueError):
+            with ev.override_max_keep_ratio(model, 1.5):
+                pass
+
+        # CLI defaults and parsing check
+        ap = ev.build_arg_parser()
+        ns_def = ap.parse_args(["--ckpt", "dummy.pt"])
+        self.assertEqual(ns_def.beam_size, 1)
+        self.assertAlmostEqual(ns_def.beam_length_penalty, 0.6)
+        self.assertIsNone(ns_def.max_keep_ratio_override)
+
+        ns_custom = ap.parse_args([
+            "--ckpt", "dummy.pt",
+            "--beam-size", "4",
+            "--beam-length-penalty", "0.8",
+            "--max-keep-ratio-override", "0.65",
+        ])
+        self.assertEqual(ns_custom.beam_size, 4)
+        self.assertAlmostEqual(ns_custom.beam_length_penalty, 0.8)
+        self.assertAlmostEqual(ns_custom.max_keep_ratio_override, 0.65)
+
 
 if __name__ == "__main__":
     unittest.main()
