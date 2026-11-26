@@ -1,0 +1,120 @@
+{
+  "exp_id": "2026-11-26T01-38-ov-35-maxlen-resolution-inference-sweep",
+  "status": "COMPLETED",
+  "started_utc": "2026-11-26T00:15:20.576432+00:00",
+  "completed_utc": "2026-11-26T00:41:17.219805+00:00",
+  "elapsed_secs": 1555.08,
+  "platform": "colab-NVIDIA L4",
+  "hf_eval_path": "evals/2026-11-26T01-38-ov-35-maxlen-resolution-inference-sweep.json",
+  "ckpt_hf_path": "checkpoints/iter10_soup_baseline/uni_omr_soup.pt",
+  "matrix_table": [
+    {
+      "max_dim": 1280,
+      "max_len": 3840,
+      "printed_clean_note_f1": 0.899661,
+      "printed_photo_note_f1": 0.881793,
+      "hw_clean_note_f1": 0.279924,
+      "hw_photo_note_f1": 0.186656,
+      "all45_clean_note_f1": 0.706854,
+      "all45_photo_note_f1": 0.665529,
+      "truncated_pages_90": 3,
+      "total_decode_secs_horizon": 485.122
+    },
+    {
+      "max_dim": 1280,
+      "max_len": 5120,
+      "printed_clean_note_f1": 0.899661,
+      "printed_photo_note_f1": 0.881793,
+      "hw_clean_note_f1": 0.2783,
+      "hw_photo_note_f1": 0.184931,
+      "all45_clean_note_f1": 0.706349,
+      "all45_photo_note_f1": 0.664992,
+      "truncated_pages_90": 2,
+      "total_decode_secs_horizon": 485.122
+    },
+    {
+      "max_dim": 1280,
+      "max_len": 6144,
+      "printed_clean_note_f1": 0.899661,
+      "printed_photo_note_f1": 0.881793,
+      "hw_clean_note_f1": 0.277339,
+      "hw_photo_note_f1": 0.184252,
+      "all45_clean_note_f1": 0.706049,
+      "all45_photo_note_f1": 0.66478,
+      "truncated_pages_90": 2,
+      "total_decode_secs_horizon": 485.122
+    },
+    {
+      "max_dim": 1536,
+      "max_len": 3840,
+      "printed_clean_note_f1": 0.889468,
+      "printed_photo_note_f1": 0.873848,
+      "hw_clean_note_f1": 0.261849,
+      "hw_photo_note_f1": 0.192078,
+      "all45_clean_note_f1": 0.694209,
+      "all45_photo_note_f1": 0.661742,
+      "truncated_pages_90": 3,
+      "total_decode_secs_horizon": 483.457
+    },
+    {
+      "max_dim": 1536,
+      "max_len": 5120,
+      "printed_clean_note_f1": 0.889468,
+      "printed_photo_note_f1": 0.873848,
+      "hw_clean_note_f1": 0.258807,
+      "hw_photo_note_f1": 0.186235,
+      "all45_clean_note_f1": 0.693263,
+      "all45_photo_note_f1": 0.659924,
+      "truncated_pages_90": 3,
+      "total_decode_secs_horizon": 483.457
+    },
+    {
+      "max_dim": 1536,
+      "max_len": 6144,
+      "printed_clean_note_f1": 0.889468,
+      "printed_photo_note_f1": 0.873848,
+      "hw_clean_note_f1": 0.257582,
+      "hw_photo_note_f1": 0.183633,
+      "all45_clean_note_f1": 0.692881,
+      "all45_photo_note_f1": 0.659114,
+      "truncated_pages_90": 2,
+      "total_decode_secs_horizon": 483.457
+    },
+    {
+      "max_dim": 1792,
+      "max_len": 3840,
+      "printed_clean_note_f1": 0.85023,
+      "printed_photo_note_f1": 0.860218,
+      "hw_clean_note_f1": 0.236968,
+      "hw_photo_note_f1": 0.18652,
+      "all45_clean_note_f1": 0.659437,
+      "all45_photo_note_f1": 0.650623,
+      "truncated_pages_90": 3,
+      "total_decode_secs_horizon": 479.055
+    },
+    {
+      "max_dim": 1792,
+      "max_len": 5120,
+      "printed_clean_note_f1": 0.85023,
+      "printed_photo_note_f1": 0.860218,
+      "hw_clean_note_f1": 0.232182,
+      "hw_photo_note_f1": 0.179052,
+      "all45_clean_note_f1": 0.657948,
+      "all45_photo_note_f1": 0.6483,
+      "truncated_pages_90": 1,
+      "total_decode_secs_horizon": 479.055
+    },
+    {
+      "max_dim": 1792,
+      "max_len": 6144,
+      "printed_clean_note_f1": 0.85023,
+      "printed_photo_note_f1": 0.860218,
+      "hw_clean_note_f1": 0.231377,
+      "hw_photo_note_f1": 0.179052,
+      "all45_clean_note_f1": 0.657698,
+      "all45_photo_note_f1": 0.6483,
+      "truncated_pages_90": 0,
+      "total_decode_secs_horizon": 479.055
+    }
+  ]
+}

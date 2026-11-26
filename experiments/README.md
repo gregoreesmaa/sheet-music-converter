@@ -41,3 +41,5 @@ experiments/
 | 10 | `ablation-eagle3-speculative-speed` (`eagle3_drafter.py` vs `MTP-4`) | Modal `L4` (BF16) | Wave 3 | `QUEUED` (after `v2` ckpt) |
 | 11 | `rism-multiview-pseudolabels` (`generate_rism_pseudolabels.py` on 5,707 RISM) | Kaggle `2× T4` (FP16) | Wave 3 | `QUEUED` (after Iter 10.5) |
 | 12 | `ablation-dinov3-dense-distill-v2` (offline dense teacher → `v2` 5M backbone) | Modal `L4` (BF16) | Wave 3 | `QUEUED` |
+| 35 | [2026-11-26T01-38-ov-35-maxlen-resolution-inference-sweep](./2026-11-26T01-38-ov-35-maxlen-resolution-inference-sweep/OUTCOME.md) (`max_dim ∈ {1280,1536,1792}` × `max_len ∈ {3840,5120,6144}`) | Colab `L4` (BF16) | Wave 4 | `COMPLETED (ITERATE)` — `1280px/3840` wins `all45_clean=0.7069` (`+0.0126`), `hw_clean=0.2799` (`+0.0181`), `printed_clean=0.8997` (`+0.0102`); `max_len>3840` strictly harmful; successor `ov-35b` queued |
+| 35b | [2026-11-26T02-45-ov-35b-lower-res-tight-maxlen-sweep](./2026-11-26T02-45-ov-35b-lower-res-tight-maxlen-sweep/) (`max_dim ∈ {1024,1152,1280,1408}` × `max_len ∈ {2560,3072,3584,3840}`) | Colab `L4` (BF16) | Wave 4 | `QUEUED` (successor to Exp 35) |
