@@ -770,50 +770,61 @@
     "id": "2026-11-26T07-40-i13-13-cross-system-header-consensus",
     "wave": 9,
     "priority": 13,
-    "provider": "colab_l4",
-    "gpu": "L4",
+    "provider": "kaggle",
+    "gpu": "2xT4",
     "est_minutes": 25,
     "est_cu": 2.1,
     "script": "experiments/2026-11-26T07-40-i13-13-cross-system-header-consensus/run_colab.py",
     "hf_eval_target": "evals/2026-11-26T07-40-i13-13-cross-system-header-consensus.json",
-    "status": "QUEUED",
+    "status": "RUNNING",
     "depends_on": [],
     "session": "i13-13",
-    "started_at": "2026-11-26T09:12:54Z",
-    "log_path": "D:\\tmp\\overnight-queue-logs\\2026-11-26T07-40-i13-13-cross-system-header-consensus.log",
-    "note": "re-queued after triage fix 2026-11-26 (round 3)"
+    "started_at": "2026-11-26T17:47:27Z",
+    "log_path": "D:\\tmp\\overnight-queue-logs\\2026-11-26T07-40-i13-13-cross-system-header-consensus.kaggle.log",
+    "note": "re-queued after triage fix 2026-11-26 (round 3)",
+    "kernel_id": "gregoreesmaa/omr-i13-13"
   },
   {
     "id": "2026-11-26T07-40-i13-14-photo-illum-flatten-autocrop",
     "wave": 9,
     "priority": 14,
-    "provider": "modal_l4",
-    "gpu": "L4",
+    "provider": "kaggle",
+    "gpu": "2xT4",
     "est_minutes": 22,
     "est_cu": 1.9,
     "script": "experiments/2026-11-26T07-40-i13-14-photo-illum-flatten-autocrop/run_colab.py",
     "hf_eval_target": "evals/2026-11-26T07-40-i13-14-photo-illum-flatten-autocrop.json",
-    "status": "QUEUED",
+    "status": "FAILED",
     "depends_on": [],
-    "started_at": "2026-11-26T10:36:34Z",
-    "log_path": "D:\\tmp\\overnight-queue-logs\\2026-11-26T07-40-i13-14-photo-illum-flatten-autocrop.modal.log",
-    "note": "re-queued after triage fix 2026-11-26 (round 3)"
+    "started_at": "2026-11-26T17:23:18Z",
+    "log_path": "D:\\tmp\\overnight-queue-logs\\2026-11-26T07-40-i13-14-photo-illum-flatten-autocrop.kaggle.log",
+    "note": "re-queued after triage fix 2026-11-26 (round 3)",
+    "kernel_id": "gregoreesmaa/omr-i13-14",
+    "completed_at": "2026-11-26T17:47:27Z",
+    "elapsed_sec": 1448.94,
+    "returncode": 1,
+    "failure_reason": "kaggle_state=ERROR hf_eval_exists=False"
   },
   {
     "id": "2026-11-26T07-40-i13-15-confidence-selective-hires-redecode",
     "wave": 9,
     "priority": 15,
-    "provider": "modal_l4",
-    "gpu": "L4",
+    "provider": "kaggle",
+    "gpu": "2xT4",
     "est_minutes": 28,
     "est_cu": 2.3,
     "script": "experiments/2026-11-26T07-40-i13-15-confidence-selective-hires-redecode/run_colab.py",
     "hf_eval_target": "evals/2026-11-26T07-40-i13-15-confidence-selective-hires-redecode.json",
-    "status": "QUEUED",
+    "status": "FAILED",
     "depends_on": [],
-    "started_at": "2026-11-26T10:37:13Z",
-    "log_path": "D:\\tmp\\overnight-queue-logs\\2026-11-26T07-40-i13-15-confidence-selective-hires-redecode.modal.log",
-    "note": "re-queued after triage fix 2026-11-26 (round 3)"
+    "started_at": "2026-11-26T16:15:21Z",
+    "log_path": "D:\\tmp\\overnight-queue-logs\\2026-11-26T07-40-i13-15-confidence-selective-hires-redecode.kaggle.log",
+    "note": "re-queued after triage fix 2026-11-26 (round 3)",
+    "kernel_id": "gregoreesmaa/omr-i13-15",
+    "completed_at": "2026-11-26T16:27:42Z",
+    "elapsed_sec": 741.56,
+    "returncode": 1,
+    "failure_reason": "kaggle_state=ERROR hf_eval_exists=False"
   },
   {
     "id": "2026-11-26T07-40-i13-16-mathpix-conf-gated-redecode",
@@ -1026,7 +1037,7 @@
     "title": "Hybrid Encoder n_axial_layers vs n_global_layers Iso-Depth Split Sweep",
     "wave": 9,
     "priority": 1,
-    "provider": "modal_l4",
+    "provider": "colab_l4",
     "gpu": "L4",
     "colab_session": "i13-25-ax-gl",
     "est_minutes": 34,
@@ -1065,9 +1076,12 @@
       }
     ],
     "session": "i13-25",
-    "started_at": "2026-11-26T08:02:57Z",
-    "log_path": "D:\\tmp\\overnight-queue-logs\\2026-11-26T07-40-i13-25-axial-global-layer-split.modal.log",
-    "note": "re-queued after triage fix 2026-11-26 (round 2)"
+    "started_at": "2026-11-26T17:23:15Z",
+    "log_path": "D:\\tmp\\overnight-queue-logs\\2026-11-26T07-40-i13-25-axial-global-layer-split.log",
+    "note": "re-queued after transient Colab websocket drop (RuntimeError: Connection was lost at step 250/400; run_colab.py verified clean)",
+    "completed_at": "2026-11-26T18:03:27Z",
+    "elapsed_sec": 2412.17,
+    "returncode": 1
   },
   {
     "id": "2026-11-26T07-40-i13-26-gqa-kv-heads-sweep",
@@ -1075,7 +1089,7 @@
     "title": "Decoder GQA n_kv_heads Visual Cross-Attention Bottleneck Sweep (1, 2, 4, 8)",
     "wave": 9,
     "priority": 2,
-    "provider": "modal_l4",
+    "provider": "colab_l4",
     "gpu": "L4",
     "colab_session": "i13-26-gqa-kv",
     "est_minutes": 32,
@@ -1085,7 +1099,7 @@
     "plan": "experiments/2026-11-26T07-40-i13-26-gqa-kv-heads-sweep/PLAN.md",
     "hf_eval_target": "evals/2026-11-26T07-40-i13-26-gqa-kv-heads-sweep.json",
     "hf_run_target": "runs/2026-11-26T07-40-i13-26-gqa-kv-heads-sweep.json",
-    "status": "QUEUED",
+    "status": "RUNNING",
     "depends_on": [],
     "datasets": [
       "datasets/iter10_5_proxy_2k.tar"
@@ -1110,8 +1124,8 @@
       }
     ],
     "session": "i13-26",
-    "started_at": "2026-11-26T08:02:57Z",
-    "log_path": "D:\\tmp\\overnight-queue-logs\\2026-11-26T07-40-i13-26-gqa-kv-heads-sweep.modal.log",
+    "started_at": "2026-11-26T18:01:45Z",
+    "log_path": "D:\\tmp\\overnight-queue-logs\\2026-11-26T07-40-i13-26-gqa-kv-heads-sweep.log",
     "note": "re-queued after triage fix 2026-11-26 (round 2)"
   },
   {
@@ -1120,7 +1134,7 @@
     "title": "Aspect-Normalized 1D/2D-RoPE rope_coord_scale Aliasing Sweep (32, 64, 128, 256)",
     "wave": 9,
     "priority": 3,
-    "provider": "modal_l4",
+    "provider": "colab_l4",
     "gpu": "L4",
     "colab_session": "i13-27-rope-scale",
     "est_minutes": 32,
@@ -1130,7 +1144,7 @@
     "plan": "experiments/2026-11-26T07-40-i13-27-rope-coord-scale-sweep/PLAN.md",
     "hf_eval_target": "evals/2026-11-26T07-40-i13-27-rope-coord-scale-sweep.json",
     "hf_run_target": "runs/2026-11-26T07-40-i13-27-rope-coord-scale-sweep.json",
-    "status": "QUEUED",
+    "status": "RUNNING",
     "depends_on": [],
     "datasets": [
       "datasets/iter10_5_proxy_2k.tar"
@@ -1155,8 +1169,8 @@
       }
     ],
     "session": "i13-27",
-    "started_at": "2026-11-26T08:05:28Z",
-    "log_path": "D:\\tmp\\overnight-queue-logs\\2026-11-26T07-40-i13-27-rope-coord-scale-sweep.modal.log",
+    "started_at": "2026-11-26T18:08:48Z",
+    "log_path": "D:\\tmp\\overnight-queue-logs\\2026-11-26T07-40-i13-27-rope-coord-scale-sweep.log",
     "note": "re-queued after triage fix 2026-11-26 (round 2)"
   },
   {
@@ -1376,16 +1390,23 @@
     "id": "2026-11-26T06-25-ov-38b-scribe-ttt-budget-cons-3840",
     "wave": 9,
     "priority": 40,
-    "provider": "colab_l4",
-    "gpu": "L4",
+    "provider": "kaggle",
+    "gpu": "2xT4",
     "est_minutes": 30,
     "script": "experiments/2026-11-26T06-25-ov-38b-scribe-ttt-budget-cons-3840/run_colab.py",
     "hf_eval_target": "evals/2026-11-26T06-25-ov-38b-scribe-ttt-budget-cons-3840.json",
-    "status": "QUEUED",
+    "status": "COMPLETED",
     "depends_on": [
       "2026-11-26T01-38-ov-38-scribe-ttt-lr-steps-sweep"
     ],
-    "restored": "queue clobber 2026-11-26"
+    "restored": "queue clobber 2026-11-26",
+    "kernel_id": "gregoreesmaa/omr-ov-38b",
+    "started_at": "2026-11-26T16:15:21Z",
+    "log_path": "D:\\tmp\\overnight-queue-logs\\2026-11-26T06-25-ov-38b-scribe-ttt-budget-cons-3840.kaggle.log",
+    "completed_at": "2026-11-26T17:45:46Z",
+    "elapsed_sec": 5383.73,
+    "returncode": 0,
+    "hf_eval_exists": true
   },
   {
     "id": "2026-11-26T14-30-i13-06b-sar-sam-conf-skip-ttt",
@@ -1418,13 +1439,16 @@
     "est_cu": 1.0,
     "script": "experiments/2026-11-26T14-30-i13-11b-audiveris-voice-aware-rhythm-repair/run_colab.py",
     "hf_eval_target": "evals/2026-11-26T14-30-i13-11b-audiveris-voice-aware-rhythm-repair.json",
-    "status": "RUNNING",
+    "status": "COMPLETED",
     "depends_on": [
       "2026-11-26T07-40-i13-11-audiveris-humdrum-postproc"
     ],
     "session": "i13-11",
-    "started_at": "2026-11-26T13:42:59Z",
-    "log_path": "D:\\tmp\\overnight-queue-logs\\2026-11-26T14-30-i13-11b-audiveris-voice-aware-rhythm-repair.log"
+    "started_at": "2026-11-26T17:23:15Z",
+    "log_path": "D:\\tmp\\overnight-queue-logs\\2026-11-26T14-30-i13-11b-audiveris-voice-aware-rhythm-repair.log",
+    "completed_at": "2026-11-26T18:01:45Z",
+    "elapsed_sec": 2310.38,
+    "returncode": 0
   },
   {
     "id": "2026-11-26T14-30-i13-16b-mathpix-conf-gated-redecode-fixed",
@@ -1436,29 +1460,35 @@
     "est_cu": 1.7,
     "script": "experiments/2026-11-26T14-30-i13-16b-mathpix-conf-gated-redecode-fixed/run_colab.py",
     "hf_eval_target": "evals/2026-11-26T14-30-i13-16b-mathpix-conf-gated-redecode-fixed.json",
-    "status": "RUNNING",
+    "status": "FAILED",
     "depends_on": [
       "2026-11-26T07-40-i13-16-mathpix-conf-gated-redecode"
     ],
     "session": "i13-16",
-    "started_at": "2026-11-26T14:02:08Z",
-    "log_path": "D:\\tmp\\overnight-queue-logs\\2026-11-26T14-30-i13-16b-mathpix-conf-gated-redecode-fixed.log"
+    "started_at": "2026-11-26T18:03:27Z",
+    "log_path": "D:\\tmp\\overnight-queue-logs\\2026-11-26T14-30-i13-16b-mathpix-conf-gated-redecode-fixed.log",
+    "completed_at": "2026-11-26T18:08:48Z",
+    "elapsed_sec": 320.89,
+    "returncode": 1
   },
   {
     "id": "2026-11-26T14-30-i13-18b-conf-gated-ilms-blank",
     "wave": 10,
     "priority": 15,
-    "provider": "colab_l4",
-    "gpu": "L4",
+    "provider": "kaggle",
+    "gpu": "2xT4",
     "est_minutes": 35,
     "est_cu": 2.9,
     "script": "experiments/2026-11-26T14-30-i13-18b-conf-gated-ilms-blank/run_colab.py",
     "hf_eval_target": "evals/2026-11-26T14-30-i13-18b-conf-gated-ilms-blank.json",
-    "status": "QUEUED",
+    "status": "RUNNING",
     "depends_on": [
       "2026-11-26T07-40-i13-18-trocr-pylaia-vcd-ilms",
       "2026-11-26T07-40-i13-17-paddleocr-vrfm-band-router"
-    ]
+    ],
+    "kernel_id": "gregoreesmaa/omr-i13-18b",
+    "started_at": "2026-11-26T17:23:18Z",
+    "log_path": "D:\\tmp\\overnight-queue-logs\\2026-11-26T14-30-i13-18b-conf-gated-ilms-blank.kaggle.log"
   },
   {
     "id": "2026-11-26T14-30-ov-19b-router-saliency-keep-converged",
