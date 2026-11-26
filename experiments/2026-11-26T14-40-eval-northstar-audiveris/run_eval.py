@@ -18,6 +18,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import zipfile
 from typing import Any, Sequence
 
 REPO_ROOT = pathlib.Path(__file__).resolve().parents[2]
@@ -27,15 +28,17 @@ if str(MVD_DIR) not in sys.path:
 
 DEFAULT_MANIFEST = pathlib.Path(r"D:\tmp\northstar-eval-pack\manifest.json")
 DEFAULT_OUT_DIR = pathlib.Path(r"D:\tmp\northstar-eval-runs\audiveris")
-DEFAULT_IMAGE = "audiveris-northstar:5.3.1"
+DEFAULT_IMAGE = "audiveris-northstar:5.11.0"
 
-DOCKERFILE_TEMPLATE = """FROM eclipse-temurin:21-jre
+DOCKERFILE_TEMPLATE = """FROM eclipse-temurin:21-jre-noble
 RUN apt-get update && apt-get install -y --no-install-recommends \\
     curl unzip tesseract-ocr tesseract-ocr-eng libtesseract-dev \\
+    libgtk-3-0t64 libxrender1 fontconfig \\
     && rm -rf /var/lib/apt/lists/*
-ARG AUDIVERIS_DEB_URL=https://github.com/Audiveris/audiveris/releases/download/5.3.1/Audiveris-5.3.1-ubuntu22.04-x86_64.deb
-RUN curl -fSL "${AUDIVERIS_DEB_URL}" -o /tmp/audiveris.deb \\
-    && apt-get update && apt-get install -y --no-install-recommends /tmp/audiveris.deb \\
+ARG AUDIVERIS_DEB_URL=https://github.com/Audiveris/audiveris/releases/download/5.11.0/Audiveris-5.11.0-ubuntu24.04-x86_64.deb
+RUN mkdir -p /usr/share/desktop-directories /usr/share/applications /etc/xdg/menus/applications-merged /usr/share/mime/packages /usr/share/icons/hicolor \\
+    && curl -fSL "${AUDIVERIS_DEB_URL}" -o /tmp/audiveris.deb \\
+    && apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends /tmp/audiveris.deb \\
     && rm -rf /tmp/audiveris.deb /var/lib/apt/lists/*
 ENTRYPOINT ["/opt/audiveris/bin/Audiveris"]
 """
@@ -51,11 +54,21 @@ def _atomic_write_text(path: pathlib.Path, text: str) -> None:
 def build_docker_image(image_tag: str) -> None:
     """Build the isolated Audiveris black-box Docker image."""
     with tempfile.TemporaryDirectory(prefix="audiveris-docker-") as td:
-        df = pathlib.Path(td) / "Dockerfile"
+        td_path = pathlib.Path(td)
+        df = td_path / "Dockerfile"
         df.write_text(DOCKERFILE_TEMPLATE, encoding="utf-8")
-        cmd = ["docker", "build", "-t", image_tag, td]
+        env = os.environ.copy()
+        # Avoid Windows Docker Desktop credential helper failures when pulling
+        # public base images from headless shells where docker-credential-desktop
+        # is not on PATH.
+        if shutil.which("docker-credential-desktop") is None:
+            docker_cfg = td_path / "docker-config"
+            docker_cfg.mkdir(exist_ok=True)
+            (docker_cfg / "config.json").write_text("{}", encoding="utf-8")
+            env["DOCKER_CONFIG"] = str(docker_cfg)
+        cmd = ["docker", "build", "-t", image_tag, str(td_path)]
         print(f"[audiveris] running: {' '.join(cmd)}", flush=True)
-        subprocess.run(cmd, check=True)
+        subprocess.run(cmd, env=env, check=True)
 
 
 def run_audiveris_page(
@@ -116,8 +129,22 @@ def run_audiveris_page(
         exports = sorted(out_dir.rglob("*.mxl")) + sorted(out_dir.rglob("*.musicxml")) + sorted(out_dir.rglob("*.xml"))
         if exports:
             src = exports[0]
-            dst = out_mxml_dir / f"{page_id}{src.suffix.lower()}"
-            tmp = dst.with_suffix(dst.suffix + ".tmp")
+            dst = out_mxml_dir / f"{page_id}.musicxml"
+            if src.suffix.lower() == ".mxl":
+                # Extract the primary MusicXML score from the .mxl archive into
+                # <page_id>.musicxml so it never collides with stale empty files.
+                with zipfile.ZipFile(src, "r") as zf:
+                    xml_members = [
+                        n for n in zf.namelist()
+                        if n.lower().endswith((".musicxml", ".xml")) and not n.upper().startswith("META-INF/")
+                    ]
+                    if xml_members:
+                        xml_bytes = zf.read(xml_members[0])
+                        tmp = dst.with_suffix(".musicxml.tmp")
+                        tmp.write_bytes(xml_bytes)
+                        os.replace(tmp, dst)
+                        return True, "ok(.mxl->.musicxml)", elapsed
+            tmp = dst.with_suffix(".musicxml.tmp")
             shutil.copy2(src, tmp)
             os.replace(tmp, dst)
             return True, f"ok({src.suffix.lower()})", elapsed
@@ -139,7 +166,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--skip-eval", action="store_true", help="Exit after --build-image")
     parser.add_argument("--manifest", type=pathlib.Path, default=DEFAULT_MANIFEST)
     parser.add_argument("--out-dir", type=pathlib.Path, default=DEFAULT_OUT_DIR)
-    parser.add_argument("--system-name", type=str, default="audiveris-5.3.1-docker")
+    parser.add_argument("--system-name", type=str, default="audiveris-5.11.0-docker")
     parser.add_argument("--timeout-s", type=int, default=120)
     parser.add_argument("--memory", type=str, default="6g")
     parser.add_argument("--resume", action="store_true")

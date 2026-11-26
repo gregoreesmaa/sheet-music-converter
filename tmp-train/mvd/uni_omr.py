@@ -76,6 +76,10 @@ if str(_THIS_DIR) not in sys.path:
     sys.path.insert(0, str(_THIS_DIR))
 
 import data  # noqa: E402
+try:
+    import grammar  # noqa: E402
+except Exception:
+    grammar = None  # type: ignore[assignment]
 
 # ---------------------------------------------------------------------------
 # Vocabulary: preserves all data.VOCAB + PAD/BOS/EOS IDs verbatim, and appends
@@ -3251,6 +3255,7 @@ def apply_online_augment(
     rism_fda_prob: float = 0.0,
     rism_adain_prob: float = 0.0,
     rism_fda_beta: float = 0.02,
+    postwarp_1bit_prob: Optional[float] = None,
 ) -> Image.Image:
     """Online phone-photo, scanner, and historical manuscript degradation.
 
@@ -3288,6 +3293,14 @@ def apply_online_augment(
     archival_p = (0.55 if is_hw else 0.12) if hw_archival_prob is None else float(hw_archival_prob)
     do_archival = (not did_rism_transfer) and (r.random() < archival_p)
     do_1bit = (not did_rism_transfer) and (not do_archival) and (r.random() < 0.15)
+    pw_1bit_p = (0.08 if (not is_hw and not is_strip) else 0.0) if postwarp_1bit_prob is None else float(postwarp_1bit_prob)
+    do_postwarp_1bit = (
+        (not did_rism_transfer)
+        and (not do_archival)
+        and (not do_1bit)
+        and (pw_1bit_p > 0.0)
+        and (r.random() < pw_1bit_p)
+    )
 
     def _sample_dark_desk() -> Tuple[int, int, int]:
         if r.random() < 0.40:
@@ -3484,14 +3497,14 @@ def apply_online_augment(
                 out = Image.fromarray(np.repeat(bw[..., None], 3, axis=2), mode="RGB")
 
     # B. Thin-ink dropout / faint pencil (p=0.18; skip on pure 1-bit before framing half the time)
-    if (not do_1bit or r.random() < 0.45) and r.random() < 0.18 and orig_w >= 32 and orig_h >= 32:
+    if (not (do_1bit or do_postwarp_1bit) or r.random() < 0.45) and r.random() < 0.18 and orig_w >= 32 and orig_h >= 32:
         out = _apply_thin_ink_dropout(out, r)
 
-    # C. Asymmetric & 4-sided dark/wood desk border framing (p=0.45 full page, p=0.15 strip)
-    border_p = 0.15 if is_strip else 0.45
+    # C. Asymmetric & 4-sided dark/wood desk border framing (p=0.45 full page, p=0.15 strip, p=0.70 post-warp 1-bit)
+    border_p = 0.70 if do_postwarp_1bit else (0.15 if is_strip else 0.45)
     if (not has_dark_border) and r.random() < border_p and orig_w >= 32 and orig_h >= 32:
         has_dark_border = True
-        dark_fill = _sample_dark_desk()
+        dark_fill = (0, 0, 0) if do_postwarp_1bit else _sample_dark_desk()
         if r.random() < 0.55:
             # 4-sided dark/wood desk border (1-12% per side)
             sides = [True, True, True, True]
@@ -3509,7 +3522,7 @@ def apply_online_augment(
         ch = orig_h + pad_t + pad_b
         if _cv2 is not None:
             arr_in = np.asarray(out, dtype=np.uint8)
-            if r.random() < 0.55:
+            if (not do_postwarp_1bit) and r.random() < 0.55:
                 np_rng = np.random.default_rng(r.randint(0, 2**31 - 1))
                 gw, gh = 32, 32
                 base_arr = np.array(dark_fill, dtype=np.float32).reshape(1, 1, 3)
@@ -3528,7 +3541,7 @@ def apply_online_augment(
             out = Image.fromarray(_cv2.resize(canvas_arr, (orig_w, orig_h), interpolation=_cv2.INTER_LINEAR), mode="RGB")
         else:
             canvas = Image.new("RGB", (cw, ch), dark_fill)
-            if r.random() < 0.55:
+            if (not do_postwarp_1bit) and r.random() < 0.55:
                 np_rng = np.random.default_rng(r.randint(0, 2**31 - 1))
                 gw, gh = 32, 32
                 base_arr = np.array(dark_fill, dtype=np.float32).reshape(1, 1, 3)
@@ -3544,7 +3557,7 @@ def apply_online_augment(
 
     # D1. Cylindrical / book-gutter page curl (p=0.25 full page, p=0.10 strip)
     if r.random() < (0.10 if is_strip else 0.25) and orig_w >= 32 and orig_h >= 32:
-        curl_fill = dark_fill if has_dark_border else page_fill
+        curl_fill = (0, 0, 0) if do_postwarp_1bit else (dark_fill if has_dark_border else page_fill)
         out = _apply_page_curl(out, r, border_fill=curl_fill)
 
     # D2. Perspective quad warp (p=0.45 full page, 1-9% keystone; p=0.20 strip, 1-4%)
@@ -3559,7 +3572,7 @@ def apply_online_augment(
             (w_f * (1.0 - r.uniform(0.01, max_jit)), h_f * (1.0 - r.uniform(0.01, max_jit))),
             (w_f * r.uniform(0.01, max_jit), h_f * (1.0 - r.uniform(0.01, max_jit))),
         ]
-        p_fill = dark_fill if (has_dark_border or r.random() < 0.50) else page_fill
+        p_fill = (0, 0, 0) if do_postwarp_1bit else (dark_fill if (has_dark_border or r.random() < 0.50) else page_fill)
         out = _fast_perspective(out, src_pts, dst_pts, p_fill)
 
     # D3. Rotation (p=0.55 full page +/-7.0 deg with expand=True; p=0.35 strip +/-1.5 deg)
@@ -3567,11 +3580,40 @@ def apply_online_augment(
     if r.random() < rot_p:
         max_ang = 1.5 if is_strip else 7.0
         angle = r.uniform(-max_ang, max_ang)
-        if has_dark_border and r.random() < 0.70:
+        if do_postwarp_1bit:
+            rot_fill = (0, 0, 0)
+        elif has_dark_border and r.random() < 0.70:
             rot_fill = dark_fill
         else:
             rot_fill = page_fill
         out = _fast_rotate(out, angle, rot_fill, expand=(not is_strip))
+
+    # D4. Post-warp 1-bit B&W scanner adaptive threshold (p=0.08 on printed full pages):
+    # Runs AFTER perspective + rotation + solid-black border padding so training sees
+    # crisp 1-bit (0/255) staircase-aliased staff lines + solid-black scanner borders,
+    # skipping downstream photometric/blur/JPEG/noise smoothing.
+    if do_postwarp_1bit:
+        dark_floor = r.randint(25, 55)
+        if _cv2 is not None:
+            luma_u8 = _cv2.cvtColor(np.asarray(out, dtype=np.uint8), _cv2.COLOR_RGB2GRAY)
+            local_bg = _cv2.blur(luma_u8, (31, 31))
+            delta_u8 = int(round(r.uniform(0.08, 0.20) * 255.0))
+            bw = np.where(
+                (luma_u8.astype(np.int16) >= (local_bg.astype(np.int16) - delta_u8)) & (luma_u8 > dark_floor),
+                np.uint8(255),
+                np.uint8(0),
+            )
+            out = Image.fromarray(_cv2.cvtColor(bw, _cv2.COLOR_GRAY2RGB), mode="RGB")
+        else:
+            luma_u8 = np.asarray(out.convert("L"), dtype=np.uint8)
+            luma_f = luma_u8.astype(np.float32) * (1.0 / 255.0)
+            local_bg_f = np.asarray(
+                out.convert("L").filter(ImageFilter.BoxBlur(15)), dtype=np.float32
+            ) * (1.0 / 255.0)
+            delta = r.uniform(0.08, 0.20)
+            bw = np.where((luma_f >= (local_bg_f - delta)) & (luma_u8 > dark_floor), np.uint8(255), np.uint8(0))
+            out = Image.fromarray(np.repeat(bw[..., None], 3, axis=2), mode="RGB")
+        return out
 
     # E1. Photometric pass (fast OpenCV 64x64 uint8 shading + LUT contrast, or NumPy fallback):
     # uneven shadows/vignette/tint + brightness/contrast.
@@ -3832,6 +3874,13 @@ def _is_pre_degraded_path(path: Any) -> bool:
     return bool(_PRE_DEGRADED_RE.search(str(path)))
 
 
+def _maybe_canonicalize_voices(tokens: List[str], enabled: bool) -> List[str]:
+    """Optionally canonicalize multi-voice measure ordering via ``grammar.canonicalize_measure_voices``."""
+    if enabled and grammar is not None and hasattr(grammar, "canonicalize_measure_voices"):
+        return grammar.canonicalize_measure_voices(tokens)
+    return tokens
+
+
 class UniStripDataset(Dataset):
     """Real single-staff strip dataset ``(png, *-bekern.txt)``."""
 
@@ -3850,6 +3899,7 @@ class UniStripDataset(Dataset):
         rism_fda_prob: float = 0.0,
         rism_adain_prob: float = 0.0,
         rism_fda_beta: float = 0.02,
+        canonicalize_voices: bool = True,
     ) -> None:
         self.pairs = list(pairs)
         self.strip_height = int(strip_height)
@@ -3864,6 +3914,7 @@ class UniStripDataset(Dataset):
         self.rism_fda_prob = float(max(0.0, min(1.0, rism_fda_prob)))
         self.rism_adain_prob = float(max(0.0, min(1.0, rism_adain_prob)))
         self.rism_fda_beta = float(rism_fda_beta)
+        self.canonicalize_voices = bool(canonicalize_voices)
         self._seq_cache: Dict[int, np.ndarray] = {}
 
     def __len__(self) -> int:
@@ -3897,7 +3948,7 @@ class UniStripDataset(Dataset):
 
         cached_seq = self._seq_cache.get(sample_idx)
         if cached_seq is None:
-            toks = data.load_bekern(bekern_path)
+            toks = _maybe_canonicalize_voices(data.load_bekern(bekern_path), self.canonicalize_voices)
             ids = _cap_token_ids([BOS_ID] + data.encode(toks) + [EOS_ID], self.max_seq_len)
             cached_seq = np.asarray(ids, dtype=_SEQ_CACHE_DTYPE)
             self._seq_cache[sample_idx] = cached_seq
@@ -3906,6 +3957,7 @@ class UniStripDataset(Dataset):
             "seq": torch.from_numpy(cached_seq).to(torch.long),
             "sample_id": img_path.stem,
             "kind": self.kind,
+            "domain": "hw" if self.is_hw else "printed",
         }
 
 
@@ -3927,7 +3979,9 @@ def _sample_weighted_fullpage_dim(base_dim: int, rng: Optional[random.Random] = 
         return int(r.choice(valid))
     all_choices = (1024, 1088, 1152, 1280, 1344, 1408, 1536)
     valid_all = [c for c in all_choices if c <= hi]
-    return int(r.choice(valid_all)) if valid_all else _round_mult16(hi, min_val=16)
+    if valid_all:
+        return int(valid_all[-1]) if u >= 0.50 else int(r.choice(valid_all))
+    return _round_mult16(hi, min_val=16)
 
 
 class UniFullPageDataset(Dataset):
@@ -3947,6 +4001,7 @@ class UniFullPageDataset(Dataset):
         rism_fda_prob: float = 0.0,
         rism_adain_prob: float = 0.0,
         rism_fda_beta: float = 0.02,
+        canonicalize_voices: bool = True,
     ) -> None:
         self.pairs = list(pairs)
         self.fullpage_max_dim = int(fullpage_max_dim)
@@ -3960,6 +4015,7 @@ class UniFullPageDataset(Dataset):
         self.rism_fda_prob = float(max(0.0, min(1.0, rism_fda_prob)))
         self.rism_adain_prob = float(max(0.0, min(1.0, rism_adain_prob)))
         self.rism_fda_beta = float(rism_fda_beta)
+        self.canonicalize_voices = bool(canonicalize_voices)
         self._batch_target_dim: Optional[int] = None
         self._seq_cache: Dict[int, np.ndarray] = {}
 
@@ -4021,6 +4077,7 @@ class UniFullPageDataset(Dataset):
                 if s_idx > 0:
                     stitched.append(SYS_TOKEN)
                 stitched.extend(data.load_bekern(b_path))
+            stitched = _maybe_canonicalize_voices(stitched, self.canonicalize_voices)
             ids = _cap_token_ids(encode_uni(stitched, add_bos_eos=True), self.max_seq_len)
             cached_seq = np.asarray(ids, dtype=_SEQ_CACHE_DTYPE)
             self._seq_cache[sample_idx] = cached_seq
@@ -4196,6 +4253,7 @@ def collate_uni_batch(samples: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
         images = torch.ones((B, 3, max_h, max_w), dtype=torch.float32)
     seqs = torch.full((B, max_t), PAD_ID, dtype=torch.long)
     sample_ids: List[str] = []
+    domains: List[str] = []
     orig_hw: List[Tuple[int, int]] = []
     orig_seq_len: List[int] = []
     for i, s in enumerate(samples):
@@ -4208,11 +4266,13 @@ def collate_uni_batch(samples: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
         seqs[i, :t_len] = sq
         orig_seq_len.append(t_len)
         sample_ids.append(str(s.get("sample_id", i)))
+        domains.append(str(s.get("domain") or ("hw" if s.get("kind") == "hw_strip" else "printed")))
 
     return {
         "images": images,
         "seq": seqs,
         "sample_ids": sample_ids,
+        "domains": domains,
         "orig_hw": orig_hw,
         "orig_seq_len": orig_seq_len,
         "kind": samples[0].get("kind", "unknown") if B > 0 else "empty",
@@ -4224,6 +4284,7 @@ def unpack_collated_batch(batch: Dict[str, Any], fallback_kind: str) -> List[Dic
     B_loc = int(batch["images"].shape[0])
     orig_hw = batch.get("orig_hw")
     orig_seq_len = batch.get("orig_seq_len")
+    domains = batch.get("domains")
     out: List[Dict[str, Any]] = []
     for i in range(B_loc):
         im = batch["images"][i]
@@ -4242,6 +4303,7 @@ def unpack_collated_batch(batch: Dict[str, Any], fallback_kind: str) -> List[Dic
             "seq": sq,
             "sample_id": batch["sample_ids"][i],
             "kind": fallback_kind,
+            "domain": domains[i] if (domains is not None and i < len(domains)) else ("hw" if fallback_kind == "hw_strip" else "printed"),
         })
     return out
 
@@ -5404,6 +5466,7 @@ def run_train(args: argparse.Namespace, cfg: UniOMRConfig) -> Dict[str, Any]:
                     f"removed cross-modality leaks: printed_strips={leaked_st}, hw_strips={leaked_hw}, fullpage={leaked_fp}"
                 )
 
+        canon_voices = bool(getattr(args, "canonicalize_voices", True))
         if st_tr or st_va:
             strip_train_ds = UniStripDataset(
                 st_tr,
@@ -5414,6 +5477,7 @@ def run_train(args: argparse.Namespace, cfg: UniOMRConfig) -> Dict[str, Any]:
                 aug_prob=aug_prob,
                 kind="strip",
                 return_uint8=True,
+                canonicalize_voices=canon_voices,
             )
             strip_val_ds = UniStripDataset(
                 st_va,
@@ -5423,6 +5487,7 @@ def run_train(args: argparse.Namespace, cfg: UniOMRConfig) -> Dict[str, Any]:
                 augment=False,
                 kind="strip",
                 return_uint8=True,
+                canonicalize_voices=canon_voices,
             ) if st_va else None
             if prefetch_threads > 0 and args.num_workers == 0 and len(st_tr) > 0:
                 pf_st = AsyncThreadPrefetcher(
@@ -5463,6 +5528,7 @@ def run_train(args: argparse.Namespace, cfg: UniOMRConfig) -> Dict[str, Any]:
                 aug_prob=aug_prob,
                 kind="hw_strip",
                 return_uint8=True,
+                canonicalize_voices=canon_voices,
             )
             hw_strip_val_ds = UniStripDataset(
                 hw_va,
@@ -5472,6 +5538,7 @@ def run_train(args: argparse.Namespace, cfg: UniOMRConfig) -> Dict[str, Any]:
                 augment=False,
                 kind="hw_strip",
                 return_uint8=True,
+                canonicalize_voices=canon_voices,
             ) if hw_va else None
             if prefetch_threads > 0 and args.num_workers == 0 and len(hw_tr) > 0:
                 pf_hw = AsyncThreadPrefetcher(
@@ -5517,6 +5584,7 @@ def run_train(args: argparse.Namespace, cfg: UniOMRConfig) -> Dict[str, Any]:
                 aug_prob=aug_prob,
                 multi_scale=fp_multi_scale,
                 return_uint8=True,
+                canonicalize_voices=canon_voices,
             )
             fullpage_val_ds = UniFullPageDataset(
                 fp_va,
@@ -5524,6 +5592,7 @@ def run_train(args: argparse.Namespace, cfg: UniOMRConfig) -> Dict[str, Any]:
                 max_seq_len=args.max_seq_len,
                 augment=False,
                 return_uint8=True,
+                canonicalize_voices=canon_voices,
             ) if fp_va else None
             if prefetch_threads > 0 and args.num_workers == 0 and len(fp_tr) > 0:
                 pf_fp = AsyncThreadPrefetcher(
@@ -6263,6 +6332,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--max-seq-len", type=int, default=1024, help="Max token sequence length")
     p.add_argument("--augment", action="store_true", help="Enable online phone-photo degradation on train")
     p.add_argument("--aug-prob", type=float, default=0.75, help="Probability of applying online augmentation when --augment is set (default: 0.75)")
+    p.add_argument(
+        "--canonicalize-voices",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Canonicalize per-measure voice ordering to voice-major on target load via grammar.canonicalize_measure_voices (default: True)",
+    )
     p.add_argument("--val-count", type=int, default=100, help="Held-out validation sample count per modality")
     p.add_argument("--num-workers", type=int, default=0, help="DataLoader worker processes")
     p.add_argument("--prefetch-threads", type=int, default=None, help="Background threads for async batch prefetching (default: 6 on CUDA, 0 on CPU/dry-run)")

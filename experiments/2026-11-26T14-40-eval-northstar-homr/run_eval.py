@@ -44,12 +44,12 @@ def install_isolated_venv(venv_dir: pathlib.Path) -> pathlib.Path:
     if not venv_dir.exists():
         print(f"[homr] creating isolated venv at {venv_dir}...", flush=True)
         subprocess.run([sys.executable, "-m", "venv", str(venv_dir)], check=True)
-    pip_exe = venv_dir / "Scripts" / "pip.exe"
-    if not pip_exe.is_file():
-        pip_exe = venv_dir / "bin" / "pip"
+    python_exe = venv_dir / "Scripts" / "python.exe"
+    if not python_exe.is_file():
+        python_exe = venv_dir / "bin" / "python"
     print(f"[homr] installing homr into {venv_dir}...", flush=True)
-    subprocess.run([str(pip_exe), "install", "--upgrade", "pip"], check=True)
-    subprocess.run([str(pip_exe), "install", "homr"], check=True)
+    subprocess.run([str(python_exe), "-m", "pip", "install", "--upgrade", "pip"], check=True)
+    subprocess.run([str(python_exe), "-m", "pip", "install", "homr", "onnxruntime"], check=True)
     homr_exe = venv_dir / "Scripts" / "homr.exe"
     if not homr_exe.is_file():
         homr_exe = venv_dir / "bin" / "homr"

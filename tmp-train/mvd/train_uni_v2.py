@@ -303,6 +303,7 @@ class _GeneralizedJSDAutograd(torch.autograd.Function):
         temp: float,
         ignore_index: int,
         teacher_ce_cap: float = 0.0,
+        sample_weights: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         tau = float(max(1e-4, temp))
         inv_tau = 1.0 / tau
@@ -328,6 +329,11 @@ class _GeneralizedJSDAutograd(torch.autograd.Function):
                 gate_frac = student_logits.new_ones((), dtype=torch.float32)
                 valid = base_valid.to(torch.float32)
             denom = valid.sum().clamp(min=1.0)
+            if sample_weights is not None:
+                sw = sample_weights.detach().to(device=valid.device, dtype=torch.float32).reshape(-1, 1)
+                eff_valid = valid * sw
+            else:
+                eff_valid = valid
 
             if tau != 1.0:
                 t_buf.mul_(inv_tau)
@@ -349,7 +355,7 @@ class _GeneralizedJSDAutograd(torch.autograd.Function):
                 if need_grad:
                     diff.sub_(per_tok.unsqueeze(-1))
                     diff.mul_(p_s)
-                    diff.mul_((valid * (tau / denom)).unsqueeze(-1))
+                    diff.mul_((eff_valid * (tau / denom)).unsqueeze(-1))
                     grad_s = diff.to(student_logits.dtype)
                 del p_s, diff
             elif b >= 1.0 - 1e-6:
@@ -360,7 +366,7 @@ class _GeneralizedJSDAutograd(torch.autograd.Function):
                 if need_grad:
                     p_s = log_p_s.exp_()
                     p_s.sub_(p_t)
-                    p_s.mul_((valid * (tau / denom)).unsqueeze(-1))
+                    p_s.mul_((eff_valid * (tau / denom)).unsqueeze(-1))
                     grad_s = p_s.to(student_logits.dtype)
                     del p_s
                 del p_t, log_p_s
@@ -386,11 +392,11 @@ class _GeneralizedJSDAutograd(torch.autograd.Function):
                     # = (1 - beta) * tau * P_S * ((log_p_s - log_m) - KL(P_S || M))
                     log_p_s.sub_(kl_s.unsqueeze(-1))
                     log_p_s.mul_(p_s)
-                    log_p_s.mul_((valid * ((1.0 - b) * tau / denom)).unsqueeze(-1))
+                    log_p_s.mul_((eff_valid * ((1.0 - b) * tau / denom)).unsqueeze(-1))
                     grad_s = log_p_s.to(student_logits.dtype)
                 del p_s, log_p_s
 
-            loss = ((per_tok * valid).sum() / denom) * (tau * tau)
+            loss = ((per_tok * eff_valid).sum() / denom) * (tau * tau)
 
         if need_grad:
             ctx.save_for_backward(grad_s)
@@ -400,9 +406,9 @@ class _GeneralizedJSDAutograd(torch.autograd.Function):
     @staticmethod
     def backward(
         ctx: Any, grad_output: torch.Tensor, _grad_gate: Optional[torch.Tensor]
-    ) -> Tuple[Optional[torch.Tensor], None, None, None, None, None, None]:
+    ) -> Tuple[Optional[torch.Tensor], None, None, None, None, None, None, None]:
         (grad_s,) = ctx.saved_tensors
-        return grad_s * grad_output.to(grad_s.dtype), None, None, None, None, None, None
+        return grad_s * grad_output.to(grad_s.dtype), None, None, None, None, None, None, None
 
 
 def compute_generalized_jsd_loss(
@@ -414,13 +420,14 @@ def compute_generalized_jsd_loss(
     ignore_index: int = PAD_ID,
     teacher_ce_cap: float = 0.0,
     return_gate_frac: bool = False,
+    sample_weights: Optional[torch.Tensor] = None,
 ) -> Any:
     """Generalized Jensen-Shannon Divergence ``G-JSD_beta(P_T || P_S) * temp^2``.
 
     Numerically stable in float32 using ``log_softmax`` + ``logaddexp`` with analytic
     backward (eliminates intermediate ``(B, T, V)`` autograd tensors).
     Masked over ``targets != ignore_index`` (and optionally ``teacher_ce <= teacher_ce_cap``)
-    with zero CUDA-CPU syncs.
+    with optional per-sample ``sample_weights`` ``(B,)`` and zero CUDA-CPU syncs.
     """
     loss, gate_frac = _GeneralizedJSDAutograd.apply(
         student_logits,
@@ -430,6 +437,7 @@ def compute_generalized_jsd_loss(
         float(temp),
         int(ignore_index),
         float(teacher_ce_cap),
+        sample_weights,
     )
     if return_gate_frac:
         return loss, gate_frac
@@ -447,6 +455,7 @@ def compute_sparse_topk_jsd_loss(
     ignore_index: int = PAD_ID,
     teacher_ce_cap: float = 0.0,
     return_gate_frac: bool = False,
+    sample_weights: Optional[torch.Tensor] = None,
 ) -> Any:
     """Sparse Top-K Generalized JSD over cached ``(B, T, K)`` teacher logits & indices.
 
@@ -496,7 +505,15 @@ def compute_sparse_topk_jsd_loss(
     else:
         gate_frac = student_logits.new_ones((), dtype=torch.float32)
     mask_f = mask.float()
-    loss = (per_tok * mask_f).sum() / mask_f.sum().clamp(min=1.0)
+    denom = mask_f.sum().clamp(min=1.0)
+    if sample_weights is not None:
+        sw = sample_weights.detach().to(
+            device=student_logits.device, dtype=torch.float32, non_blocking=nb
+        ).reshape(-1, 1)
+        eff_mask_f = mask_f * sw
+    else:
+        eff_mask_f = mask_f
+    loss = (per_tok * eff_mask_f).sum() / denom
     out_loss = (loss * (tau * tau)).to(student_logits.dtype)
     if return_gate_frac:
         return out_loss, gate_frac
@@ -1032,14 +1049,65 @@ _HW_SAMPLE_ID_MARKERS: Tuple[str, ...] = (
     "hw_strip",
     "hw-sim",
     "hw_sim",
+    "hwsim",
     "rhw_",
     "hw-",
 )
+
+_HW_DOMAIN_VALUES: Tuple[str, ...] = (
+    "hw",
+    "real_hw",
+    "synth_hw",
+    "real_hw_archival",
+    "real_hw_stitched",
+    "hw_strip",
+)
+
+_STATE_TOKEN_PREFIXES: Tuple[str, ...] = (
+    "time-",
+    "key",
+    "clef-",
+    "tuplet-start-",
+)
+
+_STATE_TOKEN_WEIGHT_CACHE: Dict[Tuple[int, float, torch.device, torch.dtype], torch.Tensor] = {}
 
 
 def _is_hw_sample_id(sample_id: str) -> bool:
     low = str(sample_id).replace("\\", "/").lower()
     return any(tok in low for tok in _HW_SAMPLE_ID_MARKERS)
+
+
+def _is_hw_domain(domain: str) -> bool:
+    dom = str(domain or "").strip().lower()
+    if not dom:
+        return False
+    return dom in _HW_DOMAIN_VALUES or dom.startswith(("hw_", "hw-", "real_hw", "synth_hw"))
+
+
+def build_state_token_weights(
+    vocab_size: int,
+    state_weight: float,
+    device: torch.device,
+    dtype: torch.dtype = torch.float32,
+) -> torch.Tensor:
+    """Return a cached 1D ``(vocab_size,)`` per-token CE weight tensor upweighting musical state tokens."""
+    w_val = float(state_weight)
+    key = (int(vocab_size), w_val, device, dtype)
+    cached = _STATE_TOKEN_WEIGHT_CACHE.get(key)
+    if cached is not None:
+        return cached
+    weights = torch.ones((int(vocab_size),), device=device, dtype=dtype)
+    if w_val != 1.0:
+        state_ids = [
+            int(tid)
+            for tid, tok in data.ID_TO_TOKEN.items()
+            if int(tid) < int(vocab_size) and str(tok).startswith(_STATE_TOKEN_PREFIXES)
+        ]
+        if state_ids:
+            weights[state_ids] = w_val
+    _STATE_TOKEN_WEIGHT_CACHE[key] = weights
+    return weights
 
 
 @contextlib.contextmanager
@@ -1080,6 +1148,7 @@ def forward_and_loss_v2(
     teacher_v1: Optional[UniOMRNet] = None,
     teacher_cache: Optional[TopKTeacherCache] = None,
     sample_ids: Optional[Sequence[str]] = None,
+    domains: Optional[Sequence[str]] = None,
     kd_alpha: float = 0.0,
     kd_beta: float = 0.5,
     kd_temp: float = 2.0,
@@ -1094,6 +1163,7 @@ def forward_and_loss_v2(
     staff_seg_loss_weight: float = 0.20,
     stroke_hog_weight: float = 0.15,
     label_smoothing: float = 0.05,
+    state_token_loss_weight: float = 1.0,
     sys_y_target: Optional[torch.Tensor] = None,
     sys_y_mask: Optional[torch.Tensor] = None,
     staff_seg_target: Optional[torch.Tensor] = None,
@@ -1191,19 +1261,57 @@ def forward_and_loss_v2(
             label_smoothing=label_smoothing,
         )
 
+        # Optional per-token CE upweighting on musical state tokens (time-*, key*, clef-*, tuplet-start-*).
+        # Default 1.0 leaves weight=None (zero overhead & 100% bit-identical to unweighted CE).
+        st_w = float(state_token_loss_weight)
+        if st_w > 1.0:
+            s_logits: torch.Tensor = out["logits"]
+            V_ce = int(s_logits.shape[-1])
+            ls_ce = float(max(0.0, min(0.5, label_smoothing)))
+            state_tok_weights = build_state_token_weights(
+                V_ce, st_w, device=s_logits.device, dtype=s_logits.dtype
+            )
+            weighted_ce = F.cross_entropy(
+                s_logits.reshape(-1, V_ce),
+                tgt_out.reshape(-1),
+                weight=state_tok_weights,
+                ignore_index=PAD_ID,
+                label_smoothing=ls_ce,
+            )
+            losses["ce_loss"] = weighted_ce
+            losses["loss"] = (
+                weighted_ce
+                + mtp_loss_weight * losses["mtp_loss"]
+                + saliency_loss_weight * losses["saliency_loss"]
+                + sys_y_loss_weight * losses["sys_y_loss"]
+                + sys_count_loss_weight * losses["sys_count_loss"]
+                + staff_seg_loss_weight * losses["staff_seg_loss"]
+                + stroke_hog_weight * losses["stroke_hog_loss"]
+            )
+
         # Hybrid KD: prefer offline Top-K cache hits, otherwise fall back to online frozen v1 teacher.
-        # Optionally downweight/skip KD on HW batches (--kd-hw-scale) and gate per-token KD by
-        # teacher cross-entropy (--kd-teacher-ce-cap). Completely skip teacher forward when eff_kd_alpha <= 0.
+        # Optionally downweight/skip KD on HW samples (--kd-hw-scale) using both batch domains and
+        # sample_ids, and gate per-token KD by teacher cross-entropy (--kd-teacher-ce-cap).
+        # Completely skip teacher forward when eff_kd_alpha <= 0.
         eff_kd_alpha = float(kd_alpha)
-        hw_scale = float(kd_hw_scale)
+        hw_scale = float(max(0.0, kd_hw_scale))
+        sample_kd_weights: Optional[torch.Tensor] = None
         if eff_kd_alpha > 0.0 and hw_scale != 1.0:
+            B_kd = int(images.shape[0])
             if kind == "hw_strip":
                 eff_kd_alpha *= hw_scale
-            elif sample_ids:
-                n_hw_ids = sum(1 for sid in sample_ids if _is_hw_sample_id(sid))
-                if n_hw_ids > 0:
-                    hw_frac_batch = float(n_hw_ids) / float(len(sample_ids))
-                    eff_kd_alpha *= (1.0 - hw_frac_batch) + hw_frac_batch * hw_scale
+            else:
+                per_sample_scales: List[float] = []
+                for idx in range(B_kd):
+                    dom_i = domains[idx] if (domains is not None and idx < len(domains)) else ""
+                    sid_i = sample_ids[idx] if (sample_ids is not None and idx < len(sample_ids)) else ""
+                    is_hw_i = _is_hw_domain(dom_i) or _is_hw_sample_id(sid_i)
+                    per_sample_scales.append(hw_scale if is_hw_i else 1.0)
+                n_hw_batch = sum(1 for s in per_sample_scales if s != 1.0)
+                if n_hw_batch == B_kd:
+                    eff_kd_alpha *= hw_scale
+                elif n_hw_batch > 0:
+                    sample_kd_weights = torch.tensor(per_sample_scales, device=dev, dtype=torch.float32)
 
         kd_loss = out["logits"].new_zeros(())
         kd_gate_frac = out["logits"].new_ones((), dtype=torch.float32)
@@ -1224,6 +1332,7 @@ def forward_and_loss_v2(
                         valid_mask=c_mask,
                         teacher_ce_cap=kd_teacher_ce_cap,
                         return_gate_frac=True,
+                        sample_weights=sample_kd_weights,
                     )
                     used_cache = True
                 del c_vals, c_idx, c_mask
@@ -1245,6 +1354,7 @@ def forward_and_loss_v2(
                     temp=kd_temp,
                     teacher_ce_cap=kd_teacher_ce_cap,
                     return_gate_frac=True,
+                    sample_weights=sample_kd_weights,
                 )
                 del t_logits_inf
 
@@ -2113,6 +2223,7 @@ def run_train_v2(args: argparse.Namespace) -> Dict[str, Any]:
     grad_clip = float(getattr(args, "grad_clip", 1.0))
     kd_teacher_ce_cap = float(getattr(args, "kd_teacher_ce_cap", 0.0))
     kd_hw_scale = float(getattr(args, "kd_hw_scale", 1.0))
+    state_token_loss_weight = float(getattr(args, "state_token_loss_weight", 1.0))
     print(
         f"[UniOMRv2 opt] mode={opt.mode} | muon_params={len(opt.muon_param_names)} | "
         f"adamw_params={len(opt.adamw_param_names)} | no_decay_params={len(opt.no_decay_param_names)} | "
@@ -2211,7 +2322,7 @@ def run_train_v2(args: argparse.Namespace) -> Dict[str, Any]:
         step_idx: int,
         micro_idx: int,
         want_fp: bool,
-    ) -> Tuple[torch.Tensor, torch.Tensor, List[str], str]:
+    ) -> Tuple[torch.Tensor, torch.Tensor, List[str], str, List[str]]:
         if not use_real_data:
             bs_syn = args.batch_size if want_fp else strip_batch_size
             imgs, sq, _ = _make_synthetic_batch(
@@ -2223,7 +2334,7 @@ def run_train_v2(args: argparse.Namespace) -> Dict[str, Any]:
                 with_uv=False,
             )
             sids = [f"syn_{step_idx}_{micro_idx}_{i}" for i in range(bs_syn)]
-            return imgs, sq, sids, ("fullpage" if want_fp else "strip")
+            return imgs, sq, sids, ("fullpage" if want_fp else "strip"), [""] * bs_syn
 
         if want_fp and fullpage_train_iter is not None:
             b = next(fullpage_train_iter)
@@ -2235,19 +2346,28 @@ def run_train_v2(args: argparse.Namespace) -> Dict[str, Any]:
                 b["seq"].to(device, non_blocking=(device.type == "cuda")),
                 list(b.get("sample_ids", [])),
                 "fullpage",
+                list(b.get("domains", [])),
             )
 
         if mix_strip_domains:
             picked: List[Dict[str, Any]] = []
+            picked_domains: List[str] = []
             n_hw = 0
             for _ in range(strip_batch_size):
                 if strip_mixer.next_is_hw():
                     picked.append(_pop_strip(hw_strip_pool, hw_strip_train_iter, "hw_strip"))
+                    picked_domains.append("hw_strip")
                     n_hw += 1
                 else:
                     picked.append(_pop_strip(pr_strip_pool, strip_train_iter, "strip"))
+                    picked_domains.append("printed")
             b = collate_uni_batch(picked)
             kind = "mixed_strip" if (0 < n_hw < strip_batch_size) else ("hw_strip" if n_hw > 0 else "strip")
+            raw_doms = list(b.get("domains", []))
+            doms = [
+                (raw_doms[i] if (i < len(raw_doms) and raw_doms[i]) else picked_domains[i])
+                for i in range(len(picked_domains))
+            ]
             imgs = _images_to_device_float(b["images"], device, non_blocking=(device.type == "cuda"))
             if args.channels_last:
                 imgs = imgs.to(memory_format=torch.channels_last)
@@ -2256,6 +2376,7 @@ def run_train_v2(args: argparse.Namespace) -> Dict[str, Any]:
                 b["seq"].to(device, non_blocking=(device.type == "cuda")),
                 list(b.get("sample_ids", [])),
                 kind,
+                doms,
             )
 
         if strip_train_iter is not None and hw_strip_train_iter is not None:
@@ -2273,6 +2394,7 @@ def run_train_v2(args: argparse.Namespace) -> Dict[str, Any]:
                 b["seq"].to(device, non_blocking=(device.type == "cuda")),
                 list(b.get("sample_ids", [])),
                 kind,
+                list(b.get("domains", [])),
             )
         it = hw_strip_train_iter if hw_strip_train_iter is not None else strip_train_iter
         kind = "hw_strip" if hw_strip_train_iter is not None else "strip"
@@ -2286,6 +2408,7 @@ def run_train_v2(args: argparse.Namespace) -> Dict[str, Any]:
             b["seq"].to(device, non_blocking=(device.type == "cuda")),
             list(b.get("sample_ids", [])),
             kind,
+            list(b.get("domains", [])),
         )
 
     def _run_eval_suite(step_label: Any) -> Dict[str, Any]:
@@ -2400,7 +2523,7 @@ def run_train_v2(args: argparse.Namespace) -> Dict[str, Any]:
             oom_hit = False
 
             for micro in range(step_ga):
-                images, seq, sample_ids, kind = _next_batch(step, micro, want_fp=step_is_fp)
+                images, seq, sample_ids, kind, domains = _next_batch(step, micro, want_fp=step_is_fp)
                 try:
                     losses, out = forward_and_loss_v2(
                         model,
@@ -2409,6 +2532,7 @@ def run_train_v2(args: argparse.Namespace) -> Dict[str, Any]:
                         teacher_v1=teacher_v1,
                         teacher_cache=teacher_cache,
                         sample_ids=sample_ids,
+                        domains=domains,
                         kd_alpha=cur_kd_alpha,
                         kd_beta=float(args.kd_beta),
                         kd_temp=float(args.kd_temp),
@@ -2423,6 +2547,7 @@ def run_train_v2(args: argparse.Namespace) -> Dict[str, Any]:
                         staff_seg_loss_weight=float(args.staff_seg_loss_weight),
                         stroke_hog_weight=float(args.stroke_hog_weight),
                         label_smoothing=float(args.label_smoothing),
+                        state_token_loss_weight=state_token_loss_weight,
                         use_bf16=use_bf16,
                         device=device,
                     )
@@ -2686,6 +2811,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--staff-seg-loss-weight", type=float, default=0.20)
     p.add_argument("--stroke-hog-weight", type=float, default=0.15)
     p.add_argument("--label-smoothing", type=float, default=0.05)
+    p.add_argument(
+        "--state-token-loss-weight",
+        type=float,
+        default=1.0,
+        help="Per-token CE loss weight for musical state tokens (time-*, key*, clef-*, tuplet-start-*); 1.0 = unweighted",
+    )
     p.add_argument("--cass-prob", type=float, default=0.0)
     p.add_argument("--qat-int4", action="store_true")
     p.add_argument("--qat-int4-last-frac", type=float, default=0.15)

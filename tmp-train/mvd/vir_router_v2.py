@@ -175,10 +175,10 @@ def compute_ink_and_paper_gate_f32(
     border_px = edge_connected_f * dark_px_f
 
     border_dilated_px = F.max_pool2d(
-        F.max_pool2d(border_px, kernel_size=(1, 33), stride=1, padding=(0, 16)),
-        kernel_size=(33, 1),
+        F.max_pool2d(border_px, kernel_size=(1, 13), stride=1, padding=(0, 6)),
+        kernel_size=(13, 1),
         stride=1,
-        padding=(16, 0),
+        padding=(6, 0),
     )
     paper_px = (1.0 - border_dilated_px).clamp(0.0, 1.0)
 

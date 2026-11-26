@@ -2615,6 +2615,167 @@ class TestUniOMR(unittest.TestCase):
             self.assertEqual(fp_pr["image"].shape[0], 3)
             self.assertEqual(fp_rhw["image"].shape[0], 3)
 
+    def test_zo_pre_iter13_domains_multiscale_postwarp_1bit_and_voice_canon(self) -> None:
+        """(zo) Pre-Iter-13 fixes: collate domains, _sample_weighted_fullpage_dim cap, post-warp 1-bit, voice canon."""
+        import random as _py_random
+        from unittest import mock
+
+        # 1. collate_uni_batch propagates "domains" (including hw/real_hw/default fallback) & unpack preserves it
+        s_pr = {
+            "image": torch.zeros(3, 64, 128, dtype=torch.uint8),
+            "seq": torch.tensor([uni_omr.BOS_ID, 1, uni_omr.EOS_ID], dtype=torch.long),
+            "sample_id": "opaque_stem_001",
+            "kind": "fullpage",
+            "domain": "printed",
+        }
+        s_hw = {
+            "image": torch.zeros(3, 64, 128, dtype=torch.uint8),
+            "seq": torch.tensor([uni_omr.BOS_ID, 2, uni_omr.EOS_ID], dtype=torch.long),
+            "sample_id": "opaque_stem_002",
+            "kind": "fullpage",
+            "domain": "hw",
+        }
+        s_rhw = {
+            "image": torch.zeros(3, 64, 128, dtype=torch.uint8),
+            "seq": torch.tensor([uni_omr.BOS_ID, 3, uni_omr.EOS_ID], dtype=torch.long),
+            "sample_id": "opaque_stem_003",
+            "kind": "fullpage",
+            "domain": "real_hw",
+        }
+        s_default = {
+            "image": torch.zeros(3, 64, 128, dtype=torch.uint8),
+            "seq": torch.tensor([uni_omr.BOS_ID, 4, uni_omr.EOS_ID], dtype=torch.long),
+            "sample_id": "opaque_stem_004",
+            "kind": "strip",
+        }
+        s_hw_strip = {
+            "image": torch.zeros(3, 64, 128, dtype=torch.uint8),
+            "seq": torch.tensor([uni_omr.BOS_ID, 5, uni_omr.EOS_ID], dtype=torch.long),
+            "sample_id": "opaque_stem_005",
+            "kind": "hw_strip",
+        }
+        collated = uni_omr.collate_uni_batch([s_pr, s_hw, s_rhw, s_default, s_hw_strip])
+        self.assertIn("domains", collated)
+        self.assertEqual(collated["domains"], ["printed", "hw", "real_hw", "printed", "hw"])
+        unpacked = uni_omr.unpack_collated_batch(collated, "fullpage")
+        self.assertEqual([u["domain"] for u in unpacked], ["printed", "hw", "real_hw", "printed", "hw"])
+
+        # 2. _sample_weighted_fullpage_dim(1408) & (1280) sample cap >= 50% of the time (not starved to 1024px)
+        rng_1408 = _py_random.Random(2026)
+        dims_1408 = [uni_omr._sample_weighted_fullpage_dim(1408, rng=rng_1408) for _ in range(1000)]
+        frac_1408 = dims_1408.count(1408) / len(dims_1408)
+        self.assertGreater(frac_1408, 0.50, f"Expected 1408px >=50% (50% top-bin + ~10% mid-bin), got {frac_1408:.3f}")
+        self.assertLessEqual(max(dims_1408), 1408)
+        self.assertGreaterEqual(min(dims_1408), 1024)
+
+        rng_1280 = _py_random.Random(2027)
+        dims_1280 = [uni_omr._sample_weighted_fullpage_dim(1280, rng=rng_1280) for _ in range(1000)]
+        frac_1280 = dims_1280.count(1280) / len(dims_1280)
+        self.assertGreater(frac_1280, 0.70, f"Expected 1280px >=70% (50% top-bin + 30% mid-bin), got {frac_1280:.3f}")
+        self.assertLessEqual(max(dims_1280), 1280)
+
+        # 3. Post-warp 1-bit scanner branch produces pure binary {0, 255} pixels with crisp post-warp edges
+        src = np.full((256, 320, 3), 248, dtype=np.uint8)
+        for sy in (60, 72, 84, 96, 108, 160, 172, 184, 196, 208):
+            src[sy : sy + 2, 24:296, :] = 10
+        for bx in (24, 160, 294):
+            src[60:110, bx : bx + 2, :] = 10
+            src[160:210, bx : bx + 2, :] = 10
+        src_pil = Image.fromarray(src, mode="RGB")
+
+        # Force post-warp 1-bit on multiple seeds (finding seeds where do_1bit is False) and verify pure {0, 255}
+        n_pure_1bit_cv2 = 0
+        for seed in range(30):
+            aug = uni_omr.apply_online_augment(
+                src_pil,
+                rng=_py_random.Random(seed),
+                is_hw=False,
+                hw_archival_prob=0.0,
+                is_strip=False,
+                postwarp_1bit_prob=1.0,
+            )
+            arr = np.asarray(aug, dtype=np.uint8)
+            uniq = set(np.unique(arr).tolist())
+            if uniq == {0, 255}:
+                n_pure_1bit_cv2 += 1
+                # All 3 RGB channels must be identical grayscale binary
+                np.testing.assert_array_equal(arr[:, :, 0], arr[:, :, 1])
+                np.testing.assert_array_equal(arr[:, :, 0], arr[:, :, 2])
+                # Must retain both black ink/border and white paper
+                black_frac = float((arr[:, :, 0] == 0).mean())
+                self.assertGreater(black_frac, 0.005)
+                self.assertLess(black_frac, 0.80)
+        # do_1bit fires ~15% of the time, so >=70% of seeds must hit postwarp_1bit and be strictly {0, 255}
+        self.assertGreaterEqual(n_pure_1bit_cv2, 20, f"Expected >=20/30 pure 1-bit outputs, got {n_pure_1bit_cv2}")
+
+        # Verify PIL fallback path also yields strict {0, 255}
+        with mock.patch.object(uni_omr, "_cv2", None):
+            n_pure_1bit_pil = 0
+            for seed in range(15):
+                aug = uni_omr.apply_online_augment(
+                    src_pil,
+                    rng=_py_random.Random(seed),
+                    is_hw=False,
+                    hw_archival_prob=0.0,
+                    is_strip=False,
+                    postwarp_1bit_prob=1.0,
+                )
+                uniq = set(np.unique(np.asarray(aug, dtype=np.uint8)).tolist())
+                if uniq == {0, 255}:
+                    n_pure_1bit_pil += 1
+            self.assertGreaterEqual(n_pure_1bit_pil, 10)
+
+        # Verify default p=0.08 triggers on printed fullpage and never triggers on HW/strip when archival=0
+        n_default_hits = 0
+        for seed in range(200):
+            aug = uni_omr.apply_online_augment(src_pil, rng=_py_random.Random(seed), is_hw=False, is_strip=False)
+            if set(np.unique(np.asarray(aug, dtype=np.uint8)).tolist()) == {0, 255}:
+                n_default_hits += 1
+        self.assertGreater(n_default_hits, 3, f"Default p=0.08 post-warp 1-bit should trigger on printed fullpage, got {n_default_hits}/200")
+        self.assertLess(n_default_hits, 40)
+
+        # 4. Canonicalize measure voices on training target load (default True + opt-out False + CLI flag)
+        interleaved_bek = (
+            "clef-G-2\nvoice-1\nquarter\nC\n4\nvoice-2\nquarter\nE\n3\n"
+            "voice-1\nquarter\nD\n4\nvoice-2\nquarter\nF\n3\nbar\n"
+        )
+        expected_canon = [
+            "clef-G-2",
+            "voice-1", "quarter", "C", "4", "quarter", "D", "4",
+            "voice-2", "quarter", "E", "3", "quarter", "F", "3",
+            "bar",
+        ]
+        expected_raw = [
+            "clef-G-2",
+            "voice-1", "quarter", "C", "4",
+            "voice-2", "quarter", "E", "3",
+            "voice-1", "quarter", "D", "4",
+            "voice-2", "quarter", "F", "3",
+            "bar",
+        ]
+        with tempfile.TemporaryDirectory() as td:
+            td_p = Path(td)
+            img_p = td_p / "poly_p1.png"
+            bek_p = td_p / "poly_p1-bekern.txt"
+            src_pil.save(img_p)
+            bek_p.write_text(interleaved_bek, encoding="utf-8")
+
+            st_canon = uni_omr.UniStripDataset([(img_p, bek_p)], strip_height=64, max_strip_width=160, augment=False)
+            st_raw = uni_omr.UniStripDataset([(img_p, bek_p)], strip_height=64, max_strip_width=160, augment=False, canonicalize_voices=False)
+            self.assertEqual(uni_omr.decode_uni(st_canon[0]["seq"].tolist()), expected_canon)
+            self.assertEqual(uni_omr.decode_uni(st_raw[0]["seq"].tolist()), expected_raw)
+            self.assertEqual(st_canon[0]["domain"], "printed")
+
+            fp_canon = uni_omr.UniFullPageDataset([(img_p, [bek_p], "hw")], fullpage_max_dim=128, augment=False)
+            fp_raw = uni_omr.UniFullPageDataset([(img_p, [bek_p], "hw")], fullpage_max_dim=128, augment=False, canonicalize_voices=False)
+            self.assertEqual(uni_omr.decode_uni(fp_canon[0]["seq"].tolist()), expected_canon)
+            self.assertEqual(uni_omr.decode_uni(fp_raw[0]["seq"].tolist()), expected_raw)
+
+        ap = uni_omr.build_arg_parser()
+        self.assertTrue(ap.parse_args([]).canonicalize_voices)
+        self.assertTrue(ap.parse_args(["--canonicalize-voices"]).canonicalize_voices)
+        self.assertFalse(ap.parse_args(["--no-canonicalize-voices"]).canonicalize_voices)
+
 
 if __name__ == "__main__":
     unittest.main()

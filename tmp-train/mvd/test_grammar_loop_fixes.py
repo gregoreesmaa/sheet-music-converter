@@ -306,14 +306,98 @@ class GrammarLoopFixesTest(unittest.TestCase):
         _, eos_ok = st.allowed()
         self.assertTrue(eos_ok)
 
+    def test_loophole_5_single_system_runaway_capped(self):
+        """Loophole #5: MAX_BARS_PER_SYSTEM & MAX_TOKENS_PER_SYSTEM force <sys>/<eos> on single-system runaways."""
+        vocab_size = len(data.VOCAB) + 4
+        _, _, eos_id, sys_id, _, _ = eval_s31._vocab_spec(vocab_size)
+        steps = ["C", "D", "E", "F", "G", "A", "B"]
+
+        # Part 1: Hit MAX_BARS_PER_SYSTEM with distinct non-repeating bars (bypassing bar-hash & n-gram guards)
+        st = grammar.PrefixState(strict=False)
+        for t in ["clef-G-2", "key+0", "time-4-4"]:
+            st.step(t)
+        for b_idx in range(grammar.MAX_BARS_PER_SYSTEM - 1):
+            pitches = [
+                (steps[(b_idx + k) % 7], 4 + ((b_idx // 7 + k) % 2))
+                for k in range(4)
+            ]
+            for t in _make_pitched_bar(pitches, dur="quarter"):
+                st.step(t)
+        self.assertEqual(st.bars_in_system, grammar.MAX_BARS_PER_SYSTEM - 1)
+        allow_before, eos_before = st.allowed()
+        self.assertIn(_T["quarter"], allow_before)
+        self.assertTrue(eos_before)
+
+        # Emit the bar that hits MAX_BARS_PER_SYSTEM
+        last_bar = _make_pitched_bar([("G", 5), ("F", 5), ("E", 5), ("D", 5)], dur="quarter")
+        for t in last_bar:
+            st.step(t)
+        self.assertEqual(st.bars_in_system, grammar.MAX_BARS_PER_SYSTEM)
+        allow_capped, eos_capped = st.allowed()
+        self.assertEqual(allow_capped, set())
+        self.assertTrue(eos_capped)
+        self.assertTrue(st.can_emit_sys())
+        allowed_ids = eval_s31._allowed_ids_for_state(st, vocab_size)
+        self.assertEqual(set(allowed_ids), {eos_id, sys_id})
+
+        # copy() preserves counters; reset_system() zeroes both and restores normal decoding
+        st_copy = st.copy()
+        self.assertEqual(st_copy.bars_in_system, grammar.MAX_BARS_PER_SYSTEM)
+        self.assertEqual(st_copy.tokens_in_system, st.tokens_in_system)
+        st.reset_system()
+        self.assertEqual(st.bars_in_system, 0)
+        self.assertEqual(st.tokens_in_system, 0)
+        allow_after, _ = st.allowed()
+        self.assertIn(_T["clef-G-2"], allow_after)
+        self.assertIn(_T["quarter"], allow_after)
+
+        # Part 2: Hit MAX_TOKENS_PER_SYSTEM with fewer than MAX_BARS_PER_SYSTEM bars (dense varied bars)
+        st2 = grammar.PrefixState(strict=False)
+        for t in ["clef-G-2", "key+0", "time-4-4"]:
+            st2.step(t)
+        b_idx = 0
+        while st2.tokens_in_system < grammar.MAX_TOKENS_PER_SYSTEM:
+            # 25 varied 32nd notes per bar (~77 tokens/bar -> hits 1440 in ~19 bars < 28)
+            pitches = [
+                (steps[(b_idx * 3 + k) % 7], 3 + ((b_idx + k // 7) % 3))
+                for k in range(25)
+            ]
+            bar_toks = _make_pitched_bar(pitches, dur="32nd")
+            for t in bar_toks:
+                st2.step(t)
+                if st2.tokens_in_system >= grammar.MAX_TOKENS_PER_SYSTEM:
+                    break
+            b_idx += 1
+        self.assertLess(st2.bars_in_system, grammar.MAX_BARS_PER_SYSTEM)
+        self.assertGreaterEqual(st2.tokens_in_system, grammar.MAX_TOKENS_PER_SYSTEM)
+        # If stopped mid-note (dur/step), current note is still allowed to complete cleanly
+        if st2.mode == "dur":
+            allow_mid, eos_mid = st2.allowed()
+            self.assertIn(_T["C"], allow_mid)
+            self.assertFalse(eos_mid)
+            st2.step("C")
+        if st2.mode == "step":
+            allow_mid, eos_mid = st2.allowed()
+            self.assertIn(_T["4"], allow_mid)
+            self.assertFalse(eos_mid)
+            st2.step("4")
+        # At boundary/pitch-tail, ONLY <sys> / <eos> remain legal!
+        allow_cap2, eos_cap2 = st2.allowed()
+        self.assertEqual(allow_cap2, set())
+        self.assertTrue(eos_cap2)
+        self.assertEqual(set(eval_s31._allowed_ids_for_state(st2, vocab_size)), {eos_id, sys_id})
+
     def test_suite31_hw_45_gt_sequences_100pct_safe(self):
         """All 45 suite31_hw GT sequences pass PrefixState with broken=False, 0 false blocks, can_emit_eos()==True."""
+        import xml.etree.ElementTree as ET
+
         mpath = REPO_ROOT / "data-gen" / "score-corpus" / "suite31" / "suite31_hw_manifest.json"
         self.assertTrue(mpath.exists(), f"Missing manifest: {mpath}")
         _, pieces = eval_s31.resolve_manifest_pieces(mpath)
         self.assertEqual(len(pieces), 45)
 
         max_bar_toks = 0
+        max_xml_bars_per_sys = 0
         with tempfile.TemporaryDirectory(prefix="test_grammar_s31_") as tmpdir:
             workdir = Path(tmpdir)
             for p in pieces:
@@ -321,7 +405,31 @@ class GrammarLoopFixesTest(unittest.TestCase):
                 toks, _ = esg.suite31_page_refs(p["gt"], "test-" + slug, workdir)
                 self.assertGreater(len(toks), 0, f"Empty GT for {slug}")
 
-                st = grammar.PrefixState(strict=False)
+                # Check per-system bar counts on MusicXMLs that encode <print new-system="yes"/>
+                root = ET.parse(p["gt"]).getroot()
+                parts = root.findall("part")
+                if parts:
+                    is_p1 = Path(p["gt"]).name.startswith("gt-p1-")
+                    sys_bars = [0]
+                    for m_idx, m in enumerate(parts[0].findall("measure")):
+                        pr = m.find("print")
+                        if m_idx > 0 and pr is not None:
+                            if not is_p1 and pr.attrib.get("new-page") == "yes":
+                                break
+                            if pr.attrib.get("new-system") == "yes":
+                                sys_bars.append(0)
+                        sys_bars[-1] += 1
+                    if len(sys_bars) > 1:
+                        max_xml_bars_per_sys = max(max_xml_bars_per_sys, max(sys_bars))
+
+                # suite31_page_refs emits flat page-level bekern without <sys> separators;
+                # enforce per-system caps when <sys> is present, and disable only for flat streams.
+                has_sys = "<sys>" in toks
+                st = grammar.PrefixState(
+                    strict=False,
+                    max_bars_per_system=grammar.MAX_BARS_PER_SYSTEM if has_sys else None,
+                    max_tokens_per_system=grammar.MAX_TOKENS_PER_SYSTEM if has_sys else None,
+                )
                 for idx, tok in enumerate(toks):
                     if tok == "<sys>":
                         self.assertTrue(st.can_emit_sys(), f"{slug}@{idx}: can_emit_sys() False on GT <sys>")
@@ -348,6 +456,7 @@ class GrammarLoopFixesTest(unittest.TestCase):
                 self.assertTrue(eos_ok, f"{slug}: allowed() eos_ok=False at <eos>")
 
         self.assertLessEqual(max_bar_toks + 64, grammar.MAX_TOKENS_PER_BAR)
+        self.assertLessEqual(max_xml_bars_per_sys + 8, grammar.MAX_BARS_PER_SYSTEM)
 
 
 if __name__ == "__main__":

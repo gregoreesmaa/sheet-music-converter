@@ -328,6 +328,52 @@ class TestEvalUniSuite31V2AndTTA(unittest.TestCase):
         self.assertGreater(meta_fb["est_unit_px"], 4.5)
         self.assertEqual(dim_fallback, 1408)
 
+    def test_crop_dark_borders_and_border_blindness_fix(self) -> None:
+        # 1. Clean page (< 1% dark border) -> auto-skip, return bit-identical object
+        pw, ph = 1100, 1408
+        clean = np.full((ph, pw, 3), 255, dtype=np.uint8)
+        for sys_y in (200, 450, 700, 950, 1200):
+            for k in range(5):
+                y = sys_y + k * 10
+                clean[y : y + 2, 40 : pw - 40, :] = 0
+        clean_pil = Image.fromarray(clean, mode="RGB")
+
+        out_clean, cmeta_clean = preprocess_dewarp.crop_dark_borders(clean_pil)
+        self.assertFalse(cmeta_clean["cropped"])
+        self.assertIs(out_clean, clean_pil)
+        self.assertTrue(np.array_equal(np.asarray(out_clean), clean))
+
+        # 2. Synthetic 1-bit photo with 100px solid-black padding on all 4 sides
+        pad = 100
+        padded = np.zeros((ph + 2 * pad, pw + 2 * pad, 3), dtype=np.uint8)
+        padded[pad : pad + ph, pad : pad + pw, :] = clean
+        padded_pil = Image.fromarray(padded, mode="RGB")
+
+        cropped_pil, cmeta_pad = preprocess_dewarp.crop_dark_borders(padded_pil)
+        self.assertTrue(cmeta_pad["cropped"])
+        self.assertGreater(cmeta_pad["border_frac"], 0.15)
+        # Safety margin (+6px outward) keeps full paper interior without clipping edge ink
+        cw, ch = cropped_pil.size
+        self.assertGreaterEqual(cw, pw)
+        self.assertGreaterEqual(ch, ph)
+        self.assertLessEqual(cw, pw + 24)
+        self.assertLessEqual(ch, ph + 24)
+
+        # 3. estimate_unitsize_max_dim on 100px black-padded photo -> ac_peak > 0.25 & accurate ~10px period
+        target_dim, umeta = preprocess_dewarp.estimate_unitsize_max_dim(
+            padded_pil, base_max_dim=1408, min_dim=1152, max_dim=1600
+        )
+        self.assertTrue(umeta["border_cropped"])
+        self.assertGreater(umeta["ac_peak"], 0.25)
+        self.assertAlmostEqual(umeta["est_unit_px"], 10.0, delta=1.0)
+        self.assertEqual(target_dim % 32, 0)
+
+        # 4. oemer_staffline_vertical_dewarp on 100px black-padded flat photo -> zero false tilt (auto-skipped)
+        dew_out, dmeta = preprocess_dewarp.oemer_staffline_vertical_dewarp(padded_pil)
+        self.assertTrue(dmeta["skipped"])
+        self.assertLess(dmeta["max_dy_px"], 1.5)
+        self.assertIs(dew_out, padded_pil)
+
     def test_measure_beam_header_guard_cap_and_cli_defaults(self) -> None:
         # 1. Trigger cap = 4 allows exactly 4 repairs then blocks further triggers
         guard = ev.MeasureBeamHeaderGuard(const_offset_limit=10, max_triggers=4)

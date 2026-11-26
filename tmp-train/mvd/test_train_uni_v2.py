@@ -37,6 +37,7 @@ from train_uni_v2 import (  # noqa: E402
     atomic_save_v2_latest,
     build_arg_parser,
     build_optimizer_v2,
+    build_state_token_weights,
     build_v2_config,
     classify_fullpage_bucket_v2,
     compute_generalized_jsd_loss,
@@ -1068,6 +1069,275 @@ class TestTrainUniV2(unittest.TestCase):
             res = run_train_v2(args)
             self.assertEqual(len(res["history"]), 2)
             self.assertGreater(res["history"][-1]["loss"], 0.0)
+
+    def test_16_kd_hw_scale_domains_and_per_sample_mixed_batch(self) -> None:
+        """kd_hw_scale=0.0 skips KD on real_hw/hw domains & hwsim stems, keeps printed KD, and handles mixed B>1."""
+        import math
+        import torch.nn.functional as F
+
+        torch.manual_seed(301)
+        student = _make_tiny_v2(grad_checkpoint=False)
+        student.train()
+        teacher = _make_tiny_v1_teacher()
+        images_1, seq_1 = _make_dummy_batch(batch_size=1, h=64, w=96, seq_len=14)
+        images_2, seq_2 = _make_dummy_batch(batch_size=2, h=64, w=96, seq_len=14)
+
+        calls: list[int] = []
+        orig_fwd = teacher.forward
+
+        def _spy(*a, **kw):
+            calls.append(1)
+            return orig_fwd(*a, **kw)
+
+        teacher.forward = _spy  # type: ignore[method-assign]
+
+        # 1) real_hw archival stem (12148_btv1b108604041_f6) with domains=["real_hw"] -> eff_kd_alpha == 0.0
+        losses_arch, _ = forward_and_loss_v2(
+            student,
+            images_1,
+            seq_1,
+            teacher_v1=teacher,
+            sample_ids=["12148_btv1b108604041_f6"],
+            domains=["real_hw"],
+            kd_alpha=0.35,
+            kd_hw_scale=0.0,
+            kind="fullpage",
+            device=torch.device("cpu"),
+        )
+        self.assertEqual(len(calls), 0, "Teacher forward must be skipped for domains=['real_hw']")
+        self.assertEqual(float(losses_arch["kd_loss"].item()), 0.0)
+
+        # 2) synth_hw stem (hwsim_03965) with domains=["hw"] -> eff_kd_alpha == 0.0
+        losses_hwsim, _ = forward_and_loss_v2(
+            student,
+            images_1,
+            seq_1,
+            teacher_v1=teacher,
+            sample_ids=["hwsim_03965"],
+            domains=["hw"],
+            kd_alpha=0.35,
+            kd_hw_scale=0.0,
+            kind="fullpage",
+            device=torch.device("cpu"),
+        )
+        self.assertEqual(len(calls), 0, "Teacher forward must be skipped for domains=['hw'] / hwsim stem")
+        self.assertEqual(float(losses_hwsim["kd_loss"].item()), 0.0)
+
+        # 3) Legacy caller without domains still catches hwsim_03965 via _HW_SAMPLE_ID_MARKERS
+        losses_hwsim_nodom, _ = forward_and_loss_v2(
+            student,
+            images_1,
+            seq_1,
+            teacher_v1=teacher,
+            sample_ids=["hwsim_03965"],
+            domains=None,
+            kd_alpha=0.35,
+            kd_hw_scale=0.0,
+            kind="fullpage",
+            device=torch.device("cpu"),
+        )
+        self.assertEqual(len(calls), 0, "Teacher forward must be skipped for hwsim stem even when domains=None")
+        self.assertEqual(float(losses_hwsim_nodom["kd_loss"].item()), 0.0)
+
+        # 4) real_hw_archival + real_hw_stitched domains with opaque stems -> skipped
+        losses_subdom, _ = forward_and_loss_v2(
+            student,
+            images_2,
+            seq_2,
+            teacher_v1=teacher,
+            sample_ids=["opaque_a", "opaque_b"],
+            domains=["real_hw_archival", "real_hw_stitched"],
+            kd_alpha=0.35,
+            kd_hw_scale=0.0,
+            kind="fullpage",
+            device=torch.device("cpu"),
+        )
+        self.assertEqual(len(calls), 0, "Teacher forward must be skipped for real_hw_archival/stitched")
+        self.assertEqual(float(losses_subdom["kd_loss"].item()), 0.0)
+
+        # 5) Printed sample keeps full KD
+        losses_pr, _ = forward_and_loss_v2(
+            student,
+            images_1,
+            seq_1,
+            teacher_v1=teacher,
+            sample_ids=["piece_001"],
+            domains=["printed"],
+            kd_alpha=0.35,
+            kd_hw_scale=0.0,
+            kind="fullpage",
+            device=torch.device("cpu"),
+        )
+        self.assertEqual(len(calls), 1, "Teacher forward must run for domains=['printed']")
+        self.assertGreater(float(losses_pr["kd_loss"].item()), 0.0)
+
+        # 6) Mixed B=2 batch (printed + real_hw) with kd_hw_scale=0.0: exact per-sample weighting
+        g = torch.Generator().manual_seed(307)
+        s_base = torch.randn((2, 10, VOCAB_SIZE), generator=g, dtype=torch.float32)
+        t_base = torch.randn((2, 10, VOCAB_SIZE), generator=g, dtype=torch.float32)
+        targets = torch.randint(0, PAD_ID, (2, 10), generator=g, dtype=torch.long)
+        targets[:, -2:] = PAD_ID
+        sw = torch.tensor([1.0, 0.0], dtype=torch.float32)
+
+        for beta in (0.0, 0.5, 1.0):
+            s_opt = s_base.clone().requires_grad_(True)
+            l_opt = compute_generalized_jsd_loss(
+                s_opt, t_base, targets, beta=beta, temp=2.0, sample_weights=sw
+            )
+            self.assertGreater(float(l_opt.item()), 0.0)
+            l_opt.backward()
+            assert s_opt.grad is not None
+            # Row 1 (HW, weight=0.0) must receive exact 0 gradient; Row 0 (printed, weight=1.0) nonzero
+            self.assertEqual(float(s_opt.grad[1].abs().max().item()), 0.0)
+            self.assertGreater(float(s_opt.grad[0].abs().max().item()), 0.0)
+
+            # Reference parity check
+            s_ref = s_base.clone().requires_grad_(True)
+            tau = 2.0
+            log_ps = F.log_softmax(s_ref / tau, dim=-1)
+            log_pt = F.log_softmax(t_base / tau, dim=-1)
+            ps, pt = log_ps.exp(), log_pt.exp()
+            if beta <= 1e-6:
+                per_tok = (ps * (log_ps - log_pt)).sum(-1)
+            elif beta >= 1.0 - 1e-6:
+                per_tok = (pt * (log_pt - log_ps)).sum(-1)
+            else:
+                log_m = torch.logaddexp(math.log(beta) + log_pt, math.log(1.0 - beta) + log_ps)
+                per_tok = beta * (pt * (log_pt - log_m)).sum(-1) + (1.0 - beta) * (ps * (log_ps - log_m)).sum(-1)
+            valid = (targets != PAD_ID).float()
+            l_ref = ((per_tok * valid * sw.unsqueeze(1)).sum() / valid.sum().clamp(min=1.0)) * (tau * tau)
+            self.assertLess(abs(float(l_opt.item()) - float(l_ref.item())), 1e-5)
+            l_ref.backward()
+            assert s_ref.grad is not None
+            self.assertLess(float((s_opt.grad - s_ref.grad).abs().max().item()), 1e-5)
+
+        # Sparse Top-K per-sample weighting
+        vals_k, idx_k = torch.topk(t_base, k=8, dim=-1)
+        s_sp = s_base.clone().requires_grad_(True)
+        l_sp = compute_sparse_topk_jsd_loss(
+            s_sp, vals_k.to(torch.float16), idx_k.to(torch.uint8), targets, beta=0.5, temp=2.0, sample_weights=sw
+        )
+        self.assertGreater(float(l_sp.item()), 0.0)
+        l_sp.backward()
+        assert s_sp.grad is not None
+        self.assertEqual(float(s_sp.grad[1].abs().max().item()), 0.0)
+        self.assertGreater(float(s_sp.grad[0].abs().max().item()), 0.0)
+
+        # End-to-end forward_and_loss_v2 on mixed B=2 batch
+        student.zero_grad(set_to_none=True)
+        losses_mix, _ = forward_and_loss_v2(
+            student,
+            images_2,
+            seq_2,
+            teacher_v1=teacher,
+            sample_ids=["piece_001", "12148_btv1b108604041_f6"],
+            domains=["printed", "real_hw"],
+            kd_alpha=0.35,
+            kd_hw_scale=0.0,
+            kind="fullpage",
+            device=torch.device("cpu"),
+        )
+        self.assertEqual(len(calls), 2, "Mixed batch must still run teacher for printed row")
+        self.assertTrue(torch.isfinite(losses_mix["kd_loss"]).item())
+        self.assertGreater(float(losses_mix["kd_loss"].item()), 0.0)
+        losses_mix["loss"].backward()
+        self.assertIsNotNone(student.lm_head.weight.grad)
+
+    def test_17_state_token_loss_weight(self) -> None:
+        """--state-token-loss-weight upweights time-*/key*/clef-*/tuplet-start-* CE while 1.0 is bit-identical."""
+        import data as _data
+
+        parser = build_arg_parser()
+        default_args = parser.parse_args([])
+        self.assertEqual(default_args.state_token_loss_weight, 1.0)
+        parsed = parser.parse_args(["--state-token-loss-weight", "2.5"])
+        self.assertAlmostEqual(parsed.state_token_loss_weight, 2.5, places=6)
+
+        # Weight vector inspection
+        w = build_state_token_weights(VOCAB_SIZE, 2.5, device=torch.device("cpu"), dtype=torch.float32)
+        self.assertEqual(tuple(w.shape), (VOCAB_SIZE,))
+        for tok in ("time-3-2", "clef-C-3", "key-2", "tuplet-start-3-2"):
+            tid = _data.TOKEN_TO_ID[tok]
+            self.assertAlmostEqual(float(w[tid].item()), 2.5, places=6, msg=f"Expected 2.5 on {tok}")
+        for tok in ("quarter", "C", "4", "bar"):
+            tid = _data.TOKEN_TO_ID[tok]
+            self.assertAlmostEqual(float(w[tid].item()), 1.0, places=6, msg=f"Expected 1.0 on {tok}")
+        self.assertAlmostEqual(float(w[PAD_ID].item()), 1.0, places=6)
+
+        # Default 1.0 is bit-identical to unweighted path
+        torch.manual_seed(401)
+        student = _make_tiny_v2(grad_checkpoint=False)
+        student.eval()  # deterministic forward (no dropout/mixstyle noise)
+        images, _ = _make_dummy_batch(batch_size=1, h=64, w=96, seq_len=12)
+
+        state_toks = ["time-3-2", "clef-C-3", "key-2", "tuplet-start-3-2"]
+        note_toks = ["quarter", "C", "4", "bar", "quarter", "D"]
+        seq_ids = [BOS_ID] + [_data.TOKEN_TO_ID[t] for t in state_toks + note_toks] + [EOS_ID]
+        seq = torch.tensor([seq_ids], dtype=torch.long)
+
+        # Bias lm_head so note_toks have positive logits and state_toks have negative logits
+        # (ensuring state tokens have strictly higher per-token CE than note tokens).
+        state_ids = [_data.TOKEN_TO_ID[t] for t in state_toks]
+        note_ids = [_data.TOKEN_TO_ID[t] for t in note_toks]
+        with torch.no_grad():
+            student.lm_head.weight.zero_()
+            for tid in note_ids:
+                student.lm_head.weight[tid].fill_(0.5)
+            for tid in state_ids:
+                student.lm_head.weight[tid].fill_(-0.5)
+            probe_logits = student(images, seq[:, :-1], return_aux=False, return_mtp=False)["logits"]
+            if float(probe_logits[0, 0, state_ids[0]].item()) > float(probe_logits[0, 0, note_ids[0]].item()):
+                student.lm_head.weight.neg_()
+
+        l_default, _ = forward_and_loss_v2(
+            student, images, seq, label_smoothing=0.05, device=torch.device("cpu")
+        )
+        l_one, _ = forward_and_loss_v2(
+            student, images, seq, label_smoothing=0.05, state_token_loss_weight=1.0, device=torch.device("cpu")
+        )
+        self.assertTrue(torch.equal(l_default["ce_loss"], l_one["ce_loss"]))
+        self.assertTrue(torch.equal(l_default["loss"], l_one["loss"]))
+
+        # state_token_loss_weight=2.5 increases CE loss on high-error state targets, matches F.cross_entropy(weight=w),
+        # and backprops cleanly.
+        student.zero_grad(set_to_none=True)
+        l_weighted, out_w = forward_and_loss_v2(
+            student, images, seq, label_smoothing=0.05, state_token_loss_weight=2.5, device=torch.device("cpu")
+        )
+        ref_w_ce = torch.nn.functional.cross_entropy(
+            out_w["logits"].reshape(-1, VOCAB_SIZE),
+            seq[:, 1:].reshape(-1),
+            weight=w,
+            ignore_index=PAD_ID,
+            label_smoothing=0.05,
+        )
+        self.assertLess(abs(float(l_weighted["ce_loss"].item()) - float(ref_w_ce.item())), 1e-6)
+        self.assertGreater(
+            float(l_weighted["ce_loss"].item()),
+            float(l_one["ce_loss"].item()),
+            "Upweighting high-error state tokens must increase CE loss",
+        )
+        self.assertGreater(float(l_weighted["loss"].item()), float(l_one["loss"].item()))
+        l_weighted["loss"].backward()
+        assert student.lm_head.weight.grad is not None
+        self.assertTrue(torch.isfinite(student.lm_head.weight.grad).all().item())
+
+        # End-to-end 2-step dry-run with --state-token-loss-weight 2.5
+        args_run = parser.parse_args([
+            "--preset", "tiny",
+            "--device", "cpu",
+            "--no-bf16",
+            "--steps", "2",
+            "--batch-size", "2",
+            "--grad-accum", "1",
+            "--seq-len", "12",
+            "--state-token-loss-weight", "2.5",
+            "--eval-every", "0",
+            "--gpu-ema-decay", "0.0",
+        ])
+        res = run_train_v2(args_run)
+        self.assertEqual(len(res["history"]), 2)
+        self.assertGreater(res["history"][-1]["loss"], 0.0)
 
 
 if __name__ == "__main__":

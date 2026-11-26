@@ -84,6 +84,8 @@ MAX_CONSECUTIVE_GRACE = 8
 MAX_CONSECUTIVE_BAR_REST = 24
 MAX_SYSTEMS = 24
 MAX_TOKENS_PER_BAR = 288
+MAX_BARS_PER_SYSTEM = 28
+MAX_TOKENS_PER_SYSTEM = 1440
 RECENT_WINDOW_MIN = 512
 RECENT_WINDOW_KEEP = 576
 RECENT_WINDOW_CAP = 640
@@ -161,12 +163,21 @@ class PrefixState:
                  'chords_on_onset', 'grace_run',
                  'consec_bar_rest_bars', 'bar_has_pitched', 'bar_has_bar_rest',
                  'sys_count', 'sys_has_event',
+                 'bars_in_system', 'tokens_in_system',
+                 'max_bars_per_system', 'max_tokens_per_system',
                  'tokens_since_bar', 'cur_sys_tokens', 'completed_system_hashes',
                  'cur_bar_tokens', 'sys_bar_hashes', 'bar_repeat_forbidden_tok',
                  'comp_num', 'comp_digits', 'comp_val',
                  'allow_percussion_tab', 'vocab_map')
 
-    def __init__(self, strict=False, allow_percussion_tab=False, vocab_map=None):
+    def __init__(
+        self,
+        strict=False,
+        allow_percussion_tab=False,
+        vocab_map=None,
+        max_bars_per_system=MAX_BARS_PER_SYSTEM,
+        max_tokens_per_system=MAX_TOKENS_PER_SYSTEM,
+    ):
         self.mode = 'bound'
         self.header_open = True
         self.seg_last = [False]
@@ -207,6 +218,10 @@ class PrefixState:
         self.bar_has_bar_rest = False
         self.sys_count = 0
         self.sys_has_event = False
+        self.bars_in_system = 0
+        self.tokens_in_system = 0
+        self.max_bars_per_system = max_bars_per_system
+        self.max_tokens_per_system = max_tokens_per_system
         self.tokens_since_bar = 0
         self.cur_sys_tokens = []
         self.completed_system_hashes = {}
@@ -259,6 +274,10 @@ class PrefixState:
         c.bar_has_bar_rest = self.bar_has_bar_rest
         c.sys_count = self.sys_count
         c.sys_has_event = self.sys_has_event
+        c.bars_in_system = self.bars_in_system
+        c.tokens_in_system = self.tokens_in_system
+        c.max_bars_per_system = self.max_bars_per_system
+        c.max_tokens_per_system = self.max_tokens_per_system
         c.tokens_since_bar = self.tokens_since_bar
         c.cur_sys_tokens = list(self.cur_sys_tokens)
         c.completed_system_hashes = dict(self.completed_system_hashes)
@@ -321,11 +340,27 @@ class PrefixState:
             return False
         return True
 
+    def _sys_is_capped(self):
+        """True if the current system hit MAX_BARS_PER_SYSTEM or MAX_TOKENS_PER_SYSTEM."""
+        if (
+            self.max_bars_per_system is not None
+            and self.bars_in_system >= self.max_bars_per_system
+        ):
+            return True
+        if (
+            self.max_tokens_per_system is not None
+            and self.tokens_in_system >= self.max_tokens_per_system
+        ):
+            return True
+        return False
+
     def can_emit_eos(self, cur_len=None, max_len=None):
         """Return True iff <eos> is legal here (guards against empty trailing systems)."""
         if cur_len is not None and max_len is not None and cur_len >= max_len:
             return True
         if (self.sys_count + 1) >= MAX_SYSTEMS:
+            return True
+        if self._sys_is_capped():
             return True
         return bool(self.sys_has_event)
 
@@ -339,6 +374,8 @@ class PrefixState:
                 )
         self.sys_count += 1
         self.sys_has_event = False
+        self.bars_in_system = 0
+        self.tokens_in_system = 0
         self.tokens_since_bar = 0
         self.cur_sys_tokens = []
         self.cur_bar_tokens = []
@@ -549,6 +586,7 @@ class PrefixState:
             else:
                 self.consec_bar_rest_bars = 0
             self._record_completed_bar()
+            self.bars_in_system += 1
             self.cur_bar_tokens = []
             self.tokens_since_bar = 0
             self.bar_has_pitched = False
@@ -703,6 +741,7 @@ class PrefixState:
         if len(self.recent) > RECENT_WINDOW_CAP:
             del self.recent[:-RECENT_WINDOW_KEEP]
         self.cur_sys_tokens.append(t)
+        self.tokens_in_system += 1
         if t not in BAR_LIKES:
             self.cur_bar_tokens.append(t)
             self.tokens_since_bar += 1
@@ -1049,9 +1088,12 @@ class PrefixState:
         vm = self.vocab_map
         allow = set()
         bar_tok_capped = self.tokens_since_bar >= MAX_TOKENS_PER_BAR
+        sys_capped = self._sys_is_capped()
         eos_ok = (len(self.recent) == 0) or self.can_emit_eos()
 
         def add_boundary(placed=None):
+            if sys_capped:
+                return
             if bar_tok_capped:
                 allow.add(vm[BAR])
                 allow.update(vm[t] for t in BAR_RIGHT if t in vm)
@@ -1152,7 +1194,7 @@ class PrefixState:
             allow.update(vm[t] for t in OCTAVES if t in vm)
             return allow, False
         if self.mode == 'pitch-tail':
-            if not bar_tok_capped:
+            if not (bar_tok_capped or sys_capped):
                 # decode.rs consumes a single optional alter BEFORE the dot
                 # loop; a second alter, or an alter after dots, never parses.
                 if not (self.strict
@@ -1169,7 +1211,7 @@ class PrefixState:
             add_boundary(placed=True)
             return allow, eos_ok
         if self.mode == 'tiestart':
-            if not bar_tok_capped:
+            if not (bar_tok_capped or sys_capped):
                 allow.add(vm[TIE_STOP])
                 allow.update(vm[t] for t in MODS)
             add_boundary(placed=True)
@@ -1186,7 +1228,7 @@ class PrefixState:
                     allow.add(vm[t])
             return allow, False
         if self.mode == 'rest-tail':
-            if not bar_tok_capped:
+            if not (bar_tok_capped or sys_capped):
                 if self._dot_ok():
                     allow.add(vm[DOT])
                 allow.update(vm[t] for t in MODS)

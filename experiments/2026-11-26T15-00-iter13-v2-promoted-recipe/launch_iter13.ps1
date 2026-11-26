@@ -19,10 +19,11 @@ param(
     [string]$Stage2OutDir = "D:\tmp\mvd-runs\uni-omr-iter13-v2-stage2-24k",
     [string]$EvalOutDir   = "D:\tmp\uni-omr-suite31-ood",
     [string]$TeacherCkpt  = "D:\tmp\mvd-runs\uni-omr-iter10_5-v1\uni_omr_ema_best.pt",
-    [string]$Manifest     = "D:\tmp\uni_fullpage_iter11_clean.jsonl",
+    [string]$Manifest     = "D:\tmp\uni_fullpage_iter13_clean.jsonl",
     [string]$RismStyleDir = "D:\tmp\unlabeled-10k-real\rism_hw",
     [string]$PrintedStrip = "tmp-train/mvd-sysdata-t32",
-    [string]$HwStrip      = "D:\tmp\real-hw-strips-iter7"
+    [string]$HwStrip      = "D:\tmp\real-hw-strips-iter7",
+    [string]$HwStripV06   = "D:\tmp\hw-sim-v06-historical-clean\stage2_strips"
 )
 
 $ErrorActionPreference = "Stop"
@@ -50,7 +51,7 @@ $Stage1Args = @(
     "--preset", "small_45m",
     "--curriculum", "strip",
     "--strip-dirs", $PrintedStrip,
-    "--hw-strip-dirs", $HwStrip,
+    "--hw-strip-dirs", $HwStrip, $HwStripV06,
     "--hw-frac", "0.30",
     "--strip-batch-size", "8",
     "--strip-grad-accum", "4",
@@ -79,6 +80,7 @@ $Stage1Args = @(
     "--kd-temp", "1.5",
     "--kd-teacher-ce-cap", "1.5",
     "--kd-hw-scale", "0.0",
+    "--state-token-loss-weight", "2.5",
     "--gpu-ema-decay", "0.995",
     "--gpu-ema-every", "2",
     "--eval-every", "2000",
@@ -109,7 +111,7 @@ $Stage1Latest = Join-Path $Stage1OutDir "uni_omr_v2_ema_latest.pt"
 $Stage1Ckpt   = if (Test-Path $Stage1Best) { $Stage1Best } elseif (Test-Path $Stage1Latest) { $Stage1Latest } else { $Stage1Best }
 
 # ---------------------------------------------------------------------------
-# Stage 2: 24,000-step Pure Fullpage (1280px multi-scale + FDA/AdaIN + QAT-INT4)
+# Stage 2: 24,000-step Pure Fullpage (1408px multi-scale + FDA/AdaIN + QAT-INT4)
 # ---------------------------------------------------------------------------
 $Stage2Args = @(
     "--preset", "small_45m",
@@ -122,7 +124,7 @@ $Stage2Args = @(
     "--split-archival-hw",
     "--val-count", "16",
     "--val-real-hw-count", "16",
-    "--fullpage-max-dim", "1280",
+    "--fullpage-max-dim", "1408",
     "--multi-scale",
     "--max-seq-len", "3840",
     "--batch-size", "2",
@@ -152,6 +154,7 @@ $Stage2Args = @(
     "--kd-temp", "1.5",
     "--kd-teacher-ce-cap", "1.5",
     "--kd-hw-scale", "0.0",
+    "--state-token-loss-weight", "2.5",
     "--qat-int4",
     "--qat-int4-last-frac", "0.15",
     "--qat-int4-block-size", "64",
@@ -205,7 +208,7 @@ $EvalFastArgs = @(
 $EvalBeamArgs = @(
     "--ckpt", $Stage2Ckpt,
     "--max-dim", "1408",
-    "--max-len", "3584",
+    "--max-len", "4096",
     "--use-grammar",
     "--use-mtp-spec",
     "--oemer-dewarp",
@@ -228,7 +231,7 @@ if (-not $SkipEval) {
         throw "Iter 13 Eval Pass 1 failed with exit code $LASTEXITCODE"
     }
 
-    Write-Host "=== [Iter 13 Eval Pass 2] Promoted high-acc suite31_hw (1408px/3584, FSA+MTP-4+oemer-dewarp+mbeam2_cap4_lp2_w64) ==="
+    Write-Host "=== [Iter 13 Eval Pass 2] Promoted high-acc suite31_hw (1408px/4096, FSA+MTP-4+oemer-dewarp+mbeam2_cap4_lp2_w64) ==="
     & $Python -u $EvalScript @EvalBeamArgs
     if ($LASTEXITCODE -ne 0) {
         throw "Iter 13 Eval Pass 2 failed with exit code $LASTEXITCODE"
