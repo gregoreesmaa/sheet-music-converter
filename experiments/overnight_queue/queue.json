@@ -421,5 +421,20 @@
     "depends_on": [
       "2026-11-26T00-54-ablation-vir-vico-router"
     ]
+  },
+  {
+    "id": "2026-11-26T02-20-academic-dual-verifier-v2-fixed-render",
+    "wave": 4,
+    "priority": 3,
+    "provider": "colab_l4",
+    "gpu": "L4",
+    "est_minutes": 35,
+    "est_cu": 2.8,
+    "script": "experiments/2026-11-26T02-20-academic-dual-verifier-v2-fixed-render/run_colab.py",
+    "hf_eval_target": "evals/2026-11-26T02-20-academic-dual-verifier-v2-fixed-render.json",
+    "status": "QUEUED",
+    "depends_on": [
+      "2026-11-26T01-30-academic-dual-verifier-rlvr-ttc"
+    ]
   }
 ]

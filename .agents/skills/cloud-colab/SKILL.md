@@ -24,8 +24,9 @@ description: >-
 - **Quick balance & session check:**
   ```powershell
   .\.venv\Scripts\colab.exe usage
-  .\.venv\Scripts\colab.exe sessions
+  .\.venv\Scripts\colab.exe ls
   ```
+  *(Note: the list subcommand is `colab ls`, NOT `colab list` or `colab sessions`.)*
 
 ---
 
@@ -36,7 +37,7 @@ Verified balance on `2026-11-26`: **`1,479.59` compute units** (Pro/Pro+ pool).
 | GPU | VRAM | BF16 Native | Approx. CU/hr | Best Use in `sheet-music-converter` |
 |---|---:|---|---:|---|
 | `T4` | 16 GB | **No** (`cc=7.5`, FP16-only) | ~1.9 | Cheap CPU/GPU data prep or FP16 inference only (avoid for BF16 training) |
-| `L4` | 24 GB | **Yes** (`cc=8.9`) | ~4.8 | Fast proxy ablations, `suite31_hw` OOD evals, Wave 3 experiments |
+| `L4` | 24 GB | **Yes** (`cc=8.9`) | **2.33** *(measured)* | Fast proxy ablations, `suite31_hw` OOD evals, overnight DAG queue (`~635` L4-hrs on 1,478 CU) |
 | `A100` | 40 GB | **Yes** (`cc=8.0`) | ~11–13 | Full `1536px` `UniOMR v2` training runs (Iter 11+) & large-batch RLVR |
 | `H100` | 80 GB | **Yes** (`cc=9.0`) | ~15–18 | High-leverage architecture sprints once code is 100% verified on L4 |
 
@@ -81,6 +82,8 @@ Verified balance on `2026-11-26`: **`1,479.59` compute units** (Pro/Pro+ pool).
 - **2026-11-26 (Colab concurrency & `exec --timeout` gotchas):**
   - **Per-tier GPU concurrency cap:** When 2 `L4` sessions are already active, `colab new --gpu L4` returns `Allocation refused (precondition failed)`. Falling back to `--gpu A100` provisions cleanly on A100-SXM4-40GB (separate tier, `cc=(8, 0)`, BF16 native, Rust release builds of `assembly-serialize` + `eval-harness` finish in `31.8s`).
   - **`colab exec` default 30s silence timeout:** `colab exec` raises `TimeoutError: no message from the kernel for 30s` if a cell is quiet for >30s. ALWAYS pass `--timeout 600` (or higher) to `colab exec` for training/eval scripts!
+  - **`importlib.invalidate_caches()` after in-cell `pip install`:** If a script checks `__import__(pkg)` (triggering `ImportError`), then runs `pip install -q <pkg>`, you MUST call `importlib.invalidate_caches()` before importing modules that optionally import `<pkg>`, or Python's finder cache silently returns `ImportError` (`render_ok_rate = 0.0` trap!). Always add a fail-fast `assert` smoke test after runtime installs!
+  - **`verovio.toolkit()` C++ font-table race under `ThreadPoolExecutor` (2026-11-26, Academic Exp A):** Instantiating `verovio.toolkit()` concurrently in worker threads triggers `[Error] Bravura font could not be loaded` / `[Error] Leipzig font could not be loaded` and returns `None` for 100% of threads (`render_ok_rate = 0.0`). Always serialize `verovio.toolkit()` calls through a single module-level instance guarded by `threading.Lock()` (fixed in `tmp-train/mvd/dual_verifier.py`), leaving `resvg_py` SVG→PNG rasterization unlocked in parallel.
 - **2026-11-26 (Exp 8 `L4` benchmark via `colab.exe 0.8.0`):**
   - **`colab exec` has NO `-c` flag:** Pass inline code as a positional argument (`colab exec -s <name> "print(1)"`) or pass a script file with `-f <path>`.
   - **`colab install` prefers `uv` automatically:** Installing `onnx==1.23.2 onnxruntime==1.31.1 onnx-ir onnxscript huggingface_hub` took only `~13 s` on an `L4` VM.

@@ -1,6 +1,6 @@
 # Academic Experiment A: Dual-Verified Render-Cycle RLVR & Test-Time Compute Scaling (`2026-11-26T01-30-academic-dual-verifier-rlvr-ttc`)
 
-**Status:** `RUNNING` (Phase 1 — Dual-Verifier Falsification Gate & TTC Scaling Curve `K ∈ {1, 4, 16}` on Colab `L4`)
+**Status:** `COMPLETED (ITERATE)` — `render_ok_rate = 0.0` (`R_vis` disabled by import-cache + `verovio` thread-race bugs); `R_sym`-only achieved `+0.0233` Printed F1 and `+0.0361` HW Oracle headroom. Follow-up queued: [`2026-11-26T02-20-academic-dual-verifier-v2-fixed-render`](../2026-11-26T02-20-academic-dual-verifier-v2-fixed-render/).
 
 ## Summary & Hypothesis
 
