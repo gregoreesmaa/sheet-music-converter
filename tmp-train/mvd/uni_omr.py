@@ -186,10 +186,14 @@ class RMSNorm(nn.Module):
         super().__init__()
         self.eps = eps
         self.weight = nn.Parameter(torch.ones(dim))
+        self._normalized_shape: Tuple[int, ...] = (int(dim),)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if hasattr(F, "rms_norm"):
-            return F.rms_norm(x, (self.weight.shape[0],), self.weight, self.eps)
+            if x.dtype in (torch.bfloat16, torch.float16):
+                with torch.amp.autocast(device_type=x.device.type, enabled=False):
+                    return F.rms_norm(x, self._normalized_shape, self.weight.to(x.dtype), self.eps)
+            return F.rms_norm(x, self._normalized_shape, self.weight, self.eps)
         norm = torch.rsqrt(x.pow(2).mean(dim=-1, keepdim=True) + self.eps)
         return x * norm * self.weight
 
@@ -217,13 +221,18 @@ def _rotate_half(x: torch.Tensor) -> torch.Tensor:
 
 
 def apply_rope(q: torch.Tensor, k: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Apply rotary embeddings.
+    """Apply rotary embeddings using half-dim slicing (zero _rotate_half allocations).
 
     q, k: ``(B, H, L, D)``
-    cos, sin: ``(B, 1, L, D)`` or ``(1, 1, L, D)``
+    cos, sin: ``(B, 1, L, D)`` or ``(1, 1, L, D)`` with symmetric halves ``[c, c]`` / ``[s, s]``.
     """
-    q_rot = (q * cos) + (_rotate_half(q) * sin)
-    k_rot = (k * cos) + (_rotate_half(k) * sin)
+    half = q.shape[-1] // 2
+    c = cos[..., :half]
+    s = sin[..., :half]
+    q1, q2 = q.chunk(2, dim=-1)
+    k1, k2 = k.chunk(2, dim=-1)
+    q_rot = torch.cat((q1 * c - q2 * s, q2 * c + q1 * s), dim=-1)
+    k_rot = torch.cat((k1 * c - k2 * s, k2 * c + k1 * s), dim=-1)
     return q_rot, k_rot
 
 
@@ -648,6 +657,8 @@ class InkTokenRouter(nn.Module):
                     k = max(k_min, min(k_max, k_dyn))
         else:
             k = max(1, min(N, int(math.ceil(N * ratio))))
+            if self.max_kept_tokens > 0:
+                k = min(k, self.max_kept_tokens)
 
         if k >= N:
             gate = (0.5 + 0.5 * torch.sigmoid(score_flat)).unsqueeze(-1)
@@ -1128,6 +1139,7 @@ class QATInt4Controller:
                 return F.linear(x, w + delta, mod.bias)
             return F.linear(x, mod.weight, mod.bias)
 
+        mod._qat_enabled = self.enabled  # type: ignore[attr-defined]
         mod.forward = _qat_forward  # type: ignore[method-assign]
 
     @property
@@ -1150,16 +1162,21 @@ class QATInt4Controller:
 
     def enable(self) -> None:
         self.enabled = True
+        for mod in self._orig_forwards:
+            mod._qat_enabled = True  # type: ignore[attr-defined]
         self.refresh_cache()
 
     def disable(self) -> None:
         self.enabled = False
+        for mod in self._orig_forwards:
+            mod._qat_enabled = False  # type: ignore[attr-defined]
         self.invalidate_cache()
 
     def detach(self) -> None:
         """Restore original ``forward`` methods on all patched ``nn.Linear`` modules."""
         for mod, orig_fwd in self._orig_forwards.items():
             mod.forward = orig_fwd  # type: ignore[method-assign]
+            mod._qat_enabled = False  # type: ignore[attr-defined]
         self._orig_forwards.clear()
         self._cached_deltas.clear()
         self.target_names.clear()
@@ -3860,14 +3877,50 @@ def _pil_to_chw_uint8(img: Image.Image) -> torch.Tensor:
 _SEQ_CACHE_DTYPE = np.int16 if VOCAB_SIZE <= 32767 else np.int32
 
 
+_PINNED_U8_STAGING: Dict[Tuple[int, ...], torch.Tensor] = {}
+_PINNED_U8_STAGING_MAX: int = 16
+
+
+def _get_main_thread_pinned_u8(shape: Tuple[int, ...]) -> Optional[torch.Tensor]:
+    """Return a reusable pinned CPU uint8 staging buffer (main thread only, never worker threads)."""
+    if threading.current_thread() is not threading.main_thread():
+        return None
+    buf = _PINNED_U8_STAGING.get(shape)
+    if buf is not None:
+        return buf
+    if len(_PINNED_U8_STAGING) >= _PINNED_U8_STAGING_MAX:
+        _PINNED_U8_STAGING.clear()
+    try:
+        buf = torch.empty(shape, dtype=torch.uint8, pin_memory=True)
+        _PINNED_U8_STAGING[shape] = buf
+        return buf
+    except Exception:
+        return None
+
+
 def _images_to_device_float(
     images: torch.Tensor,
     device: torch.device,
     non_blocking: bool = True,
+    dtype: Optional[torch.dtype] = None,
 ) -> torch.Tensor:
-    t = images.to(device, non_blocking=non_blocking)
+    src = images
+    if (
+        device.type == "cuda"
+        and src.device.type == "cpu"
+        and src.dtype == torch.uint8
+        and (not src.is_pinned())
+    ):
+        pinned = _get_main_thread_pinned_u8(tuple(src.shape))
+        if pinned is not None:
+            pinned.copy_(src)
+            src = pinned
+    t = src.to(device, non_blocking=non_blocking)
+    target_dtype = dtype if dtype is not None else torch.float32
     if t.dtype == torch.uint8:
-        return t.float().div_(255.0)
+        return t.to(dtype=target_dtype).div_(255.0)
+    if dtype is not None and t.dtype != dtype:
+        return t.to(dtype=dtype)
     return t
 
 
@@ -4252,11 +4305,15 @@ class MultiScaleBatchSampler:
 
 FIXED_HW_BUCKETS: Tuple[Tuple[int, int], ...] = (
     # Portrait (H >= W)
+    (1024, 768),
     (1152, 832),
+    (1280, 960),
     (1408, 1024),
     (1408, 1152),
     # Landscape (W > H)
+    (768, 1024),
     (832, 1152),
+    (960, 1280),
     (1024, 1408),
     (1152, 1408),
 )

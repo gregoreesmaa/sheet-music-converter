@@ -245,17 +245,22 @@ class TestIter13SpeedOpts(unittest.TestCase):
         self.assertLess(abs(float(new_losses["loss"] - legacy_total)), 1e-5)
 
     # ------------------------------------------------------------------
-    # 4. Fixed 6-bucket (H, W) padding in collate_uni_batch & prefetcher
+    # 4. Fixed 10-bucket (H, W) padding in collate_uni_batch & prefetcher
     # ------------------------------------------------------------------
     def test_collate_fixed_hw_buckets_snaps_and_never_crops(self) -> None:
+        self.assertEqual(len(FIXED_HW_BUCKETS), 10)
         cases = [
-            # Portrait buckets
-            ((900, 700), (1152, 832)),
+            # Portrait buckets (including new 1024x768 and 1280x960)
+            ((900, 700), (1024, 768)),
+            ((1024, 768), (1024, 768)),
             ((1152, 832), (1152, 832)),
+            ((1280, 960), (1280, 960)),
             ((1300, 950), (1408, 1024)),
             ((1400, 1100), (1408, 1152)),
-            # Landscape buckets
-            ((700, 900), (832, 1152)),
+            # Landscape buckets (including new 768x1024 and 960x1280)
+            ((700, 900), (768, 1024)),
+            ((768, 1024), (768, 1024)),
+            ((960, 1280), (960, 1280)),
             ((950, 1300), (1024, 1408)),
             ((1100, 1400), (1152, 1408)),
             # Oversized fallback -> mult-64, NEVER cropped
@@ -300,7 +305,7 @@ class TestIter13SpeedOpts(unittest.TestCase):
         )
         try:
             b = next(pf)
-            self.assertEqual(tuple(b["images"].shape), (2, 3, 1152, 832))
+            self.assertEqual(tuple(b["images"].shape), (2, 3, 1024, 768))
             self.assertIn((b["images"].shape[2], b["images"].shape[3]), FIXED_HW_BUCKETS)
         finally:
             pf.close()
@@ -423,6 +428,258 @@ class TestIter13SpeedOpts(unittest.TestCase):
                     student, images, seq, cass_prob=0.30, cass_batch_prob=0.5, kind="fullpage"
                 )
             self.assertEqual(dec_calls["n"], 4)
+
+    # ------------------------------------------------------------------
+    # 6. Tier 3: InkTokenRouter clamps k <= max_kept_tokens with override
+    # ------------------------------------------------------------------
+    def test_tier3_ink_router_clamps_max_kept_tokens_with_override(self) -> None:
+        torch.manual_seed(11)
+        router = InkTokenRouter(
+            d_model=32,
+            keep_ratio=0.40,
+            dynamic_routing=True,
+            max_kept_tokens=20,
+            n_bg_summary=4,
+        ).eval()
+        # N = 10 * 10 = 100; 0.45 * 100 = 45 > max_kept_tokens(20)
+        feat_2d = torch.randn(2, 32, 10, 10)
+        with torch.no_grad():
+            toks, coords, info = router(feat_2d, keep_ratio_override=0.45, compute_ink_recall=False)
+        self.assertEqual(info["k_kept"], 20)
+        self.assertEqual(toks.shape, (2, 24, 32))
+        self.assertEqual(coords.shape, (2, 24, 2))
+
+    # ------------------------------------------------------------------
+    # 7. Tier 3: RMSNorm bf16 + half-dim apply_rope + fused QKV + fused MTP-4
+    # ------------------------------------------------------------------
+    def test_tier3_rmsnorm_rope_fused_qkv_and_mtp_parity(self) -> None:
+        from uni_omr import RMSNorm as V1RMSNorm, RoPE1D, _rotate_half, apply_rope
+        from uni_omr_v2 import (
+            GroupedQueryAttention,
+            QATInt4ControllerV2,
+            RMSNorm as V2RMSNorm,
+            _is_qat_linear_active,
+        )
+
+        torch.manual_seed(17)
+        # 7a. RMSNorm fp32 & bf16 parity + stays bf16 under cpu autocast
+        for cls in (V1RMSNorm, V2RMSNorm):
+            rn = cls(32)
+            with torch.no_grad():
+                rn.weight.uniform_(0.5, 1.5)
+            x32 = torch.randn(2, 8, 32, dtype=torch.float32)
+            ref32 = x32 * torch.rsqrt(x32.pow(2).mean(dim=-1, keepdim=True) + rn.eps) * rn.weight
+            out32 = rn(x32)
+            self.assertEqual(out32.dtype, torch.float32)
+            self.assertTrue(torch.allclose(out32, ref32, atol=1e-5))
+
+            x16 = x32.to(torch.bfloat16)
+            with torch.amp.autocast(device_type="cpu", dtype=torch.bfloat16):
+                out16 = rn(x16)
+            self.assertEqual(out16.dtype, torch.bfloat16)
+            self.assertTrue(torch.allclose(out16.float(), ref32, atol=2e-2))
+
+        # 7b. Half-dim apply_rope matches legacy _rotate_half algebraically
+        rope = RoPE1D(head_dim=16)
+        cos, sin = rope(12, device=torch.device("cpu"), dtype=torch.float32)
+        q = torch.randn(2, 4, 12, 16)
+        k = torch.randn(2, 2, 12, 16)
+        q_ref = (q * cos) + (_rotate_half(q) * sin)
+        k_ref = (k * cos) + (_rotate_half(k) * sin)
+        q_new, k_new = apply_rope(q, k, cos, sin)
+        self.assertTrue(torch.allclose(q_new, q_ref, atol=1e-6))
+        self.assertTrue(torch.allclose(k_new, k_ref, atol=1e-6))
+
+        # 7c. Fused QKV (self-attn & cross-attn) matches unfused reference (< 1e-4)
+        gqa = GroupedQueryAttention(d_model=64, n_heads=4, n_kv_heads=2, use_rope=True).eval()
+        h_in = torch.randn(2, 12, 64)
+        mem_in = torch.randn(2, 16, 64)
+        with torch.no_grad():
+            sa_fused = gqa(h_in, h_in, rope_cos=cos, rope_sin=sin, is_causal=True)
+            ca_fused = gqa(h_in, mem_in, is_cross=True)
+            # Force unfused path via _is_qat_linear_active=True mock
+            with mock.patch("uni_omr_v2._is_qat_linear_active", return_value=True):
+                sa_ref = gqa(h_in, h_in, rope_cos=cos, rope_sin=sin, is_causal=True)
+                ca_ref = gqa(h_in, mem_in, is_cross=True)
+        self.assertTrue(torch.allclose(sa_fused, sa_ref, atol=1e-5))
+        self.assertTrue(torch.allclose(ca_fused, ca_ref, atol=1e-5))
+
+        # 7d. Fused MTP-4 matches unfused MTPHead loop (< 1e-4) & respects QAT toggle
+        cfg = tv2.uni_omr_v2_tiny(mtp_k=4)
+        model = UniOMRv2Net(cfg).eval()
+        imgs = torch.rand(2, 3, 128, 192)
+        tgt_in = torch.randint(4, VOCAB_SIZE, (2, 16), dtype=torch.long)
+        tgt_in[:, 0] = BOS_ID
+        with torch.no_grad():
+            mem, _, _ = model.encode_image(imgs, return_aux=False)
+            logits_fused, mtp_fused, _ = model.decode_tokens(
+                tgt_in, mem, return_mtp=True, return_aux=False, apply_tok_dropout=False
+            )
+            with mock.patch("uni_omr_v2._is_qat_linear_active", return_value=True):
+                logits_ref, mtp_ref, _ = model.decode_tokens(
+                    tgt_in, mem, return_mtp=True, return_aux=False, apply_tok_dropout=False
+                )
+        self.assertTrue(torch.allclose(logits_fused, logits_ref, atol=1e-4))
+        self.assertEqual(len(mtp_fused), len(mtp_ref))
+        for mf, mr in zip(mtp_fused, mtp_ref):
+            self.assertTrue(torch.allclose(mf, mr, atol=1e-4))
+
+        # Verify QATInt4ControllerV2 toggles _qat_enabled properly
+        qat = QATInt4ControllerV2(model, block_size=32, enabled=False)
+        self.assertFalse(_is_qat_linear_active(model.dec_layers[0].self_attn.q_proj))
+        qat.enable()
+        self.assertTrue(_is_qat_linear_active(model.dec_layers[0].self_attn.q_proj))
+        self.assertTrue(_is_qat_linear_active(model.mtp_heads[0].proj))
+        qat.disable()
+        self.assertFalse(_is_qat_linear_active(model.dec_layers[0].self_attn.q_proj))
+        qat.detach()
+
+    # ------------------------------------------------------------------
+    # 8. Tier 3: compute_stroke_hog_target scatter_ bit-identical to scatter_add_
+    # ------------------------------------------------------------------
+    def test_tier3_stroke_hog_scatter_bit_identical(self) -> None:
+        import math
+        from uni_omr_v2 import _get_sobel_kxy, compute_stroke_hog_target
+
+        torch.manual_seed(23)
+        img = torch.rand(2, 3, 64, 96)
+        n_bins = 8
+        target_hw = (16, 24)  # exact 4x factor -> avg_pool2d fast path
+
+        out_new = compute_stroke_hog_target(img, target_hw=target_hw, n_bins=n_bins)
+
+        # Reference using scatter_add_ + adaptive_avg_pool2d (exact same arithmetic ops)
+        with torch.no_grad():
+            luma_f = img[:, 0:1].to(torch.float32) * 0.299
+            luma_f.add_(img[:, 1:2], alpha=0.587).add_(img[:, 2:3], alpha=0.114)
+            gxy = F.conv2d(luma_f, _get_sobel_kxy(img.device), padding=1)
+            gx, gy = gxy[:, 0:1], gxy[:, 1:2]
+            mag = gx.mul(gx).addcmul_(gy, gy).add_(1e-8).sqrt_()
+            bin_f = torch.atan2(gy, gx).remainder_(math.pi).mul_(float(n_bins) / math.pi)
+            bin_floor = torch.floor(bin_f)
+            bin_lo = bin_floor.to(torch.long) % n_bins
+            bin_hi = (bin_lo + 1) % n_bins
+            w_hi = bin_f.sub_(bin_floor)
+            w_lo = 1.0 - w_hi
+            hog_full = luma_f.new_zeros((2, n_bins, 64, 96), dtype=torch.float32)
+            hog_full.scatter_add_(1, bin_lo, mag * w_lo)
+            hog_full.scatter_add_(1, bin_hi, mag.mul_(w_hi))
+            hog_pooled = F.adaptive_avg_pool2d(hog_full, target_hw)
+            norm = hog_pooled.pow(2).sum(dim=1, keepdim=True).add_(1e-4).sqrt_()
+            ref = hog_pooled.div_(norm)
+
+        self.assertTrue(torch.equal(out_new, ref))
+
+    # ------------------------------------------------------------------
+    # 9. Tier 3: BatchedMuon parity with torch.optim.Muon
+    # ------------------------------------------------------------------
+    def test_tier3_batched_muon_matches_torch_muon(self) -> None:
+        if not hasattr(torch.optim, "Muon"):
+            self.skipTest("torch.optim.Muon not available in this PyTorch build")
+
+        shapes = [(32, 32), (32, 32), (64, 32), (64, 32), (32, 64), (32, 64)]
+        for dtype, tol in ((torch.float32, 1e-5), (torch.bfloat16, 1e-3)):
+            with self.subTest(dtype=dtype):
+                torch.manual_seed(31)
+                params_ref = [
+                    torch.nn.Parameter(torch.randn(s, dtype=dtype)) for s in shapes
+                ]
+                params_bat = [
+                    torch.nn.Parameter(p.detach().clone()) for p in params_ref
+                ]
+                grads = [torch.randn(s, dtype=dtype) for s in shapes]
+                for pr, pb, g in zip(params_ref, params_bat, grads):
+                    pr.grad = g.clone()
+                    pb.grad = g.clone()
+
+                opt_ref = torch.optim.Muon(
+                    params_ref,
+                    lr=1e-3,
+                    weight_decay=0.01,
+                    momentum=0.95,
+                    nesterov=True,
+                    ns_steps=5,
+                    adjust_lr_fn="match_rms_adamw",
+                )
+                opt_bat = tv2.BatchedMuon(
+                    params_bat,
+                    lr=1e-3,
+                    weight_decay=0.01,
+                    momentum=0.95,
+                    nesterov=True,
+                    ns_steps=5,
+                    adjust_lr_fn="match_rms_adamw",
+                )
+                opt_ref.step()
+                opt_bat.step()
+
+                for pr, pb in zip(params_ref, params_bat):
+                    diff = float((pr.detach().float() - pb.detach().float()).abs().max())
+                    self.assertLess(diff, tol, f"shape={tuple(pr.shape)} dtype={dtype} max_diff={diff}")
+
+    # ------------------------------------------------------------------
+    # 10. Tier 3: Active-item teacher slicing, teacher-max-dim, kd-stop-frac
+    # ------------------------------------------------------------------
+    def test_tier3_teacher_active_slicing_max_dim_and_stop_frac(self) -> None:
+        parser = tv2.build_arg_parser()
+        args_def = parser.parse_args([])
+        self.assertEqual(args_def.teacher_max_dim, 0)
+        self.assertAlmostEqual(args_def.kd_stop_frac, 1.0)
+
+        args_custom = parser.parse_args(["--teacher-max-dim", "1024", "--kd-stop-frac", "0.65"])
+        self.assertEqual(args_custom.teacher_max_dim, 1024)
+        self.assertAlmostEqual(args_custom.kd_stop_frac, 0.65)
+
+        torch.manual_seed(41)
+        student = UniOMRv2Net(tv2.uni_omr_v2_tiny())
+        teacher = UniOMRNet(
+            UniOMRConfig(
+                d_model=64,
+                n_heads=4,
+                n_enc_layers=1,
+                n_dec_layers=1,
+                ffn_mult=2.0,
+                dropout=0.0,
+                backbone_stride=16,
+                use_uv_aux=False,
+                mtp_k=1,
+                n_bg_summary=4,
+            )
+        ).eval()
+
+        # Batch of 2: item 0 printed (active), item 1 real_hw (weight 0 -> sliced out)
+        images = torch.rand(2, 3, 192, 256)
+        seq = torch.tensor(
+            [
+                [BOS_ID, 5, 6, 7, 8, EOS_ID],
+                [BOS_ID, 9, 10, 11, 12, EOS_ID],
+            ],
+            dtype=torch.long,
+        )
+        seen_shapes: list = []
+        orig_t_fwd = teacher.forward
+
+        def _spy_t(t_imgs, t_tgt, *a, **kw):
+            seen_shapes.append(tuple(t_imgs.shape))
+            return orig_t_fwd(t_imgs, t_tgt, *a, **kw)
+
+        with mock.patch.object(teacher, "forward", side_effect=_spy_t):
+            losses, _ = tv2.forward_and_loss_v2(
+                student,
+                images,
+                seq,
+                teacher_v1=teacher,
+                domains=["printed", "real_hw"],
+                kd_alpha=0.3,
+                kd_hw_scale=0.0,
+                teacher_max_dim=128,
+                cass_prob=0.0,
+                kind="fullpage",
+            )
+        # Only 1 active item passed to teacher, and downscaled from (192, 256) -> (96, 128)
+        self.assertEqual(seen_shapes, [(1, 3, 96, 128)])
+        self.assertGreaterEqual(float(losses["kd_loss"]), 0.0)
+        losses["loss"].backward()
 
 
 if __name__ == "__main__":

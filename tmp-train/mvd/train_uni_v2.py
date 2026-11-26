@@ -56,6 +56,11 @@ import time
 from typing import Any, Dict, Iterator, List, Optional, Sequence, Tuple
 
 import numpy as np
+try:
+    import cv2 as _cv2
+    _cv2.setNumThreads(1)
+except Exception:
+    pass
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -800,6 +805,139 @@ def _is_no_decay_param(name: str, p: nn.Parameter) -> bool:
     )
 
 
+def _muon_adjust_lr(lr: float, adjust_lr_fn: Optional[str], param_shape: torch.Size) -> float:
+    """Exact learning rate adjustment matching ``torch.optim.Muon``."""
+    a_dim, b_dim = int(param_shape[0]), int(param_shape[1])
+    if adjust_lr_fn is None or adjust_lr_fn == "original":
+        ratio = math.sqrt(max(1.0, float(a_dim) / float(b_dim)))
+    elif adjust_lr_fn == "match_rms_adamw":
+        ratio = 0.2 * math.sqrt(float(max(a_dim, b_dim)))
+    elif adjust_lr_fn == "spectral_unclamped":
+        ratio = math.sqrt(float(a_dim) / float(b_dim))
+    else:
+        ratio = 1.0
+    return float(lr) * ratio
+
+
+class BatchedMuon(torch.optim.Optimizer):
+    """Shape-batched ``bmm`` Muon optimizer with exact parity to ``torch.optim.Muon``.
+
+    Groups same-shape 2D parameters into 3D batches, runs batched quintic Newton-Schulz
+    (``ns_steps=5``) in ``bfloat16`` via ``torch.bmm`` / ``torch.baddbmm``, and applies
+    ``torch._foreach_*`` momentum + decoupled weight decay + parameter updates.
+    """
+
+    def __init__(
+        self,
+        params: Any,
+        lr: float = 1e-3,
+        weight_decay: float = 0.1,
+        momentum: float = 0.95,
+        nesterov: bool = True,
+        ns_coefficients: Tuple[float, float, float] = (3.4445, -4.7750, 2.0315),
+        eps: float = 1e-7,
+        ns_steps: int = 5,
+        adjust_lr_fn: Optional[str] = "match_rms_adamw",
+    ) -> None:
+        if lr < 0.0:
+            raise ValueError(f"Invalid lr: {lr}")
+        if momentum < 0.0:
+            raise ValueError(f"Invalid momentum: {momentum}")
+        if weight_decay < 0.0:
+            raise ValueError(f"Invalid weight_decay: {weight_decay}")
+        if adjust_lr_fn is not None and adjust_lr_fn not in (
+            "original",
+            "match_rms_adamw",
+            "spectral_unclamped",
+        ):
+            raise ValueError(f"Unsupported adjust_lr_fn: {adjust_lr_fn}")
+        defaults = dict(
+            lr=float(lr),
+            weight_decay=float(weight_decay),
+            momentum=float(momentum),
+            nesterov=bool(nesterov),
+            ns_coefficients=tuple(float(c) for c in ns_coefficients),
+            eps=float(eps),
+            ns_steps=int(ns_steps),
+            adjust_lr_fn=adjust_lr_fn,
+        )
+        super().__init__(params, defaults)
+        for group in self.param_groups:
+            for p in group["params"]:
+                if p.ndim != 2:
+                    raise ValueError(f"BatchedMuon only supports 2D parameters, got shape {tuple(p.shape)}")
+
+    @torch.no_grad()
+    def step(self, closure: Any = None) -> Any:
+        loss = None
+        if closure is not None:
+            with torch.enable_grad():
+                loss = closure()
+
+        for group in self.param_groups:
+            lr = float(group["lr"])
+            wd = float(group["weight_decay"])
+            momentum = float(group["momentum"])
+            nesterov = bool(group["nesterov"])
+            a, b, c = group["ns_coefficients"]
+            eps = float(group["eps"])
+            ns_steps = int(group["ns_steps"])
+            adjust_lr_fn = group["adjust_lr_fn"]
+
+            buckets: Dict[
+                Tuple[Tuple[int, int], torch.dtype, torch.device],
+                Tuple[List[torch.Tensor], List[torch.Tensor], List[torch.Tensor]],
+            ] = {}
+            for p in group["params"]:
+                grad = p.grad
+                if grad is None:
+                    continue
+                if grad.ndim != 2:
+                    raise ValueError(f"BatchedMuon gradient must be 2D, got {tuple(grad.shape)}")
+                state = self.state[p]
+                buf = state.get("momentum_buffer")
+                if buf is None:
+                    buf = torch.zeros_like(p)
+                    state["momentum_buffer"] = buf
+                key = ((int(p.shape[0]), int(p.shape[1])), p.dtype, p.device)
+                entry = buckets.get(key)
+                if entry is None:
+                    buckets[key] = ([p], [grad], [buf])
+                else:
+                    entry[0].append(p)
+                    entry[1].append(grad)
+                    entry[2].append(buf)
+
+            for (shape_hw, p_dtype, _), (ps, gs, bufs) in buckets.items():
+                torch._foreach_lerp_(bufs, gs, 1.0 - momentum)
+                if nesterov:
+                    updates = torch._foreach_lerp(gs, bufs, momentum)
+                else:
+                    updates = bufs
+
+                # Batched quintic Newton-Schulz orthogonalization in bfloat16
+                x = torch.stack(updates, dim=0).to(torch.bfloat16)
+                transposed = shape_hw[0] > shape_hw[1]
+                if transposed:
+                    x = x.transpose(1, 2).contiguous()
+                norms = x.norm(dim=(-2, -1), keepdim=True).clamp(min=eps)
+                x.div_(norms)
+                for _ in range(ns_steps):
+                    gram = torch.bmm(x, x.transpose(1, 2))
+                    gram_upd = torch.baddbmm(gram, gram, gram, beta=b, alpha=c)
+                    x = torch.baddbmm(x, gram_upd, x, beta=a, alpha=1.0)
+                if transposed:
+                    x = x.transpose(1, 2)
+
+                ortho_list = list(x.to(p_dtype).unbind(0))
+                adj_lr = _muon_adjust_lr(lr, adjust_lr_fn, ps[0].shape)
+                if wd != 0.0:
+                    torch._foreach_mul_(ps, 1.0 - lr * wd)
+                torch._foreach_add_(ps, ortho_list, alpha=-adj_lr)
+
+        return loss
+
+
 class HybridOptimizerV2:
     """Unified wrapper over ``Muon + AdamW`` (or pure ``AdamW`` fallback)."""
 
@@ -889,13 +1027,12 @@ def build_optimizer_v2(
     want_muon = (
         str(optimizer_name).strip().lower() == "muon"
         and (device_type == "cuda" or allow_cpu_muon)
-        and hasattr(torch.optim, "Muon")
         and len(muon_params) > 0
     )
     if want_muon:
         eff_muon_lr = float(muon_lr) if muon_lr is not None else float(lr)
         try:
-            opt_muon = torch.optim.Muon(
+            opt_muon = BatchedMuon(
                 muon_params,
                 lr=eff_muon_lr,
                 weight_decay=weight_decay,
@@ -1155,6 +1292,7 @@ def forward_and_loss_v2(
     kd_teacher_ce_cap: float = 0.0,
     kd_hw_scale: float = 1.0,
     kd_prob: float = 1.0,
+    teacher_max_dim: int = 0,
     cass_prob: float = 0.0,
     cass_batch_prob: float = 1.0,
     kind: str = "fullpage",
@@ -1213,11 +1351,18 @@ def forward_and_loss_v2(
                     images, return_aux=need_any_enc_aux
                 )
                 mem_det = tuple(m.detach() for m in mem_levels)
+                was_training = model.training
+                try:
+                    model.eval()
+                    with torch.no_grad():
+                        draft_logits, _, _ = model.decode_tokens(
+                            tgt_in, mem_det, return_mtp=False, return_aux=False, apply_tok_dropout=False
+                        )
+                        pred_ids = draft_logits.argmax(dim=-1)
+                finally:
+                    model.train(was_training)
+                del draft_logits
                 with torch.no_grad():
-                    draft_logits, _, _ = model.decode_tokens(
-                        tgt_in, mem_det, return_mtp=False, return_aux=False, apply_tok_dropout=False
-                    )
-                    pred_ids = draft_logits.argmax(dim=-1)
                     tail_in = tgt_in[:, 1:]
                     cass_mask = (
                         (torch.rand_like(tail_in, dtype=torch.float32) < cass_prob)
@@ -1334,33 +1479,67 @@ def forward_and_loss_v2(
                     used_cache = True
                 del c_vals, c_idx, c_mask
             if (not used_cache) and teacher_v1 is not None:
-                t_first_param = next(teacher_v1.parameters(), None)
-                t_dtype = t_first_param.dtype if t_first_param is not None else images.dtype
-                with torch.inference_mode():
-                    t_images = images.to(dtype=t_dtype) if images.dtype != t_dtype else images
-                    t_out = teacher_v1(
-                        t_images,
-                        tgt_in,
-                        keep_ratio_override=0.45,
-                        return_aux=False,
-                        return_mtp=False,
-                        compute_ink_recall=False,
+                active_idx: Optional[torch.Tensor] = None
+                if sample_kd_weights is not None:
+                    active_idx = (sample_kd_weights > 0).nonzero(as_tuple=True)[0]
+                if active_idx is not None and active_idx.numel() == 0:
+                    kd_loss = out["logits"].new_zeros(())
+                    kd_gate_frac = out["logits"].new_ones((), dtype=torch.float32)
+                else:
+                    slice_active = active_idx is not None and int(active_idx.numel()) < int(images.shape[0])
+                    t_first_param = next(teacher_v1.parameters(), None)
+                    t_dtype = t_first_param.dtype if t_first_param is not None else images.dtype
+                    with torch.inference_mode():
+                        src_imgs = images.index_select(0, active_idx) if slice_active else images
+                        src_tgt_in = tgt_in.index_select(0, active_idx) if slice_active else tgt_in
+                        t_max_d = int(teacher_max_dim)
+                        if t_max_d > 0:
+                            th, tw = int(src_imgs.shape[-2]), int(src_imgs.shape[-1])
+                            if max(th, tw) > t_max_d:
+                                scale = float(t_max_d) / float(max(th, tw))
+                                cap_32 = max(32, (t_max_d // 32) * 32)
+                                new_h = max(32, min(cap_32, (int(round(th * scale)) // 32) * 32))
+                                new_w = max(32, min(cap_32, (int(round(tw * scale)) // 32) * 32))
+                                interp_in = src_imgs.float() if src_imgs.dtype == torch.bfloat16 else src_imgs
+                                src_imgs = F.interpolate(
+                                    interp_in,
+                                    size=(new_h, new_w),
+                                    mode="bilinear",
+                                    align_corners=False,
+                                    antialias=True,
+                                )
+                        t_images = src_imgs.to(dtype=t_dtype) if src_imgs.dtype != t_dtype else src_imgs
+                        t_out = teacher_v1(
+                            t_images,
+                            src_tgt_in,
+                            keep_ratio_override=0.45,
+                            return_aux=False,
+                            return_mtp=False,
+                            compute_ink_recall=False,
+                        )
+                        t_logits_inf = t_out["logits"]
+                        del t_out, t_images, src_imgs, src_tgt_in
+                    # _GeneralizedJSDAutograd consumes teacher_logits inside no_grad without saving it,
+                    # so no extra (B, T, V) clone is needed.
+                    if slice_active:
+                        s_logits_kd = out["logits"].index_select(0, active_idx)
+                        tgt_out_kd = tgt_out.index_select(0, active_idx)
+                        sw_kd = sample_kd_weights.index_select(0, active_idx) if sample_kd_weights is not None else None
+                    else:
+                        s_logits_kd = out["logits"]
+                        tgt_out_kd = tgt_out
+                        sw_kd = sample_kd_weights
+                    kd_loss, kd_gate_frac = compute_generalized_jsd_loss(
+                        s_logits_kd,
+                        t_logits_inf,
+                        tgt_out_kd,
+                        beta=kd_beta,
+                        temp=kd_temp,
+                        teacher_ce_cap=kd_teacher_ce_cap,
+                        return_gate_frac=True,
+                        sample_weights=sw_kd,
                     )
-                    t_logits_inf = t_out["logits"]
-                    del t_out, t_images
-                # _GeneralizedJSDAutograd consumes teacher_logits inside no_grad without saving it,
-                # so no extra (B, T, V) clone is needed.
-                kd_loss, kd_gate_frac = compute_generalized_jsd_loss(
-                    out["logits"],
-                    t_logits_inf,
-                    tgt_out,
-                    beta=kd_beta,
-                    temp=kd_temp,
-                    teacher_ce_cap=kd_teacher_ce_cap,
-                    return_gate_frac=True,
-                    sample_weights=sample_kd_weights,
-                )
-                del t_logits_inf
+                    del t_logits_inf
 
             losses["loss"] = losses["loss"] + eff_kd_alpha * kd_loss
 
@@ -2364,9 +2543,12 @@ def run_train_v2(args: argparse.Namespace) -> Dict[str, Any]:
             sids = [f"syn_{step_idx}_{micro_idx}_{i}" for i in range(bs_syn)]
             return imgs, sq, sids, ("fullpage" if want_fp else "strip"), [""] * bs_syn
 
+        img_dtype = torch.bfloat16 if use_bf16 else torch.float32
         if want_fp and fullpage_train_iter is not None:
             b = next(fullpage_train_iter)
-            imgs = _images_to_device_float(b["images"], device, non_blocking=(device.type == "cuda"))
+            imgs = _images_to_device_float(
+                b["images"], device, non_blocking=(device.type == "cuda"), dtype=img_dtype
+            )
             if args.channels_last:
                 imgs = imgs.to(memory_format=torch.channels_last)
             return (
@@ -2396,7 +2578,9 @@ def run_train_v2(args: argparse.Namespace) -> Dict[str, Any]:
                 (raw_doms[i] if (i < len(raw_doms) and raw_doms[i]) else picked_domains[i])
                 for i in range(len(picked_domains))
             ]
-            imgs = _images_to_device_float(b["images"], device, non_blocking=(device.type == "cuda"))
+            imgs = _images_to_device_float(
+                b["images"], device, non_blocking=(device.type == "cuda"), dtype=img_dtype
+            )
             if args.channels_last:
                 imgs = imgs.to(memory_format=torch.channels_last)
             return (
@@ -2414,7 +2598,9 @@ def run_train_v2(args: argparse.Namespace) -> Dict[str, Any]:
             else:
                 b = next(strip_train_iter)
                 kind = "strip"
-            imgs = _images_to_device_float(b["images"], device, non_blocking=(device.type == "cuda"))
+            imgs = _images_to_device_float(
+                b["images"], device, non_blocking=(device.type == "cuda"), dtype=img_dtype
+            )
             if args.channels_last:
                 imgs = imgs.to(memory_format=torch.channels_last)
             return (
@@ -2428,7 +2614,9 @@ def run_train_v2(args: argparse.Namespace) -> Dict[str, Any]:
         kind = "hw_strip" if hw_strip_train_iter is not None else "strip"
         assert it is not None
         b = next(it)
-        imgs = _images_to_device_float(b["images"], device, non_blocking=(device.type == "cuda"))
+        imgs = _images_to_device_float(
+            b["images"], device, non_blocking=(device.type == "cuda"), dtype=img_dtype
+        )
         if args.channels_last:
             imgs = imgs.to(memory_format=torch.channels_last)
         return (
@@ -2534,9 +2722,23 @@ def run_train_v2(args: argparse.Namespace) -> Dict[str, Any]:
             lr_scale = cur_lr / max(1e-12, float(args.lr))
             opt.set_lr(lr_scale)
 
-            cur_kd_alpha = kd_alpha_for_step(
-                step, steps, float(args.kd_alpha), anneal_last_frac=0.25
-            ) if (teacher_v1 is not None or teacher_cache is not None) else 0.0
+            kd_stop_frac = float(getattr(args, "kd_stop_frac", 1.0))
+            if kd_stop_frac < 1.0 and (float(step) / float(max(1, steps))) >= kd_stop_frac:
+                if teacher_v1 is not None:
+                    del teacher_v1
+                    teacher_v1 = None
+                    if device.type == "cuda":
+                        torch.cuda.empty_cache()
+                    print(
+                        f"[UniOMRv2 KD] stopped and freed frozen v1 teacher at step {step}/{steps} "
+                        f"(kd_stop_frac={kd_stop_frac:.2f})",
+                        flush=True,
+                    )
+                cur_kd_alpha = 0.0
+            else:
+                cur_kd_alpha = kd_alpha_for_step(
+                    step, steps, float(args.kd_alpha), anneal_last_frac=0.25
+                ) if (teacher_v1 is not None or teacher_cache is not None) else 0.0
 
             step_is_fp = _step_is_fullpage(step)
             step_ga = grad_accum if step_is_fp else strip_grad_accum
@@ -2567,6 +2769,7 @@ def run_train_v2(args: argparse.Namespace) -> Dict[str, Any]:
                         kd_teacher_ce_cap=kd_teacher_ce_cap,
                         kd_hw_scale=kd_hw_scale,
                         kd_prob=float(getattr(args, "kd_prob", 1.0)),
+                        teacher_max_dim=int(getattr(args, "teacher_max_dim", 0)),
                         cass_prob=float(args.cass_prob),
                         cass_batch_prob=float(getattr(args, "cass_batch_prob", 1.0)),
                         kind=kind,
@@ -2821,6 +3024,18 @@ def build_arg_parser() -> argparse.ArgumentParser:
         type=float,
         default=1.0,
         help="Probability of running frozen teacher KD on eligible microbatches (default 1.0)",
+    )
+    p.add_argument(
+        "--teacher-max-dim",
+        type=int,
+        default=0,
+        help="Optional max(H, W) downscale for frozen v1 teacher input (multiple of 32; 0 = disabled)",
+    )
+    p.add_argument(
+        "--kd-stop-frac",
+        type=float,
+        default=1.0,
+        help="Stop teacher KD and free teacher weights once step / total_steps >= kd_stop_frac (default 1.0)",
     )
 
     # Optimizer & WSD schedule

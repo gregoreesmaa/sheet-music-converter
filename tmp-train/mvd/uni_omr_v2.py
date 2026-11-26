@@ -140,6 +140,18 @@ __all__ = [
 _HAS_F_RMS_NORM: bool = hasattr(F, "rms_norm")
 
 
+def _active_compute_dtype(x: torch.Tensor) -> torch.dtype:
+    """Return active autocast dtype for ``x.device.type`` when enabled, else ``x.dtype``."""
+    if torch.is_autocast_enabled(x.device.type):
+        return torch.get_autocast_dtype(x.device.type)
+    return x.dtype
+
+
+def _is_qat_linear_active(mod: nn.Linear) -> bool:
+    """Return True if ``mod`` has an active QAT-INT4 monkey-patch (zero state_dict change)."""
+    return bool(getattr(mod, "_qat_enabled", False))
+
+
 class RMSNorm(_BaseRMSNorm):
     """ONNX-safe fused RMSNorm using native PyTorch ``F.rms_norm`` (zero state_dict change)."""
 
@@ -149,6 +161,9 @@ class RMSNorm(_BaseRMSNorm):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if _HAS_F_RMS_NORM and not torch.onnx.is_in_onnx_export():
+            if x.dtype in (torch.bfloat16, torch.float16):
+                with torch.amp.autocast(device_type=x.device.type, enabled=False):
+                    return F.rms_norm(x, self._normalized_shape, self.weight.to(x.dtype), self.eps)
             return F.rms_norm(x, self._normalized_shape, self.weight, self.eps)
         norm = torch.rsqrt(x.pow(2).mean(dim=-1, keepdim=True) + self.eps)
         return x * norm * self.weight
@@ -1255,10 +1270,13 @@ class HybridAxialMergerEncoder(nn.Module):
         ``L_mem <= max_mem_tokens``.
         """
         _, _, H_p, W_p = feat_2d.shape
+        compute_dtype = _active_compute_dtype(feat_2d)
         x = feat_2d.permute(0, 2, 3, 1).contiguous()  # (B, H', W', D)
+        if x.dtype != compute_dtype:
+            x = x.to(dtype=compute_dtype)
 
-        row_cos, row_sin = self.axial_rope(W_p, device=x.device, dtype=x.dtype)
-        col_cos, col_sin = self.axial_rope(H_p, device=x.device, dtype=x.dtype)
+        row_cos, row_sin = self.axial_rope(W_p, device=x.device, dtype=compute_dtype)
+        col_cos, col_sin = self.axial_rope(H_p, device=x.device, dtype=compute_dtype)
 
         use_ckpt = self.training and self.cfg.grad_checkpoint and torch.is_grad_enabled()
         for layer in self.axial_layers:
@@ -1462,10 +1480,20 @@ def compute_stroke_hog_target(
 
         B, _, H, W = luma_f.shape
         hog_full = luma_f.new_zeros((B, n_bins, H, W), dtype=torch.float32)
-        hog_full.scatter_add_(1, bin_lo, mag * w_lo)
-        hog_full.scatter_add_(1, bin_hi, mag.mul_(w_hi))
+        if n_bins >= 2:
+            # bin_hi = (bin_lo + 1) % n_bins != bin_lo everywhere, so scatter_ is bit-identical
+            # to scatter_add_ on zero-initialized hog_full while eliminating atomicAdd contention.
+            hog_full.scatter_(1, bin_lo, mag * w_lo)
+            hog_full.scatter_(1, bin_hi, mag.mul_(w_hi))
+        else:
+            hog_full.scatter_add_(1, bin_lo, mag * w_lo)
+            hog_full.scatter_add_(1, bin_hi, mag.mul_(w_hi))
 
-        hog_pooled = F.adaptive_avg_pool2d(hog_full, (int(target_hw[0]), int(target_hw[1])))
+        h_t, w_t = int(target_hw[0]), int(target_hw[1])
+        if H == 4 * h_t and W == 4 * w_t:
+            hog_pooled = F.avg_pool2d(hog_full, kernel_size=4, stride=4)
+        else:
+            hog_pooled = F.adaptive_avg_pool2d(hog_full, (h_t, w_t))
         norm = hog_pooled.pow(2).sum(dim=1, keepdim=True).add_(1e-4).sqrt_()
         return hog_pooled.div_(norm)
 
@@ -1594,21 +1622,60 @@ class GroupedQueryAttention(nn.Module):
         is_cross: bool = False,
     ) -> Any:
         B, Lq, _ = q_in.shape
-        q = self.q_norm(self.q_proj(q_in).view(B, Lq, self.n_heads, self.head_dim)).transpose(1, 2)
-
-        if is_cross and past_kv is not None:
-            k, v = past_kv
-        else:
-            if kv_in is None:
-                raise ValueError("kv_in must be provided when past_kv is None")
-            Lk = kv_in.shape[1]
-            k = self.k_norm(self.k_proj(kv_in).view(B, Lk, self.n_kv_heads, self.head_dim)).transpose(1, 2)
-            v = self.v_proj(kv_in).view(B, Lk, self.n_kv_heads, self.head_dim).transpose(1, 2)
+        in_onnx = torch.onnx.is_in_onnx_export()
+        can_fuse_qkv = (
+            (not is_cross)
+            and (kv_in is q_in)
+            and (not in_onnx)
+            and (self.q_proj.bias is None and self.k_proj.bias is None and self.v_proj.bias is None)
+            and (not _is_qat_linear_active(self.q_proj))
+            and (not _is_qat_linear_active(self.k_proj))
+            and (not _is_qat_linear_active(self.v_proj))
+        )
+        if can_fuse_qkv:
+            w_qkv = torch.cat((self.q_proj.weight, self.k_proj.weight, self.v_proj.weight), dim=0)
+            qkv = F.linear(q_in, w_qkv)
+            d_q = self.n_heads * self.head_dim
+            d_kv = self.n_kv_heads * self.head_dim
+            q_raw, k_raw, v_raw = qkv.split((d_q, d_kv, d_kv), dim=-1)
+            q = self.q_norm(q_raw.view(B, Lq, self.n_heads, self.head_dim)).transpose(1, 2)
+            k = self.k_norm(k_raw.view(B, Lq, self.n_kv_heads, self.head_dim)).transpose(1, 2)
+            v = v_raw.view(B, Lq, self.n_kv_heads, self.head_dim).transpose(1, 2)
             if self.use_rope and rope_cos is not None and rope_sin is not None:
                 q, k = apply_rope(q, k, rope_cos, rope_sin)
-            if not is_cross and past_kv is not None:
+            if past_kv is not None:
                 k = torch.cat([past_kv[0], k], dim=2)
                 v = torch.cat([past_kv[1], v], dim=2)
+        else:
+            q = self.q_norm(self.q_proj(q_in).view(B, Lq, self.n_heads, self.head_dim)).transpose(1, 2)
+
+            if is_cross and past_kv is not None:
+                k, v = past_kv
+            else:
+                if kv_in is None:
+                    raise ValueError("kv_in must be provided when past_kv is None")
+                Lk = kv_in.shape[1]
+                can_fuse_kv = (
+                    (not in_onnx)
+                    and (self.k_proj.bias is None and self.v_proj.bias is None)
+                    and (not _is_qat_linear_active(self.k_proj))
+                    and (not _is_qat_linear_active(self.v_proj))
+                )
+                if can_fuse_kv:
+                    w_kv = torch.cat((self.k_proj.weight, self.v_proj.weight), dim=0)
+                    kv = F.linear(kv_in, w_kv)
+                    d_kv = self.n_kv_heads * self.head_dim
+                    k_raw, v_raw = kv.split((d_kv, d_kv), dim=-1)
+                    k = self.k_norm(k_raw.view(B, Lk, self.n_kv_heads, self.head_dim)).transpose(1, 2)
+                    v = v_raw.view(B, Lk, self.n_kv_heads, self.head_dim).transpose(1, 2)
+                else:
+                    k = self.k_norm(self.k_proj(kv_in).view(B, Lk, self.n_kv_heads, self.head_dim)).transpose(1, 2)
+                    v = self.v_proj(kv_in).view(B, Lk, self.n_kv_heads, self.head_dim).transpose(1, 2)
+                if self.use_rope and rope_cos is not None and rope_sin is not None:
+                    q, k = apply_rope(q, k, rope_cos, rope_sin)
+                if not is_cross and past_kv is not None:
+                    k = torch.cat([past_kv[0], k], dim=2)
+                    v = torch.cat([past_kv[1], v], dim=2)
 
         present_kv = (k, v) if use_cache else None
 
@@ -1693,6 +1760,7 @@ class GQADecoderLayer(nn.Module):
         rope_sin: torch.Tensor,
         past_kv: Optional[Tuple[Optional[Tuple[torch.Tensor, torch.Tensor]], Optional[Tuple[torch.Tensor, torch.Tensor]]]] = None,
         use_cache: bool = False,
+        checkpoint_ffn: bool = False,
     ) -> Any:
         h = self.norm1(x)
         r_cos = rope_cos if self.use_rope else None
@@ -1722,7 +1790,10 @@ class GQADecoderLayer(nn.Module):
 
         x = x + self.drop(self.self_attn(h, h, rope_cos=r_cos, rope_sin=r_sin, is_causal=True))
         x = x + self.drop(self.cross_attn(self.norm2(x), memory))
-        x = x + self.drop(self.ffn(self.norm3(x)))
+        if checkpoint_ffn and self.training and torch.is_grad_enabled():
+            x = x + self.drop(_grad_ckpt(self.ffn, self.norm3(x), use_reentrant=False))
+        else:
+            x = x + self.drop(self.ffn(self.norm3(x)))
         return x
 
 
@@ -1952,11 +2023,14 @@ class UniOMRv2Net(nn.Module):
             inp_ids = torch.where(drop_mask, rand_toks, inp_ids)
 
         x = self.tok_emb(inp_ids)
+        compute_dtype = _active_compute_dtype(x)
+        if x.dtype != compute_dtype:
+            x = x.to(dtype=compute_dtype)
         past_len = 0
         if past_kvs is not None and len(past_kvs) > 0 and past_kvs[0] is not None and past_kvs[0][0] is not None:
             past_len = int(past_kvs[0][0][0].shape[2])
 
-        cos_all, sin_all = self.rope1d(past_len + T, device=x.device, dtype=x.dtype)
+        cos_all, sin_all = self.rope1d(past_len + T, device=x.device, dtype=compute_dtype)
         cos1d = cos_all[:, :, past_len : past_len + T, :]
         sin1d = sin_all[:, :, past_len : past_len + T, :]
 
@@ -1970,12 +2044,10 @@ class UniOMRv2Net(nn.Module):
             else:
                 mem_final = memory
 
-        use_dec_ckpt = (
-            self.training
-            and self.cfg.grad_checkpoint
-            and torch.is_grad_enabled()
-            and (x.shape[0] * x.shape[1] > 4096)
-        )
+        bt = int(x.shape[0] * x.shape[1])
+        can_dec_ckpt = self.training and self.cfg.grad_checkpoint and torch.is_grad_enabled()
+        use_dec_full_ckpt = can_dec_ckpt and (bt > 8192)
+        use_dec_ffn_ckpt = can_dec_ckpt and (4096 < bt <= 8192)
         new_past_kvs: List[Any] = []
         for idx, layer in enumerate(self.dec_layers):
             layer_past = past_kvs[idx] if past_kvs is not None else None
@@ -1993,18 +2065,51 @@ class UniOMRv2Net(nn.Module):
                     past_kv=layer_past, use_cache=True,
                 )
                 new_past_kvs.append(layer_kv)
-            elif use_dec_ckpt:
+            elif use_dec_full_ckpt:
                 x = _grad_ckpt(
                     layer, x, layer_mem, cos1d, sin1d,
                     use_reentrant=False,
                 )
             else:
-                x = layer(x, memory=layer_mem, rope_cos=cos1d, rope_sin=sin1d)
+                x = layer(
+                    x, memory=layer_mem, rope_cos=cos1d, rope_sin=sin1d,
+                    checkpoint_ffn=use_dec_ffn_ckpt,
+                )
         h = self.dec_norm(x)
 
         want_mtp = self.training if return_mtp is None else bool(return_mtp)
         if want_mtp and len(self.mtp_heads) > 0:
-            all_h = torch.stack([h, *(head(h) for head in self.mtp_heads)], dim=0)
+            can_fuse_mtp = (
+                _HAS_F_RMS_NORM
+                and (not torch.onnx.is_in_onnx_export())
+                and all(
+                    (head.proj.bias is None) and (not _is_qat_linear_active(head.proj))
+                    for head in self.mtp_heads
+                )
+            )
+            if can_fuse_mtp:
+                eps0 = float(self.mtp_heads[0].norm.eps)
+                if all(float(head.norm.eps) == eps0 for head in self.mtp_heads):
+                    B_h, T_h, D_h = h.shape
+                    if h.dtype in (torch.bfloat16, torch.float16):
+                        with torch.amp.autocast(device_type=h.device.type, enabled=False):
+                            h_unit = F.rms_norm(h, (D_h,), None, eps0)
+                    else:
+                        h_unit = F.rms_norm(h, (D_h,), None, eps0)
+                    w_mtp = torch.cat(
+                        [head.proj.weight * head.norm.weight.unsqueeze(0) for head in self.mtp_heads],
+                        dim=0,
+                    )
+                    mtp_h = h.unsqueeze(0) + F.silu(
+                        F.linear(h_unit, w_mtp)
+                        .view(B_h, T_h, len(self.mtp_heads), D_h)
+                        .permute(2, 0, 1, 3)
+                    )
+                    all_h = torch.cat((h.unsqueeze(0), mtp_h), dim=0)
+                else:
+                    all_h = torch.stack([h, *(head(h) for head in self.mtp_heads)], dim=0)
+            else:
+                all_h = torch.stack([h, *(head(h) for head in self.mtp_heads)], dim=0)
             all_logits = self.lm_head(all_h)
             logits = all_logits[0]
             mtp_logits: List[torch.Tensor] = list(all_logits[1:].unbind(0))
@@ -2121,18 +2226,33 @@ class UniOMRv2Net(nn.Module):
             label_smoothing=ls,
         )
 
-        # MTP-4 auxiliary losses
+        # MTP-4 auxiliary losses (unified single contiguous cross_entropy over PAD-padded shifted targets)
         mtp_logits: List[torch.Tensor] = out.get("mtp_logits", [])
         T = targets.shape[1]
-        mtp_terms: List[torch.Tensor] = []
-        for idx, m_logits in enumerate(mtp_logits):
-            shift = idx + 1
-            if T > shift:
-                m_pred = m_logits[:, :-shift, :].reshape(-1, V)
-                m_tgt = targets[:, shift:].reshape(-1)
-                m_loss = F.cross_entropy(m_pred, m_tgt, ignore_index=PAD_ID, label_smoothing=ls)
-                mtp_terms.append(torch.nan_to_num(m_loss, nan=0.0))
-        mtp_loss = torch.stack(mtp_terms).mean() if mtp_terms else logits.new_zeros(())
+        if mtp_logits and T > 1:
+            n_mtp = len(mtp_logits)
+            mtp_stacked = torch.stack(mtp_logits, dim=0)  # (M, B, T, V)
+            shifted_tgts = torch.full(
+                (n_mtp, targets.shape[0], T),
+                PAD_ID,
+                device=targets.device,
+                dtype=targets.dtype,
+            )
+            for idx in range(n_mtp):
+                shift = idx + 1
+                if T > shift:
+                    shifted_tgts[idx, :, :-shift] = targets[:, shift:]
+            mtp_loss = torch.nan_to_num(
+                F.cross_entropy(
+                    mtp_stacked.reshape(-1, V),
+                    shifted_tgts.reshape(-1),
+                    ignore_index=PAD_ID,
+                    label_smoothing=ls,
+                ),
+                nan=0.0,
+            )
+        else:
+            mtp_loss = logits.new_zeros(())
 
         # Router saliency BCE loss
         rinfo = out.get("router_info") or {}

@@ -156,12 +156,14 @@ $Stage2Args = @(
     "--rism-adain-prob", "0.20",
     "--rism-fda-beta", "0.02",
     "--teacher-ckpt", $TeacherCkpt,
+    "--teacher-max-dim", "1024",
     "--kd-beta", "0.5",
     "--kd-alpha", "0.30",
     "--kd-temp", "1.5",
     "--kd-teacher-ce-cap", "1.5",
     "--kd-hw-scale", "0.0",
     "--kd-prob", "0.5",
+    "--kd-stop-frac", "0.65",
     "--state-token-loss-weight", "2.5",
     "--qat-int4",
     "--qat-int4-last-frac", "0.15",
@@ -170,7 +172,7 @@ $Stage2Args = @(
     "--gpu-ema-every", "5",
     "--eval-every", "4000",
     "--eval-max-len", "1024",
-    "--save-every-minutes", "5.0",
+    "--save-every-minutes", "15.0",
     "--bf16",
     "--grad-checkpoint",
     "--num-workers", "0",
@@ -247,10 +249,18 @@ if (-not $SkipEval) {
         throw "Iter 13 Eval Pass 2 failed with exit code $LASTEXITCODE"
     }
 
-    Write-Host "=== [Iter 13 Eval Pass 3] Full 125-page OMR-NorthStar (neg-control-gate + fixed mscz-rs export) ==="
-    & $Python -u "experiments/2026-11-26T14-40-eval-northstar-iter12-v2/run_eval.py" --ckpt $Stage2Ckpt --system-name "uni-omr-iter13-v2-24k-ema" --out-dir "D:\tmp\northstar-eval-runs\iter13-v2" --device cuda --bf16 --neg-control-gate
+    Write-Host "=== [Iter 13 Eval Pass 3] Full 125-page OMR-NorthStar on BEST EMA ckpt (neg-control-gate + fixed mscz-rs export) ==="
+    & $Python -u "experiments/2026-11-26T14-40-eval-northstar-iter12-v2/run_eval.py" --ckpt $Stage2Ckpt --system-name "uni-omr-iter13-v2-24k-ema-best" --out-dir "D:\tmp\northstar-eval-runs\iter13-v2" --device cuda --bf16 --neg-control-gate
     if ($LASTEXITCODE -ne 0) {
-        throw "Iter 13 Eval Pass 3 (OMR-NorthStar) failed with exit code $LASTEXITCODE"
+        throw "Iter 13 Eval Pass 3 (OMR-NorthStar best) failed with exit code $LASTEXITCODE"
+    }
+
+    if ((Test-Path $Stage2Latest) -and ($Stage2Latest -ne $Stage2Ckpt)) {
+        Write-Host "=== [Iter 13 Eval Pass 4] Full 125-page OMR-NorthStar on LAST EMA ckpt ($Stage2Latest) ==="
+        & $Python -u "experiments/2026-11-26T14-40-eval-northstar-iter12-v2/run_eval.py" --ckpt $Stage2Latest --system-name "uni-omr-iter13-v2-24k-ema-last" --out-dir "D:\tmp\northstar-eval-runs\iter13-v2-last" --device cuda --bf16 --neg-control-gate
+        if ($LASTEXITCODE -ne 0) {
+            throw "Iter 13 Eval Pass 4 (OMR-NorthStar last) failed with exit code $LASTEXITCODE"
+        }
     }
 } else {
     Write-Host "=== [Iter 13 Eval] Skipped (-SkipEval) ==="
