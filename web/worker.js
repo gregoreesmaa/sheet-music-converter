@@ -15,6 +15,11 @@ import {
   bekernToMsczAndMusicXml,
   validateBekernSyntax,
 } from './wasm/mscz_wasm.js';
+import {
+  selectV2Target,
+  runV2DynamicDecodeLoop,
+  runV2NpuStaticDecodeLoop,
+} from './v2_runtime.js';
 
 const ORT_CDN_BASE = 'https://cdn.jsdelivr.net/npm/onnxruntime-web@1.21.0/dist/';
 const ORT_ESM_URL = `${ORT_CDN_BASE}ort.webgpu.min.mjs`;
@@ -1555,6 +1560,9 @@ const state = {
   ort: null,
   wasmReady: false,
   modelsReady: false,
+  isV2: false,
+  v2Manifest: null,
+  v2Target: null,
   backend: 'wasm',
   capabilities: { webgpu: false, webnn: false, wasm: true },
   numThreads: 1,
@@ -1664,8 +1672,8 @@ async function warmupWebGpuSessions(ort, encSession, decSession, vocab) {
   const emptyV = [];
 
   try {
-    // 1. Minimal encoder run (32x32)
-    imgT = new ort.Tensor('float32', new Float32Array(1 * 3 * 32 * 32), [1, 3, 32, 32]);
+    // 1. Minimal encoder run (64x64 — safe for both v1 4x8 and v2 8x16 strides)
+    imgT = new ort.Tensor('float32', new Float32Array(1 * 3 * 64 * 64), [1, 3, 64, 64]);
     encOut = await encSession.run({ image: imgT });
 
     // 2. Minimal T=1 decoder run
@@ -1824,8 +1832,89 @@ async function handleInit(msg = {}) {
     return;
   }
 
-  // 3. Load vocab.json + ONNX encoder/decoder (prefer WebGPU INT4 + MTP-4, fallback to WASM SIMD 8T)
+  // 3. Load UniOMR v2 (manifest.json) if present, else legacy v1 vocab.json
   try {
+    const v2Manifest = await fetchJsonOptional('./models/manifest.json');
+    const isV2 = Boolean(v2Manifest && v2Manifest.schema_version === 2 && v2Manifest.arch === 'uni_omr_v2');
+
+    if (isV2) {
+      const vocabFile = v2Manifest.vocab_file || 'vocab.json';
+      const vocabRaw = await fetchJsonOptional(`./models/${vocabFile}`);
+      if (!vocabRaw) {
+        self.postMessage({ type: 'models-missing' });
+        return;
+      }
+      state.isV2 = true;
+      state.v2Manifest = v2Manifest;
+      state.vocab = normalizeVocab({ ...(v2Manifest.model || {}), ...vocabRaw });
+      state.fsa = new BekernFsa(state.vocab.idToToken);
+      state.modelIo = { ...(v2Manifest.model || {}), ...vocabRaw };
+
+      const preferred = msg?.forceBackend || 'auto';
+      let selected = selectV2Target(v2Manifest, state.capabilities, preferred);
+      let loaded = false;
+
+      if (selected && selected.target === 'webgpu') {
+        let wgEnc = null;
+        let wgDec = null;
+        try {
+          const nLayers = state.vocab.nDecLayers || 8;
+          const nMtpHeads = Math.max(0, Number(selected.mtpK || 1) - 1);
+          const decOutLoc = { logits: 'cpu' };
+          for (let m = 0; m < nMtpHeads; m++) {
+            decOutLoc[`mtp_logits_${m}`] = 'cpu';
+          }
+          for (let i = 0; i < nLayers; i++) {
+            decOutLoc[`present_k_${i}`] = 'gpu-buffer';
+            decOutLoc[`present_v_${i}`] = 'gpu-buffer';
+          }
+          wgEnc = await createOrtSession(ort, `./models/${selected.encoderFile}`, 'webgpu', {
+            preferredOutputLocation: 'gpu-buffer',
+          });
+          wgDec = await createOrtSession(ort, `./models/${selected.decoderFile}`, 'webgpu', {
+            preferredOutputLocation: decOutLoc,
+          });
+          await warmupWebGpuSessions(ort, wgEnc, wgDec, state.vocab);
+          state.encoderSession = wgEnc;
+          state.decoderSession = wgDec;
+          state.v2Target = selected;
+          state.backend = 'webgpu';
+          state.mtpK = Number(selected.mtpK || 1);
+          state.useMtp = state.mtpK >= 2;
+          loaded = true;
+        } catch (wgErr) {
+          console.warn('UniOMR v2 WebGPU session/warmup failed, falling back to WASM SIMD:', wgErr);
+          try { if (wgEnc?.release) await wgEnc.release(); } catch (_) {}
+          try { if (wgDec?.release) await wgDec.release(); } catch (_) {}
+          selected = selectV2Target(v2Manifest, { ...state.capabilities, webgpu: false }, 'cpu');
+        }
+      }
+
+      if (!loaded) {
+        const provider = selected.executionProvider || 'wasm';
+        state.encoderSession = await createOrtSession(ort, `./models/${selected.encoderFile}`, provider);
+        state.decoderSession = await createOrtSession(ort, `./models/${selected.decoderFile}`, provider);
+        state.v2Target = selected;
+        state.backend = provider;
+        state.mtpK = Number(selected.mtpK || 1);
+        state.useMtp = state.mtpK >= 2 && selected.kvMode !== 'static_ring_buffer';
+      }
+
+      state.modelsReady = true;
+      self.postMessage({
+        type: 'models-ready',
+        arch: 'uni_omr_v2',
+        backend: state.backend,
+        capabilities: state.capabilities,
+        numThreads: state.numThreads,
+        useMtp: state.useMtp,
+        mtpK: state.mtpK,
+        maxDim: state.vocab.maxDim || state.modelIo.max_dim || 1280,
+        maxTokens: state.modelIo.max_tokens || DEFAULT_MAX_TOKENS,
+      });
+      return;
+    }
+
     const vocabRaw = await fetchJsonOptional('./models/vocab.json');
     if (!vocabRaw) {
       self.postMessage({ type: 'models-missing' });
@@ -2050,23 +2139,81 @@ async function handleRecognizePage(msg) {
       });
     };
 
-    // Optional 1-shot KV-cache prefill for <prev_state> ... </prev_state>
-    const prefillRes = await prefillPrevStateKv({
-      ort,
-      decoderSession: state.decoderSession,
-      encOutputs,
-      pastK,
-      pastV,
-      nLayers,
-      prevStateIds,
-      tokenToId,
-      useMtp: state.useMtp,
-    });
-    pastK = prefillRes.pastK;
-    pastV = prefillRes.pastV;
-    const prefilledLen = prefillRes.prefilledLen;
+    if (state.isV2) {
+      let lastProgressAt = 0;
+      const v2Progress = (info) => {
+        currentStep = info.tokens;
+        if (info.tokens - lastProgressAt >= 4 || info.hitEos) {
+          lastProgressAt = info.tokens;
+          postDecodeProgress(info.tokens);
+        }
+      };
 
-    if (state.useMtp) {
+      const v2Res = state.v2Target?.kvMode === 'static_ring_buffer'
+        ? await runV2NpuStaticDecodeLoop({
+          decoderSession: state.decoderSession,
+          crossKv: encOutputs,
+          kvMaxLen: state.v2Target.kvMaxLen || 2048,
+          nKvHeads,
+          headDim,
+          nDecLayers: nLayers,
+          bosId,
+          eosId,
+          maxTokens,
+          fsa,
+          ort,
+          vocabSize,
+          onProgress: v2Progress,
+          shouldCancel: () => state.cancelRequested,
+        })
+        : await runV2DynamicDecodeLoop({
+          decoderSession: state.decoderSession,
+          crossKv: encOutputs,
+          bosId,
+          eosId,
+          maxTokens,
+          mtpK: state.mtpK,
+          fsa,
+          ort,
+          nDecLayers: nLayers,
+          nKvHeads,
+          headDim,
+          vocabSize,
+          onProgress: v2Progress,
+          shouldCancel: () => state.cancelRequested,
+        });
+
+      if (v2Res.cancelled) {
+        self.postMessage({ type: 'cancelled', requestId });
+        return;
+      }
+
+      for (const tokId of v2Res.tokenIds) {
+        emitToken(tokId);
+      }
+      const loopCheck = detectRepetitionLoop(generatedIds, idToToken);
+      if (loopCheck.detected) {
+        stoppedByLoop = true;
+        generatedTokens.length = Math.max(0, loopCheck.cutAt);
+      }
+    } else {
+      // Optional 1-shot KV-cache prefill for <prev_state> ... </prev_state> (legacy v1)
+      const prefillRes = await prefillPrevStateKv({
+        ort,
+        decoderSession: state.decoderSession,
+        encOutputs,
+        pastK,
+        pastV,
+        nLayers,
+        prevStateIds,
+        tokenToId,
+        useMtp: state.useMtp,
+      });
+      pastK = prefillRes.pastK;
+      pastV = prefillRes.pastV;
+      const prefilledLen = prefillRes.prefilledLen;
+
+      if (state.useMtp) {
       // 4-token FSA-verified MTP-4 speculative decoding (WebGPU native)
       let pendingDrafts = null;
       let totalGenerated = 0;
@@ -2257,6 +2404,7 @@ async function handleRecognizePage(msg) {
           postDecodeProgress(step + 1);
         }
       }
+    }
     }
 
     const rawFinalTokens = stoppedByLoop ? trimToCleanBoundary(generatedTokens) : generatedTokens;

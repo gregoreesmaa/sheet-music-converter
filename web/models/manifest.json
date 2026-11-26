@@ -1,0 +1,62 @@
+{
+  "schema_version": 2,
+  "arch": "uni_omr_v2",
+  "opset": 17,
+  "vocab_file": "vocab.json",
+  "model": {
+    "d_model": 384,
+    "n_heads": 8,
+    "n_kv_heads": 2,
+    "head_dim": 48,
+    "n_axial_layers": 2,
+    "n_global_layers": 4,
+    "n_dec_layers": 8,
+    "vocab_size": 237,
+    "mtp_k": 4,
+    "max_mem_tokens": 3072
+  },
+  "targets": {
+    "webgpu": {
+      "target": "webgpu",
+      "encoder_file": "webgpu/uni_omr_v2_encoder.onnx",
+      "decoder_file": "webgpu/uni_omr_v2_decoder.onnx",
+      "encoder_bytes": 15729834,
+      "decoder_bytes": 13786545,
+      "total_bytes": 29516379,
+      "d_model": 384,
+      "n_heads": 8,
+      "n_kv_heads": 2,
+      "head_dim": 48,
+      "n_dec_layers": 8,
+      "mtp_k": 4,
+      "static_hw": null,
+      "static_k_mem": null,
+      "static_dec_t": null,
+      "kv_max_len": null,
+      "kv_mode": "dynamic_slice",
+      "quant_format": "int4_matmul_nbits_b32",
+      "chunked_sdpa_q": null
+    },
+    "cpu": {
+      "target": "cpu",
+      "encoder_file": "cpu/uni_omr_v2_encoder.onnx",
+      "decoder_file": "cpu/uni_omr_v2_decoder.onnx",
+      "encoder_bytes": 21431756,
+      "decoder_bytes": 21107772,
+      "total_bytes": 42539528,
+      "d_model": 384,
+      "n_heads": 8,
+      "n_kv_heads": 2,
+      "head_dim": 48,
+      "n_dec_layers": 8,
+      "mtp_k": 4,
+      "static_hw": null,
+      "static_k_mem": null,
+      "static_dec_t": null,
+      "kv_max_len": null,
+      "kv_mode": "dynamic_slice",
+      "quant_format": "int8_dynamic_quint8",
+      "chunked_sdpa_q": 256
+    }
+  }
+}

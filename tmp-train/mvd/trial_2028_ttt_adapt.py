@@ -240,6 +240,61 @@ def compute_multiview_consistency_loss(
 
 
 # ---------------------------------------------------------------------------
+# Promoted Presets (ov-38b) & 3-Decimal Confidence Skip Gate (i13-06c)
+# ---------------------------------------------------------------------------
+
+TTT_MODE_PRESETS: Dict[str, Dict[str, Any]] = {
+    "backbone_cons": {
+        "adapt_scope": "backbone_router",
+        "ttt_lr": 3e-5,
+        "ttt_steps": 2,
+        "cons_weight": 1.0,
+        "ent_weight": 0.0,
+        "kl_weight": 0.0,
+        "l2_weight": 1e-2,
+        "grad_clip": 1.0,
+    },
+}
+
+VALID_TTT_MODES: Tuple[str, ...] = ("custom", "backbone_cons")
+
+
+def format_conf_skip_thr(thr: float) -> str:
+    """Format confidence skip threshold to 3 decimals so -0.035/-0.040/-0.045 never collide."""
+    return f"{float(thr):.3f}"
+
+
+def format_conf_skip_tag(thr: float) -> str:
+    """Format a collision-free 3-decimal tag (e.g. -0.040 -> '0040', -0.035 -> '0035')."""
+    return f"{abs(float(thr)):.3f}".replace(".", "")
+
+
+def should_skip_ttt_by_confidence(
+    mean_logprob: float,
+    conf_skip_thr: Optional[float],
+) -> bool:
+    """Return True when ``mean_logprob > conf_skip_thr`` (skip TTT with 0 weight updates)."""
+    if conf_skip_thr is None:
+        return False
+    return float(mean_logprob) > float(conf_skip_thr)
+
+
+def compute_pseudo_mean_logprob(
+    pseudo_cache: Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, int]],
+) -> float:
+    """Compute mean top-token log-probability over valid positions (exact i13-06c formula)."""
+    if pseudo_cache is None:
+        return -10.0
+    inp_ids, _conf_mask, valid_mask, ref_log_probs, _n_conf = pseudo_cache
+    n_valid = int(valid_mask.sum().item())
+    if n_valid <= 0 or inp_ids.shape[1] < 2:
+        return -10.0
+    top_lp = ref_log_probs.max(dim=-1).values
+    mean_lp = float(((top_lp * valid_mask).sum() / valid_mask.sum().clamp(min=1.0)).item())
+    return round(mean_lp, 5)
+
+
+# ---------------------------------------------------------------------------
 # TTTSession — Snapshot, Per-Page Adaptation, Bit-Exact Restore
 # ---------------------------------------------------------------------------
 
@@ -248,19 +303,24 @@ class TTTSession:
 
     Snapshots ONLY the adapted parameters (by default ``RMSNorm`` weights in
     ``backbone``, ``enc_layers``, and ``enc_norm`` — ``< 0.1%`` of model
-    parameters) so ``restore()`` / ``reset()`` is instant and bit-exact
-    (``max_diff == 0.0``) between documents.
+    parameters; or ``backbone_router`` for promoted ``ov-38b`` ``backbone_cons``)
+    so ``restore()`` / ``reset()`` is instant and bit-exact (``max_diff == 0.0``)
+    between documents.
 
     Args:
         model: ``UniOMRNet`` instance.
         ttt_lr: AdamW learning rate for per-page adaptation (default ``5e-5``).
-        adapt_scope: which normalization parameters to adapt:
+        adapt_scope: which parameters to adapt:
             - ``'norms'`` (default): ``RMSNorm`` weights in ``backbone``,
               ``enc_layers``, ``enc_norm``.
             - ``'all_rms_norms'``: all ``RMSNorm`` weights in the model
               (encoder + router + decoder).
             - ``'norms_with_gn'``: ``RMSNorm`` in ``enc_layers``/``enc_norm``
               plus ``GroupNorm`` affine params in ``backbone``/``router``.
+            - ``'backbone_router'``: all parameters in ``backbone`` + ``router``
+              with ``enc_layers``/``enc_norm``/decoder frozen (promoted ``ov-38b``).
+            - ``'full_encoder'``: all parameters in ``backbone``, ``router``,
+              ``enc_layers``, and ``enc_norm``.
         conf_threshold: minimum token probability for Loss 2 self-distillation.
         cons_weight: weight on Loss 1 (multi-view encoder & router consistency).
         ent_weight: weight on Loss 2 (confidence-gated conditional entropy).
@@ -271,9 +331,11 @@ class TTTSession:
         strict_grammar: whether ``PrefixState`` uses strict bar-duration rules.
         max_decode_len: max tokens for the fast pre-TTT pseudo-label decode.
         seed: base seed for deterministic multi-view jitter.
+        conf_skip_thr: optional 3-decimal ``mean_logprob`` skip gate (``i13-06c``;
+            e.g. ``-0.040`` skips pages with ``mean_logprob > -0.040`` untouched).
     """
 
-    VALID_SCOPES = ("norms", "all_rms_norms", "norms_with_gn")
+    VALID_SCOPES = ("norms", "all_rms_norms", "norms_with_gn", "backbone_router", "full_encoder")
 
     def __init__(
         self,
@@ -290,6 +352,7 @@ class TTTSession:
         strict_grammar: bool = False,
         max_decode_len: int = 512,
         seed: int = 2028,
+        conf_skip_thr: Optional[float] = None,
     ) -> None:
         if adapt_scope not in self.VALID_SCOPES:
             raise ValueError(
@@ -311,6 +374,9 @@ class TTTSession:
         self.strict_grammar = bool(strict_grammar)
         self.max_decode_len = int(max_decode_len)
         self.seed = int(seed)
+        self.conf_skip_thr: Optional[float] = (
+            float(conf_skip_thr) if conf_skip_thr is not None else None
+        )
 
         self._adapted_named_params: List[Tuple[str, nn.Parameter]] = self._select_adapted_params()
         if not self._adapted_named_params:
@@ -343,6 +409,21 @@ class TTTSession:
                             )
                             selected.append((full_name, p))
 
+        def _collect_all_from_root(root_name: str) -> None:
+            root_mod = getattr(self.model, root_name, None)
+            prefix = root_name
+            if root_mod is None and root_name == "router":
+                encoder = getattr(self.model, "encoder", None)
+                if encoder is not None:
+                    root_mod = getattr(encoder, "router", None)
+                    prefix = "encoder.router"
+            if root_mod is None:
+                return
+            for pname, p in root_mod.named_parameters():
+                if id(p) not in seen:
+                    seen.add(id(p))
+                    selected.append((f"{prefix}.{pname}", p))
+
         if self.adapt_scope == "norms":
             for root in ("backbone", "enc_layers", "enc_norm"):
                 _collect_from_root(root, (uni_omr.RMSNorm,))
@@ -352,6 +433,12 @@ class TTTSession:
         elif self.adapt_scope == "norms_with_gn":
             for root in ("backbone", "router", "enc_layers", "enc_norm"):
                 _collect_from_root(root, (uni_omr.RMSNorm, nn.GroupNorm))
+        elif self.adapt_scope == "backbone_router":
+            for root in ("backbone", "router"):
+                _collect_all_from_root(root)
+        elif self.adapt_scope == "full_encoder":
+            for root in ("backbone", "router", "enc_layers", "enc_norm"):
+                _collect_all_from_root(root)
 
         return selected
 
@@ -477,17 +564,23 @@ class TTTSession:
         image_tensor: torch.Tensor,
         steps: int = 3,
         max_decode_len: Optional[int] = None,
+        mean_logprob: Optional[float] = None,
+        conf_skip_thr: Optional[float] = None,
     ) -> Dict[str, Any]:
-        """Adapt the selected ``RMSNorm`` weights on a single unseen page.
+        """Adapt the selected parameters on a single unseen page.
 
         Args:
             image_tensor: ``(1, 3, H, W)`` (or ``(3, H, W)``) float tensor in ``[0, 1]``.
             steps: number of low-LR TTT gradient steps (typically 1–3).
             max_decode_len: optional override for the pre-TTT greedy decode length.
+            mean_logprob: optional precomputed page confidence (``mean_logprob``) for the
+                ``i13-06c`` confidence skip gate. When ``None`` and a skip threshold is
+                active, it is computed via ``_fast_constrained_pseudo_decode``.
+            conf_skip_thr: optional per-call override for ``self.conf_skip_thr``.
 
         Returns:
             Dictionary of per-step losses, gradient norms, confidence stats,
-            and elapsed wall time.
+            skip-gate status, and elapsed wall time.
         """
         if image_tensor.ndim == 3:
             img = image_tensor.unsqueeze(0)
@@ -503,12 +596,21 @@ class TTTSession:
             )
 
         t0 = time.perf_counter()
+        eff_skip_thr: Optional[float] = (
+            self.conf_skip_thr if conf_skip_thr is None else float(conf_skip_thr)
+        )
+        eff_skip_str: Optional[str] = (
+            format_conf_skip_thr(eff_skip_thr) if eff_skip_thr is not None else None
+        )
         n_steps = int(steps)
         if n_steps <= 0:
             return {
                 "steps": 0,
                 "n_decoded_tokens": 0,
                 "n_confident_tokens": 0,
+                "skipped_by_conf_gate": False,
+                "mean_logprob": round(float(mean_logprob), 5) if mean_logprob is not None else None,
+                "conf_skip_thr": eff_skip_str,
                 "loss_history": [],
                 "cons_loss_history": [],
                 "ent_loss_history": [],
@@ -516,6 +618,24 @@ class TTTSession:
                 "grad_norm_history": [],
                 "elapsed_secs": 0.0,
             }
+
+        # Fast-path confidence skip when caller already supplied mean_logprob
+        if eff_skip_thr is not None and mean_logprob is not None:
+            if should_skip_ttt_by_confidence(mean_logprob, eff_skip_thr):
+                return {
+                    "steps": 0,
+                    "n_decoded_tokens": 0,
+                    "n_confident_tokens": 0,
+                    "skipped_by_conf_gate": True,
+                    "mean_logprob": round(float(mean_logprob), 5),
+                    "conf_skip_thr": eff_skip_str,
+                    "loss_history": [],
+                    "cons_loss_history": [],
+                    "ent_loss_history": [],
+                    "kl_loss_history": [],
+                    "grad_norm_history": [],
+                    "elapsed_secs": 0.0,
+                }
 
         device = next(self.model.parameters()).device
         img = img.to(device=device)
@@ -529,17 +649,43 @@ class TTTSession:
         ent_loss_history: List[float] = []
         kl_loss_history: List[float] = []
         grad_norm_history: List[float] = []
+        n_decoded = 0
+        n_confident = 0
+        obs_mean_lp: Optional[float] = (
+            round(float(mean_logprob), 5) if mean_logprob is not None else None
+        )
 
         try:
             self.model.eval()
             for p in self.model.parameters():
                 p.requires_grad_(id(p) in self._adapted_param_ids)
 
-            # 1. Pre-TTT fast constrained greedy decode for Loss 2 (Tent/SCRIBE)
-            inp_ids, conf_mask, valid_mask, ref_log_probs, n_confident = (
-                self._fast_constrained_pseudo_decode(img, max_len=dec_len)
-            )
-            n_decoded = int(inp_ids.shape[1])
+            need_pseudo_for_loss = (self.ent_weight > 0.0) or (self.kl_weight > 0.0)
+            need_pseudo_for_gate = (eff_skip_thr is not None) and (obs_mean_lp is None)
+
+            inp_ids = conf_mask = valid_mask = ref_log_probs = None
+            if need_pseudo_for_loss or need_pseudo_for_gate:
+                pseudo_cache = self._fast_constrained_pseudo_decode(img, max_len=dec_len)
+                inp_ids, conf_mask, valid_mask, ref_log_probs, n_confident = pseudo_cache
+                n_decoded = int(inp_ids.shape[1])
+                if obs_mean_lp is None:
+                    obs_mean_lp = compute_pseudo_mean_logprob(pseudo_cache)
+                if eff_skip_thr is not None and should_skip_ttt_by_confidence(obs_mean_lp, eff_skip_thr):
+                    elapsed = max(1e-6, time.perf_counter() - t0)
+                    return {
+                        "steps": 0,
+                        "n_decoded_tokens": n_decoded,
+                        "n_confident_tokens": n_confident,
+                        "skipped_by_conf_gate": True,
+                        "mean_logprob": obs_mean_lp,
+                        "conf_skip_thr": eff_skip_str,
+                        "loss_history": [],
+                        "cons_loss_history": [],
+                        "ent_loss_history": [],
+                        "kl_loss_history": [],
+                        "grad_norm_history": [],
+                        "elapsed_secs": round(elapsed, 4),
+                    }
 
             adapted_params = [p for _, p in self._adapted_named_params]
             snap_on_dev = [
@@ -570,7 +716,14 @@ class TTTSession:
                     loss_ent = torch.zeros((), device=device, dtype=torch.float32)
                     loss_kl = torch.zeros((), device=device, dtype=torch.float32)
 
-                    if n_confident > 0 and self.ent_weight > 0.0:
+                    if (
+                        n_confident > 0
+                        and need_pseudo_for_loss
+                        and inp_ids is not None
+                        and conf_mask is not None
+                        and valid_mask is not None
+                        and ref_log_probs is not None
+                    ):
                         with self._autocast_ctx(device):
                             logits, _ = self.model.decode_tokens(
                                 inp_ids,
@@ -580,9 +733,10 @@ class TTTSession:
                                 apply_tok_dropout=False,
                             )
                         log_p = F.log_softmax(logits.float(), dim=-1)
-                        p_cur = log_p.exp()
-                        ent_tok = -(p_cur * log_p).sum(dim=-1)  # (1, T)
-                        loss_ent = (ent_tok * conf_mask).sum() / conf_mask.sum().clamp(min=1.0)
+                        if self.ent_weight > 0.0:
+                            p_cur = log_p.exp()
+                            ent_tok = -(p_cur * log_p).sum(dim=-1)  # (1, T)
+                            loss_ent = (ent_tok * conf_mask).sum() / conf_mask.sum().clamp(min=1.0)
 
                         if self.kl_weight > 0.0:
                             ref_p = ref_log_probs.exp()
@@ -638,6 +792,9 @@ class TTTSession:
             "steps": len(loss_history),
             "n_decoded_tokens": n_decoded,
             "n_confident_tokens": n_confident,
+            "skipped_by_conf_gate": False,
+            "mean_logprob": obs_mean_lp,
+            "conf_skip_thr": eff_skip_str,
             "loss_history": loss_history,
             "cons_loss_history": cons_loss_history,
             "ent_loss_history": ent_loss_history,
@@ -645,6 +802,68 @@ class TTTSession:
             "grad_norm_history": grad_norm_history,
             "elapsed_secs": round(elapsed, 4),
         }
+
+
+def resolve_ttt_mode_config(args: argparse.Namespace) -> Dict[str, Any]:
+    """Resolve effective TTT hyperparameters from ``--ttt-mode`` preset or custom CLI args."""
+    mode = str(getattr(args, "ttt_mode", "custom")).strip().lower()
+    if mode not in VALID_TTT_MODES:
+        raise ValueError(f"Unsupported --ttt-mode={mode!r}; expected one of {VALID_TTT_MODES}")
+    if mode in TTT_MODE_PRESETS:
+        cfg = dict(TTT_MODE_PRESETS[mode])
+    else:
+        cfg = {
+            "adapt_scope": str(args.adapt_scope),
+            "ttt_lr": float(args.ttt_lr),
+            "ttt_steps": int(args.ttt_steps),
+            "cons_weight": float(args.cons_weight),
+            "ent_weight": float(args.ent_weight),
+            "kl_weight": float(args.kl_weight),
+            "l2_weight": float(args.l2_weight),
+            "grad_clip": float(args.grad_clip),
+        }
+    cfg["ttt_mode"] = mode
+    cfg["conf_skip_thr"] = (
+        float(args.ttt_conf_skip_thr)
+        if getattr(args, "ttt_conf_skip_thr", None) is not None
+        else None
+    )
+    return cfg
+
+
+def build_ttt_session(
+    model: Any,
+    mode: str = "backbone_cons",
+    *,
+    use_bf16: bool = False,
+    strict_grammar: bool = False,
+    conf_skip_thr: Optional[float] = None,
+    max_decode_len: int = 512,
+    seed: int = 2028,
+) -> Tuple[TTTSession, int]:
+    """Instantiate a ``TTTSession`` for a named promoted preset (e.g. ``backbone_cons``)."""
+    key = str(mode).strip().lower()
+    if key not in TTT_MODE_PRESETS:
+        raise ValueError(
+            f"Unsupported TTT preset mode={mode!r}; expected one of {tuple(TTT_MODE_PRESETS)}"
+        )
+    preset = TTT_MODE_PRESETS[key]
+    session = TTTSession(
+        model=model,
+        ttt_lr=float(preset["ttt_lr"]),
+        adapt_scope=str(preset["adapt_scope"]),
+        cons_weight=float(preset["cons_weight"]),
+        ent_weight=float(preset["ent_weight"]),
+        kl_weight=float(preset["kl_weight"]),
+        l2_weight=float(preset["l2_weight"]),
+        grad_clip=float(preset["grad_clip"]),
+        use_bf16=use_bf16,
+        strict_grammar=strict_grammar,
+        max_decode_len=max_decode_len,
+        seed=seed,
+        conf_skip_thr=conf_skip_thr,
+    )
+    return session, int(preset["ttt_steps"])
 
 
 # ---------------------------------------------------------------------------
@@ -780,27 +999,34 @@ def run_suite31_ttt_ab(args: argparse.Namespace) -> Dict[str, Any]:
 
     domains = [d.strip() for d in args.domains.split(",") if d.strip()]
     use_bf16 = bool(args.bf16 and device.type == "cuda")
+    eff_cfg = resolve_ttt_mode_config(args)
 
     ttt = TTTSession(
         model=model,
-        ttt_lr=args.ttt_lr,
-        adapt_scope=args.adapt_scope,
+        ttt_lr=eff_cfg["ttt_lr"],
+        adapt_scope=eff_cfg["adapt_scope"],
         conf_threshold=args.conf_threshold,
-        cons_weight=args.cons_weight,
-        ent_weight=args.ent_weight,
-        kl_weight=args.kl_weight,
-        l2_weight=args.l2_weight,
-        grad_clip=args.grad_clip,
+        cons_weight=eff_cfg["cons_weight"],
+        ent_weight=eff_cfg["ent_weight"],
+        kl_weight=eff_cfg["kl_weight"],
+        l2_weight=eff_cfg["l2_weight"],
+        grad_clip=eff_cfg["grad_clip"],
         use_bf16=use_bf16,
         strict_grammar=args.strict_grammar,
         max_decode_len=args.ttt_max_decode_len,
+        conf_skip_thr=eff_cfg["conf_skip_thr"],
+    )
+    skip_str = (
+        f" | conf_skip_thr={format_conf_skip_thr(eff_cfg['conf_skip_thr'])}"
+        if eff_cfg["conf_skip_thr"] is not None
+        else ""
     )
 
     print(
         f"[2028 TTT A/B] ckpt={args.ckpt} (step={ckpt_meta['step']}) | device={device} | "
-        f"scope={ttt.adapt_scope} ({ttt.adapted_param_count:,} params = "
-        f"{ttt.adapted_param_fraction * 100.0:.4f}%) | steps={args.ttt_steps} | "
-        f"lr={args.ttt_lr:g} | pieces={len(pieces)} | domains={domains}",
+        f"mode={eff_cfg['ttt_mode']} | scope={ttt.adapt_scope} ({ttt.adapted_param_count:,} params = "
+        f"{ttt.adapted_param_fraction * 100.0:.4f}%) | steps={eff_cfg['ttt_steps']} | "
+        f"lr={eff_cfg['ttt_lr']:g}{skip_str} | pieces={len(pieces)} | domains={domains}",
         flush=True,
     )
 
@@ -840,17 +1066,20 @@ def run_suite31_ttt_ab(args: argparse.Namespace) -> Dict[str, Any]:
 
                 # Adapt on page + evaluate After TTT
                 ttt.restore()
-                ttt_stats = ttt.adapt_on_page(img_t, steps=args.ttt_steps)
-                after = _decode_and_score_page(
-                    model, cfg, img_t, ref_page_toks, page_ref_notes, workdir,
-                    f"ttt-after-{slug}-{domain}",
-                    max_len=args.max_len,
-                    use_grammar=args.use_grammar,
-                    strict_grammar=args.strict_grammar,
-                    use_mtp_spec=args.use_mtp_spec,
-                    use_bf16=use_bf16,
-                    device=device,
-                )
+                ttt_stats = ttt.adapt_on_page(img_t, steps=eff_cfg["ttt_steps"])
+                if ttt_stats.get("skipped_by_conf_gate"):
+                    after = dict(before)
+                else:
+                    after = _decode_and_score_page(
+                        model, cfg, img_t, ref_page_toks, page_ref_notes, workdir,
+                        f"ttt-after-{slug}-{domain}",
+                        max_len=args.max_len,
+                        use_grammar=args.use_grammar,
+                        strict_grammar=args.strict_grammar,
+                        use_mtp_spec=args.use_mtp_spec,
+                        use_bf16=use_bf16,
+                        device=device,
+                    )
                 ttt.restore()
 
                 d_note = after["note_f1"] - before["note_f1"]
@@ -918,17 +1147,24 @@ def run_suite31_ttt_ab(args: argparse.Namespace) -> Dict[str, Any]:
         "ckpt_meta": ckpt_meta,
         "model_config": asdict(cfg),
         "ttt_config": {
-            "ttt_steps": int(args.ttt_steps),
-            "ttt_lr": float(args.ttt_lr),
-            "adapt_scope": str(args.adapt_scope),
+            "ttt_mode": str(eff_cfg["ttt_mode"]),
+            "ttt_steps": int(eff_cfg["ttt_steps"]),
+            "ttt_lr": float(eff_cfg["ttt_lr"]),
+            "adapt_scope": str(eff_cfg["adapt_scope"]),
             "adapted_param_count": ttt.adapted_param_count,
             "adapted_param_fraction": round(ttt.adapted_param_fraction, 6),
             "conf_threshold": float(args.conf_threshold),
-            "cons_weight": float(args.cons_weight),
-            "ent_weight": float(args.ent_weight),
-            "kl_weight": float(args.kl_weight),
-            "l2_weight": float(args.l2_weight),
-            "grad_clip": float(args.grad_clip),
+            "ttt_conf_skip_thr": eff_cfg["conf_skip_thr"],
+            "ttt_conf_skip_thr_str": (
+                format_conf_skip_thr(eff_cfg["conf_skip_thr"])
+                if eff_cfg["conf_skip_thr"] is not None
+                else None
+            ),
+            "cons_weight": float(eff_cfg["cons_weight"]),
+            "ent_weight": float(eff_cfg["ent_weight"]),
+            "kl_weight": float(eff_cfg["kl_weight"]),
+            "l2_weight": float(eff_cfg["l2_weight"]),
+            "grad_clip": float(eff_cfg["grad_clip"]),
         },
         "summary": summary,
         "rows": rows,
@@ -950,6 +1186,25 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--manifest",
         default=str(ev.DEFAULT_MANIFEST),
         help="Path to suite31_hw_manifest.json",
+    )
+    ap.add_argument(
+        "--ttt-mode",
+        default="custom",
+        choices=VALID_TTT_MODES,
+        help=(
+            "TTT preset mode: 'custom' uses explicit --adapt-scope/--ttt-lr/--ttt-steps flags; "
+            "'backbone_cons' applies the promoted ov-38b preset "
+            "(scope=backbone_router, lr=3e-5, steps=2, ent=0.0, kl=0.0, cons=1.0, l2=1e-2)."
+        ),
+    )
+    ap.add_argument(
+        "--ttt-conf-skip-thr",
+        type=float,
+        default=None,
+        help=(
+            "Optional 3-decimal mean_logprob confidence skip gate (i13-06c; "
+            "promoted: -0.040 skips pages with mean_logprob > -0.040 untouched)."
+        ),
     )
     ap.add_argument("--ttt-steps", type=int, default=3, help="TTT gradient steps per page")
     ap.add_argument("--ttt-lr", type=float, default=5e-5, help="TTT AdamW learning rate")

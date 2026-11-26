@@ -267,7 +267,38 @@ assert all(
     t not in _BASE_PRE_ITER7 for t in _ITER7_D1_ADD
 ), "iter7 D1 add must be append-only (id stability)"
 
-VOCAB: List[str] = _BASE_PRE_ITER7 + _ITER7_D1_ADD
+# bekern+v2 Phase A (2026-11-26): append-only expressive & structural tokens
+# for OMR-NorthStar S_expr/S_struct parity (8 extended dynamics, 9 articulations/
+# ornaments/technical, 11 structural tokens). Appended strictly AFTER
+# _ITER7_D1_ADD so all existing IDs 0..232 stay 100% verbatim for vocab-expand
+# warm-start from Iter 13 checkpoints.
+_BASE_PRE_V2A = _BASE_PRE_ITER7 + _ITER7_D1_ADD
+_BEKERN_V2A_ADD: List[str] = (
+    # 8 extended dynamics
+    [
+        "dyn-ppp", "dyn-fff", "dyn-fp", "dyn-sf",
+        "dyn-sfp", "dyn-fz", "dyn-rfz", "dyn-sffz",
+    ]
+    # 9 articulations / ornaments / technical
+    + [
+        "art-arpeggiate", "art-trill", "art-tremolo", "art-mordent",
+        "art-turn", "art-staccatissimo", "art-up-bow", "art-down-bow",
+        "art-soft-accent",
+    ]
+    # 11 structural markers
+    + [
+        "<staff>", "xstaff-up", "xstaff-down",
+        "ottava-8va", "ottava-8vb", "ottava-stop",
+        "cue", "volta-1", "volta-2",
+        "tup-open", "tup-close",
+    ]
+)
+assert all(
+    t not in _BASE_PRE_V2A for t in _BEKERN_V2A_ADD
+), "bekern+v2 Phase A add must be append-only (id stability)"
+assert len(_BEKERN_V2A_ADD) == len(set(_BEKERN_V2A_ADD)), "duplicate in _BEKERN_V2A_ADD"
+
+VOCAB: List[str] = _BASE_PRE_V2A + _BEKERN_V2A_ADD
 TOKEN_TO_ID: Dict[str, int] = {t: i for i, t in enumerate(VOCAB)}
 ID_TO_TOKEN: Dict[int, str] = {i: t for i, t in enumerate(VOCAB)}
 
@@ -332,14 +363,21 @@ def build_vocab(
     checkpoints load cleanly via vocab-expand.
     """
     vocab = list(VOCAB)
+    seen = set(vocab)
+    def _extend_unique(extra: Sequence[str]) -> None:
+        for tok in extra:
+            if tok not in seen:
+                vocab.append(tok)
+                seen.add(tok)
+
     if include_ext_dynamics:
-        vocab.extend(EXT_DYNAMICS_VOCAB)
+        _extend_unique(EXT_DYNAMICS_VOCAB)
     if include_lyric_markers:
-        vocab.extend(EXT_LYRIC_MARKERS_VOCAB)
+        _extend_unique(EXT_LYRIC_MARKERS_VOCAB)
     if include_percussion_tab:
-        vocab.extend(EXT_PERCUSSION_TAB_VOCAB)
+        _extend_unique(EXT_PERCUSSION_TAB_VOCAB)
     if include_multipage_state:
-        vocab.extend(MULTIPAGE_STATE_TOKENS)
+        _extend_unique(MULTIPAGE_STATE_TOKENS)
     assert len(vocab) == len(set(vocab)), "extended vocab has duplicates"
     return vocab, {t: i for i, t in enumerate(vocab)}
 

@@ -692,6 +692,9 @@ def precompute_teacher_cache(
     batch_size: int = 4,
     use_bf16: bool = False,
     teacher_ckpt: str = "",
+    skip_hw: bool = False,
+    keep_ratio_override: Optional[float] = 0.45,
+    compute_ink_recall: bool = False,
 ) -> TopKTeacherCache:
     """Run frozen v1 teacher on clean datasets and write an offline ``TopKTeacherCache``."""
     teacher.eval()
@@ -703,8 +706,40 @@ def precompute_teacher_cache(
     )
 
     for ds_name, ds in datasets:
+        if skip_hw and str(ds_name).strip().lower() == "hw_strips":
+            print(
+                f"[TopKTeacherCache] skipping {ds_name} (skip_hw=True)",
+                flush=True,
+            )
+            continue
+
+        ds_to_run: Any = ds
+        n_skipped_hw = 0
+        if skip_hw and isinstance(ds, UniFullPageDataset):
+            keep_indices: List[int] = []
+            for idx, entry in enumerate(ds.pairs):
+                img_path = entry[0]
+                if len(entry) > 2:
+                    dom = str(entry[2]).strip().lower()
+                elif ds.domains is not None and idx < len(ds.domains):
+                    dom = str(ds.domains[idx]).strip().lower()
+                else:
+                    dom = ""
+                if _is_hw_domain(dom) or _is_hw_sample_id(Path(img_path).stem):
+                    n_skipped_hw += 1
+                    continue
+                keep_indices.append(idx)
+            if not keep_indices:
+                print(
+                    f"[TopKTeacherCache] skipping {ds_name}: all {n_skipped_hw} samples are HW (skip_hw=True)",
+                    flush=True,
+                )
+                continue
+            if n_skipped_hw > 0:
+                ds_to_run = torch.utils.data.Subset(ds, keep_indices)
+
         loader = DataLoader(
-            ds,
+            ds_to_run,
             batch_size=max(1, int(batch_size)),
             shuffle=False,
             num_workers=0,
@@ -716,20 +751,52 @@ def precompute_teacher_cache(
         t_first_param = next(teacher.parameters(), None)
         t_dtype = t_first_param.dtype if t_first_param is not None else torch.float32
         for batch in loader:
+            sids = batch["sample_ids"]
+            domains = batch.get("domains")
+            orig_lens = batch["orig_seq_len"]
+            active_idx: Optional[List[int]] = None
+            if skip_hw:
+                active_idx = []
+                for i, sid in enumerate(sids):
+                    dom_i = domains[i] if (domains is not None and i < len(domains)) else ""
+                    if _is_hw_domain(dom_i) or _is_hw_sample_id(sid):
+                        n_skipped_hw += 1
+                        continue
+                    active_idx.append(i)
+                if not active_idx:
+                    continue
+                if len(active_idx) == len(sids):
+                    active_idx = None
+
             images = _images_to_device_float(batch["images"], device, non_blocking=(device.type == "cuda"))
             if images.dtype != t_dtype:
                 images = images.to(dtype=t_dtype)
             seq = batch["seq"].to(device, non_blocking=(device.type == "cuda"))
+            if active_idx is not None:
+                idx_t = torch.tensor(active_idx, device=device, dtype=torch.long)
+                images = images.index_select(0, idx_t)
+                seq = seq.index_select(0, idx_t)
+                sids = [sids[i] for i in active_idx]
+                orig_lens = [orig_lens[i] for i in active_idx]
+
             tgt_in = seq[:, :-1]
             with amp_ctx:
-                out = teacher(images, tgt_in, return_aux=False, return_mtp=False)
+                out = teacher(
+                    images,
+                    tgt_in,
+                    keep_ratio_override=keep_ratio_override,
+                    return_aux=False,
+                    return_mtp=False,
+                    compute_ink_recall=compute_ink_recall,
+                )
             vals_b, idx_b = extract_topk_from_logits(out["logits"], k=k)
-            for i, sid in enumerate(batch["sample_ids"]):
-                eff_len = max(0, int(batch["orig_seq_len"][i]) - 1)
+            for i, sid in enumerate(sids):
+                eff_len = max(0, int(orig_lens[i]) - 1)
                 records.append((str(sid), vals_b[i, :eff_len], idx_b[i, :eff_len]))
         dt = max(1e-6, time.perf_counter() - t0)
+        skip_msg = f" (skipped_hw={n_skipped_hw})" if n_skipped_hw > 0 else ""
         print(
-            f"[TopKTeacherCache] precomputed {ds_name}: {len(records) - n_before} samples in {dt:.1f}s",
+            f"[TopKTeacherCache] precomputed {ds_name}: {len(records) - n_before} samples in {dt:.1f}s{skip_msg}",
             flush=True,
         )
 
@@ -1207,7 +1274,24 @@ _STATE_TOKEN_PREFIXES: Tuple[str, ...] = (
     "tuplet-start-",
 )
 
+_EXPR_TOKEN_PREFIXES: Tuple[str, ...] = (
+    "dyn-",
+    "hairpin-",
+    "slur-",
+    "tie-",
+    "art-",
+    "ottava-",
+)
+
+_EXPR_TOKEN_EXACT: Tuple[str, ...] = (
+    "fermata",
+    "stacc",
+    "accent",
+    "tenuto",
+)
+
 _STATE_TOKEN_WEIGHT_CACHE: Dict[Tuple[int, float, torch.device, torch.dtype], torch.Tensor] = {}
+_CE_TOKEN_WEIGHT_CACHE: Dict[Tuple[int, float, float, torch.device, torch.dtype], torch.Tensor] = {}
 
 
 def _is_hw_sample_id(sample_id: str) -> bool:
@@ -1244,6 +1328,46 @@ def build_state_token_weights(
         if state_ids:
             weights[state_ids] = w_val
     _STATE_TOKEN_WEIGHT_CACHE[key] = weights
+    return weights
+
+
+def _is_expr_token(tok: str) -> bool:
+    s = str(tok)
+    return s.startswith(_EXPR_TOKEN_PREFIXES) or s in _EXPR_TOKEN_EXACT
+
+
+def build_ce_token_weights(
+    vocab_size: int,
+    state_weight: float = 1.0,
+    expr_weight: float = 1.0,
+    device: torch.device = torch.device("cpu"),
+    dtype: torch.dtype = torch.float32,
+) -> torch.Tensor:
+    """Return a cached 1D ``(vocab_size,)`` per-token CE weight tensor combining state & expressive weights."""
+    st_w = float(state_weight)
+    ex_w = float(expr_weight)
+    key = (int(vocab_size), st_w, ex_w, device, dtype)
+    cached = _CE_TOKEN_WEIGHT_CACHE.get(key)
+    if cached is not None:
+        return cached
+    weights = torch.ones((int(vocab_size),), device=device, dtype=dtype)
+    if st_w != 1.0:
+        state_ids = [
+            int(tid)
+            for tid, tok in data.ID_TO_TOKEN.items()
+            if int(tid) < int(vocab_size) and str(tok).startswith(_STATE_TOKEN_PREFIXES)
+        ]
+        if state_ids:
+            weights[state_ids] *= st_w
+    if ex_w != 1.0:
+        expr_ids = [
+            int(tid)
+            for tid, tok in data.ID_TO_TOKEN.items()
+            if int(tid) < int(vocab_size) and _is_expr_token(tok)
+        ]
+        if expr_ids:
+            weights[expr_ids] *= ex_w
+    _CE_TOKEN_WEIGHT_CACHE[key] = weights
     return weights
 
 
@@ -1304,6 +1428,7 @@ def forward_and_loss_v2(
     stroke_hog_weight: float = 0.15,
     label_smoothing: float = 0.05,
     state_token_loss_weight: float = 1.0,
+    expr_token_loss_weight: float = 1.0,
     sys_y_target: Optional[torch.Tensor] = None,
     sys_y_mask: Optional[torch.Tensor] = None,
     staff_seg_target: Optional[torch.Tensor] = None,
@@ -1398,15 +1523,21 @@ def forward_and_loss_v2(
                     return_mtp=(model.cfg.mtp_k > 1),
                 )
 
-        # Optional per-token CE upweighting on musical state tokens (time-*, key*, clef-*, tuplet-start-*).
+        # Optional per-token CE upweighting on musical state tokens (time-*, key*, clef-*, tuplet-start-*)
+        # and/or expressive tokens (dyn-*, hairpin-*, slur-*, tie-*, art-*, fermata, stacc, accent, tenuto, ottava-*).
         # Passed directly into model.compute_loss so F.cross_entropy runs ONCE instead of twice.
         # Default 1.0 leaves ce_token_weights=None (zero overhead & 100% bit-identical to unweighted CE).
         st_w = float(state_token_loss_weight)
+        ex_w = float(expr_token_loss_weight)
         ce_token_weights: Optional[torch.Tensor] = None
-        if st_w > 1.0:
+        if st_w != 1.0 or ex_w != 1.0:
             s_logits: torch.Tensor = out["logits"]
-            ce_token_weights = build_state_token_weights(
-                int(s_logits.shape[-1]), st_w, device=s_logits.device, dtype=s_logits.dtype
+            ce_token_weights = build_ce_token_weights(
+                int(s_logits.shape[-1]),
+                state_weight=st_w,
+                expr_weight=ex_w,
+                device=s_logits.device,
+                dtype=s_logits.dtype,
             )
 
         losses = model.compute_loss(
@@ -2341,6 +2472,10 @@ def run_train_v2(args: argparse.Namespace) -> Dict[str, Any]:
     )
     if args.max_mem_tokens is not None:
         cfg_overrides["max_mem_tokens"] = int(args.max_mem_tokens)
+    if getattr(args, "n_axial_layers", None) is not None:
+        cfg_overrides["n_axial_layers"] = int(args.n_axial_layers)
+    if getattr(args, "n_global_layers", None) is not None:
+        cfg_overrides["n_global_layers"] = int(args.n_global_layers)
     cfg = build_v2_config(args.preset, **cfg_overrides)
 
     use_bf16 = bool(args.bf16 and device.type == "cuda")
@@ -2377,6 +2512,9 @@ def run_train_v2(args: argparse.Namespace) -> Dict[str, Any]:
                 batch_size=max(1, int(args.batch_size)),
                 use_bf16=use_bf16,
                 teacher_ckpt=str(args.teacher_ckpt),
+                skip_hw=(float(getattr(args, "kd_hw_scale", 1.0)) <= 0.0),
+                keep_ratio_override=0.45,
+                compute_ink_recall=False,
             )
             n_cached = len(cache)
             cache.close()
@@ -2431,6 +2569,7 @@ def run_train_v2(args: argparse.Namespace) -> Dict[str, Any]:
     kd_teacher_ce_cap = float(getattr(args, "kd_teacher_ce_cap", 0.0))
     kd_hw_scale = float(getattr(args, "kd_hw_scale", 1.0))
     state_token_loss_weight = float(getattr(args, "state_token_loss_weight", 1.0))
+    expr_token_loss_weight = float(getattr(args, "expr_token_loss_weight", 1.0))
     print(
         f"[UniOMRv2 opt] mode={opt.mode} | muon_params={len(opt.muon_param_names)} | "
         f"adamw_params={len(opt.adamw_param_names)} | no_decay_params={len(opt.no_decay_param_names)} | "
@@ -2781,6 +2920,7 @@ def run_train_v2(args: argparse.Namespace) -> Dict[str, Any]:
                         stroke_hog_weight=float(args.stroke_hog_weight),
                         label_smoothing=float(args.label_smoothing),
                         state_token_loss_weight=state_token_loss_weight,
+                        expr_token_loss_weight=expr_token_loss_weight,
                         use_bf16=use_bf16,
                         device=device,
                     )
@@ -2991,6 +3131,18 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default=None,
         help="Override preset max_mem_tokens (default: None = use preset value, e.g. 3072 for small_45m)",
     )
+    p.add_argument(
+        "--n-axial-layers",
+        type=int,
+        default=None,
+        help="Override preset encoder n_axial_layers (default: None = preset default, e.g. 2; use 1 for ax1_gl5)",
+    )
+    p.add_argument(
+        "--n-global-layers",
+        type=int,
+        default=None,
+        help="Override preset encoder n_global_layers (default: None = preset default, e.g. 4; use 5 for ax1_gl5)",
+    )
     p.add_argument("--mtp-k", type=int, default=4)
     p.add_argument("--use-sys-y-aux", action="store_true", default=True)
     p.add_argument("--no-use-sys-y-aux", dest="use_sys_y_aux", action="store_false")
@@ -3073,6 +3225,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
         type=float,
         default=1.0,
         help="Per-token CE loss weight for musical state tokens (time-*, key*, clef-*, tuplet-start-*); 1.0 = unweighted",
+    )
+    p.add_argument(
+        "--expr-token-loss-weight",
+        type=float,
+        default=1.0,
+        help="Per-token CE loss weight for expressive tokens (dyn-*, hairpin-*, slur-*, tie-*, art-*, fermata, stacc, accent, tenuto, ottava-*); 1.0 = unweighted",
     )
     p.add_argument("--cass-prob", type=float, default=0.0)
     p.add_argument(

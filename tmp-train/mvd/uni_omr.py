@@ -28,6 +28,7 @@ import argparse
 from collections import Counter, deque
 from concurrent.futures import Future, ThreadPoolExecutor
 import contextlib
+import hashlib
 import inspect
 import io
 import json
@@ -4019,10 +4020,26 @@ class UniStripDataset(Dataset):
         return {
             "image": img_t,
             "seq": torch.from_numpy(cached_seq).to(torch.long),
-            "sample_id": img_path.stem,
+            "sample_id": make_sample_id(img_path),
             "kind": self.kind,
             "domain": "hw" if self.is_hw else "printed",
         }
+
+
+def make_sample_id(img_path: Union[str, Path]) -> str:
+    """Return a deterministic collision-free sample ID preserving stem readability.
+
+    Uses ``f"{path.stem}_{blake2b(resolved_path, digest_size=8)}"`` so identically
+    named files in different directories (e.g. ``page_001.png``) never collide in
+    ``TopKTeacherCache``, while preserving HW stem markers for ``_is_hw_sample_id``.
+    """
+    p = Path(img_path)
+    try:
+        norm = str(p.resolve())
+    except Exception:
+        norm = str(p)
+    h8 = hashlib.blake2b(norm.encode("utf-8"), digest_size=8).hexdigest()
+    return f"{p.stem}_{h8}"
 
 
 def _sample_weighted_fullpage_dim(base_dim: int, rng: Optional[random.Random] = None) -> int:
@@ -4148,7 +4165,7 @@ class UniFullPageDataset(Dataset):
         return {
             "image": img_t,
             "seq": torch.from_numpy(cached_seq).to(torch.long),
-            "sample_id": img_path.stem,
+            "sample_id": make_sample_id(img_path),
             "kind": "fullpage",
             "domain": domain,
         }

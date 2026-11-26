@@ -25,6 +25,7 @@ import contextlib
 from dataclasses import asdict, fields
 import difflib
 import json
+import math
 import statistics
 import sys
 import tempfile
@@ -629,6 +630,195 @@ def generate_constrained(
     seq = torch.cat(out_tokens, dim=1)
     if return_info:
         return seq, router_info
+    return seq
+
+
+# ---------------------------------------------------------------------------
+# 1b. Confidence-Gated ILMS Blank Decoding (Promoted i13-18b)
+# ---------------------------------------------------------------------------
+
+def build_canonical_blank_pil(max_dim: int) -> Image.Image:
+    """Create a canonical A4-aspect warm-paper blank RGB page (encoded once per session)."""
+    h = max(32, int(max_dim))
+    w = max(64, int(round(h * 0.72)))
+    return Image.new("RGB", (w, h), (242, 239, 230))
+
+
+def apply_conf_gated_ilms_logits(
+    logits_orig: torch.Tensor,
+    logits_blank: Optional[torch.Tensor],
+    *,
+    alpha: float,
+    conf_thr: float = 0.85,
+    beta: float = 0.10,
+    fsa_mask: Optional[torch.Tensor] = None,
+) -> Tuple[torch.Tensor, bool]:
+    """Apply promoted ``i13-18b`` confidence-gated ILMS blank-prior subtraction.
+
+    When ``max_prob >= conf_thr`` (default ``0.85``), leaves ``lo_masked``
+    bit-identical and returns ``(lo_masked, False)`` without touching
+    ``logits_blank``. Only on uncertain tokens (``max_prob < conf_thr``) does
+    it compute ``(1 + alpha) * lo_masked - alpha * logits_blank`` with
+    plausibility cutoff ``log_beta = log(beta)``.
+    """
+    lo = logits_orig.float()
+    lo_masked = (lo + fsa_mask) if fsa_mask is not None else lo
+
+    a = float(alpha)
+    if a <= 0.0 or logits_blank is None:
+        return lo_masked, False
+
+    logp_o = F.log_softmax(lo_masked, dim=-1)
+    max_logp = float(logp_o.max(dim=-1).values.item())
+    log_conf_thr = math.log(max(1e-6, min(1.0, float(conf_thr))))
+    if max_logp >= log_conf_thr:
+        return lo_masked, False
+
+    lr = logits_blank.float()
+    plaus_cut = max_logp + math.log(max(1e-6, float(beta)))
+    vcd_logits = (1.0 + a) * lo_masked - a * lr
+    vcd_logits = vcd_logits.masked_fill(logp_o < plaus_cut, -1e9)
+    if fsa_mask is not None:
+        vcd_logits = vcd_logits + fsa_mask
+    return vcd_logits, True
+
+
+@torch.no_grad()
+def generate_conf_gated_ilms(
+    model: Any,
+    images: torch.Tensor,
+    mem_blank: Optional[Any],
+    max_len: int = 1024,
+    alpha: float = 0.40,
+    conf_thr: float = 0.85,
+    beta: float = 0.10,
+    use_grammar: bool = True,
+    strict_grammar: bool = False,
+    keep_ratio_override: Optional[float] = None,
+    return_stats: bool = True,
+) -> Any:
+    """KV-cached greedy/FSA decoding with promoted ``i13-18b`` confidence-gated lazy ILMS.
+
+    Encodes ``images`` once (B=1), skips the blank-LM decoder branch completely
+    whenever ``max_prob >= conf_thr`` (guaranteeing ``0.000`` drift on confident
+    tokens), and lazily catches up ``past_ref`` in a single parallel chunk pass
+    only when an uncertain token triggers (``max_prob < conf_thr``).
+    """
+    if int(images.shape[0]) != 1:
+        raise ValueError(
+            f"generate_conf_gated_ilms expects batch size 1, got shape {tuple(images.shape)}"
+        )
+
+    mem_orig, _, router_info = model.encode_image(
+        images,
+        keep_ratio_override=keep_ratio_override,
+        return_aux=False,
+    )
+    device = images.device
+    vocab_size = int(model.cfg.vocab_size)
+    _, bos_id, eos_id, _, tok_to_id, _ = _vocab_spec(vocab_size)
+    state = (
+        grammar.PrefixState(strict=strict_grammar, vocab_map=tok_to_id)
+        if use_grammar
+        else None
+    )
+
+    out_ids: List[int] = [bos_id]
+    past_orig: Optional[List[Any]] = None
+    past_ref: Optional[List[Any]] = None
+    ref_synced_len = 0
+
+    use_ilms = (float(alpha) > 0.0) and (mem_blank is not None)
+    log_conf_thr = math.log(max(1e-6, min(1.0, float(conf_thr))))
+
+    n_uncertain = 0
+    n_ilms_applied = 0
+    n_changed = 0
+    n_ref_calls = 0
+    cur_id = bos_id
+
+    for _ in range(int(max_len)):
+        cur_t = torch.tensor([[cur_id]], dtype=torch.long, device=device)
+        logits_o, _, past_orig = model.decode_tokens(
+            cur_t,
+            memory=mem_orig if past_orig is None else None,
+            return_mtp=False,
+            past_kvs=past_orig,
+            use_cache=True,
+        )
+        lo = logits_o[0, -1, :].float()
+
+        fsa_mask: Optional[torch.Tensor] = None
+        if use_grammar and state is not None:
+            allowed = _allowed_ids_for_state(state, vocab_size)
+            if allowed:
+                fsa_mask = torch.full_like(lo, -1e9)
+                fsa_mask[allowed] = 0.0
+                lo_masked = lo + fsa_mask
+            else:
+                lo_masked = lo
+        else:
+            lo_masked = lo
+
+        greedy_tok = int(torch.argmax(lo_masked).item())
+        tok_id = greedy_tok
+
+        if use_ilms:
+            logp_o = F.log_softmax(lo_masked, dim=-1)
+            max_logp = float(logp_o[greedy_tok].item())
+            if max_logp < log_conf_thr:
+                n_uncertain += 1
+                chunk_ids = out_ids[ref_synced_len:]
+                chunk_t = torch.tensor([chunk_ids], dtype=torch.long, device=device)
+                logits_r, _, past_ref = model.decode_tokens(
+                    chunk_t,
+                    memory=mem_blank if past_ref is None else None,
+                    return_mtp=False,
+                    past_kvs=past_ref,
+                    use_cache=True,
+                )
+                ref_synced_len = len(out_ids)
+                n_ref_calls += 1
+
+                lr = logits_r[0, -1, :].float()
+                vcd_logits, applied = apply_conf_gated_ilms_logits(
+                    lo,
+                    lr,
+                    alpha=float(alpha),
+                    conf_thr=float(conf_thr),
+                    beta=float(beta),
+                    fsa_mask=fsa_mask,
+                )
+                if applied:
+                    n_ilms_applied += 1
+                    tok_id = int(torch.argmax(vcd_logits).item())
+                    if tok_id != greedy_tok:
+                        n_changed += 1
+
+        out_ids.append(tok_id)
+        if tok_id == eos_id:
+            break
+        if use_grammar and state is not None:
+            state = _advance_grammar_state(
+                state, tok_id, strict=strict_grammar, vocab_size=vocab_size
+            )
+        cur_id = tok_id
+
+    seq = torch.tensor([out_ids], dtype=torch.long, device=device)
+    n_steps = max(1, len(out_ids) - 1)
+    stats = {
+        "ilms_alpha": float(alpha),
+        "ilms_conf_thr": float(conf_thr),
+        "n_toks": len(out_ids),
+        "n_uncertain": n_uncertain,
+        "uncertain_frac": round(n_uncertain / n_steps, 4),
+        "n_ilms_applied": n_ilms_applied,
+        "n_ref_calls": n_ref_calls,
+        "n_vcd_changed": n_changed,
+        "router_info": router_info,
+    }
+    if return_stats:
+        return seq, stats
     return seq
 
 
@@ -1810,6 +2000,9 @@ def _decode_single_view(
     measure_beam_lp: Optional[float] = 2.0,
     measure_beam_max_window: int = 64,
     compute_logprob: bool = False,
+    ilms_alpha: float = 0.0,
+    ilms_conf_thr: float = 0.85,
+    mem_blank: Optional[Any] = None,
 ) -> Tuple[torch.Tensor, Optional[Dict[str, Any]], float, Optional[float]]:
     """Decode one ``(1, 3, H, W)`` image tensor using the configured decoder mode."""
     pad_id, _, _, _, _, _ = _vocab_spec(int(cfg.vocab_size))
@@ -1832,6 +2025,18 @@ def _decode_single_view(
                     length_penalty=beam_length_penalty,
                     use_grammar=args.use_grammar,
                     strict_grammar=args.strict_grammar,
+                )
+            elif float(ilms_alpha) > 0.0 and mem_blank is not None:
+                seq = generate_conf_gated_ilms(
+                    model,
+                    img_t,
+                    mem_blank=mem_blank,
+                    max_len=args.max_len,
+                    alpha=float(ilms_alpha),
+                    conf_thr=float(ilms_conf_thr),
+                    use_grammar=args.use_grammar,
+                    strict_grammar=args.strict_grammar,
+                    return_stats=False,
                 )
             elif args.use_mtp_spec or measure_beam_size > 1:
                 seq, mtp_stats = generate_mtp_spec(
@@ -1895,6 +2100,19 @@ def evaluate_suite31(args: argparse.Namespace) -> Dict[str, Any]:
     measure_beam_max_window = int(getattr(args, "measure_beam_max_window", 64))
     use_oemer_dewarp = bool(getattr(args, "oemer_dewarp", False))
     use_unitsize_norm = bool(getattr(args, "unitsize_norm", False))
+    ilms_alpha = float(getattr(args, "ilms_alpha", 0.0))
+    ilms_conf_thr = float(getattr(args, "ilms_conf_thr", 0.85))
+    if ilms_alpha < 0.0:
+        raise ValueError(f"--ilms-alpha must be >= 0.0, got {ilms_alpha}")
+    if not (0.0 < ilms_conf_thr <= 1.0):
+        raise ValueError(f"--ilms-conf-thr must be in (0, 1], got {ilms_conf_thr}")
+    ttt_mode = str(getattr(args, "ttt_mode", "none")).strip().lower()
+    if ttt_mode not in ("none", "backbone_cons"):
+        raise ValueError(f"--ttt-mode must be 'none' or 'backbone_cons', got {ttt_mode!r}")
+    ttt_conf_skip_thr_raw = getattr(args, "ttt_conf_skip_thr", None)
+    ttt_conf_skip_thr: Optional[float] = (
+        float(ttt_conf_skip_thr_raw) if ttt_conf_skip_thr_raw is not None else None
+    )
     max_keep_ratio_override = getattr(args, "max_keep_ratio_override", None)
     tta_scales = parse_tta_scales(getattr(args, "tta_scales", None))
     tta_rerank = str(getattr(args, "tta_rerank", "fsa_logprob_mbr")).strip().lower()
@@ -1911,19 +2129,23 @@ def evaluate_suite31(args: argparse.Namespace) -> Dict[str, Any]:
         )
     else:
         mode_tag = (
-            ("mtp-spec" if (args.use_mtp_spec or measure_beam_size > 1) else "greedy")
+            ("ilms" if ilms_alpha > 0.0 else ("mtp-spec" if (args.use_mtp_spec or measure_beam_size > 1) else "greedy"))
             + ("+grammar" if args.use_grammar else "")
             + ("(strict)" if (args.use_grammar and args.strict_grammar) else "")
             + (
                 f"+mbeam{measure_beam_size}(cap={measure_beam_cap},lp={measure_beam_lp:g},w={measure_beam_max_window})"
-                if measure_beam_size > 1
+                if (measure_beam_size > 1 and ilms_alpha <= 0.0)
                 else ""
             )
+            + (f"(a={ilms_alpha:.2f},thr={ilms_conf_thr:.2f})" if ilms_alpha > 0.0 else "")
         )
     if use_oemer_dewarp:
         mode_tag += "+dewarp"
     if use_unitsize_norm:
         mode_tag += "+unitsize"
+    if ttt_mode != "none":
+        skip_tag = f",skip={ttt_conf_skip_thr:.3f}" if ttt_conf_skip_thr is not None else ""
+        mode_tag += f"+ttt({ttt_mode}{skip_tag})"
     if tta_scales:
         mode_tag += f"+tta({','.join(str(s) for s in tta_scales)}:{tta_rerank})"
     mkr_str = (
@@ -1946,6 +2168,32 @@ def evaluate_suite31(args: argparse.Namespace) -> Dict[str, Any]:
     workdir = Path(tempfile.mkdtemp(prefix="uni_s31_"))
     piece_rows: List[Dict[str, Any]] = []
     _, _, eos_id, _, _, _ = _vocab_spec(int(cfg.vocab_size))
+
+    mem_blank_cached: Optional[Any] = None
+    if ilms_alpha > 0.0:
+        blank_pil = build_canonical_blank_pil(int(args.max_dim))
+        blank_t = uni_omr._pil_to_chw_tensor(blank_pil).unsqueeze(0).to(device)
+        with torch.no_grad():
+            b_ctx = (
+                torch.autocast(device_type="cuda", dtype=torch.bfloat16)
+                if use_bf16
+                else _nullcontext()
+            )
+            with b_ctx:
+                mem_blank_cached, _, _ = model.encode_image(blank_t, return_aux=False)
+
+    ttt_session: Optional[Any] = None
+    ttt_steps: int = 0
+    if ttt_mode != "none":
+        import trial_2028_ttt_adapt as ttt_mod  # noqa: PLC0415
+
+        ttt_session, ttt_steps = ttt_mod.build_ttt_session(
+            model,
+            mode=ttt_mode,
+            use_bf16=use_bf16,
+            strict_grammar=args.strict_grammar,
+            conf_skip_thr=ttt_conf_skip_thr,
+        )
 
     with override_max_keep_ratio(model, max_keep_ratio_override):
         for idx, piece in enumerate(pieces, start=1):
@@ -1991,21 +2239,55 @@ def evaluate_suite31(args: argparse.Namespace) -> Dict[str, Any]:
                         target_dim = int(args.max_dim)
                     pil_im = uni_omr._resize_fullpage_pil(work_rgb, target_dim)
                     img_t = uni_omr._pil_to_chw_tensor(pil_im).unsqueeze(0).to(device)
-                    seq, mtp_stats, elapsed, _ = _decode_single_view(
-                        model=model,
-                        cfg=cfg,
-                        img_t=img_t,
-                        args=args,
-                        device=device,
-                        use_bf16=use_bf16,
-                        beam_size=beam_size,
-                        beam_length_penalty=beam_length_penalty,
-                        measure_beam_size=measure_beam_size,
-                        measure_beam_cap=measure_beam_cap,
-                        measure_beam_lp=measure_beam_lp,
-                        measure_beam_max_window=measure_beam_max_window,
-                        compute_logprob=False,
-                    )
+                    ttt_page_stats: Optional[Dict[str, Any]] = None
+                    if ttt_session is not None:
+                        ttt_session.restore()
+                        try:
+                            ttt_page_stats = ttt_session.adapt_on_page(img_t, steps=ttt_steps)
+                            seq, mtp_stats, elapsed, _ = _decode_single_view(
+                                model=model,
+                                cfg=cfg,
+                                img_t=img_t,
+                                args=args,
+                                device=device,
+                                use_bf16=use_bf16,
+                                beam_size=beam_size,
+                                beam_length_penalty=beam_length_penalty,
+                                measure_beam_size=measure_beam_size,
+                                measure_beam_cap=measure_beam_cap,
+                                measure_beam_lp=measure_beam_lp,
+                                measure_beam_max_window=measure_beam_max_window,
+                                compute_logprob=False,
+                                ilms_alpha=ilms_alpha,
+                                ilms_conf_thr=ilms_conf_thr,
+                                mem_blank=mem_blank_cached,
+                            )
+                        finally:
+                            ttt_session.restore()
+                    else:
+                        seq, mtp_stats, elapsed, _ = _decode_single_view(
+                            model=model,
+                            cfg=cfg,
+                            img_t=img_t,
+                            args=args,
+                            device=device,
+                            use_bf16=use_bf16,
+                            beam_size=beam_size,
+                            beam_length_penalty=beam_length_penalty,
+                            measure_beam_size=measure_beam_size,
+                            measure_beam_cap=measure_beam_cap,
+                            measure_beam_lp=measure_beam_lp,
+                            measure_beam_max_window=measure_beam_max_window,
+                            compute_logprob=False,
+                            ilms_alpha=ilms_alpha,
+                            ilms_conf_thr=ilms_conf_thr,
+                            mem_blank=mem_blank_cached,
+                        )
+                    if ttt_page_stats is not None:
+                        pre_meta["ttt_steps"] = ttt_page_stats["steps"]
+                        pre_meta["ttt_skipped"] = bool(ttt_page_stats.get("skipped_by_conf_gate", False))
+                        pre_meta["ttt_mean_logprob"] = ttt_page_stats.get("mean_logprob")
+                        pre_meta["ttt_elapsed_secs"] = ttt_page_stats["elapsed_secs"]
                     seq_ids = seq[0].detach().cpu().tolist()
                     pred_raw_toks = decode_uni_compat(
                         seq_ids, vocab_size=int(cfg.vocab_size), skip_special=True
@@ -2042,6 +2324,9 @@ def evaluate_suite31(args: argparse.Namespace) -> Dict[str, Any]:
                             measure_beam_lp=measure_beam_lp,
                             measure_beam_max_window=measure_beam_max_window,
                             compute_logprob=True,
+                            ilms_alpha=ilms_alpha,
+                            ilms_conf_thr=ilms_conf_thr,
+                            mem_blank=mem_blank_cached,
                         )
                         total_elapsed += v_elapsed
                         v_seq_ids = v_seq[0].detach().cpu().tolist()
@@ -2234,6 +2519,13 @@ def evaluate_suite31(args: argparse.Namespace) -> Dict[str, Any]:
             "measure_beam_max_window": measure_beam_max_window,
             "oemer_dewarp": use_oemer_dewarp,
             "unitsize_norm": use_unitsize_norm,
+            "ilms_alpha": ilms_alpha,
+            "ilms_conf_thr": ilms_conf_thr,
+            "ttt_mode": ttt_mode,
+            "ttt_conf_skip_thr": ttt_conf_skip_thr,
+            "ttt_conf_skip_thr_str": (
+                f"{ttt_conf_skip_thr:.3f}" if ttt_conf_skip_thr is not None else None
+            ),
             "max_keep_ratio_override": (
                 float(max_keep_ratio_override)
                 if max_keep_ratio_override is not None
@@ -2368,6 +2660,31 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--unitsize-norm",
         action="store_true",
         help="Opt-in Homr unit_size inter-staffline spacing adaptive max_dim normalization (i13-10)",
+    )
+    ap.add_argument(
+        "--ilms-alpha",
+        type=float,
+        default=0.0,
+        help="Opt-in confidence-gated ILMS blank prior subtraction weight (i13-18b; 0.0 = off, 0.40 = promoted)",
+    )
+    ap.add_argument(
+        "--ilms-conf-thr",
+        type=float,
+        default=0.85,
+        help="Confidence probability threshold below which ILMS blank subtraction triggers (i13-18b default: 0.85)",
+    )
+    ap.add_argument(
+        "--ttt-mode",
+        type=str,
+        default="none",
+        choices=("none", "backbone_cons"),
+        help="Opt-in per-page Test-Time Training preset (ov-38b; none = off, backbone_cons = promoted backbone+router consistency TTT)",
+    )
+    ap.add_argument(
+        "--ttt-conf-skip-thr",
+        type=float,
+        default=None,
+        help="Opt-in 3-decimal mean_logprob skip gate for --ttt-mode (i13-06c; promoted: -0.040)",
     )
     ap.add_argument(
         "--max-keep-ratio-override",

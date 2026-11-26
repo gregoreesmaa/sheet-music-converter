@@ -200,30 +200,46 @@ class VocabPlusTest(unittest.TestCase):
     PRE = 133  # len(VOCAB) before the T3.1 bekern+ append
     POST_BEKERNPLUS = 156  # len(VOCAB) before the T3.2 t32-corpus append
     POST_T32 = 175  # len(VOCAB) before the leland 128th append
+    POST_ITER7 = 233  # len(VOCAB) before bekern+v2 Phase A append
 
     def test_size(self):
         self.assertEqual(len(data._BEKERNPLUS), 23)
         self.assertEqual(len(data._T32_ADD), 19)
         self.assertEqual(len(data._LELAND_ADD), 1)
-        self.assertEqual(len(data.VOCAB), self.POST_T32 + 1)
-        self.assertEqual(len(data.VOCAB), 176)
+        self.assertEqual(len(data._BEKERN_V2A_ADD), 28)
+        self.assertEqual(len(data._BASE_PRE_V2A), self.POST_ITER7)
+        self.assertEqual(len(data.VOCAB), self.POST_ITER7 + 28)
+        self.assertEqual(len(data.VOCAB), 261)
 
     def test_append_only_id_stability(self):
-        self.assertEqual(list(data.VOCAB[-len(data._LELAND_ADD):]),
-                         list(data._LELAND_ADD))
-        self.assertEqual(list(data.VOCAB[-(len(data._T32_ADD)
-                                           + len(data._LELAND_ADD)):-len(data._LELAND_ADD)]),
-                         list(data._T32_ADD))
-        self.assertEqual(list(data.VOCAB[-(len(data._BEKERNPLUS)
-                                           + len(data._T32_ADD)
-                                           + len(data._LELAND_ADD)):-(len(data._T32_ADD)
-                                           + len(data._LELAND_ADD))]),
-                         list(data._BEKERNPLUS))
+        self.assertEqual(
+            list(data.VOCAB[self.POST_ITER7:]),
+            list(data._BEKERN_V2A_ADD),
+        )
+        self.assertEqual(
+            list(data.VOCAB[self.PRE:self.POST_BEKERNPLUS]),
+            list(data._BEKERNPLUS),
+        )
+        self.assertEqual(
+            list(data.VOCAB[self.POST_BEKERNPLUS:self.POST_T32]),
+            list(data._T32_ADD),
+        )
+        self.assertEqual(
+            list(data.VOCAB[self.POST_T32:self.POST_T32 + len(data._LELAND_ADD)]),
+            list(data._LELAND_ADD),
+        )
         self.assertEqual(len(set(data.VOCAB)), len(data.VOCAB))
         for old in ("quarter", "C", "4", "rest", "bar", "tie-start",
                     "clef-G-2", "key+0", "time-4-4", "voice-1",
                     "tuplet-start-3-2", "bar-rest", "breve", "chord"):
             self.assertLess(data.TOKEN_TO_ID[old], self.PRE, old)
+        for v2tok in data._BEKERN_V2A_ADD:
+            self.assertGreaterEqual(data.TOKEN_TO_ID[v2tok], self.POST_ITER7, v2tok)
+            self.assertEqual(data.decode(data.encode([v2tok])), [v2tok])
+        # build_vocab with include_ext_dynamics=True stays duplicate-free
+        ext_vocab, _ = data.build_vocab(include_ext_dynamics=True)
+        self.assertEqual(ext_vocab[:len(data.VOCAB)], list(data.VOCAB))
+        self.assertEqual(len(ext_vocab), len(set(ext_vocab)))
         self.assertEqual(data.PAD_ID, len(data.VOCAB))
         self.assertEqual(data.BOS_ID, len(data.VOCAB) + 1)
         self.assertEqual(data.EOS_ID, len(data.VOCAB) + 2)

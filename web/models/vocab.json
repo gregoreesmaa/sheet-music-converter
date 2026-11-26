@@ -1,4 +1,5 @@
 {
+  "arch": "uni_omr_v2",
   "vocab": [
     "A",
     "B",
@@ -245,9 +246,12 @@
   "vocab_size": 237,
   "max_dim": 1280,
   "d_model": 384,
-  "n_enc_layers": 4,
-  "n_dec_layers": 6,
-  "n_heads": 6,
-  "head_dim": 64,
-  "backbone_stride": "4x8"
+  "n_axial_layers": 2,
+  "n_global_layers": 4,
+  "n_dec_layers": 8,
+  "n_heads": 8,
+  "n_kv_heads": 2,
+  "head_dim": 48,
+  "mtp_k": 4,
+  "max_mem_tokens": 3072
 }
