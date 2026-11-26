@@ -86,7 +86,9 @@ def _atomic_write_json(path: pathlib.Path, payload: Mapping[str, Any]) -> None:
 
 
 def _ensure_packages() -> None:
-    """Install lightweight missing runtime packages without overwriting PyTorch."""
+    """Install lightweight missing runtime packages without pre-importing into sys.modules."""
+    import importlib.util
+
     needed: List[str] = []
     for mod, pkg in (
         ("transformers", "transformers>=4.45.0,<5.0.0"),
@@ -98,14 +100,12 @@ def _ensure_packages() -> None:
         ("einops", "einops"),
         ("timm", "timm"),
     ):
-        try:
-            __import__(mod)
-        except ImportError:
+        if importlib.util.find_spec(mod) is None:
             needed.append(pkg)
     if needed:
         print(f"[setup] Installing missing packages: {needed}", flush=True)
         subprocess.run(
-            [sys.executable, "-m", "pip", "install", "-q", "--no-deps" if False else "--upgrade-strategy", "only-if-needed", *needed],
+            [sys.executable, "-m", "pip", "install", "-q", "--upgrade-strategy", "only-if-needed", *needed],
             check=True,
         )
 
@@ -165,6 +165,10 @@ def _load_smt_model(model_id: str, device: str):
         has_flash = False
 
     cfg = SMTConfig.from_pretrained(model_id)
+    if not hasattr(cfg, "is_encoder_decoder"):
+        cfg.is_encoder_decoder = False
+    if not hasattr(cfg, "tie_word_embeddings"):
+        cfg.tie_word_embeddings = False
     if getattr(cfg, "use_flash_attn", False) and not has_flash:
         print("[model] flash_attn not installed; setting config.use_flash_attn = False", flush=True)
         cfg.use_flash_attn = False

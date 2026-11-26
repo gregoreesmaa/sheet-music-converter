@@ -2114,6 +2114,14 @@ def run_train_v2(args: argparse.Namespace) -> Dict[str, Any]:
     if device.type == "cuda":
         torch.backends.cuda.matmul.allow_tf32 = True
         torch.backends.cudnn.allow_tf32 = True
+        # Force CUTLASS EFFICIENT_ATTENTION globally (covers frozen v1 teacher SDPA too;
+        # avoids cuDNN 9.10's ~640ms/shape CPU plan recompilation on variable (mem, T) shapes).
+        if hasattr(torch.backends.cuda, "enable_cudnn_sdp"):
+            torch.backends.cuda.enable_cudnn_sdp(False)
+        if hasattr(torch.backends.cuda, "enable_flash_sdp"):
+            torch.backends.cuda.enable_flash_sdp(False)
+        if hasattr(torch.backends.cuda, "enable_mem_efficient_sdp"):
+            torch.backends.cuda.enable_mem_efficient_sdp(True)
 
     cfg = build_v2_config(
         args.preset,
