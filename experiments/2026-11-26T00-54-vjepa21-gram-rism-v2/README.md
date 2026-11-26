@@ -1,6 +1,6 @@
 # Experiment `2026-11-26T00-54-vjepa21-gram-rism-v2` — V-JEPA 2.1 + DINOv3 Gram Anchoring + Stroke-HOG SSL Pretraining on RISM HW (`UniOMR v2 small_45m`)
 
-- **Status:** `RUNNING` (launched detached on Modal `L4`)
+- **Status:** `COMPLETED (ITERATE)` — finished `1,500` steps on Modal `L4` (`48.0 min`, `0` OOMs, `0` NaNs), but CPU SVD scrutiny revealed severe rank collapse (`p3_erank=2.1/384`, `mem_erank=2.6/384`, `cross_page_cos=0.9993` at `best.pt` step 385). **DO NOT warm-start Iter 11 from this checkpoint.** See [OUTCOME.md](OUTCOME.md) and successor [`2026-11-26T02-20-vjepa21-vicreg-anticollapse-rism-v2`](../2026-11-26T02-20-vjepa21-vicreg-anticollapse-rism-v2/README.md).
 - **Platform:** Modal (`L4`, 24 GB VRAM, native BF16, profile `gregoreesmaa1`)
 - **Baseline Commit SHA:** `9d73170`
 
@@ -19,7 +19,7 @@ Pretrain the `UniOMR v2 small_45m` vision encoder (`AnisotropicMusicBackbone` + 
 ## Quick Links
 
 - Plan, live cloud IDs, & copy-paste monitor/resume commands: [PLAN.md](PLAN.md)
-- Outcome (written after completion & downstream evaluation): `OUTCOME.md` (pending)
+- Outcome (written after completion & CPU collapse audit): [OUTCOME.md](OUTCOME.md)
 - Launcher script: [run_modal.py](run_modal.py)
 - Pretrainer script: `tmp-train/mvd/pretrain_ijepa_rism_v2.py`
 - Hugging Face Hub (`gregoreesmaa/sheet-music-converter-omr`, private dataset):

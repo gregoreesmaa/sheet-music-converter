@@ -780,6 +780,62 @@ def compute_gram_anchoring_loss(
     return torch.stack(losses).mean()
 
 
+def compute_vicreg_loss(
+    feats: torch.Tensor,
+    var_weight: float = 1.0,
+    cov_weight: float = 0.04,
+    gamma: float = 1.0,
+    max_tokens: int = 512,
+) -> torch.Tensor:
+    """VICReg variance + covariance anti-collapse regularizer on ``(B, K, D)`` tokens.
+
+    Prevents rank collapse (like Exp 2's ``mem_erank -> 2.6/384``) by:
+      1. Hinge std loss keeping per-channel std >= ``gamma`` across tokens.
+      2. Off-diagonal covariance penalty decorrelating feature channels.
+    """
+    B, K, D = feats.shape
+    x = feats.reshape(B * K, D).float()
+    if x.shape[0] > max_tokens:
+        stride = max(1, x.shape[0] // max_tokens)
+        x = x[::stride][:max_tokens]
+    if x.shape[0] < 2:
+        return feats.new_zeros((), dtype=torch.float32)
+
+    x_centered = x - x.mean(dim=0, keepdim=True)
+    loss = feats.new_zeros((), dtype=torch.float32)
+    if float(var_weight) > 0.0:
+        std = torch.sqrt(x_centered.var(dim=0, unbiased=False) + 1e-4)
+        var_loss = F.relu(float(gamma) - std).mean()
+        loss = loss + float(var_weight) * var_loss
+    if float(cov_weight) > 0.0:
+        cov = (x_centered.transpose(0, 1) @ x_centered) / float(max(1, x_centered.shape[0] - 1))
+        off_diag = cov - torch.diag(torch.diag(cov))
+        cov_loss = (off_diag * off_diag).sum() / float(max(1, D))
+        loss = loss + float(cov_weight) * cov_loss
+    return loss
+
+
+@torch.no_grad()
+def compute_effective_rank_stats(feats: torch.Tensor, max_tokens: int = 256) -> Dict[str, float]:
+    """Compute effective rank, mean channel std, and mean off-diagonal cosine on ``(B, K, D)``."""
+    x = feats[0].float()
+    if x.shape[0] > max_tokens:
+        idx = torch.linspace(0, x.shape[0] - 1, max_tokens, device=x.device).long()
+        x = x.index_select(0, idx)
+    if x.shape[0] < 2:
+        return {"erank": 0.0, "tok_std": 0.0, "within_cos": 0.0}
+    tok_std = float(x.std(dim=0).mean().item())
+    xn = F.normalize(x, dim=-1, eps=1e-6)
+    cos_m = xn @ xn.transpose(0, 1)
+    n = x.shape[0]
+    within_cos = float(((cos_m.sum() - cos_m.trace()) / float(n * (n - 1))).item())
+    xc = x - x.mean(dim=0, keepdim=True)
+    s = torch.linalg.svdvals(xc)
+    pr = (s * s) / ((s * s).sum() + 1e-12)
+    erank = float(math.exp(float(-(pr * (pr + 1e-12).log()).sum().item())))
+    return {"erank": erank, "tok_std": tok_std, "within_cos": within_cos}
+
+
 def compute_vjepa21_losses(
     pred_levels: Tuple[torch.Tensor, torch.Tensor, torch.Tensor],
     target_levels: Tuple[torch.Tensor, torch.Tensor, torch.Tensor],
@@ -801,8 +857,12 @@ def compute_vjepa21_losses(
     gram_max_tokens: int = 512,
     stroke_hog_weight: float = 0.25,
     router_cons_weight: float = 0.2,
+    vicreg_var_weight: float = 0.0,
+    vicreg_cov_weight: float = 0.0,
+    mem_post_merger_student: Optional[torch.Tensor] = None,
+    router_loss_mode: str = "bce",
 ) -> Dict[str, torch.Tensor]:
-    """Compute combined V-JEPA 2.1 DeepStack + Gram Anchoring + Stroke-HOG + Router loss."""
+    """Compute combined V-JEPA 2.1 DeepStack + Gram Anchoring + Stroke-HOG + VICReg + Router loss."""
     k_kept = kept_idx.shape[1]
     masked_kept = torch.gather(grid_mask.flatten(1), 1, kept_idx)           # (B, k_kept) bool
     visible_kept = ~masked_kept
@@ -867,15 +927,41 @@ def compute_vjepa21_losses(
     if float(router_cons_weight) > 0.0:
         tgt_prob = torch.sigmoid(sal_logits_teacher.detach().float())
         bce_map = F.binary_cross_entropy_with_logits(sal_logits_student.float(), tgt_prob, reduction="none")
-        router_loss = (bce_map * up_f).sum() / up_f.sum().clamp(min=1e-6)
+        if router_loss_mode == "kl":
+            p_clamped = tgt_prob.clamp(1e-6, 1.0 - 1e-6)
+            entropy_map = -(p_clamped * torch.log(p_clamped) + (1.0 - p_clamped) * torch.log(1.0 - p_clamped))
+            kl_map = (bce_map - entropy_map).clamp(min=0.0)
+            router_loss = (kl_map * up_f).sum() / up_f.sum().clamp(min=1e-6)
+        else:
+            router_loss = (bce_map * up_f).sum() / up_f.sum().clamp(min=1e-6)
     else:
         router_loss = jepa_total.new_zeros((), dtype=torch.float32)
+
+    # 5. Optional VICReg anti-collapse regularization on post-merger (pre-pos2d) and final tokens
+    if float(vicreg_var_weight) > 0.0 or float(vicreg_cov_weight) > 0.0:
+        vicreg_final = compute_vicreg_loss(
+            mem_final_student[:, :k_kept, :],
+            var_weight=vicreg_var_weight,
+            cov_weight=vicreg_cov_weight,
+        )
+        if mem_post_merger_student is not None:
+            vicreg_post = compute_vicreg_loss(
+                mem_post_merger_student[:, :k_kept, :],
+                var_weight=vicreg_var_weight,
+                cov_weight=vicreg_cov_weight,
+            )
+            vicreg_loss = 0.5 * (vicreg_post + vicreg_final)
+        else:
+            vicreg_loss = vicreg_final
+    else:
+        vicreg_loss = jepa_total.new_zeros((), dtype=torch.float32)
 
     total_loss = (
         jepa_total
         + float(gram_weight) * gram_loss
         + float(stroke_hog_weight) * stroke_hog_loss
         + float(router_cons_weight) * router_loss
+        + vicreg_loss
     )
     masked_ink_frac = (is_ink & masked_kept).sum().float() / is_ink.sum().float().clamp(min=1.0)
 
@@ -887,6 +973,7 @@ def compute_vjepa21_losses(
         "gram": gram_loss,
         "stroke_hog": stroke_hog_loss,
         "router_loss": router_loss,
+        "vicreg_loss": vicreg_loss,
         "masked_ink_frac": masked_ink_frac,
     }
 
@@ -1091,8 +1178,12 @@ def vjepa21_forward_loss(
     gram_max_tokens: int = 512,
     stroke_hog_weight: float = 0.25,
     router_cons_weight: float = 0.2,
-) -> Dict[str, torch.Tensor]:
-    """Run one full V-JEPA 2.1 + Gram Anchoring + Stroke-HOG forward pass and return loss dict."""
+    vicreg_var_weight: float = 0.0,
+    vicreg_cov_weight: float = 0.0,
+    router_loss_mode: str = "bce",
+    compute_rank_stats: bool = False,
+) -> Dict[str, Any]:
+    """Run one full V-JEPA 2.1 + Gram Anchoring + Stroke-HOG + VICReg forward pass and return loss dict."""
     amp_ctx = (
         torch.amp.autocast(device_type=device_type, dtype=torch.bfloat16)
         if use_bf16
@@ -1140,7 +1231,7 @@ def vjepa21_forward_loss(
         hog_pred = stroke_hog_head(p2)
         hog_target = compute_sobel_hog_target(images, target_hw=(p2.shape[2], p2.shape[3]), n_bins=8)
 
-        losses = compute_vjepa21_losses(
+        losses: Dict[str, Any] = compute_vjepa21_losses(
             pred_levels=pred_levels,
             target_levels=target_levels,
             mem_final_student=mem_levels_s[2],
@@ -1160,7 +1251,19 @@ def vjepa21_forward_loss(
             gram_max_tokens=gram_max_tokens,
             stroke_hog_weight=stroke_hog_weight,
             router_cons_weight=router_cons_weight,
+            vicreg_var_weight=vicreg_var_weight,
+            vicreg_cov_weight=vicreg_cov_weight,
+            mem_post_merger_student=mem_levels_s[0],
+            router_loss_mode=router_loss_mode,
         )
+        if compute_rank_stats:
+            k_kept = kept_idx.shape[1]
+            post_stats = compute_effective_rank_stats(target_levels[0][:, :k_kept, :])
+            final_stats = compute_effective_rank_stats(target_levels[2][:, :k_kept, :])
+            losses["post_erank"] = post_stats["erank"]
+            losses["mem_erank"] = final_stats["erank"]
+            losses["tok_std"] = final_stats["tok_std"]
+            losses["within_cos"] = final_stats["within_cos"]
     return losses
 
 
@@ -1295,12 +1398,20 @@ def run_pretrain(args: argparse.Namespace) -> Dict[str, Any]:
     last_autosave_t = time.monotonic()
     autosave_interval_s = max(0.0, float(args.save_every_minutes) * 60.0)
 
+    effective_gram_weight = 0.0 if (getattr(args, "disable_random_gram", False) and not args.init_from) else float(args.gram_weight)
+    vicreg_var_w = float(getattr(args, "vicreg_var_weight", 0.0))
+    vicreg_cov_w = float(getattr(args, "vicreg_cov_weight", 0.0))
+    router_loss_mode = str(getattr(args, "router_loss_mode", "bce"))
+    if getattr(args, "disable_random_gram", False) and not args.init_from and float(args.gram_weight) > 0.0:
+        print("[V-JEPA2.1 cfg] --disable-random-gram active with no --init-from: setting gram_weight=0.0", flush=True)
+
     try:
         for step in range(1, args.steps + 1):
             lr_mult = cosine_lr_mult(step - 1, args.steps, warmup_steps=warmup_steps)
             opt.set_lr_mult(lr_mult)
             opt.zero_grad(set_to_none=True)
 
+            is_log_step = (step == 1 or step % args.log_every == 0 or step == args.steps)
             acc = {
                 "loss": 0.0,
                 "jepa_masked": 0.0,
@@ -1309,11 +1420,13 @@ def run_pretrain(args: argparse.Namespace) -> Dict[str, Any]:
                 "gram": 0.0,
                 "stroke_hog": 0.0,
                 "router_loss": 0.0,
+                "vicreg_loss": 0.0,
                 "masked_ink_frac": 0.0,
             }
+            rank_stats: Dict[str, float] = {}
             valid_micros = 0
 
-            for _ in range(args.grad_accum):
+            for micro_idx in range(args.grad_accum):
                 batch_cpu = next(loader)
                 images = batch_cpu.to(device, non_blocking=(device.type == "cuda"))
                 try:
@@ -1330,10 +1443,14 @@ def run_pretrain(args: argparse.Namespace) -> Dict[str, Any]:
                         level_weights=level_weights,
                         masked_weight=args.masked_weight,
                         visible_weight=args.visible_weight,
-                        gram_weight=args.gram_weight,
+                        gram_weight=effective_gram_weight,
                         gram_max_tokens=args.gram_max_tokens,
                         stroke_hog_weight=args.stroke_hog_weight,
                         router_cons_weight=args.router_cons_weight,
+                        vicreg_var_weight=vicreg_var_w,
+                        vicreg_cov_weight=vicreg_cov_w,
+                        router_loss_mode=router_loss_mode,
+                        compute_rank_stats=(is_log_step and micro_idx == 0),
                     )
                     scaled_loss = losses["loss"] / float(args.grad_accum)
                     if not torch.isfinite(scaled_loss):
@@ -1342,6 +1459,13 @@ def run_pretrain(args: argparse.Namespace) -> Dict[str, Any]:
                     scaled_loss.backward()
                     for k in acc:
                         acc[k] += float(losses[k].detach().item())
+                    if "mem_erank" in losses:
+                        rank_stats = {
+                            "post_erank": round(float(losses["post_erank"]), 2),
+                            "mem_erank": round(float(losses["mem_erank"]), 2),
+                            "tok_std": round(float(losses["tok_std"]), 4),
+                            "within_cos": round(float(losses["within_cos"]), 4),
+                        }
                     valid_micros += 1
                 except RuntimeError as exc:
                     if "out of memory" in str(exc).lower():
@@ -1387,20 +1511,27 @@ def run_pretrain(args: argparse.Namespace) -> Dict[str, Any]:
                     "gram": round(avg["gram"], 5),
                     "stroke_hog": round(avg["stroke_hog"], 5),
                     "router_loss": round(avg["router_loss"], 5),
+                    "vicreg_loss": round(avg["vicreg_loss"], 5),
                     "masked_ink_frac": round(avg["masked_ink_frac"], 3),
                     "lr_mult": round(lr_mult, 5),
                     "ema_decay": round(ema_decay, 5),
                     "vram_gb": round(vram_gb, 2),
                     "steps_per_sec": round(sps, 2),
                     "oom_skips": oom_skips,
+                    **rank_stats,
                 }
                 history.append(rec)
+                erank_str = (
+                    f" erank={rank_stats['post_erank']:.1f}/{rank_stats['mem_erank']:.1f} std={rank_stats['tok_std']:.3f}"
+                    if rank_stats
+                    else ""
+                )
                 print(
                     f"[V-JEPA2.1 step {step:5d}/{args.steps}] "
                     f"loss={avg['loss']:.4f} (ema={ema_loss_track:.4f}) "
                     f"m={avg['jepa_masked']:.4f} v={avg['jepa_visible']:.4f} "
                     f"deep={avg['deep_sup']:.4f} gram={avg['gram']:.4f} "
-                    f"hog={avg['stroke_hog']:.4f} mask_ink={avg['masked_ink_frac']:.2f} "
+                    f"hog={avg['stroke_hog']:.4f} vic={avg['vicreg_loss']:.4f} mask_ink={avg['masked_ink_frac']:.2f}{erank_str} "
                     f"decay={ema_decay:.4f} vram={vram_gb:.2f}GB ({sps:.2f} it/s)",
                     flush=True,
                 )
@@ -1494,7 +1625,11 @@ def build_argparser() -> argparse.ArgumentParser:
     p.add_argument("--gram-weight", type=float, default=1.0, help="DINOv3 Gram anchoring loss weight (default: 1.0)")
     p.add_argument("--gram-max-tokens", type=int, default=512, help="Max subsampled ink tokens for Gram matrix (default: 512)")
     p.add_argument("--stroke-hog-weight", type=float, default=0.25, help="Sobel-HOG stroke reconstruction weight (default: 0.25)")
-    p.add_argument("--router-cons-weight", type=float, default=0.2, help="Unmasked paper router saliency BCE weight (default: 0.2)")
+    p.add_argument("--router-cons-weight", type=float, default=0.2, help="Unmasked paper router saliency consistency weight (default: 0.2)")
+    p.add_argument("--router-loss-mode", type=str, choices=("bce", "kl"), default="bce", help="Router consistency loss: bce (legacy) or kl (zero-floor KL divergence)")
+    p.add_argument("--vicreg-var-weight", type=float, default=0.0, help="VICReg variance anti-collapse weight on post-merger & final tokens (default: 0.0; recommended 1.0)")
+    p.add_argument("--vicreg-cov-weight", type=float, default=0.0, help="VICReg off-diagonal covariance penalty weight (default: 0.0; recommended 0.04)")
+    p.add_argument("--disable-random-gram", action="store_true", help="Automatically disable Gram anchoring when --init-from is None (prevents anchoring to random-init collapsed Gram)")
     p.add_argument("--bf16", action="store_true", help="Enable bfloat16 autocast")
     p.add_argument("--channels-last", action="store_true", help="Use NHWC channels_last for ConvBackbone")
     p.add_argument("--grad-checkpoint", dest="grad_checkpoint", action="store_true", default=None)

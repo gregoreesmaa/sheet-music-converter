@@ -29,7 +29,8 @@ experiments/
 |---|---|---|---|---|
 | 0 | [2026-11-26T00-26-iter10-5-v1-redteam-fixes](./2026-11-26T00-26-iter10-5-v1-redteam-fixes/) | Local RTX 4080 SUPER | Active | `RUNNING` (`task-1383`, 8k steps) |
 | 1 | `cut-rism-real-ink-v06` (`train_cut_rism.py` + translate `hw-sim-v06`) | Kaggle `2× T4` (FP16) | Wave 1 | `QUEUED` (waiting on HF shards) |
-| 2 | `vjepa21-gram-rism-v2-small45m` (`pretrain_ijepa_rism_v2.py`, 2k steps) | Modal `L4` (BF16) | Wave 1 | `QUEUED` (waiting on HF shards) |
+| 2 | [2026-11-26T00-54-vjepa21-gram-rism-v2](./2026-11-26T00-54-vjepa21-gram-rism-v2/OUTCOME.md) (`pretrain_ijepa_rism_v2.py`, 1.5k steps) | Modal `L4` (BF16) | Wave 1 | `COMPLETED (ITERATE)` — rank collapse (`mem_erank=2.6`); DO NOT warm-start Iter 11 |
+| 2b | [2026-11-26T02-20-vjepa21-vicreg-anticollapse-rism-v2](./2026-11-26T02-20-vjepa21-vicreg-anticollapse-rism-v2/) (`VICReg + KL-router + no-random-gram` + `suite31_hw` transfer) | Colab `L4` (BF16) | Wave 7 | `QUEUED` (successor to Exp 2) |
 | 3 | [2026-11-26T00-54-ablation-vir-vico-router](./2026-11-26T00-54-ablation-vir-vico-router/) (`ViRTwoTierRouter+ViCO` vs `InkTokenRouterV2`) | Modal `2× L4` (BF16) | Wave 1 | `COMPLETED` (`ITERATE` — Keep `InkTokenRouterV2` for Iter 11; successor [`2026-11-26T02-18-ablation-vir-router-bucket-parity`](./2026-11-26T02-18-ablation-vir-router-bucket-parity/) queued) |
 | 4 | `ablation-muon-vs-adamw-v2` (`Muon+AdamW` vs `AdamW` on `v2`) | Modal `L4` (BF16) | Wave 1 | `QUEUED` (waiting on HF shards) |
 | 5 | `ablation-unlabeled-rism-rlvr` (`rlvr_grpo.py` on Iter-10 `soup`) | Modal `L4` (BF16) | Wave 1 | `QUEUED` (waiting on HF shards) |

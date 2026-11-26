@@ -436,5 +436,20 @@
     "depends_on": [
       "2026-11-26T01-30-academic-dual-verifier-rlvr-ttc"
     ]
+  },
+  {
+    "id": "2026-11-26T02-20-vjepa21-vicreg-anticollapse-rism-v2",
+    "wave": 7,
+    "priority": 31,
+    "provider": "colab_l4",
+    "gpu": "L4",
+    "est_minutes": 45,
+    "est_cu": 3.6,
+    "script": "experiments/2026-11-26T02-20-vjepa21-vicreg-anticollapse-rism-v2/run_colab.py",
+    "hf_eval_target": "evals/2026-11-26T02-20-vjepa21-vicreg-anticollapse-rism-v2.json",
+    "status": "QUEUED",
+    "depends_on": [
+      "2026-11-26T00-54-vjepa21-gram-rism-v2"
+    ]
   }
 ]
