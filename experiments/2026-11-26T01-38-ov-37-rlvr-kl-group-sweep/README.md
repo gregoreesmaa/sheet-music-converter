@@ -1,6 +1,6 @@
 # `2026-11-26T01-38-ov-37-rlvr-kl-group-sweep` — Beat-Conservation + `<sys>`-Loop RLVR `kl_beta` × Group Size (`G`) Sweep
 
-- **Status:** `QUEUED` (Overnight Batch 09, Wave 7 — Google Colab `NVIDIA L4`, `cc=8.9`, BF16)
+- **Status:** `COMPLETED (ITERATE)` — Executed on Kaggle `2× T4` (`78.5 min`, FP32). Winner `kl0.06_G8` (`hw_photo +0.0301`, `hw_clean +0.0035`, `printed_clean -0.0008`, checkpoint uploaded to HF) & balanced runner-up `kl0.15_G4` (`hw_clean +0.0178`, `hw_photo +0.0130`, `KL=0.0574`). Successor [`2026-11-26T04-02-ov-37b-rlvr-scale200-len512-eval3840`](../2026-11-26T04-02-ov-37b-rlvr-scale200-len512-eval3840/README.md) queued.
 - **Baseline:** Commit `164852f` | Checkpoint: HF `checkpoints/iter10_soup_baseline/uni_omr_soup.pt` (`hw_clean 0.2550`, `hw_photo 0.1516`, `printed_clean 0.8895`, `printed_photo 0.8738`, `all45_clean 0.6921`)
 - **Single Variable Tested:** 2D sweep of label-free GRPO RLVR (`tmp-train/mvd/rlvr_grpo.py`) regularization strength `kl_beta` ∈ `{0.02, 0.06, 0.15}` × rollout group size `G` ∈ `{4, 8}` (6 arms) on unlabeled real historical RISM manuscripts (`datasets/rism_hw_5707.tar`), measuring `suite31_hw` HW Note F1 / beat-conservation gains vs printed retention.
 
@@ -12,6 +12,6 @@ Label-free structural-validity RLVR (`compute_unlabeled_structural_reward`: FSA 
 ## Quick Links
 - Execution Plan, Hyperparameters & Decision Tree: [PLAN.md](./PLAN.md)
 - Standalone Colab L4 Runner: [run_colab.py](./run_colab.py)
-- Outcome: `OUTCOME.md` *(to be written immediately once Colab run completes)*
+- Outcome: [OUTCOME.md](./OUTCOME.md) (`COMPLETED — ITERATE`)
 - Hugging Face Eval Target: `gregoreesmaa/sheet-music-converter-omr` → `evals/2026-11-26T01-38-ov-37-rlvr-kl-group-sweep.json`
 - Hugging Face Run Ledger: `gregoreesmaa/sheet-music-converter-omr` → `runs/2026-11-26T01-38-ov-37-rlvr-kl-group-sweep.json`

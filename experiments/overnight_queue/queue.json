@@ -125,14 +125,19 @@
     "id": "2026-11-26T01-38-ov-21-paper-gate-border-threshold",
     "wave": 5,
     "priority": 9,
-    "provider": "colab_l4",
-    "gpu": "L4",
+    "provider": "kaggle",
+    "gpu": "2xT4",
     "est_minutes": 20,
     "est_cu": 1.7,
     "script": "experiments/2026-11-26T01-38-ov-21-paper-gate-border-threshold/run_colab.py",
     "hf_eval_target": "evals/2026-11-26T01-38-ov-21-paper-gate-border-threshold.json",
-    "status": "QUEUED",
-    "depends_on": []
+    "status": "FAILED",
+    "depends_on": [],
+    "kernel_id": "gregoreesmaa/omr-ov-21",
+    "completed_at": "2026-11-26T01:54:57Z",
+    "elapsed_sec": 5756.67,
+    "returncode": 1,
+    "failure_reason": "kaggle_state=ERROR hf_eval_exists=False"
   },
   {
     "id": "2026-11-26T01-38-ov-19-router-saliency-keep-sweep",
@@ -309,14 +314,17 @@
     "id": "2026-11-26T01-38-ov-37-rlvr-kl-group-sweep",
     "wave": 7,
     "priority": 23,
-    "provider": "colab_l4",
-    "gpu": "L4",
+    "provider": "kaggle",
+    "gpu": "2xT4",
     "est_minutes": 35,
     "est_cu": 2.8,
     "script": "experiments/2026-11-26T01-38-ov-37-rlvr-kl-group-sweep/run_colab.py",
     "hf_eval_target": "evals/2026-11-26T01-38-ov-37-rlvr-kl-group-sweep.json",
-    "status": "QUEUED",
-    "depends_on": []
+    "status": "COMPLETED",
+    "depends_on": [],
+    "completed_at": "2026-11-26T01:31:52Z",
+    "elapsed_sec": 4709.81,
+    "returncode": 0
   },
   {
     "id": "2026-11-26T01-38-ov-39-rism-pseudolabel-threshold-sweep",
@@ -328,8 +336,15 @@
     "est_cu": 2.8,
     "script": "experiments/2026-11-26T01-38-ov-39-rism-pseudolabel-threshold-sweep/run_colab.py",
     "hf_eval_target": "evals/2026-11-26T01-38-ov-39-rism-pseudolabel-threshold-sweep.json",
-    "status": "QUEUED",
-    "depends_on": []
+    "status": "COMPLETED",
+    "depends_on": [],
+    "completed_at": "2026-11-26T01:53:05Z",
+    "started_at": "2026-11-26T00:13:20Z",
+    "elapsed_sec": 5984.98,
+    "returncode": 0,
+    "verdict": "PROMOTE",
+    "best_arm_id": "lp-0.35_beat0.70",
+    "best_hw_avg_delta": 0.023553
   },
   {
     "id": "2026-11-26T01-38-ov-31-vjepa21-mask-ratio-sweep",
@@ -456,6 +471,21 @@
     "status": "QUEUED",
     "depends_on": [
       "2026-11-26T00-54-ablation-muon-vs-adamw"
+    ]
+  },
+  {
+    "id": "2026-11-26T04-02-ov-37b-rlvr-scale200-len512-eval3840",
+    "wave": 7,
+    "priority": 23,
+    "provider": "colab_l4",
+    "gpu": "L4",
+    "est_minutes": 40,
+    "est_cu": 3.2,
+    "script": "experiments/2026-11-26T04-02-ov-37b-rlvr-scale200-len512-eval3840/run_colab.py",
+    "hf_eval_target": "evals/2026-11-26T04-02-ov-37b-rlvr-scale200-len512-eval3840.json",
+    "status": "QUEUED",
+    "depends_on": [
+      "2026-11-26T01-38-ov-37-rlvr-kl-group-sweep"
     ]
   }
 ]

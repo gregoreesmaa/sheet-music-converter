@@ -112,3 +112,5 @@ Place this alongside your entrypoint script (e.g. `train_kaggle.py`) inside `<ke
 - **2026-11-26 (GPU slot limit returns `rc=0` on `kernels push`):**
   - When both concurrent free-tier GPU slots are already occupied, `kaggle kernels push` exits with **`rc=0`** and prints `Kernel push error: Maximum batch GPU session count of 2 reached.` to stdout (no non-zero exit code).
   - Always inspect stdout for `"Maximum batch GPU session count"` and treat it as a transient `[WAIT-SLOT]` (sleep 60s & retry) rather than a hard failure, and never rely solely on `rc == 0` to assume a push succeeded.
+- **2026-11-26 (`ov-37` T4 silent FP32 fallback when gating on `cc[0] >= 8`):**
+  - Scripts ported from Colab L4 that only write `use_bf16 = bool(cc[0] >= 8)` without an `elif` branch for `FP16 + torch.amp.GradScaler` silently run in **pure FP32** on Kaggle T4 (`cc=7.5`), ~2.2× slower (`78.5 min` vs `~35 min`) while leaving GPU 1 idle. Always provide an explicit `amp_dtype = torch.bfloat16 if cc[0] >= 8 else torch.float16` + `GradScaler(enabled=(amp_dtype == torch.float16))` path so T4 runs get Tensor Core speed without NaNs.
