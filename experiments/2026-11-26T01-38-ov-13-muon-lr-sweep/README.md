@@ -1,7 +1,7 @@
 ---
 id: 2026-11-26T01-38-ov-13-muon-lr-sweep
 title: "Overnight Exp 13: Muon+AdamW Peak LR Sweep on UniOMR v2 small_45m"
-status: QUEUED
+status: COMPLETED (ITERATE)
 wave: 4
 priority: 1
 provider: colab_l4
@@ -13,7 +13,7 @@ baseline_sha: 164852f
 
 # `2026-11-26T01-38-ov-13-muon-lr-sweep` — Muon+AdamW Peak LR Sweep (`UniOMR v2 small_45m`)
 
-- **Status:** `QUEUED` (Wave 4 overnight batch 01, Google Colab `L4`)
+- **Status:** `COMPLETED (ITERATE)` — `lr_5p0e-4` won monotonically at upper boundary (`EMA val_ce -0.1106`, `EMA token_f1 +0.0690`, lower `grad_norm_p95=3.66`), but with `61.8%` EMA init lag and coupled-AdamW RAW greedy-decode jitter (`RAW token_f1 0.1670`); successor [`2026-11-26T03-31-exp4b-decoupled-muon-lr-sweep`](../2026-11-26T03-31-exp4b-decoupled-muon-lr-sweep/PLAN.md) queued
 - **Baseline Commit SHA:** `164852f`
 - **Model:** `UniOMR v2 small_45m` (`~43M` params, `bf16`, `fullpage_max_dim=1280`)
 - **Dataset (100% permissive):** `gregoreesmaa/sheet-music-converter-omr` → `datasets/iter10_5_proxy_2k.tar` (`2,000` train + `64` val full pages, zero `CC-BY-NC`, zero `suite31_hw` overlap)
@@ -42,6 +42,6 @@ baseline_sha: 164852f
 
 - Plan & Copy-Paste Launch Commands: [PLAN.md](./PLAN.md)
 - Colab Runner: [run_colab.py](./run_colab.py)
-- Outcome: `OUTCOME.md` *(written after HF eval JSON is retrieved)*
+- Outcome: [OUTCOME.md](./OUTCOME.md) (`ITERATE` → successor [`2026-11-26T03-31-exp4b-decoupled-muon-lr-sweep`](../2026-11-26T03-31-exp4b-decoupled-muon-lr-sweep/PLAN.md))
 - HF Eval JSON: `gregoreesmaa/sheet-music-converter-omr` → `evals/2026-11-26T01-38-ov-13-muon-lr-sweep.json`
 - HF Run Ledger: `gregoreesmaa/sheet-music-converter-omr` → `runs/2026-11-26T01-38-ov-13-muon-lr-sweep.json`

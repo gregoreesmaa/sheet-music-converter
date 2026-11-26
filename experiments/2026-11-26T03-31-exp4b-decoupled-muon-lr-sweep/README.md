@@ -1,7 +1,7 @@
 # `2026-11-26T03-31-exp4b-decoupled-muon-lr-sweep` — Decoupled `--muon-lr` Sweep with Un-Lagged EMA on `UniOMR v2 small_45m`
 
-- **Status:** `QUEUED` (Colab `L4`, Wave 4, `depends_on: ["2026-11-26T00-54-ablation-muon-vs-adamw"]`)
-- **Predecessor:** [`2026-11-26T00-54-ablation-muon-vs-adamw`](../2026-11-26T00-54-ablation-muon-vs-adamw/OUTCOME.md) (`ITERATE`)
+- **Status:** `QUEUED` (Colab `L4`, Wave 4, `depends_on: ["2026-11-26T00-54-ablation-muon-vs-adamw", "2026-11-26T01-38-ov-13-muon-lr-sweep"]`)
+- **Predecessors:** [`2026-11-26T00-54-ablation-muon-vs-adamw`](../2026-11-26T00-54-ablation-muon-vs-adamw/OUTCOME.md) (`ITERATE`), [`2026-11-26T01-38-ov-13-muon-lr-sweep`](../2026-11-26T01-38-ov-13-muon-lr-sweep/OUTCOME.md) (`ITERATE`)
 - **Baseline Commit SHA:** `9d3f4c3`
 - **Model:** `UniOMR v2 small_45m` (`~41.3M` params)
 - **Dataset:** `gregoreesmaa/sheet-music-converter-omr` → `datasets/iter10_5_proxy_2k.tar` (`2,000` train / `64` val full pages, 100% permissive)
