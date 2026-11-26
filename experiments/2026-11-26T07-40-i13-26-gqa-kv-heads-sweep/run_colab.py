@@ -283,7 +283,17 @@ def _run_arm(
     args = parser.parse_args(argv)
     args.multi_scale = False
 
-    val_pairs = uni_omr.discover_fullpage_pairs([], manifest=str(val_manifest))
+    val_pairs = []
+    for _raw_line in Path(val_manifest).read_text(encoding="utf-8").splitlines():
+        _raw_line = _raw_line.strip()
+        if not _raw_line:
+            continue
+        _rec = json.loads(_raw_line)
+        _img_p = Path(_rec["image"])
+        _beks = [Path(b) for b in _rec.get("bekerns", [])]
+        _dom = str(_rec.get("domain", "")).strip().lower()
+        if _img_p.is_file() and _beks:
+            val_pairs.append((_img_p, _beks, _dom))
     orig_split = train_uni_v2.split_train_val
     orig_build_cfg = train_uni_v2.build_v2_config
 

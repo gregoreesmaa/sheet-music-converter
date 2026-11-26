@@ -934,20 +934,21 @@ class TestUniOMR(unittest.TestCase):
         self.assertEqual(aug_a.size, base.size)
         np.testing.assert_array_equal(np.asarray(aug_a), np.asarray(aug_b))
 
-        # Across 30 deterministic seeds, verify dark-border framing & 1-bit scanner variants occur
+        # Across 30 deterministic seeds, verify dark-border framing & high-contrast 1-bit variants occur
         saw_dark_corner = False
-        saw_binary = False
+        saw_high_contrast = False
         for s in range(30):
             im = uni_omr.apply_online_augment(base, rng=_py_random.Random(100 + s))
             self.assertEqual(im.size, base.size)
             a = np.asarray(im)
-            if int(a[0, 0].mean()) < 80:
+            if int(a[0, 0].mean()) < 95:
                 saw_dark_corner = True
-            uniq = np.unique(a)
-            if len(uniq) <= 2 and set(uniq.tolist()).issubset({0, 255}):
-                saw_binary = True
+            # 1-bit thresholded variants preserve strong ink/paper contrast even after geometry/lighting
+            interior = a[48:-48, 36:-36]
+            if int(interior.max()) - int(interior.min()) >= 160:
+                saw_high_contrast = True
         self.assertTrue(saw_dark_corner, "Expected dark desk border framing across 30 seeds")
-        self.assertTrue(saw_binary, "Expected 1-bit scanner threshold variant across 30 seeds")
+        self.assertTrue(saw_high_contrast, "Expected crisp high-contrast 1-bit/scanner variants across 30 seeds")
 
         # 2. Verify --reset-router resets saliency_net & ink_prior_scale while preserving backbone/decoder,
         #    and --fullpage-frac controls mixed curriculum split.
@@ -1750,9 +1751,11 @@ class TestUniOMR(unittest.TestCase):
         np.testing.assert_array_equal(np.asarray(sn1), np.asarray(sn2))
         self.assertFalse(np.array_equal(np.asarray(sn1), arr))
 
-        # Gated off below 1280px; active on >= 1280px
+        # Iter-13: >=1280px gate removed; active on both small (<1280px) and large (>=1280px) images
         lr_small = uni_omr._apply_hw_lowres_defocus_compress(base, _py_random.Random(99))
-        np.testing.assert_array_equal(np.asarray(lr_small), arr)
+        self.assertEqual(lr_small.size, base.size)
+        self.assertFalse(np.array_equal(np.asarray(lr_small), arr))
+        self.assertGreater(float(np.asarray(lr_small).min()), 30.0)
 
         arr_hi = np.full((1280, 960, 3), 248, dtype=np.uint8)
         arr_hi[120:1160:24, 60:900, :] = 20
@@ -2292,6 +2295,325 @@ class TestUniOMR(unittest.TestCase):
         np.testing.assert_array_equal(
             np.asarray(uni_omr._apply_archival_verse_block(inked, _py_random.Random(1), (60, 50, 40))), inked_arr
         )
+
+    def test_zl_iter13_online_augment_fixes_and_primitives(self) -> None:
+        """(zl) Iter-13: archival/1-bit no early-return, 4 new fast primitives, <1280px low-res, and speed."""
+        import random as _py_random
+        import statistics as _stats
+        import time as _time
+        from unittest import mock
+
+        # Clean synthetic page with clear horizontal staves & vertical barlines to detect geometry warps
+        arr_rgb = np.full((384, 288, 3), 248, dtype=np.uint8)
+        for sy in (90, 100, 110, 120, 130, 230, 240, 250, 260, 270):
+            arr_rgb[sy : sy + 2, 32:256, :] = 18
+        for bx in (32, 144, 254):
+            arr_rgb[90:132, bx : bx + 2, :] = 18
+            arr_rgb[230:272, bx : bx + 2, :] = 18
+        base_rgb = Image.fromarray(arr_rgb, mode="RGB")
+        base_gray = base_rgb.convert("L")
+
+        # 1. All 4 new primitives run cleanly on BOTH grayscale ("L") and RGB ("RGB"), preserve shape/dtype/mode,
+        #    stay in [0, 255], are deterministic, modify pixels, and fall back cleanly when _cv2 is None.
+        primitives = (
+            uni_omr._apply_page_curl,
+            uni_omr._apply_cast_shadow,
+            uni_omr._apply_specular_glare,
+            uni_omr._apply_thin_ink_dropout,
+        )
+        for fn in primitives:
+            for src in (base_gray, base_rgb):
+                src_arr = np.asarray(src)
+                o1 = fn(src, _py_random.Random(42))
+                o2 = fn(src, _py_random.Random(42))
+                self.assertEqual(o1.size, src.size, f"{fn.__name__} size mismatch ({src.mode})")
+                self.assertEqual(o1.mode, src.mode, f"{fn.__name__} mode mismatch ({src.mode})")
+                a1 = np.asarray(o1)
+                self.assertEqual(a1.shape, src_arr.shape)
+                self.assertEqual(a1.dtype, np.uint8)
+                self.assertGreaterEqual(int(a1.min()), 0)
+                self.assertLessEqual(int(a1.max()), 255)
+                np.testing.assert_array_equal(a1, np.asarray(o2))
+                self.assertFalse(np.array_equal(a1, src_arr), f"{fn.__name__} was a no-op on {src.mode}")
+
+            # Graceful PIL/NumPy fallback when _cv2 is None
+            with mock.patch.object(uni_omr, "_cv2", None):
+                for src in (base_gray, base_rgb):
+                    fb = fn(src, _py_random.Random(42))
+                    self.assertEqual(fb.size, src.size)
+                    self.assertEqual(fb.mode, src.mode)
+                    fb_a = np.asarray(fb)
+                    self.assertEqual(fb_a.shape, np.asarray(src).shape)
+                    self.assertEqual(fb_a.dtype, np.uint8)
+
+        # 2. _apply_hw_lowres_defocus_compress works on <1280px images (512x384, 192x800, RGB & L)
+        for (w, h) in ((512, 384), (800, 192)):
+            a_s = np.full((h, w, 3), 246, dtype=np.uint8)
+            a_s[h // 4 : (3 * h) // 4 : 16, w // 10 : (9 * w) // 10, :] = 18
+            im_s = Image.fromarray(a_s, mode="RGB")
+            lr_rgb = uni_omr._apply_hw_lowres_defocus_compress(im_s, _py_random.Random(77))
+            self.assertEqual(lr_rgb.size, (w, h))
+            self.assertEqual(lr_rgb.mode, "RGB")
+            self.assertFalse(np.array_equal(np.asarray(lr_rgb), a_s))
+            self.assertGreater(float(np.asarray(lr_rgb).min()), 25.0)
+            lr_gray = uni_omr._apply_hw_lowres_defocus_compress(im_s.convert("L"), _py_random.Random(77))
+            self.assertEqual(lr_gray.size, (w, h))
+            self.assertEqual(lr_gray.mode, "L")
+
+        # 3. do_archival (hw_archival_prob=1.0) no longer returns early:
+        #    verify dark/wood borders, non-identity geometry, and strong illumination gradients occur across seeds
+        arch_dark_borders = 0
+        arch_wood_borders = 0
+        arch_illum_grad = 0
+        arch_geo_shifted = 0
+        for s in range(40):
+            im = uni_omr.apply_online_augment(
+                base_rgb, rng=_py_random.Random(5000 + s), is_hw=True, hw_archival_prob=1.0
+            )
+            a = np.asarray(im, dtype=np.float32)
+            # Check corners for dark/wood desk border
+            corners = [a[2, 2], a[2, -3], a[-3, 2], a[-3, -3]]
+            if any(float(c.mean()) < 105.0 for c in corners):
+                arch_dark_borders += 1
+            if any(float(c[0]) > float(c[2]) + 10.0 and float(c.mean()) < 105.0 for c in corners):
+                arch_wood_borders += 1
+            # Check strong illumination gradient (left vs right or top vs bottom interior brightness diff)
+            interior = a[48:-48, 40:-40].mean(axis=-1)
+            lr_diff = abs(float(interior[:, :40].mean()) - float(interior[:, -40:].mean()))
+            tb_diff = abs(float(interior[:40, :].mean()) - float(interior[-40:, :].mean()))
+            if max(lr_diff, tb_diff) > 22.0:
+                arch_illum_grad += 1
+            # Check geometric warp: original top staff at y=90..92 becomes sloped/shifted across x
+            band_left = float(a[88:94, 48:96].mean())
+            band_right = float(a[88:94, 192:240].mean())
+            if abs(band_left - band_right) > 12.0:
+                arch_geo_shifted += 1
+        self.assertGreater(arch_dark_borders, 5, f"Archival path missing dark borders: {arch_dark_borders}/40")
+        self.assertGreater(arch_wood_borders, 0, f"Archival path missing warm wood desk borders: {arch_wood_borders}/40")
+        self.assertGreater(arch_illum_grad, 3, f"Archival path missing strong illumination gradients: {arch_illum_grad}/40")
+        self.assertGreater(arch_geo_shifted, 5, f"Archival path missing perspective/rotation warps: {arch_geo_shifted}/40")
+
+        # 4. do_1bit path (non-archival) no longer returns early:
+        #    verify 1-bit seeds also receive dark borders, geometry, and shading/blur (not pure 2-color flat return)
+        non_binary_after_1bit = 0
+        dark_border_non_arch = 0
+        for s in range(40):
+            im = uni_omr.apply_online_augment(
+                base_rgb, rng=_py_random.Random(7000 + s), is_hw=False, hw_archival_prob=0.0
+            )
+            a = np.asarray(im)
+            corners = [a[2, 2], a[2, -3], a[-3, 2], a[-3, -3]]
+            if any(float(c.mean()) < 105.0 for c in corners):
+                dark_border_non_arch += 1
+            if len(np.unique(a)) > 2:
+                non_binary_after_1bit += 1
+        self.assertGreater(dark_border_non_arch, 10, f"Non-archival path dark borders too rare: {dark_border_non_arch}/40")
+        self.assertGreater(non_binary_after_1bit, 35)
+
+        # 5. Microbenchmark 20 calls of apply_online_augment on a 1280x960 RGB page
+        arr_hi = np.full((960, 1280, 3), 246, dtype=np.uint8)
+        arr_hi[100:860:24, 80:1200, :] = 22
+        img_hi = Image.fromarray(arr_hi, mode="RGB")
+        _ = uni_omr.apply_online_augment(img_hi, rng=_py_random.Random(0), is_hw=False)
+        times_ms = []
+        for i in range(20):
+            t0 = _time.perf_counter()
+            out_hi = uni_omr.apply_online_augment(img_hi, rng=_py_random.Random(8000 + i), is_hw=(i % 2 == 0))
+            times_ms.append((_time.perf_counter() - t0) * 1000.0)
+            self.assertEqual(out_hi.size, (1280, 960))
+        med_ms = _stats.median(times_ms)
+        self.assertLess(med_ms, 60.0, f"apply_online_augment 1280x960 median too slow: {med_ms:.2f} ms")
+
+    def test_zm_rism_style_pool_fda_and_color_adain(self) -> None:
+        """(zm) i13-05 RismStylePool, apply_fda_transfer (beta=0.02), apply_color_adain, and dataset wiring."""
+        from concurrent.futures import ThreadPoolExecutor
+        import random as _py_random
+
+        with tempfile.TemporaryDirectory() as td:
+            td_path = Path(td)
+            rism_dir = td_path / "rism_hw"
+            sub_dir = rism_dir / "nested"
+            sub_dir.mkdir(parents=True)
+
+            # Create 6 synthetic warm-parchment archival reference images with brown iron-gall ink
+            for i in range(6):
+                ref = np.empty((192, 192, 3), dtype=np.uint8)
+                ref[:, :, 0] = 205 + (i % 3) * 5   # warm R
+                ref[:, :, 1] = 175 + (i % 3) * 4   # warm G
+                ref[:, :, 2] = 125 + (i % 3) * 4   # low B (amber parchment)
+                # Add brown ink strokes so std > 0
+                ref[30:160:18, 20:172, 0] = 95
+                ref[30:160:18, 20:172, 1] = 75
+                ref[30:160:18, 20:172, 2] = 52
+                out_p = (sub_dir if i >= 3 else rism_dir) / f"rism_{i}.png"
+                Image.fromarray(ref, mode="RGB").save(out_p)
+
+            # 1. RismStylePool loads cleanly, respects max_cached, is read-only & thread-safe
+            pool = uni_omr.RismStylePool(rism_dir, max_cached=4, ref_size=128, seed=42)
+            self.assertEqual(len(pool), 4)
+            self.assertTrue(bool(pool))
+            sample0 = pool.sample(_py_random.Random(7))
+            self.assertIsNotNone(sample0)
+            assert sample0 is not None
+            self.assertEqual(sample0.shape, (128, 128, 3))
+            self.assertEqual(sample0.dtype, np.uint8)
+            self.assertFalse(sample0.flags.writeable)
+
+            def _worker(tid: int) -> bool:
+                lrng = _py_random.Random(100 + tid)
+                for _ in range(25):
+                    s = pool.sample(lrng)
+                    if s is None or s.shape != (128, 128, 3) or s.dtype != np.uint8:
+                        return False
+                return True
+
+            with ThreadPoolExecutor(max_workers=4) as ex:
+                self.assertTrue(all(ex.map(_worker, range(4))))
+
+            empty_pool = uni_omr.RismStylePool(td_path / "does_not_exist")
+            self.assertEqual(len(empty_pool), 0)
+            self.assertFalse(bool(empty_pool))
+            self.assertIsNone(empty_pool.sample())
+
+            # Clean synthetic white-paper / black-ink page with sharp horizontal staves & vertical barlines
+            src = np.full((256, 320, 3), 250, dtype=np.uint8)
+            for sy in (60, 72, 84, 96, 108, 160, 172, 184, 196, 208):
+                src[sy : sy + 2, 24:296, :] = 12
+            for bx in (24, 160, 294):
+                src[60:110, bx : bx + 2, :] = 12
+                src[160:210, bx : bx + 2, :] = 12
+            src_pil = Image.fromarray(src, mode="RGB")
+
+            # Helper: vertical edge energy correlation to verify high-freq ink edges survive
+            def _edge_corr(a_u8: np.ndarray, b_u8: np.ndarray) -> float:
+                ga = np.diff(a_u8.mean(axis=2).astype(np.float32), axis=0).ravel()
+                gb = np.diff(b_u8.mean(axis=2).astype(np.float32), axis=0).ravel()
+                ga -= ga.mean()
+                gb -= gb.mean()
+                denom = float(np.linalg.norm(ga) * np.linalg.norm(gb)) + 1e-8
+                return float(np.dot(ga, gb) / denom)
+
+            # 2. apply_fda_transfer (beta=0.02): preserves shape/dtype/[0,255], shifts mean toward ref, preserves edges
+            fda_np = uni_omr.apply_fda_transfer(src, sample0, beta=0.02)
+            self.assertIsInstance(fda_np, np.ndarray)
+            self.assertEqual(fda_np.shape, src.shape)
+            self.assertEqual(fda_np.dtype, np.uint8)
+            self.assertGreaterEqual(int(fda_np.min()), 0)
+            self.assertLessEqual(int(fda_np.max()), 255)
+            ref_mean = sample0.astype(np.float32).mean(axis=(0, 1))
+            src_mean = src.astype(np.float32).mean(axis=(0, 1))
+            fda_mean = fda_np.astype(np.float32).mean(axis=(0, 1))
+            self.assertLess(
+                float(np.linalg.norm(fda_mean - ref_mean)),
+                float(np.linalg.norm(src_mean - ref_mean)),
+                f"FDA should shift low-freq mean toward ref: src={src_mean}, fda={fda_mean}, ref={ref_mean}",
+            )
+            self.assertGreater(
+                _edge_corr(src, fda_np),
+                0.85,
+                "FDA beta=0.02 should preserve sharp high-frequency ink/staff edges",
+            )
+            # PIL input returns PIL output
+            fda_pil = uni_omr.apply_fda_transfer(src_pil, sample0, beta=0.02)
+            self.assertIsInstance(fda_pil, Image.Image)
+            self.assertEqual(fda_pil.size, src_pil.size)
+            np.testing.assert_array_equal(np.asarray(fda_pil), fda_np)
+
+            # 3. apply_color_adain (alpha=0.85): preserves shape/dtype/[0,255], shifts mean/std toward ref, preserves edges
+            adain_np = uni_omr.apply_color_adain(src, sample0, alpha=0.85)
+            self.assertIsInstance(adain_np, np.ndarray)
+            self.assertEqual(adain_np.shape, src.shape)
+            self.assertEqual(adain_np.dtype, np.uint8)
+            self.assertGreaterEqual(int(adain_np.min()), 0)
+            self.assertLessEqual(int(adain_np.max()), 255)
+            adain_mean = adain_np.astype(np.float32).mean(axis=(0, 1))
+            self.assertLess(
+                float(np.linalg.norm(adain_mean - ref_mean)),
+                float(np.linalg.norm(src_mean - ref_mean)),
+                f"Color-AdaIN should shift channel mean toward ref: src={src_mean}, adain={adain_mean}, ref={ref_mean}",
+            )
+            # Warm parchment tint: R > B after transfer
+            self.assertGreater(float(adain_mean[0]), float(adain_mean[2]) + 20.0)
+            self.assertGreater(
+                _edge_corr(src, adain_np),
+                0.95,
+                "Color-AdaIN should preserve high-frequency ink/staff edges",
+            )
+            adain_pil = uni_omr.apply_color_adain(src_pil, sample0, alpha=0.85)
+            self.assertIsInstance(adain_pil, Image.Image)
+            self.assertEqual(adain_pil.size, src_pil.size)
+            np.testing.assert_array_equal(np.asarray(adain_pil), adain_np)
+
+            # 4. apply_online_augment backward compatibility (default probs=0.0 -> bit-exact) + active modes
+            aug_base = uni_omr.apply_online_augment(src_pil, rng=_py_random.Random(99), is_hw=False)
+            aug_zero = uni_omr.apply_online_augment(
+                src_pil,
+                rng=_py_random.Random(99),
+                is_hw=False,
+                rism_style_pool=pool,
+                rism_fda_prob=0.0,
+                rism_adain_prob=0.0,
+            )
+            np.testing.assert_array_equal(np.asarray(aug_base), np.asarray(aug_zero))
+
+            aug_fda = uni_omr.apply_online_augment(
+                src_pil,
+                rng=_py_random.Random(99),
+                is_hw=False,
+                rism_style_pool=pool,
+                rism_fda_prob=1.0,
+                rism_adain_prob=0.0,
+                rism_fda_beta=0.02,
+            )
+            aug_adain = uni_omr.apply_online_augment(
+                src_pil,
+                rng=_py_random.Random(99),
+                is_hw=False,
+                rism_style_pool=pool,
+                rism_fda_prob=0.0,
+                rism_adain_prob=1.0,
+            )
+            self.assertEqual(aug_fda.size, src_pil.size)
+            self.assertEqual(aug_adain.size, src_pil.size)
+            self.assertFalse(np.array_equal(np.asarray(aug_fda), np.asarray(aug_base)))
+            self.assertFalse(np.array_equal(np.asarray(aug_adain), np.asarray(aug_base)))
+
+            # 5. UniStripDataset & UniFullPageDataset accept RismStylePool cleanly
+            img_p = td_path / "synth_p1.png"
+            bek_p = td_path / "synth_p1-bekern.txt"
+            src_pil.save(img_p)
+            bek_p.write_text("clef-G-2\nquarter\nC\n4\nbar\n", encoding="utf-8")
+
+            st_ds = uni_omr.UniStripDataset(
+                [(img_p, bek_p)],
+                strip_height=64,
+                max_strip_width=160,
+                augment=True,
+                aug_prob=1.0,
+                rism_style_pool=pool,
+                rism_fda_prob=0.5,
+                rism_adain_prob=0.5,
+                rism_fda_beta=0.02,
+            )
+            st_item = st_ds[0]
+            self.assertEqual(st_item["image"].shape[0], 3)
+            self.assertGreaterEqual(float(st_item["image"].min()), 0.0)
+            self.assertLessEqual(float(st_item["image"].max()), 1.0)
+
+            fp_ds = uni_omr.UniFullPageDataset(
+                [(img_p, [bek_p], "printed"), (img_p, [bek_p], "real_hw")],
+                fullpage_max_dim=128,
+                augment=True,
+                aug_prob=1.0,
+                rism_style_pool=pool,
+                rism_fda_prob=0.5,
+                rism_adain_prob=0.5,
+                rism_fda_beta=0.02,
+            )
+            fp_pr = fp_ds[0]
+            fp_rhw = fp_ds[1]
+            self.assertEqual(fp_pr["image"].shape[0], 3)
+            self.assertEqual(fp_rhw["image"].shape[0], 3)
 
 
 if __name__ == "__main__":

@@ -688,9 +688,9 @@ def test_iter12_kernel_speedups() -> None:
     bot_d = bi.flip(dims=(2,)).cumsum(dim=2).flip(dims=(2,)) == 0
     left_d = bi.cumsum(dim=3) == 0
     right_d = bi.flip(dims=(3,)).cumsum(dim=3).flip(dims=(3,)) == 0
-    border_ref = ((top_d | bot_d | left_d | right_d) & (luma_ref < 0.30)).to(luma_ref.dtype)
+    border_ref = ((top_d | bot_d | left_d | right_d) & (luma_ref < 0.22)).to(luma_ref.dtype)
     bd_ref = torch.nn.functional.max_pool2d(
-        torch.nn.functional.max_pool2d(border_ref, (1, 33), 1, (0, 16)), (33, 1), 1, (16, 0)
+        torch.nn.functional.max_pool2d(border_ref, (1, 13), 1, (0, 6)), (13, 1), 1, (6, 0)
     )
     paper_ref = (1.0 - bd_ref).clamp(0.0, 1.0)
     paper_grid_ref = torch.nn.functional.adaptive_avg_pool2d(paper_ref, (12, 10))
@@ -729,6 +729,78 @@ def test_iter12_kernel_speedups() -> None:
     assert len(UniOMRv2Net(UniOMRv2Config.edge85m()).state_dict()) == 383
 
 
+def test_router_p10_and_paper_gate_fixes() -> None:
+    """Verify InkTokenRouterV2 p10 baseline (>50% dense ink kept), ONNX export guard, paper_gate fixes, and zero state_dict drift."""
+    torch.manual_seed(20261126)
+
+    # 1. Dense synthetic page with 70% ink coverage must keep >= 68% (not capped at <50% by median()).
+    router = InkTokenRouterV2(
+        d_model=64,
+        dynamic_routing=True,
+        min_keep_ratio=0.15,
+        max_keep_ratio=0.75,
+        saliency_thr=0.05,
+        use_ink_prior=True,
+        max_mem_tokens=3072,
+    ).eval()
+    # Zero saliency_net output so score = 0.5 * paper_gate + sigmoid(1.0) * local_ink_norm
+    with torch.no_grad():
+        for p in router.saliency_net.parameters():
+            p.zero_()
+
+    H_p, W_p = 20, 20  # N = 400
+    N = H_p * W_p
+    # Construct a 320x320 white page with dense dark horizontal ink stripes covering 70% of rows (rows 48..272)
+    img_dense = torch.full((1, 3, 320, 320), 0.95, dtype=torch.float32)
+    # 70% of the 20x20 patches = 14 rows * 20 cols = 280/400 patches with crisp dark staff/note ink lines
+    # (keep 4px white paper margins so lines are interior notation, not edge-connected dark borders)
+    for y in range(48, 272, 6):
+        img_dense[:, :, y : y + 2, 4:316] = 0.05
+    feat = torch.zeros(1, 64, H_p, W_p)
+    with torch.no_grad():
+        _, _, info = router(feat, images=img_dense)
+    kept_frac = info["k_kept"] / float(N)
+    assert kept_frac >= 0.68, f"Dense 70%-ink page dropped ink: kept_frac={kept_frac:.3f} (expected >= 0.68)"
+    assert info["ink_recall"] >= 0.95, f"Expected high ink_recall on dense page, got {info['ink_recall']:.3f}"
+
+    # 2. ONNX export path must NOT call torch.quantile and must still keep >= 68% on dense page.
+    orig_onnx_fn = torch.onnx.is_in_onnx_export
+    orig_quantile = torch.quantile
+
+    def _forbid_quantile(*args, **kwargs):
+        raise AssertionError("torch.quantile must not be called during ONNX export")
+
+    try:
+        torch.onnx.is_in_onnx_export = lambda: True  # type: ignore[assignment]
+        torch.quantile = _forbid_quantile  # type: ignore[assignment]
+        with torch.no_grad():
+            _, _, info_onnx = router(feat, images=img_dense)
+        onnx_kept_frac = info_onnx["k_kept"] / float(N)
+        assert onnx_kept_frac >= 0.68, f"ONNX path kept_frac={onnx_kept_frac:.3f} < 0.68"
+    finally:
+        torch.onnx.is_in_onnx_export = orig_onnx_fn  # type: ignore[assignment]
+        torch.quantile = orig_quantile  # type: ignore[assignment]
+
+    # 3. paper_gate border fixes:
+    #    (a) Aged dark parchment margin (luma=0.25) is NOT masked out (threshold lowered 0.30 -> 0.22).
+    img_aged = torch.full((1, 3, 128, 128), 0.70, dtype=torch.float32)
+    img_aged[:, :, :, :16] = 0.25  # aged parchment left edge
+    _, _, eff_aged = InkTokenRouterV2._compute_ink_and_paper_gate(img_aged, 8, 8)
+    assert bool(eff_aged.all()), "Aged parchment margin (luma=0.25) must not be masked by paper_gate"
+
+    #    (b) Pure black desk border (luma=0.08, 8px wide) IS masked with ±6px dilation (not ±16px),
+    #        so a patch starting at x=16 (8px inside paper, >6px from border) stays unmasked.
+    img_desk = torch.full((1, 3, 128, 128), 0.90, dtype=torch.float32)
+    img_desk[:, :, :, :8] = 0.08  # 8px black desk border -> dilated to 14px (not 24px!)
+    _, _, eff_desk = InkTokenRouterV2._compute_ink_and_paper_gate(img_desk, 8, 8)
+    assert not bool(eff_desk[0, 0, :, 0].any()), "Leftmost desk column (x=0..16) should be masked"
+    assert bool(eff_desk[0, 0, :, 1].all()), "Second column (x=16..32, >6px from desk) must stay unmasked"
+
+    # 4. Exact preset state_dict key counts (zero schema drift)
+    assert len(UniOMRv2Net(UniOMRv2Config.small_45m()).state_dict()) == 349
+    assert len(UniOMRv2Net(UniOMRv2Config.edge85m()).state_dict()) == 383
+
+
 def main() -> None:
     summaries = _check_presets_param_counts_and_byte_budgets()
     test_aspect_normalized_rope2d_resolution_invariance()
@@ -739,6 +811,7 @@ def main() -> None:
     test_frontier_2025_2026_upgrades()
     test_iter12_compute_memory_optimizations()
     test_iter12_kernel_speedups()
+    test_router_p10_and_paper_gate_fixes()
 
     print("=== UniOMR v2 CPU Unit Tests PASSED ===")
     for name, s in summaries.items():

@@ -36,6 +36,7 @@ import os
 import random
 import re
 import sys
+import threading
 import time
 from dataclasses import dataclass, asdict
 from pathlib import Path
@@ -2319,16 +2320,19 @@ def _fast_perspective(
 
 
 def _apply_hw_lowres_defocus_compress(img: Image.Image, rng: Any) -> Image.Image:
-    """Low-res downscale (800-1150px round-trip) + mild defocus blur + contrast compression (gated to max(W,H) >= 1280)."""
+    """Low-res downscale round-trip + mild defocus blur + contrast compression (works at any resolution >= 32px)."""
+    is_gray = img.mode == "L"
     out = img if img.mode == "RGB" else img.convert("RGB")
     orig_w, orig_h = out.size
     max_side = max(orig_w, orig_h)
-    if max_side < 1280 or orig_w < 48 or orig_h < 48:
-        return out
-    rt_max = rng.randint(800, min(1150, max_side))
-    scale = float(rt_max) / float(max_side)
-    dw = max(32, int(round(orig_w * scale)))
-    dh = max(32, int(round(orig_h * scale)))
+    if orig_w < 32 or orig_h < 32:
+        return img
+    scale = float(rng.uniform(0.55, 0.85))
+    if max_side > 1350:
+        rt_max = min(int(round(max_side * scale)), 1150)
+        scale = float(rt_max) / float(max_side)
+    dw = max(24, int(round(orig_w * scale)))
+    dh = max(24, int(round(orig_h * scale)))
     sigma = float(rng.uniform(0.5, 1.1))
     c_fac = float(rng.uniform(0.48, 0.74))
     if _cv2 is not None:
@@ -2344,7 +2348,8 @@ def _apply_hw_lowres_defocus_compress(img: Image.Image, rng: Any) -> Image.Image
         vals = np.arange(256, dtype=np.float32)[:, None]
         lut = np.clip(paper_ref[None, :] + (vals - paper_ref[None, :]) * c_fac, 0.0, 255.0).astype(np.uint8)
         arr = _cv2.LUT(arr, lut.reshape(256, 1, 3))
-        return Image.fromarray(arr, mode="RGB")
+        res = Image.fromarray(arr, mode="RGB")
+        return res.convert("L") if is_gray else res
     if (dw, dh) != (orig_w, orig_h):
         out = out.resize((dw, dh), Image.Resampling.BILINEAR).resize(
             (orig_w, orig_h), Image.Resampling.BILINEAR
@@ -2358,7 +2363,8 @@ def _apply_hw_lowres_defocus_compress(img: Image.Image, rng: Any) -> Image.Image
     paper_ref_f = np.percentile(sub_f, 85.0, axis=0).reshape(1, 1, 3)
     arr_f = paper_ref_f + (arr_f - paper_ref_f) * c_fac
     np.clip(arr_f, 0.0, 1.0, out=arr_f)
-    return Image.fromarray((arr_f * 255.0).astype(np.uint8), mode="RGB")
+    res = Image.fromarray((arr_f * 255.0).astype(np.uint8), mode="RGB")
+    return res.convert("L") if is_gray else res
 
 
 def _apply_archival_border_and_colorbar(
@@ -2797,20 +2803,463 @@ def _apply_archival_watermark_stain(
     return out
 
 
+def _apply_page_curl(
+    img: Image.Image,
+    rng: Any,
+    border_fill: Optional[Tuple[int, int, int]] = None,
+) -> Image.Image:
+    """Fast cylindrical / book-gutter page curl via separable 1D cv2.remap + matched gutter shading (<2 ms)."""
+    is_gray = img.mode == "L"
+    src_img = img if img.mode in ("L", "RGB") else img.convert("RGB")
+    w, h = src_img.size
+    if w < 32 or h < 32:
+        return src_img
+
+    arr = np.asarray(src_img, dtype=np.uint8)
+    u = np.linspace(0.0, 1.0, w, dtype=np.float32)
+    mode = rng.choice(("gutter_left", "gutter_right", "arch"))
+    amp_y = float(h) * rng.uniform(0.008, 0.025) * rng.choice((-1.0, 1.0))
+    amp_x = float(w) * rng.uniform(0.004, 0.016)
+    shade_strength = rng.uniform(0.10, 0.30)
+
+    if mode == "gutter_left":
+        power = rng.uniform(2.0, 3.5)
+        curve = np.power(1.0 - u, power).astype(np.float32)
+        dy_1d = amp_y * curve
+        dx_1d = amp_x * curve
+        shade_1d = 1.0 - shade_strength * curve
+    elif mode == "gutter_right":
+        power = rng.uniform(2.0, 3.5)
+        curve = np.power(u, power).astype(np.float32)
+        dy_1d = amp_y * curve
+        dx_1d = -amp_x * curve
+        shade_1d = 1.0 - shade_strength * curve
+    else:
+        curve = np.sin(np.pi * u).astype(np.float32)
+        dy_1d = amp_y * (curve - 0.5)
+        dx_1d = amp_x * np.cos(np.pi * u).astype(np.float32) * (1.0 - curve)
+        shade_1d = 1.0 - shade_strength * (1.0 - curve)
+
+    xs = np.arange(w, dtype=np.float32) + dx_1d
+    ys = np.arange(h, dtype=np.float32)
+    if _cv2 is not None:
+        map_x = np.broadcast_to(xs[None, :], (h, w))
+        map_y = ys[:, None] + dy_1d[None, :]
+        if border_fill is not None:
+            bval: Any = int(round(sum(border_fill) / 3.0)) if is_gray else (
+                int(border_fill[0]), int(border_fill[1]), int(border_fill[2])
+            )
+            warped = _cv2.remap(
+                arr, map_x, map_y, interpolation=_cv2.INTER_LINEAR,
+                borderMode=_cv2.BORDER_CONSTANT, borderValue=bval,
+            )
+        else:
+            warped = _cv2.remap(
+                arr, map_x, map_y, interpolation=_cv2.INTER_LINEAR,
+                borderMode=_cv2.BORDER_REPLICATE,
+            )
+        if shade_strength > 0.01:
+            u64 = np.linspace(0.0, 1.0, 64, dtype=np.float32)
+            if mode == "gutter_left":
+                s64 = 1.0 - shade_strength * np.power(1.0 - u64, power).astype(np.float32)
+            elif mode == "gutter_right":
+                s64 = 1.0 - shade_strength * np.power(u64, power).astype(np.float32)
+            else:
+                s64 = 1.0 - shade_strength * (1.0 - np.sin(np.pi * u64).astype(np.float32))
+            s64_u8 = np.clip(np.round(s64 * 255.0), 0.0, 255.0).astype(np.uint8).reshape(1, 64)
+            if not is_gray:
+                s64_u8 = _cv2.cvtColor(s64_u8, _cv2.COLOR_GRAY2RGB)
+            shade_full = _cv2.resize(s64_u8, (w, h), interpolation=_cv2.INTER_LINEAR)
+            warped = _cv2.multiply(warped, shade_full, scale=1.0 / 255.0)
+        return Image.fromarray(warped, mode="L" if is_gray else "RGB")
+
+    # PIL/NumPy fallback
+    ix = np.clip(np.round(xs).astype(np.int32), 0, w - 1)
+    iy = np.clip(np.round(ys[:, None] + dy_1d[None, :]).astype(np.int32), 0, h - 1)
+    warped = arr[iy, ix[None, :]]
+    shade_u16 = np.clip(np.round(shade_1d * 256.0), 0.0, 256.0).astype(np.uint16)
+    if is_gray:
+        warped = ((warped.astype(np.uint16) * shade_u16[None, :]) >> 8).astype(np.uint8)
+    else:
+        warped = ((warped.astype(np.uint16) * shade_u16[None, :, None]) >> 8).astype(np.uint8)
+    return Image.fromarray(warped, mode="L" if is_gray else "RGB")
+
+
+def _apply_cast_shadow(img: Image.Image, rng: Any) -> Image.Image:
+    """Fast soft-edged cast shadow (hand/phone/music-stand) via low-res 64x64 mask upsample (<1 ms)."""
+    is_gray = img.mode == "L"
+    src_img = img if img.mode in ("L", "RGB") else img.convert("RGB")
+    w, h = src_img.size
+    if w < 32 or h < 32:
+        return src_img
+
+    arr = np.asarray(src_img, dtype=np.uint8)
+    mw, mh = 64, 64
+    xs = np.linspace(0.0, 1.0, mw, dtype=np.float32).reshape(1, mw)
+    ys = np.linspace(0.0, 1.0, mh, dtype=np.float32).reshape(mh, 1)
+    cx = rng.uniform(0.15, 0.85)
+    cy = rng.uniform(0.15, 0.85)
+    theta = rng.uniform(0.0, 2.0 * math.pi)
+    ct = np.float32(math.cos(theta))
+    st = np.float32(math.sin(theta))
+    signed_d = (xs - cx) * ct + (ys - cy) * st
+    penumbra = np.float32(rng.uniform(0.05, 0.18))
+
+    if rng.random() < 0.55:
+        # Half-plane cast shadow across one side/corner of the page
+        mask = np.clip(0.5 - signed_d / penumbra, 0.0, 1.0)
+    else:
+        # Linear darkened band across part of the page
+        half_w = np.float32(rng.uniform(0.08, 0.24))
+        mask = np.clip(0.5 - (np.abs(signed_d) - half_w) / penumbra, 0.0, 1.0)
+
+    dark_depth = np.float32(1.0 - rng.uniform(0.45, 0.78))
+    if is_gray:
+        mult_small = np.clip((1.0 - dark_depth * mask) * 255.0, 0.0, 255.0).astype(np.uint8)
+    else:
+        # Slight cool blue-gray shadow tint (warm light blocked -> R drops slightly more than B)
+        tint = np.array([1.04, 1.00, 0.94], dtype=np.float32).reshape(1, 1, 3)
+        mult_small = np.clip((1.0 - dark_depth * mask[..., None] * tint) * 255.0, 0.0, 255.0).astype(np.uint8)
+
+    if _cv2 is not None:
+        mult_full = _cv2.resize(mult_small, (w, h), interpolation=_cv2.INTER_LINEAR)
+        out_arr = _cv2.multiply(arr, mult_full, scale=1.0 / 255.0)
+    else:
+        mult_pil = Image.fromarray(mult_small, mode="L" if is_gray else "RGB").resize(
+            (w, h), Image.Resampling.BILINEAR
+        )
+        mult_u16 = np.asarray(mult_pil, dtype=np.uint16)
+        out_arr = ((arr.astype(np.uint16) * (mult_u16 + 1)) >> 8).astype(np.uint8)
+    return Image.fromarray(out_arr, mode="L" if is_gray else "RGB")
+
+
+def _apply_specular_glare(img: Image.Image, rng: Any) -> Image.Image:
+    """Fast elliptical/diagonal specular glare or flash hotspot via low-res 64x64 Gaussian (<1 ms)."""
+    is_gray = img.mode == "L"
+    src_img = img if img.mode in ("L", "RGB") else img.convert("RGB")
+    w, h = src_img.size
+    if w < 32 or h < 32:
+        return src_img
+
+    arr = np.asarray(src_img, dtype=np.uint8)
+    mw, mh = 64, 64
+    xs = np.linspace(0.0, 1.0, mw, dtype=np.float32).reshape(1, mw)
+    ys = np.linspace(0.0, 1.0, mh, dtype=np.float32).reshape(mh, 1)
+    cx = rng.uniform(0.15, 0.85)
+    cy = rng.uniform(0.15, 0.85)
+    theta = rng.uniform(0.0, math.pi)
+    ct = np.float32(math.cos(theta))
+    st = np.float32(math.sin(theta))
+    dx = xs - cx
+    dy = ys - cy
+    u = dx * ct + dy * st
+    v = -dx * st + dy * ct
+    rx = np.float32(rng.uniform(0.10, 0.36))
+    ry = np.float32(rng.uniform(0.06, 0.28))
+    strength = np.float32(rng.uniform(28.0, 78.0))
+    gauss = np.exp(-0.5 * ((u / rx) ** 2 + (v / ry) ** 2)) * strength
+
+    if is_gray:
+        glare_small = np.clip(gauss, 0.0, 255.0).astype(np.uint8)
+    else:
+        warm = np.array([1.00, 0.99, 0.95], dtype=np.float32).reshape(1, 1, 3)
+        glare_small = np.clip(gauss[..., None] * warm, 0.0, 255.0).astype(np.uint8)
+
+    if _cv2 is not None:
+        glare_full = _cv2.resize(glare_small, (w, h), interpolation=_cv2.INTER_LINEAR)
+        out_arr = _cv2.add(arr, glare_full)
+    else:
+        glare_pil = Image.fromarray(glare_small, mode="L" if is_gray else "RGB").resize(
+            (w, h), Image.Resampling.BILINEAR
+        )
+        glare_u16 = np.asarray(glare_pil, dtype=np.uint16)
+        out_arr = np.minimum(arr.astype(np.uint16) + glare_u16, 255).astype(np.uint8)
+    return Image.fromarray(out_arr, mode="L" if is_gray else "RGB")
+
+
+def _apply_thin_ink_dropout(img: Image.Image, rng: Any) -> Image.Image:
+    """Fast thin-ink / staff-line dropout & faint pencil erosion via masked morphological dilation (<1 ms)."""
+    is_gray = img.mode == "L"
+    src_img = img if img.mode in ("L", "RGB") else img.convert("RGB")
+    w, h = src_img.size
+    if w < 32 or h < 32:
+        return src_img
+
+    arr = np.asarray(src_img, dtype=np.uint8)
+    np_rng = np.random.default_rng(rng.randint(0, 2**31 - 1))
+    # Patchy or whole-page blend mask in [0, 255]
+    if rng.random() < 0.55:
+        # Patchy thin-ink dropout (random low-res field)
+        raw_m = np_rng.uniform(-0.35, 0.85, size=(24, 24)).astype(np.float32)
+        mask_small = np.clip(raw_m * 255.0, 0.0, 255.0).astype(np.uint8)
+    else:
+        # Subtle whole-page faint pencil / dry toner lightening
+        alpha = rng.uniform(0.22, 0.58)
+        raw_m = np.clip(
+            alpha + np_rng.uniform(-0.12, 0.12, size=(16, 16)).astype(np.float32),
+            0.0,
+            0.85,
+        )
+        mask_small = (raw_m * 255.0).astype(np.uint8)
+
+    if _cv2 is not None:
+        kshape = rng.choice(((2, 2), (3, 3), (1, 3), (3, 1)))
+        kernel = np.ones(kshape, dtype=np.uint8)
+        dilated = _cv2.dilate(arr, kernel, iterations=1)
+        if rng.random() < 0.45:
+            # Fast whole-page faint pencil / dry toner blend (~1.4 ms at 1280x960)
+            a = float(rng.uniform(0.22, 0.58))
+            out_arr = _cv2.addWeighted(arr, 1.0 - a, dilated, a, 0.0)
+            return Image.fromarray(out_arr, mode="L" if is_gray else "RGB")
+        # Patchy thin-ink dropout using OpenCV SIMD multiply + add (~3 ms at 1280x960)
+        diff = _cv2.subtract(dilated, arr)
+        mask_full = _cv2.resize(mask_small, (w, h), interpolation=_cv2.INTER_LINEAR)
+        if not is_gray:
+            mask_full = _cv2.cvtColor(mask_full, _cv2.COLOR_GRAY2RGB)
+        delta = _cv2.multiply(diff, mask_full, scale=1.0 / 255.0)
+        out_arr = _cv2.add(arr, delta)
+        return Image.fromarray(out_arr, mode="L" if is_gray else "RGB")
+
+    dilated = np.asarray(src_img.filter(ImageFilter.MaxFilter(3)), dtype=np.uint8)
+    mask_full = np.asarray(
+        Image.fromarray(mask_small, mode="L").resize((w, h), Image.Resampling.BILINEAR),
+        dtype=np.uint8,
+    )
+    # dilated >= arr everywhere for morphological dilation, so diff is exact non-negative uint8
+    diff = dilated - arr
+    if is_gray:
+        delta = ((diff.astype(np.uint16) * mask_full.astype(np.uint16)) >> 8).astype(np.uint8)
+    else:
+        delta = ((diff.astype(np.uint16) * mask_full.astype(np.uint16)[..., None]) >> 8).astype(np.uint8)
+    out_arr = arr + delta
+    return Image.fromarray(out_arr, mode="L" if is_gray else "RGB")
+
+
+class RismStylePool:
+    """Lightweight, thread-safe in-RAM pool of unpaired archival style references.
+
+    Pre-loads up to ``max_cached`` RGB images resized to ``(ref_size, ref_size)``
+    ``uint8`` (~50 MB for 256x256x256x3) so sampling a style reference during
+    training takes <0.1 ms with zero disk I/O and zero lock contention.
+    """
+
+    _IMG_EXTS = (".jpg", ".jpeg", ".png", ".webp")
+
+    def __init__(
+        self,
+        style_dir: Union[str, Path],
+        max_cached: int = 256,
+        ref_size: int = 256,
+        seed: int = 42,
+    ) -> None:
+        self.style_dir = Path(style_dir)
+        self.max_cached = max(0, int(max_cached))
+        self.ref_size = max(16, int(ref_size))
+        self.seed = int(seed)
+        self._lock = threading.Lock()
+        self._refs: Tuple[np.ndarray, ...] = ()
+
+        if self.max_cached <= 0 or not self.style_dir.is_dir():
+            return
+
+        paths = sorted(
+            p
+            for p in self.style_dir.rglob("*")
+            if p.is_file() and p.suffix.lower() in self._IMG_EXTS
+        )
+        if not paths:
+            return
+
+        if len(paths) > self.max_cached:
+            sel_rng = random.Random(self.seed)
+            paths = sel_rng.sample(paths, self.max_cached)
+
+        loaded: List[np.ndarray] = []
+        sz = self.ref_size
+        for p in paths:
+            try:
+                with Image.open(p) as raw:
+                    arr = _load_and_resize_rgb_array(p, sz, sz, raw)
+                arr = np.ascontiguousarray(arr, dtype=np.uint8)
+                arr.setflags(write=False)
+                loaded.append(arr)
+            except Exception:
+                continue
+        self._refs = tuple(loaded)
+
+    def __len__(self) -> int:
+        return len(self._refs)
+
+    def __bool__(self) -> bool:
+        return len(self._refs) > 0
+
+    def sample(self, rng: Optional[random.Random] = None) -> Optional[np.ndarray]:
+        """Return a cached ``(ref_size, ref_size, 3)`` RGB ``uint8`` style reference."""
+        refs = self._refs
+        n = len(refs)
+        if n == 0:
+            return None
+        r = rng if rng is not None else random
+        return refs[r.randrange(n)]
+
+
+def apply_fda_transfer(
+    img_rgb: Union[np.ndarray, Image.Image],
+    style_rgb: Union[np.ndarray, Image.Image],
+    beta: float = 0.02,
+) -> Union[np.ndarray, Image.Image]:
+    """Fourier Domain Adaptation (Yang & Soatto, i13-05 winning ``beta=0.02``).
+
+    Swaps only the lowest-frequency 2D-FFT amplitude envelope from an unpaired
+    archival reference onto ``img_rgb`` while preserving 100% of ``img_rgb``'s
+    phase and high-frequency ink/staff edges. Preserves input type, shape,
+    ``uint8`` dtype, and ``[0, 255]`` bounds.
+    """
+    is_pil = isinstance(img_rgb, Image.Image)
+    src_u8 = (
+        np.asarray(img_rgb if img_rgb.mode == "RGB" else img_rgb.convert("RGB"), dtype=np.uint8)
+        if is_pil
+        else np.asarray(img_rgb, dtype=np.uint8)
+    )
+    if src_u8.ndim != 3 or src_u8.shape[2] != 3:
+        raise ValueError(f"apply_fda_transfer expects (H, W, 3) RGB input, got shape {src_u8.shape}")
+    h, w, _ = src_u8.shape
+    b_val = float(beta)
+    if b_val <= 0.0 or h < 4 or w < 4:
+        return Image.fromarray(src_u8.copy(), mode="RGB") if is_pil else src_u8.copy()
+
+    sty_u8 = (
+        np.asarray(style_rgb if style_rgb.mode == "RGB" else style_rgb.convert("RGB"), dtype=np.uint8)
+        if isinstance(style_rgb, Image.Image)
+        else np.asarray(style_rgb, dtype=np.uint8)
+    )
+    if sty_u8.ndim != 3 or sty_u8.shape[2] != 3:
+        raise ValueError(f"apply_fda_transfer expects (H, W, 3) RGB style, got shape {sty_u8.shape}")
+
+    b = max(1, int(math.floor(min(h, w) * b_val)))
+    b_y = min(b, max(1, h // 2 - 1))
+    b_x = min(b, max(1, w // 2))
+
+    # Real 2D-FFT on (3, H, W) float32 via torch.fft.rfft2 (2x faster than complex fft2).
+    # Page-relative low-frequency bin k in a (sh, sw) DFT matches bin k in (h, w) up to
+    # the area scale factor (h * w) / (sh * sw), avoiding full-res FFT on the style ref.
+    sh, sw, _ = sty_u8.shape
+    if sh > 2 * b_y and (sw // 2 + 1) > b_x:
+        sty_for_fft = sty_u8
+        area_scale = float(h * w) / float(sh * sw)
+    else:
+        if _cv2 is not None:
+            sty_for_fft = _cv2.resize(sty_u8, (w, h), interpolation=_cv2.INTER_LINEAR)
+        else:
+            sty_for_fft = np.asarray(
+                Image.fromarray(sty_u8, mode="RGB").resize((w, h), Image.Resampling.BILINEAR),
+                dtype=np.uint8,
+            )
+        area_scale = 1.0
+
+    src_t = torch.from_numpy(np.array(src_u8, dtype=np.float32, copy=True)).permute(2, 0, 1)
+    sty_t = torch.from_numpy(np.array(sty_for_fft, dtype=np.float32, copy=True)).permute(2, 0, 1)
+
+    fft_src = torch.fft.rfft2(src_t, dim=(-2, -1))
+    fft_sty = torch.fft.rfft2(sty_t, dim=(-2, -1))
+
+    # Replace amplitude ONLY in the tiny low-frequency bands (0..b_y and -b_y..-1, x in 0..b_x)
+    # while leaving high-frequency bins and all phase angles untouched.
+    pos_src = fft_src[:, : b_y + 1, : b_x + 1]
+    pos_sty_amp = torch.abs(fft_sty[:, : b_y + 1, : b_x + 1]) * area_scale
+    fft_src[:, : b_y + 1, : b_x + 1] = torch.polar(pos_sty_amp, torch.angle(pos_src))
+
+    neg_src = fft_src[:, h - b_y :, : b_x + 1]
+    neg_sty_amp = torch.abs(fft_sty[:, sty_t.shape[1] - b_y :, : b_x + 1]) * area_scale
+    fft_src[:, h - b_y :, : b_x + 1] = torch.polar(neg_sty_amp, torch.angle(neg_src))
+
+    out_t = torch.fft.irfft2(fft_src, s=(h, w), dim=(-2, -1))
+    out_u8 = out_t.clamp_(0.0, 255.0).round_().to(torch.uint8).permute(1, 2, 0).contiguous().numpy()
+    return Image.fromarray(out_u8, mode="RGB") if is_pil else out_u8
+
+
+def apply_color_adain(
+    img_rgb: Union[np.ndarray, Image.Image],
+    style_rgb: Union[np.ndarray, Image.Image],
+    alpha: float = 0.85,
+) -> Union[np.ndarray, Image.Image]:
+    """Fast per-channel RGB mean/std moment transfer (AdaIN, i13-05 ``arm_color_adain``).
+
+    Matches per-channel mean/std of ``img_rgb`` toward ``style_rgb`` with blend
+    weight ``alpha`` via an exact 256-entry per-channel LUT (<0.5 ms at 1280x960).
+    Preserves input type, shape, ``uint8`` dtype, and ``[0, 255]`` bounds.
+    """
+    is_pil = isinstance(img_rgb, Image.Image)
+    src_u8 = (
+        np.asarray(img_rgb if img_rgb.mode == "RGB" else img_rgb.convert("RGB"), dtype=np.uint8)
+        if is_pil
+        else np.asarray(img_rgb, dtype=np.uint8)
+    )
+    if src_u8.ndim != 3 or src_u8.shape[2] != 3:
+        raise ValueError(f"apply_color_adain expects (H, W, 3) RGB input, got shape {src_u8.shape}")
+    a = float(max(0.0, min(1.0, alpha)))
+    if a <= 0.0:
+        return Image.fromarray(src_u8.copy(), mode="RGB") if is_pil else src_u8.copy()
+
+    sty_u8 = (
+        np.asarray(style_rgb if style_rgb.mode == "RGB" else style_rgb.convert("RGB"), dtype=np.uint8)
+        if isinstance(style_rgb, Image.Image)
+        else np.asarray(style_rgb, dtype=np.uint8)
+    )
+    if sty_u8.ndim != 3 or sty_u8.shape[2] != 3:
+        raise ValueError(f"apply_color_adain expects (H, W, 3) RGB style, got shape {sty_u8.shape}")
+
+    if _cv2 is not None:
+        s_m, s_s = _cv2.meanStdDev(src_u8)
+        t_m, t_s = _cv2.meanStdDev(sty_u8)
+        s_mean = s_m.reshape(3).astype(np.float32)
+        s_std = np.maximum(s_s.reshape(3).astype(np.float32), np.float32(1e-2))
+        t_mean = t_m.reshape(3).astype(np.float32)
+        t_std = np.maximum(t_s.reshape(3).astype(np.float32), np.float32(1e-2))
+    else:
+        src_f = src_u8.astype(np.float32)
+        sty_f = sty_u8.astype(np.float32)
+        s_mean = src_f.mean(axis=(0, 1))
+        s_std = np.maximum(src_f.std(axis=(0, 1)), np.float32(1e-2))
+        t_mean = sty_f.mean(axis=(0, 1))
+        t_std = np.maximum(sty_f.std(axis=(0, 1)), np.float32(1e-2))
+
+    # Build exact 256-entry per-channel LUT: (1 - a) * v + a * ((v - s_mean)/s_std * t_std + t_mean)
+    vals = np.arange(256, dtype=np.float32)[:, None]  # (256, 1)
+    matched = (vals - s_mean[None, :]) * (t_std / s_std)[None, :] + t_mean[None, :]
+    blended = (1.0 - a) * vals + a * matched
+    lut = np.clip(np.round(blended), 0.0, 255.0).astype(np.uint8)  # (256, 3)
+
+    if _cv2 is not None:
+        out_u8 = np.empty_like(src_u8)
+        for c in range(3):
+            out_u8[:, :, c] = _cv2.LUT(src_u8[:, :, c], lut[:, c])
+    else:
+        out_u8 = np.empty_like(src_u8)
+        for c in range(3):
+            out_u8[:, :, c] = lut[src_u8[:, :, c], c]
+    return Image.fromarray(out_u8, mode="RGB") if is_pil else out_u8
+
+
 def apply_online_augment(
     img: Image.Image,
     rng: Optional[random.Random] = None,
     is_hw: bool = False,
     hw_archival_prob: Optional[float] = None,
     is_strip: bool = False,
+    rism_style_pool: Optional[RismStylePool] = None,
+    rism_fda_prob: float = 0.0,
+    rism_adain_prob: float = 0.0,
+    rism_fda_beta: float = 0.02,
 ) -> Image.Image:
     """Online phone-photo, scanner, and historical manuscript degradation.
 
-    Supports dark desk border, perspective, rotation, shadows/vignette/parchment,
-    brightness/contrast, 1-bit scanner threshold, blur, JPEG, sensor noise, and
-    Historical Manuscript / Archival Mode (parchment + brown iron-gall ink
-    transfer, mottled foxing, verso bleed-through, optional archival border +
-    colorbar strip, and faint pre-ruled empty margin staves).
+    Supports dark/wood desk borders (4-sided & asymmetric 1-3 sided), cylindrical
+    page curl, perspective (1-9%), rotation (+/-7 deg), cast shadows, specular
+    glare, thin-ink dropout, uneven illumination/vignette/parchment, brightness/
+    contrast, 1-bit scanner threshold, low-res defocus (all resolutions), blur,
+    JPEG, sensor noise, Historical Manuscript / Archival Mode, and optional
+    unpaired RISM-5707 FDA (``beta=0.02``) / Color-AdaIN domain transfer.
 
     Preserves exact ``(W, H)`` dimensions and is deterministic per ``rng`` seed.
     """
@@ -2820,10 +3269,33 @@ def apply_online_augment(
     has_dark_border = False
     dark_fill = (25, 22, 20)
 
+    did_rism_transfer = False
+    fda_p = float(max(0.0, rism_fda_prob))
+    adain_p = float(max(0.0, rism_adain_prob))
+    if rism_style_pool is not None and len(rism_style_pool) > 0 and (fda_p > 0.0 or adain_p > 0.0):
+        u_rism = r.random()
+        if u_rism < fda_p:
+            style_ref = rism_style_pool.sample(r)
+            if style_ref is not None:
+                out = apply_fda_transfer(out, style_ref, beta=float(rism_fda_beta))  # type: ignore[assignment]
+                did_rism_transfer = True
+        elif u_rism < fda_p + adain_p:
+            style_ref = rism_style_pool.sample(r)
+            if style_ref is not None:
+                out = apply_color_adain(out, style_ref, alpha=r.uniform(0.4, 0.85))  # type: ignore[assignment]
+                did_rism_transfer = True
+
     archival_p = (0.55 if is_hw else 0.12) if hw_archival_prob is None else float(hw_archival_prob)
-    do_archival = r.random() < archival_p
+    do_archival = (not did_rism_transfer) and (r.random() < archival_p)
+    do_1bit = (not did_rism_transfer) and (not do_archival) and (r.random() < 0.15)
 
     def _sample_dark_desk() -> Tuple[int, int, int]:
+        if r.random() < 0.40:
+            # Warm wood-tone desk surface
+            wr = r.randint(40, 108)
+            wg = min(wr - r.randint(6, 26), r.randint(28, 76))
+            wb = min(wg - r.randint(6, 22), r.randint(18, 54))
+            return (wr, max(16, wg), max(10, wb))
         base = r.randint(4, 62)
         dr = max(0, min(70, base + r.randint(-5, 8)))
         dg = max(0, min(70, base + r.randint(-5, 6)))
@@ -2833,6 +3305,8 @@ def apply_online_augment(
     def _sample_paper_fill() -> Tuple[int, int, int]:
         bg_v = r.randint(235, 255)
         return (bg_v, max(225, bg_v - r.randint(0, 5)), max(215, bg_v - r.randint(0, 12)))
+
+    page_fill = _sample_paper_fill()
 
     # Random top/bottom white margin padding (p=0.25): pad 2-8% white margin on top/bottom
     # so top-aligned clean scores don't behave differently from bordered photos.
@@ -2845,34 +3319,26 @@ def apply_online_augment(
             padded = _cv2.copyMakeBorder(
                 arr_p, pad_t, pad_b, 0, 0, _cv2.BORDER_CONSTANT, value=p_fill
             )
-            out = Image.fromarray(_cv2.resize(padded, (orig_w, orig_h), interpolation=_cv2.INTER_AREA), mode="RGB")
+            out = Image.fromarray(_cv2.resize(padded, (orig_w, orig_h), interpolation=_cv2.INTER_LINEAR), mode="RGB")
         else:
             canvas = Image.new("RGB", (orig_w, orig_h + pad_t + pad_b), p_fill)
             canvas.paste(out, (0, pad_t))
             out = canvas.resize((orig_w, orig_h), Image.Resampling.BILINEAR)
 
+    # A. Paper-surface / ink-style transforms (archival parchment OR 1-bit scanner OR standard markup)
     if do_archival:
-        # Historical Manuscript / Archival Mode:
-        #   1) Optional System-1 left indentation (15-35%, p=0.10)
-        #   2) Optional faint empty pre-ruled 5-line staves in margins / inter-system gaps (p=0.25)
-        #   3) Parchment + brown iron-gall ink color transfer + mottled foxing + verso bleed
-        #   4) Optional corner sticky-note/blot occlusion (p=0.12), archival border + colorbar (p=0.40)
-        #   5) Optional low-res round-trip downscale + defocus blur + contrast compression
-        if r.random() < 0.10 and orig_w >= 128 and orig_h >= 256:
+        # Historical Manuscript / Archival Mode (continues into geometry, desk border & lighting below!)
+        if (not is_strip) and r.random() < 0.10 and orig_w >= 128 and orig_h >= 256:
             out = _apply_system1_left_indent(out, r)
-        if _cv2 is not None:
-            luma = _cv2.cvtColor(np.asarray(out, dtype=np.uint8), _cv2.COLOR_RGB2GRAY).astype(np.float32)
-            luma *= (1.0 / 255.0)
-        else:
-            luma = np.asarray(out.convert("L"), dtype=np.float32) * (1.0 / 255.0)
-        if r.random() < 0.25:
-            _add_archival_empty_staves(luma, r)
 
-        # Sample warm parchment paper RGB ~(215..245, 200..235, 170..215) with R > G > B
-        pr = r.uniform(215.0, 245.0)
-        pg = min(pr - r.uniform(4.0, 14.0), r.uniform(200.0, 235.0))
-        pb = min(pg - r.uniform(10.0, 28.0), r.uniform(170.0, 215.0))
-        paper_rgb = np.array([pr, max(190.0, pg), max(155.0, pb)], dtype=np.float32).reshape(1, 1, 3) / 255.0
+        # Sample warm parchment/amber paper RGB ~(195..245, 165..232, 115..210) with R > G > B
+        pr = r.uniform(195.0, 245.0)
+        pg = min(pr - r.uniform(5.0, 20.0), r.uniform(165.0, 232.0))
+        pb = min(pg - r.uniform(12.0, 38.0), r.uniform(115.0, 210.0))
+        pg = max(155.0, pg)
+        pb = max(105.0, pb)
+        paper_rgb = np.array([pr, pg, pb], dtype=np.float32).reshape(1, 1, 3) / 255.0
+        page_fill = (int(round(pr)), int(round(pg)), int(round(pb)))
 
         # Sample brown iron-gall ink RGB ~(70..140, 60..125, 45..105)
         ir = r.uniform(70.0, 140.0)
@@ -2891,57 +3357,77 @@ def apply_online_augment(
             int(round(float(ink_rgb[0, 0, 2]) * 255.0)),
         )
 
-        h, w = luma.shape
-        # Optional faint horizontally-flipped verso bleed-through (6-14% opacity) folded into luma
-        if r.random() < 0.65:
-            alpha = r.uniform(0.06, 0.14)
-            bleed_luma = luma[:, ::-1]
-            # Blend verso ink into luma directly (faster & equivalent to blending toward mid-brown ink)
-            luma = luma * (1.0 - alpha * (1.0 - bleed_luma))
-
-        # Low-frequency mottled foxing / aging via upsampled 16x16 noise field
+        do_empty_staves = r.random() < 0.25
+        do_bleed = r.random() < 0.65
+        bleed_alpha = r.uniform(0.06, 0.14) if do_bleed else 0.0
         np_rng = np.random.default_rng(r.randint(0, 2**31 - 1))
-        mottle_small = np.clip(
-            128.0 + np_rng.standard_normal((16, 16), dtype=np.float32) * r.uniform(16.0, 32.0),
-            0.0,
-            255.0,
-        ).astype(np.uint8)
-        mottle_scale = np.float32(r.uniform(0.04, 0.11) / 128.0)
-        if _cv2 is not None:
-            mottle = _cv2.resize(mottle_small, (w, h), interpolation=_cv2.INTER_LINEAR).astype(np.float32)
-        else:
-            mottle = np.asarray(
-                Image.fromarray(mottle_small, mode="L").resize((w, h), Image.Resampling.BILINEAR),
-                dtype=np.float32,
+        mottle_std = r.uniform(16.0, 32.0)
+        mottle_amp = r.uniform(0.04, 0.11)
+
+        if _cv2 is not None and not do_empty_staves:
+            # Fast OpenCV uint8 LUT + multiply archival transfer (~3.5 ms vs ~22 ms float32 at 1280x960)
+            luma_u8 = _cv2.cvtColor(np.asarray(out, dtype=np.uint8), _cv2.COLOR_RGB2GRAY)
+            h, w = luma_u8.shape
+            if do_bleed:
+                bleed_u8 = _cv2.flip(luma_u8, 1)
+                vals_b = np.arange(256, dtype=np.float32)
+                lut_b = np.clip(
+                    np.round(255.0 * (1.0 - bleed_alpha * (1.0 - vals_b * (1.0 / 255.0)))),
+                    0.0,
+                    255.0,
+                ).astype(np.uint8)
+                luma_u8 = _cv2.multiply(luma_u8, _cv2.LUT(bleed_u8, lut_b), scale=1.0 / 255.0)
+            vals = np.arange(256, dtype=np.float32)[:, None] * (1.0 / 255.0)
+            lut_rgb = np.clip(
+                np.round((ink_rgb.reshape(1, 3) + vals * (paper_rgb - ink_rgb).reshape(1, 3)) * 255.0),
+                0.0,
+                255.0,
+            ).astype(np.uint8).reshape(256, 1, 3)
+            rgb_u8 = _cv2.LUT(_cv2.cvtColor(luma_u8, _cv2.COLOR_GRAY2RGB), lut_rgb)
+            mottle_f = 1.0 + np.clip(
+                np_rng.standard_normal((16, 16), dtype=np.float32) * mottle_std, -128.0, 127.0
+            ) * (mottle_amp / 128.0)
+            mottle_u8 = np.clip(np.round(mottle_f * 128.0), 0.0, 255.0).astype(np.uint8)
+            mottle_full = _cv2.cvtColor(
+                _cv2.resize(mottle_u8, (w, h), interpolation=_cv2.INTER_LINEAR), _cv2.COLOR_GRAY2RGB
             )
-        mottle -= 128.0
-        mottle *= mottle_scale
-
-        # Gentle uneven illumination / edge darkening folded into a single scalar map
-        illum_map = mottle
-        illum_map += 1.0
-        if r.random() < 0.60:
-            gx = r.uniform(-0.16, 0.16)
-            gy = r.uniform(-0.16, 0.16)
-            vig = r.uniform(0.02, 0.18)
-            xs = np.linspace(-0.5, 0.5, w, dtype=np.float32).reshape(1, w)
-            ys = np.linspace(-0.5, 0.5, h, dtype=np.float32).reshape(h, 1)
-            illum_map += gx * xs + gy * ys - vig * (xs * xs + ys * ys) * 2.0
-            np.clip(illum_map, 0.62, 1.12, out=illum_map)
-
-        # Fused sensor noise folded into luma/illum before RGB expansion
-        if r.random() < 0.45:
-            sigma = r.uniform(2.0, 7.5) / 255.0
-            illum_map += np_rng.standard_normal((h, w), dtype=np.float32) * sigma
-
-        # Single RGB materialization in [0, 255]: ((paper - ink) * luma + ink) * illum_map * 255
-        luma *= illum_map
-        diff_255 = (paper_rgb - ink_rgb) * np.float32(255.0)
-        ink_255 = ink_rgb * np.float32(255.0)
-        arr = luma[..., None] * diff_255
-        arr += illum_map[..., None] * ink_255
-        np.clip(arr, 0.0, 255.0, out=arr)
-        out = Image.fromarray(arr.astype(np.uint8), mode="RGB")
+            rgb_u8 = _cv2.multiply(rgb_u8, mottle_full, scale=1.0 / 128.0)
+            out = Image.fromarray(rgb_u8, mode="RGB")
+        else:
+            if _cv2 is not None:
+                luma = _cv2.cvtColor(np.asarray(out, dtype=np.uint8), _cv2.COLOR_RGB2GRAY).astype(np.float32)
+                luma *= (1.0 / 255.0)
+            else:
+                luma = np.asarray(out.convert("L"), dtype=np.float32) * (1.0 / 255.0)
+            if do_empty_staves:
+                _add_archival_empty_staves(luma, r)
+            h, w = luma.shape
+            if do_bleed:
+                bleed_luma = luma[:, ::-1]
+                luma = luma * (1.0 - bleed_alpha * (1.0 - bleed_luma))
+            mottle_small = np.clip(
+                128.0 + np_rng.standard_normal((16, 16), dtype=np.float32) * mottle_std,
+                0.0,
+                255.0,
+            ).astype(np.uint8)
+            mottle_scale = np.float32(mottle_amp / 128.0)
+            if _cv2 is not None:
+                mottle = _cv2.resize(mottle_small, (w, h), interpolation=_cv2.INTER_LINEAR).astype(np.float32)
+            else:
+                mottle = np.asarray(
+                    Image.fromarray(mottle_small, mode="L").resize((w, h), Image.Resampling.BILINEAR),
+                    dtype=np.float32,
+                )
+            mottle -= 128.0
+            mottle *= mottle_scale
+            mottle += 1.0
+            luma *= mottle
+            diff_255 = (paper_rgb - ink_rgb) * np.float32(255.0)
+            ink_255 = ink_rgb * np.float32(255.0)
+            arr = luma[..., None] * diff_255
+            arr += mottle[..., None] * ink_255
+            np.clip(arr, 0.0, 255.0, out=arr)
+            out = Image.fromarray(arr.astype(np.uint8), mode="RGB")
 
         # Composer/copyist scratch-outs on archival pages (p=0.22 HW, p=0.06 printed)
         if r.random() < (0.22 if is_hw else 0.06):
@@ -2964,193 +3450,266 @@ def apply_online_augment(
             base_d = r.randint(6, 36)
             dark_fill = (base_d, max(4, base_d - 1), max(4, base_d - 2))
             out = _apply_archival_border_and_colorbar(out, r, dark_fill)
+    else:
+        # Pre-warp paper-surface manual corrections, HW layout/sticky-note, & performer markup
+        if is_hw and (not is_strip) and r.random() < 0.10 and orig_w >= 128 and orig_h >= 256:
+            out = _apply_system1_left_indent(out, r)
+        if r.random() < (0.22 if is_hw else 0.06):
+            out = _apply_composer_scratchouts(out, r, is_hw=is_hw)
+        if is_hw and (not is_strip) and r.random() < 0.12 and orig_w >= 64 and orig_h >= 64:
+            out = _apply_corner_sticky_note(out, r)
+        if not is_hw and r.random() < 0.18:
+            out = _apply_performer_pencil_markup(out, r)
 
-        # Mild rotation: +/-1.5 deg on strips, +/-3.0 deg with expand=True on full pages (p=0.35)
-        if r.random() < 0.35:
-            max_ang = 1.5 if is_strip else 3.0
-            angle = r.uniform(-max_ang, max_ang)
-            rot_fill = (
-                dark_fill
-                if has_dark_border
-                else (int(round(pr)), int(round(max(190.0, pg))), int(round(max(155.0, pb))))
-            )
-            out = _fast_rotate(out, angle, rot_fill, expand=(not is_strip))
+        # 1-bit / clean scanner adaptive threshold BEFORE geometry & photo framing
+        # so crisp 1-bit ink is preserved prior to perspective, rotation, desk border & lighting.
+        if do_1bit:
+            if _cv2 is not None:
+                luma_u8 = _cv2.cvtColor(np.asarray(out, dtype=np.uint8), _cv2.COLOR_RGB2GRAY)
+                local_bg = _cv2.blur(luma_u8, (31, 31))
+                delta_u8 = int(round(r.uniform(0.10, 0.22) * 255.0))
+                bw = np.where(
+                    luma_u8.astype(np.int16) >= (local_bg.astype(np.int16) - delta_u8),
+                    np.uint8(255),
+                    np.uint8(0),
+                )
+                out = Image.fromarray(_cv2.cvtColor(bw, _cv2.COLOR_GRAY2RGB), mode="RGB")
+            else:
+                luma_f = np.asarray(out.convert("L"), dtype=np.float32) * (1.0 / 255.0)
+                local_bg_f = np.asarray(
+                    out.convert("L").filter(ImageFilter.BoxBlur(15)), dtype=np.float32
+                ) * (1.0 / 255.0)
+                delta = r.uniform(0.10, 0.22)
+                bw = np.where(luma_f >= (local_bg_f - delta), np.uint8(255), np.uint8(0))
+                out = Image.fromarray(np.repeat(bw[..., None], 3, axis=2), mode="RGB")
 
-        # Low-res round-trip downscale + defocus blur + contrast compression (dense/landscape HW, max(W,H) >= 1280)
-        lowres_p = 0.25 if orig_w > orig_h else 0.15
-        if r.random() < lowres_p and max(orig_w, orig_h) >= 1280:
-            out = _apply_hw_lowres_defocus_compress(out, r)
-        elif r.random() < 0.25:
-            out = _fast_gaussian_blur(out, r.uniform(0.3, 0.8))
-        if r.random() < 0.40:
-            out = _fast_jpeg_roundtrip(out, r.randint(45, 88))
-        return out
+    # B. Thin-ink dropout / faint pencil (p=0.18; skip on pure 1-bit before framing half the time)
+    if (not do_1bit or r.random() < 0.45) and r.random() < 0.18 and orig_w >= 32 and orig_h >= 32:
+        out = _apply_thin_ink_dropout(out, r)
 
-    # 0. Pre-warp paper-surface manual corrections, HW layout/sticky-note, & performer markup
-    if is_hw and (not is_strip) and r.random() < 0.10 and orig_w >= 128 and orig_h >= 256:
-        out = _apply_system1_left_indent(out, r)
-    if r.random() < (0.22 if is_hw else 0.06):
-        out = _apply_composer_scratchouts(out, r, is_hw=is_hw)
-    if is_hw and (not is_strip) and r.random() < 0.12 and orig_w >= 64 and orig_h >= 64:
-        out = _apply_corner_sticky_note(out, r)
-    if not is_hw and r.random() < 0.18:
-        out = _apply_performer_pencil_markup(out, r)
-
-    # 1. Dark desk inset/border framing (p=0.25): pad 2-10% per side with dark desk RGB 0..70
-    if r.random() < 0.25 and orig_w >= 32 and orig_h >= 32:
+    # C. Asymmetric & 4-sided dark/wood desk border framing (p=0.45 full page, p=0.15 strip)
+    border_p = 0.15 if is_strip else 0.45
+    if (not has_dark_border) and r.random() < border_p and orig_w >= 32 and orig_h >= 32:
         has_dark_border = True
         dark_fill = _sample_dark_desk()
-        pad_l = max(1, int(round(orig_w * r.uniform(0.02, 0.10))))
-        pad_r = max(1, int(round(orig_w * r.uniform(0.02, 0.10))))
-        pad_t = max(1, int(round(orig_h * r.uniform(0.02, 0.10))))
-        pad_b = max(1, int(round(orig_h * r.uniform(0.02, 0.10))))
+        if r.random() < 0.55:
+            # 4-sided dark/wood desk border (1-12% per side)
+            sides = [True, True, True, True]
+        else:
+            # Asymmetric 1-3 sided desk border (common in handheld phone crops)
+            n_sides = r.randint(1, 3)
+            sides = [False, False, False, False]
+            for idx in r.sample((0, 1, 2, 3), n_sides):
+                sides[idx] = True
+        pad_l = max(1, int(round(orig_w * r.uniform(0.01, 0.12)))) if sides[0] else 0
+        pad_r = max(1, int(round(orig_w * r.uniform(0.01, 0.12)))) if sides[1] else 0
+        pad_t = max(1, int(round(orig_h * r.uniform(0.01, 0.12)))) if sides[2] else 0
+        pad_b = max(1, int(round(orig_h * r.uniform(0.01, 0.12)))) if sides[3] else 0
         cw = orig_w + pad_l + pad_r
         ch = orig_h + pad_t + pad_b
         if _cv2 is not None:
             arr_in = np.asarray(out, dtype=np.uint8)
-            if r.random() < 0.50:
+            if r.random() < 0.55:
                 np_rng = np.random.default_rng(r.randint(0, 2**31 - 1))
                 gw, gh = 32, 32
                 base_arr = np.array(dark_fill, dtype=np.float32).reshape(1, 1, 3)
-                gx = r.uniform(-10.0, 10.0)
-                gy = r.uniform(-10.0, 10.0)
+                gx = r.uniform(-12.0, 12.0)
+                gy = r.uniform(-12.0, 12.0)
                 xs = np.linspace(-0.5, 0.5, gw, dtype=np.float32).reshape(1, gw, 1)
                 ys = np.linspace(-0.5, 0.5, gh, dtype=np.float32).reshape(gh, 1, 1)
-                noise = np_rng.uniform(-4.0, 4.0, size=(gh, gw, 3)).astype(np.float32)
-                desk_small = np.clip(base_arr + gx * xs + gy * ys + noise, 0.0, 70.0).astype(np.uint8)
+                noise = np_rng.uniform(-5.0, 5.0, size=(gh, gw, 3)).astype(np.float32)
+                desk_small = np.clip(base_arr + gx * xs + gy * ys + noise, 0.0, 120.0).astype(np.uint8)
                 canvas_arr = _cv2.resize(desk_small, (cw, ch), interpolation=_cv2.INTER_LINEAR)
                 canvas_arr[pad_t : pad_t + orig_h, pad_l : pad_l + orig_w] = arr_in
             else:
                 canvas_arr = _cv2.copyMakeBorder(
                     arr_in, pad_t, pad_b, pad_l, pad_r, _cv2.BORDER_CONSTANT, value=dark_fill
                 )
-            out = Image.fromarray(_cv2.resize(canvas_arr, (orig_w, orig_h), interpolation=_cv2.INTER_AREA), mode="RGB")
+            out = Image.fromarray(_cv2.resize(canvas_arr, (orig_w, orig_h), interpolation=_cv2.INTER_LINEAR), mode="RGB")
         else:
             canvas = Image.new("RGB", (cw, ch), dark_fill)
-            if r.random() < 0.50:
-                # Fast subtle desk gradient/noise on low-res grid upsampled to canvas
+            if r.random() < 0.55:
                 np_rng = np.random.default_rng(r.randint(0, 2**31 - 1))
                 gw, gh = 32, 32
                 base_arr = np.array(dark_fill, dtype=np.float32).reshape(1, 1, 3)
-                gx = r.uniform(-10.0, 10.0)
-                gy = r.uniform(-10.0, 10.0)
+                gx = r.uniform(-12.0, 12.0)
+                gy = r.uniform(-12.0, 12.0)
                 xs = np.linspace(-0.5, 0.5, gw, dtype=np.float32).reshape(1, gw, 1)
                 ys = np.linspace(-0.5, 0.5, gh, dtype=np.float32).reshape(gh, 1, 1)
-                noise = np_rng.uniform(-4.0, 4.0, size=(gh, gw, 3)).astype(np.float32)
-                desk_small = np.clip(base_arr + gx * xs + gy * ys + noise, 0.0, 70.0).astype(np.uint8)
+                noise = np_rng.uniform(-5.0, 5.0, size=(gh, gw, 3)).astype(np.float32)
+                desk_small = np.clip(base_arr + gx * xs + gy * ys + noise, 0.0, 120.0).astype(np.uint8)
                 canvas = Image.fromarray(desk_small, mode="RGB").resize((cw, ch), Image.Resampling.BILINEAR)
             canvas.paste(out, (pad_l, pad_t))
             out = canvas.resize((orig_w, orig_h), Image.Resampling.BILINEAR)
 
-    # 2. Perspective quad warp (p=0.40): gentle 1-4% inward corner jitter
-    if r.random() < 0.40 and orig_w >= 32 and orig_h >= 32:
+    # D1. Cylindrical / book-gutter page curl (p=0.25 full page, p=0.10 strip)
+    if r.random() < (0.10 if is_strip else 0.25) and orig_w >= 32 and orig_h >= 32:
+        curl_fill = dark_fill if has_dark_border else page_fill
+        out = _apply_page_curl(out, r, border_fill=curl_fill)
+
+    # D2. Perspective quad warp (p=0.45 full page, 1-9% keystone; p=0.20 strip, 1-4%)
+    persp_p = 0.20 if is_strip else 0.45
+    if r.random() < persp_p and orig_w >= 32 and orig_h >= 32:
         w_f, h_f = float(orig_w), float(orig_h)
+        max_jit = 0.04 if is_strip else 0.09
         src_pts = [(0.0, 0.0), (w_f, 0.0), (w_f, h_f), (0.0, h_f)]
         dst_pts = [
-            (w_f * r.uniform(0.01, 0.04), h_f * r.uniform(0.01, 0.04)),
-            (w_f * (1.0 - r.uniform(0.01, 0.04)), h_f * r.uniform(0.01, 0.04)),
-            (w_f * (1.0 - r.uniform(0.01, 0.04)), h_f * (1.0 - r.uniform(0.01, 0.04))),
-            (w_f * r.uniform(0.01, 0.04), h_f * (1.0 - r.uniform(0.01, 0.04))),
+            (w_f * r.uniform(0.01, max_jit), h_f * r.uniform(0.01, max_jit)),
+            (w_f * (1.0 - r.uniform(0.01, max_jit)), h_f * r.uniform(0.01, max_jit)),
+            (w_f * (1.0 - r.uniform(0.01, max_jit)), h_f * (1.0 - r.uniform(0.01, max_jit))),
+            (w_f * r.uniform(0.01, max_jit), h_f * (1.0 - r.uniform(0.01, max_jit))),
         ]
-        p_fill = dark_fill if (has_dark_border or r.random() < 0.50) else _sample_paper_fill()
+        p_fill = dark_fill if (has_dark_border or r.random() < 0.50) else page_fill
         out = _fast_perspective(out, src_pts, dst_pts, p_fill)
 
-    # 3. Rotation (p=0.50): +/-1.5 deg on strips, +/-3.0 deg with expand=True on full pages
-    if r.random() < 0.50:
-        max_ang = 1.5 if is_strip else 3.0
+    # D3. Rotation (p=0.55 full page +/-7.0 deg with expand=True; p=0.35 strip +/-1.5 deg)
+    rot_p = 0.35 if is_strip else 0.55
+    if r.random() < rot_p:
+        max_ang = 1.5 if is_strip else 7.0
         angle = r.uniform(-max_ang, max_ang)
-        if has_dark_border and r.random() < 0.50:
-            rot_fill = (r.randint(0, 55), r.randint(0, 55), r.randint(0, 55))
+        if has_dark_border and r.random() < 0.70:
+            rot_fill = dark_fill
         else:
-            rot_fill = _sample_paper_fill()
+            rot_fill = page_fill
         out = _fast_rotate(out, angle, rot_fill, expand=(not is_strip))
 
-    # 4. 1-bit / clean scanner threshold (p=0.15) BEFORE shadow/vignette using local adaptive threshold
-    # so uneven illumination never turns clean pages solid black.
-    do_1bit = r.random() < 0.15
-    if do_1bit:
-        if _cv2 is not None:
-            luma_u8 = _cv2.cvtColor(np.asarray(out, dtype=np.uint8), _cv2.COLOR_RGB2GRAY)
-            local_bg = _cv2.blur(luma_u8, (31, 31))
-            delta_u8 = int(round(r.uniform(0.10, 0.22) * 255.0))
-            bw = np.where(luma_u8.astype(np.int16) >= (local_bg.astype(np.int16) - delta_u8), np.uint8(255), np.uint8(0))
-            return Image.fromarray(_cv2.cvtColor(bw, _cv2.COLOR_GRAY2RGB), mode="RGB")
-        luma_f = np.asarray(out.convert("L"), dtype=np.float32) * (1.0 / 255.0)
-        local_bg_f = np.asarray(
-            out.convert("L").filter(ImageFilter.BoxBlur(15)), dtype=np.float32
-        ) * (1.0 / 255.0)
-        delta = r.uniform(0.10, 0.22)
-        bw = np.where(luma_f >= (local_bg_f - delta), np.uint8(255), np.uint8(0))
-        return Image.fromarray(np.repeat(bw[..., None], 3, axis=2), mode="RGB")
-
-    # 5. Photometric pass (fused in-place numpy in [0, 255]): uneven shadows/vignette/parchment + brightness/contrast
+    # E1. Photometric pass (fast OpenCV 64x64 uint8 shading + LUT contrast, or NumPy fallback):
+    # uneven shadows/vignette/tint + brightness/contrast.
+    # Applies to ALL paths (standard, archival, and 1-bit photocopy) so archival & 1-bit see strong illumination!
     illum_roll = r.random()
-    do_bright = r.random() < 0.70
-    do_contrast = r.random() < 0.70
-    if illum_roll < 0.70 or do_bright or do_contrast:
-        arr = np.array(out, dtype=np.float32)
-        h, w = arr.shape[:2]
-        illum: Optional[np.ndarray] = None
-        tint: Optional[np.ndarray] = None
-        if illum_roll < 0.35:
-            # Stronger uneven shadows / vignette / warm cream-tan parchment cast (illum down to 0.40)
-            tint = np.array(
-                [r.uniform(0.92, 1.02), r.uniform(0.86, 0.98), r.uniform(0.72, 0.94)],
-                dtype=np.float32,
-            ).reshape(1, 1, 3)
-            gx = r.uniform(-0.45, 0.45)
-            gy = r.uniform(-0.45, 0.45)
-            vig = r.uniform(0.0, 0.35)
-            xs = np.linspace(-0.5, 0.5, w, dtype=np.float32).reshape(1, w, 1)
-            ys = np.linspace(-0.5, 0.5, h, dtype=np.float32).reshape(h, 1, 1)
-            r2 = (xs * xs + ys * ys) * 2.0
-            illum = np.clip(1.0 + gx * xs + gy * ys - vig * r2, 0.40, 1.15)
-        elif illum_roll < 0.70:
-            tint = np.array(
-                [r.uniform(0.95, 1.02), r.uniform(0.93, 1.00), r.uniform(0.87, 0.99)],
-                dtype=np.float32,
-            ).reshape(1, 1, 3)
-            gx = r.uniform(-0.18, 0.18)
-            gy = r.uniform(-0.18, 0.18)
-            xs = np.linspace(-0.5, 0.5, w, dtype=np.float32).reshape(1, w, 1)
-            ys = np.linspace(-0.5, 0.5, h, dtype=np.float32).reshape(h, 1, 1)
-            illum = np.clip(1.0 + gx * xs + gy * ys, 0.75, 1.15)
+    do_bright = r.random() < (0.50 if do_archival else 0.70)
+    do_contrast = r.random() < (0.45 if do_archival else 0.70)
+    if illum_roll < 0.72 or do_bright or do_contrast:
+        bright_fac = r.uniform(0.82, 1.14) if do_bright else 1.0
+        c_fac = r.uniform(0.78, 1.22) if do_contrast else 1.0
+        if _cv2 is not None:
+            arr_u8 = np.asarray(out, dtype=np.uint8)
+            h, w = arr_u8.shape[:2]
+            if illum_roll < 0.72 or do_bright:
+                mw, mh = 64, 64
+                xs = np.linspace(-0.5, 0.5, mw, dtype=np.float32).reshape(1, mw, 1)
+                ys = np.linspace(-0.5, 0.5, mh, dtype=np.float32).reshape(mh, 1, 1)
+                if illum_roll < 0.38:
+                    tint = (
+                        np.ones((1, 1, 3), dtype=np.float32)
+                        if do_archival
+                        else np.array(
+                            [r.uniform(0.92, 1.02), r.uniform(0.86, 0.98), r.uniform(0.72, 0.94)],
+                            dtype=np.float32,
+                        ).reshape(1, 1, 3)
+                    )
+                    gx = r.uniform(-0.45, 0.45)
+                    gy = r.uniform(-0.45, 0.45)
+                    vig = r.uniform(0.0, 0.35)
+                    r2 = (xs * xs + ys * ys) * 2.0
+                    illum_small = np.clip(1.0 + gx * xs + gy * ys - vig * r2, 0.40, 1.15) * tint * np.float32(bright_fac)
+                elif illum_roll < 0.72:
+                    tint = (
+                        np.ones((1, 1, 3), dtype=np.float32)
+                        if do_archival
+                        else np.array(
+                            [r.uniform(0.95, 1.02), r.uniform(0.93, 1.00), r.uniform(0.87, 0.99)],
+                            dtype=np.float32,
+                        ).reshape(1, 1, 3)
+                    )
+                    gx = r.uniform(-0.20, 0.20)
+                    gy = r.uniform(-0.20, 0.20)
+                    illum_small = np.clip(1.0 + gx * xs + gy * ys, 0.72, 1.15) * tint * np.float32(bright_fac)
+                else:
+                    illum_small = np.full((mh, mw, 3), bright_fac, dtype=np.float32)
+                # Map gain in [0, 2.0) to uint8 via scale=1/128.0 so gain > 1.0 works with zero float32 full-res alloc
+                mult_small = np.clip(np.round(illum_small * 128.0), 0.0, 255.0).astype(np.uint8)
+                mult_full = _cv2.resize(mult_small, (w, h), interpolation=_cv2.INTER_LINEAR)
+                arr_u8 = _cv2.multiply(arr_u8, mult_full, scale=1.0 / 128.0)
+            if do_contrast:
+                vals = np.arange(256, dtype=np.float32)
+                lut = np.clip(vals * np.float32(c_fac) + np.float32(127.5 * (1.0 - c_fac)), 0.0, 255.0).astype(np.uint8)
+                arr_u8 = _cv2.LUT(arr_u8, lut)
+            out = Image.fromarray(arr_u8, mode="RGB")
+        else:
+            arr = np.array(out, dtype=np.float32)
+            h, w = arr.shape[:2]
+            illum: Optional[np.ndarray] = None
+            tint_fb: Optional[np.ndarray] = None
+            if illum_roll < 0.38:
+                if not do_archival:
+                    tint_fb = np.array(
+                        [r.uniform(0.92, 1.02), r.uniform(0.86, 0.98), r.uniform(0.72, 0.94)],
+                        dtype=np.float32,
+                    ).reshape(1, 1, 3)
+                gx = r.uniform(-0.45, 0.45)
+                gy = r.uniform(-0.45, 0.45)
+                vig = r.uniform(0.0, 0.35)
+                xs = np.linspace(-0.5, 0.5, w, dtype=np.float32).reshape(1, w, 1)
+                ys = np.linspace(-0.5, 0.5, h, dtype=np.float32).reshape(h, 1, 1)
+                r2 = (xs * xs + ys * ys) * 2.0
+                illum = np.clip(1.0 + gx * xs + gy * ys - vig * r2, 0.40, 1.15)
+            elif illum_roll < 0.72:
+                if not do_archival:
+                    tint_fb = np.array(
+                        [r.uniform(0.95, 1.02), r.uniform(0.93, 1.00), r.uniform(0.87, 0.99)],
+                        dtype=np.float32,
+                    ).reshape(1, 1, 3)
+                gx = r.uniform(-0.20, 0.20)
+                gy = r.uniform(-0.20, 0.20)
+                xs = np.linspace(-0.5, 0.5, w, dtype=np.float32).reshape(1, w, 1)
+                ys = np.linspace(-0.5, 0.5, h, dtype=np.float32).reshape(h, 1, 1)
+                illum = np.clip(1.0 + gx * xs + gy * ys, 0.72, 1.15)
 
-        bright_fac = r.uniform(0.80, 1.15) if do_bright else 1.0
-        c_fac = r.uniform(0.75, 1.25) if do_contrast else 1.0
-        gain = np.float32(bright_fac * c_fac)
-        if tint is not None:
-            tint *= gain
-            arr *= tint
-        elif gain != 1.0:
-            arr *= gain
-        if illum is not None:
-            arr *= illum
-        if do_contrast:
-            arr += np.float32(127.5 * (1.0 - c_fac))
+            gain = np.float32(bright_fac * c_fac)
+            if tint_fb is not None:
+                tint_fb *= gain
+                arr *= tint_fb
+            elif gain != 1.0:
+                arr *= gain
+            if illum is not None:
+                arr *= illum
+            if do_contrast:
+                arr += np.float32(127.5 * (1.0 - c_fac))
+            np.clip(arr, 0.0, 255.0, out=arr)
+            out = Image.fromarray(arr.astype(np.uint8), mode="RGB")
 
-        np.clip(arr, 0.0, 255.0, out=arr)
-        out = Image.fromarray(arr.astype(np.uint8), mode="RGB")
+    # E2. Cast shadow (hand/phone/stand shadow band or half-plane, p=0.25)
+    if r.random() < 0.25 and orig_w >= 32 and orig_h >= 32:
+        out = _apply_cast_shadow(out, r)
 
-    # 6. Mild Gaussian blur (or HW low-res round-trip + defocus + contrast compression, max(W,H) >= 1280)
-    if is_hw and r.random() < (0.25 if orig_w > orig_h else 0.15) and max(orig_w, orig_h) >= 1280:
+    # E3. Specular glare / flash hotspot (p=0.15)
+    if r.random() < 0.15 and orig_w >= 32 and orig_h >= 32:
+        out = _apply_specular_glare(out, r)
+
+    # F1. Low-res round-trip + defocus + contrast compression (no >=1280px gate; both HW & printed)
+    lowres_p = (0.25 if orig_w > orig_h else 0.15) if is_hw else 0.12
+    if r.random() < lowres_p and orig_w >= 32 and orig_h >= 32:
         out = _apply_hw_lowres_defocus_compress(out, r)
-    elif r.random() < 0.30:
+    elif r.random() < 0.28:
         out = _fast_gaussian_blur(out, r.uniform(0.3, 1.0))
 
-    # 7. JPEG compression artifacts
-    if r.random() < 0.35:
-        out = _fast_jpeg_roundtrip(out, r.randint(35, 85))
+    # F2. JPEG compression artifacts
+    if r.random() < 0.40:
+        out = _fast_jpeg_roundtrip(out, r.randint(35, 88))
 
-    # 8. Additive Gaussian sensor noise (fast in-place luma-dominant float32 noise)
+    # F3. Additive Gaussian sensor noise (fast tiled uint8 cv2.add/subtract ~3 ms vs 29 ms float32)
     if r.random() < 0.45:
-        arr = np.array(out, dtype=np.float32)
         sigma = r.uniform(2.5, 9.0)
         np_rng = np.random.default_rng(r.randint(0, 2**31 - 1))
-        noise = np_rng.standard_normal((arr.shape[0], arr.shape[1], 1), dtype=np.float32) * np.float32(sigma)
-        arr += noise
-        np.clip(arr, 0.0, 255.0, out=arr)
-        out = Image.fromarray(arr.astype(np.uint8), mode="RGB")
+        if _cv2 is not None:
+            arr_u8 = np.asarray(out, dtype=np.uint8)
+            h, w = arr_u8.shape[:2]
+            th, tw = min(256, h), min(256, w)
+            tile = np_rng.standard_normal((th, tw), dtype=np.float32) * np.float32(sigma)
+            pos = np.clip(tile, 0.0, 255.0).astype(np.uint8)
+            neg = np.clip(-tile, 0.0, 255.0).astype(np.uint8)
+            ny = (h + th - 1) // th
+            nx = (w + tw - 1) // tw
+            pos_f = _cv2.cvtColor(_cv2.repeat(pos, ny, nx)[:h, :w], _cv2.COLOR_GRAY2RGB)
+            neg_f = _cv2.cvtColor(_cv2.repeat(neg, ny, nx)[:h, :w], _cv2.COLOR_GRAY2RGB)
+            out = Image.fromarray(_cv2.subtract(_cv2.add(arr_u8, pos_f), neg_f), mode="RGB")
+        else:
+            arr = np.array(out, dtype=np.float32)
+            noise = np_rng.standard_normal((arr.shape[0], arr.shape[1], 1), dtype=np.float32) * np.float32(sigma)
+            arr += noise
+            np.clip(arr, 0.0, 255.0, out=arr)
+            out = Image.fromarray(arr.astype(np.uint8), mode="RGB")
 
     return out
 
@@ -3287,6 +3846,10 @@ class UniStripDataset(Dataset):
         kind: str = "strip",
         return_uint8: bool = False,
         is_hw: Optional[bool] = None,
+        rism_style_pool: Optional[RismStylePool] = None,
+        rism_fda_prob: float = 0.0,
+        rism_adain_prob: float = 0.0,
+        rism_fda_beta: float = 0.02,
     ) -> None:
         self.pairs = list(pairs)
         self.strip_height = int(strip_height)
@@ -3297,6 +3860,10 @@ class UniStripDataset(Dataset):
         self.kind = str(kind)
         self.return_uint8 = bool(return_uint8)
         self.is_hw = bool(is_hw) if is_hw is not None else (self.kind == "hw_strip")
+        self.rism_style_pool = rism_style_pool
+        self.rism_fda_prob = float(max(0.0, min(1.0, rism_fda_prob)))
+        self.rism_adain_prob = float(max(0.0, min(1.0, rism_adain_prob)))
+        self.rism_fda_beta = float(rism_fda_beta)
         self._seq_cache: Dict[int, np.ndarray] = {}
 
     def __len__(self) -> int:
@@ -3308,7 +3875,17 @@ class UniStripDataset(Dataset):
         arr = _load_and_resize_strip_array(img_path, self.strip_height, self.max_strip_width)
         if self.augment and self.aug_prob > 0.0:
             if (not _is_pre_degraded_path(img_path)) and random.random() < self.aug_prob:
-                img = apply_online_augment(Image.fromarray(arr, mode="RGB"), is_hw=self.is_hw, is_strip=True)
+                p_low = str(img_path).lower()
+                use_pool = None if ("real_hw" in p_low or "real-hw" in p_low or "debussy" in p_low) else self.rism_style_pool
+                img = apply_online_augment(
+                    Image.fromarray(arr, mode="RGB"),
+                    is_hw=self.is_hw,
+                    is_strip=True,
+                    rism_style_pool=use_pool,
+                    rism_fda_prob=self.rism_fda_prob,
+                    rism_adain_prob=self.rism_adain_prob,
+                    rism_fda_beta=self.rism_fda_beta,
+                )
                 img_t = _pil_to_chw_uint8(img) if self.return_uint8 else _pil_to_chw_tensor(img)
             elif random.random() < 0.25:
                 img = apply_clean_scale_jitter(Image.fromarray(arr, mode="RGB"))
@@ -3366,6 +3943,10 @@ class UniFullPageDataset(Dataset):
         multi_scale: bool = False,
         return_uint8: bool = False,
         domains: Optional[Sequence[str]] = None,
+        rism_style_pool: Optional[RismStylePool] = None,
+        rism_fda_prob: float = 0.0,
+        rism_adain_prob: float = 0.0,
+        rism_fda_beta: float = 0.02,
     ) -> None:
         self.pairs = list(pairs)
         self.fullpage_max_dim = int(fullpage_max_dim)
@@ -3375,6 +3956,10 @@ class UniFullPageDataset(Dataset):
         self.multi_scale = bool(multi_scale)
         self.return_uint8 = bool(return_uint8)
         self.domains = [str(d).strip().lower() for d in domains] if domains is not None else None
+        self.rism_style_pool = rism_style_pool
+        self.rism_fda_prob = float(max(0.0, min(1.0, rism_fda_prob)))
+        self.rism_adain_prob = float(max(0.0, min(1.0, rism_adain_prob)))
+        self.rism_fda_beta = float(rism_fda_beta)
         self._batch_target_dim: Optional[int] = None
         self._seq_cache: Dict[int, np.ndarray] = {}
 
@@ -3410,7 +3995,16 @@ class UniFullPageDataset(Dataset):
         arr = _load_and_resize_fullpage_array(img_path, target_dim)
         if self.augment and self.aug_prob > 0.0:
             if (not _is_pre_degraded_path(img_path)) and random.random() < self.aug_prob:
-                img = apply_online_augment(Image.fromarray(arr, mode="RGB"), is_hw=is_hw, is_strip=False)
+                use_pool = None if domain == "real_hw" else self.rism_style_pool
+                img = apply_online_augment(
+                    Image.fromarray(arr, mode="RGB"),
+                    is_hw=is_hw,
+                    is_strip=False,
+                    rism_style_pool=use_pool,
+                    rism_fda_prob=self.rism_fda_prob,
+                    rism_adain_prob=self.rism_adain_prob,
+                    rism_fda_beta=self.rism_fda_beta,
+                )
                 img_t = _pil_to_chw_uint8(img) if self.return_uint8 else _pil_to_chw_tensor(img)
             elif random.random() < 0.25:
                 img = apply_clean_scale_jitter(Image.fromarray(arr, mode="RGB"))

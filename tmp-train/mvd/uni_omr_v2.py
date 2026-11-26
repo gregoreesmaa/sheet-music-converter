@@ -843,11 +843,11 @@ class InkTokenRouterV2(nn.Module):
 
         Uses a fast vectorized 4-edge inward scan stopping at the first bright
         pixel (``luma >= 0.45``) to isolate only dark exterior desk/scanner
-        borders (``luma < 0.30`` connected to the outer boundary), dilates that
-        outer border mask by 16px in pixel space (separable 1x33 + 33x1 max-pool)
-        to eliminate the paper-to-desk transition halo, and pools to the feature
-        grid. Interior shadows and dense dark ink on aged/shadowed real HW photos
-        are NEVER masked out.
+        borders (``luma < 0.22`` connected to the outer boundary), dilates that
+        outer border mask by 6px in pixel space (separable 1x13 + 13x1 max-pool)
+        to eliminate the paper-to-desk transition halo without eroding tight
+        left clefs, and pools to the feature grid. Interior shadows and dense
+        dark ink on aged/shadowed real HW photos are NEVER masked out.
         """
         if images.shape[1] == 3:
             luma = images[:, 0:1].to(torch.float32) * 0.299
@@ -856,7 +856,7 @@ class InkTokenRouterV2(nn.Module):
             luma = images.to(torch.float32).mean(dim=1, keepdim=True)
 
         # Edge-connected dark-border mask: 2 cumsums (0 flips) — bit-identical to 4-edge scan.
-        # Since (luma < 0.30) implies bright_i == 0, cs_y == cs_y[:, :, -1:, :] iff no bright pixel at y..H-1.
+        # Since (luma < 0.22) implies bright_i == 0, cs_y == cs_y[:, :, -1:, :] iff no bright pixel at y..H-1.
         bright_i = (luma >= 0.45).to(torch.int32)
         cs_y = bright_i.cumsum(dim=2)
         cs_x = bright_i.cumsum(dim=3)
@@ -866,14 +866,14 @@ class InkTokenRouterV2(nn.Module):
             | (cs_x == 0)
             | (cs_x == cs_x[:, :, :, -1:])
         )
-        border_px = (edge_dark & (luma < 0.30)).to(luma.dtype)
+        border_px = (edge_dark & (luma < 0.22)).to(luma.dtype)
 
-        # Dilate ONLY the outer border mask by 16px in pixel space (separable 1x33 + 33x1)
+        # Dilate ONLY the outer border mask by 6px in pixel space (separable 1x13 + 13x1)
         border_dilated_px = F.max_pool2d(
-            F.max_pool2d(border_px, kernel_size=(1, 33), stride=1, padding=(0, 16)),
-            kernel_size=(33, 1),
+            F.max_pool2d(border_px, kernel_size=(1, 13), stride=1, padding=(0, 6)),
+            kernel_size=(13, 1),
             stride=1,
-            padding=(16, 0),
+            padding=(6, 0),
         )
         paper_px = (1.0 - border_dilated_px).clamp_(0.0, 1.0)
 
@@ -966,8 +966,13 @@ class InkTokenRouterV2(nn.Module):
                 k = min(max(int(math.ceil(N * self.max_keep_ratio)), 1), max_k)
             else:
                 with torch.no_grad():
-                    med = score_flat.median(dim=1, keepdim=True).values
-                    above = (score_flat > (med + self.saliency_thr)).sum(dim=1)
+                    if torch.onnx.is_in_onnx_export():
+                        k10 = max(1, min(N, int(round(0.10 * max(0, N - 1))) + 1))
+                        p10 = torch.topk(score_flat, k=k10, dim=1, largest=False, sorted=True).values[:, -1:]
+                    else:
+                        p10 = torch.quantile(score_flat.float(), 0.10, dim=1, keepdim=True).to(score_flat.dtype)
+                    thr = max(self.saliency_thr, 0.15)
+                    above = (score_flat > (p10 + thr)).sum(dim=1)
                     k_dyn = int(above.max().item())
                     k_min = max(1, int(math.ceil(N * self.min_keep_ratio)))
                     k_max = max(k_min, min(N, int(math.ceil(N * self.max_keep_ratio))))

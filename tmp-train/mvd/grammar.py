@@ -12,6 +12,7 @@ Seam: if ``decode.rs`` event order changes, update ``_State`` together.
 
 from __future__ import annotations
 
+import hashlib
 import sys
 from pathlib import Path
 
@@ -82,6 +83,18 @@ MAX_CHORDS_PER_ONSET = 8
 MAX_CONSECUTIVE_GRACE = 8
 MAX_CONSECUTIVE_BAR_REST = 24
 MAX_SYSTEMS = 24
+MAX_TOKENS_PER_BAR = 288
+RECENT_WINDOW_MIN = 512
+RECENT_WINDOW_KEEP = 576
+RECENT_WINDOW_CAP = 640
+BAR_HASH_CONSEC_LIMIT = 5
+BAR_HASH_WINDOW_SIZE = 12
+BAR_HASH_WINDOW_LIMIT = 8
+_COSMETIC_SYS_TOKENS = frozenset(DYNS) | frozenset(['slur-start', 'slur-stop'])
+_COSMETIC_BAR_TOKENS = (
+    frozenset(DYNS) | frozenset(CLEFS) | frozenset(KEYS) | frozenset(TIMES)
+    | frozenset(['slur-start', 'slur-stop'])
+)
 LAX_BAR_MULT = 2.5
 LAX_BAR_MIN_BEATS = 8.0
 SHORT_PICKUP_TIMES = frozenset(['time-1-32', 'time-1-16'])
@@ -148,6 +161,8 @@ class PrefixState:
                  'chords_on_onset', 'grace_run',
                  'consec_bar_rest_bars', 'bar_has_pitched', 'bar_has_bar_rest',
                  'sys_count', 'sys_has_event',
+                 'tokens_since_bar', 'cur_sys_tokens', 'completed_system_hashes',
+                 'cur_bar_tokens', 'sys_bar_hashes', 'bar_repeat_forbidden_tok',
                  'comp_num', 'comp_digits', 'comp_val',
                  'allow_percussion_tab', 'vocab_map')
 
@@ -192,6 +207,12 @@ class PrefixState:
         self.bar_has_bar_rest = False
         self.sys_count = 0
         self.sys_has_event = False
+        self.tokens_since_bar = 0
+        self.cur_sys_tokens = []
+        self.completed_system_hashes = {}
+        self.cur_bar_tokens = []
+        self.sys_bar_hashes = []
+        self.bar_repeat_forbidden_tok = None
         # bekern v2 compositional sub-state counters (flat ints for cheap copy())
         self.comp_num = 0
         self.comp_digits = 0
@@ -238,6 +259,12 @@ class PrefixState:
         c.bar_has_bar_rest = self.bar_has_bar_rest
         c.sys_count = self.sys_count
         c.sys_has_event = self.sys_has_event
+        c.tokens_since_bar = self.tokens_since_bar
+        c.cur_sys_tokens = list(self.cur_sys_tokens)
+        c.completed_system_hashes = dict(self.completed_system_hashes)
+        c.cur_bar_tokens = list(self.cur_bar_tokens)
+        c.sys_bar_hashes = list(self.sys_bar_hashes)
+        c.bar_repeat_forbidden_tok = self.bar_repeat_forbidden_tok
         c.comp_num = self.comp_num
         c.comp_digits = self.comp_digits
         c.comp_val = self.comp_val
@@ -245,14 +272,78 @@ class PrefixState:
         c.vocab_map = self.vocab_map
         return c
 
+    @staticmethod
+    def _hash_tokens(toks):
+        return hashlib.sha1(' '.join(toks).encode('utf-8')).hexdigest()[:16]
+
+    def _canonical_system_hash(self):
+        canon = [t for t in self.cur_sys_tokens if t not in _COSMETIC_SYS_TOKENS]
+        if not canon:
+            return None
+        return self._hash_tokens(canon)
+
+    @staticmethod
+    def _is_pure_rest_bar(bar_toks):
+        return not any(t in STEPS for t in bar_toks)
+
+    def _record_completed_bar(self):
+        if not self.cur_bar_tokens or self._is_pure_rest_bar(self.cur_bar_tokens):
+            self.sys_bar_hashes.append(None)
+            self.bar_repeat_forbidden_tok = None
+            return
+        canon = [t for t in self.cur_bar_tokens if t not in _COSMETIC_BAR_TOKENS]
+        if not canon:
+            self.sys_bar_hashes.append(None)
+            self.bar_repeat_forbidden_tok = None
+            return
+        bh = self._hash_tokens(canon)
+        self.sys_bar_hashes.append(bh)
+        consec = 0
+        for prev in reversed(self.sys_bar_hashes):
+            if prev == bh:
+                consec += 1
+            else:
+                break
+        win = self.sys_bar_hashes[-BAR_HASH_WINDOW_SIZE:]
+        win_count = sum(1 for x in win if x == bh)
+        if consec >= BAR_HASH_CONSEC_LIMIT or win_count >= BAR_HASH_WINDOW_LIMIT:
+            self.bar_repeat_forbidden_tok = canon[0]
+        else:
+            self.bar_repeat_forbidden_tok = None
+
     def can_emit_sys(self):
-        """Return True iff the current system has >=1 musical event and page is under MAX_SYSTEMS."""
-        return bool(self.sys_has_event) and (self.sys_count < MAX_SYSTEMS - 1)
+        """Return True iff the current system has >=1 musical event, page is under MAX_SYSTEMS,
+        and the current system does not duplicate a previously completed system."""
+        if not self.sys_has_event or self.sys_count >= MAX_SYSTEMS - 1:
+            return False
+        cur_h = self._canonical_system_hash()
+        if cur_h is not None and self.completed_system_hashes.get(cur_h, 0) >= 1:
+            return False
+        return True
+
+    def can_emit_eos(self, cur_len=None, max_len=None):
+        """Return True iff <eos> is legal here (guards against empty trailing systems)."""
+        if cur_len is not None and max_len is not None and cur_len >= max_len:
+            return True
+        if (self.sys_count + 1) >= MAX_SYSTEMS:
+            return True
+        return bool(self.sys_has_event)
 
     def reset_system(self):
         """Advance to a new system on ``<sys>`` while preserving cross-system cycle history."""
+        if self.sys_has_event:
+            cur_h = self._canonical_system_hash()
+            if cur_h is not None:
+                self.completed_system_hashes[cur_h] = (
+                    self.completed_system_hashes.get(cur_h, 0) + 1
+                )
         self.sys_count += 1
         self.sys_has_event = False
+        self.tokens_since_bar = 0
+        self.cur_sys_tokens = []
+        self.cur_bar_tokens = []
+        self.sys_bar_hashes = []
+        self.bar_repeat_forbidden_tok = None
         self.mode = 'bound'
         self.header_open = True
         self.seg_last = [False]
@@ -280,8 +371,8 @@ class PrefixState:
         self.comp_digits = 0
         self.comp_val = 0
         self.recent.append('<sys>')
-        if len(self.recent) > 128:
-            del self.recent[:-128]
+        if len(self.recent) > RECENT_WINDOW_KEEP:
+            del self.recent[:-RECENT_WINDOW_KEEP]
 
     def _grow(self, n):
         while len(self.seg_last) < n:
@@ -457,6 +548,9 @@ class PrefixState:
                 self.consec_bar_rest_bars += 1
             else:
                 self.consec_bar_rest_bars = 0
+            self._record_completed_bar()
+            self.cur_bar_tokens = []
+            self.tokens_since_bar = 0
             self.bar_has_pitched = False
             self.bar_has_bar_rest = False
             # A stashed courtesy time-sig takes effect for the new
@@ -606,8 +700,12 @@ class PrefixState:
             self.run_tok = t
             self.run_len = 1
         self.recent.append(t)
-        if len(self.recent) > 320:
-            del self.recent[:32]
+        if len(self.recent) > RECENT_WINDOW_CAP:
+            del self.recent[:-RECENT_WINDOW_KEEP]
+        self.cur_sys_tokens.append(t)
+        if t not in BAR_LIKES:
+            self.cur_bar_tokens.append(t)
+            self.tokens_since_bar += 1
         if self.mode == 'bound':
             self.mode = self._bound(t)
         elif self.mode == 'chord':
@@ -864,16 +962,19 @@ class PrefixState:
         ngram_max=16,
         max_ngram_repeats=3,
         non_bar_ngram_repeats=8,
-        bar_ngram_max=64,
+        bar_ngram_max=160,
     ):
         """Token STRING that would extend a tight cycle or n-gram loop.
 
         Returns the single forbidden continuation token, or None. Checks:
+        0. Canonical completed-bar repeat guard within the current system
+           (>=5 consecutive identical canonical non-rest bars, or >=8 in
+           the last 12 bars, ignoring cosmetic slur/clef/dyn tokens).
         1. Identical 8-to-16-token pattern: requires a bar token (``BAR_LIKES``)
            inside the pattern to trigger at ``max_ngram_repeats`` (3) consecutive
            repeats; non-bar 8..16-token patterns (legitimate musical ostinatos /
            arpeggios) require ``non_bar_ngram_repeats`` (8) consecutive repeats.
-        2. Identical bar-containing pattern of length 17..64 repeated
+        2. Identical bar-containing pattern of length 17..160 repeated
            ``max_ngram_repeats`` (3) consecutive times (kills verbatim
            multi-bar loops without touching non-bar ostinatos).
         3. Exact adjacent repeats of any short period (1..24 tokens) past
@@ -884,6 +985,11 @@ class PrefixState:
         """
         if self.header_open:
             return None
+        if (
+            self.bar_repeat_forbidden_tok is not None
+            and all(tok in _COSMETIC_BAR_TOKENS for tok in self.cur_bar_tokens)
+        ):
+            return self.bar_repeat_forbidden_tok
         r = self.recent
         n = len(r)
         # 1. Conservative 8..16-token n-gram loop guard (bar: >3x, non-bar ostinato: >=8x)
@@ -942,8 +1048,14 @@ class PrefixState:
             return _fail_open()
         vm = self.vocab_map
         allow = set()
+        bar_tok_capped = self.tokens_since_bar >= MAX_TOKENS_PER_BAR
+        eos_ok = (len(self.recent) == 0) or self.can_emit_eos()
 
         def add_boundary(placed=None):
+            if bar_tok_capped:
+                allow.add(vm[BAR])
+                allow.update(vm[t] for t in BAR_RIGHT if t in vm)
+                return
             # Strict parity with step(): a BAR right after a BAR, and
             # a voice marker that step() would reject (non-sequential
             # open or consecutive duplicate), are masked here instead
@@ -1017,7 +1129,7 @@ class PrefixState:
 
         if self.mode == 'bound':
             add_boundary()
-            return allow, True
+            return allow, eos_ok
         if self.mode == 'grace':
             # Display-only duration follows a grace marker (never
             # strict-gated: grace steals no time).
@@ -1040,26 +1152,28 @@ class PrefixState:
             allow.update(vm[t] for t in OCTAVES if t in vm)
             return allow, False
         if self.mode == 'pitch-tail':
-            # decode.rs consumes a single optional alter BEFORE the dot
-            # loop; a second alter, or an alter after dots, never parses.
-            if not (self.strict
-                    and (self.alter_seen or self.dot_seen)):
-                allow.update(vm[t] for t in ALTERS)
-            if self._dot_ok():
-                allow.add(vm[DOT])
-            allow.add(vm[TIE_START])
-            allow.add(vm[TIE_STOP])
-            allow.update(vm[t] for t in MODS)
-            if self.allow_percussion_tab:
-                allow.update(vm[t] for t in NOTEHEADS | TAB_STRINGS | TAB_FRETS
-                             if t in vm)
+            if not bar_tok_capped:
+                # decode.rs consumes a single optional alter BEFORE the dot
+                # loop; a second alter, or an alter after dots, never parses.
+                if not (self.strict
+                        and (self.alter_seen or self.dot_seen)):
+                    allow.update(vm[t] for t in ALTERS)
+                if self._dot_ok():
+                    allow.add(vm[DOT])
+                allow.add(vm[TIE_START])
+                allow.add(vm[TIE_STOP])
+                allow.update(vm[t] for t in MODS)
+                if self.allow_percussion_tab:
+                    allow.update(vm[t] for t in NOTEHEADS | TAB_STRINGS | TAB_FRETS
+                                 if t in vm)
             add_boundary(placed=True)
-            return allow, True
+            return allow, eos_ok
         if self.mode == 'tiestart':
-            allow.add(vm[TIE_STOP])
-            allow.update(vm[t] for t in MODS)
+            if not bar_tok_capped:
+                allow.add(vm[TIE_STOP])
+                allow.update(vm[t] for t in MODS)
             add_boundary(placed=True)
-            return allow, True
+            return allow, eos_ok
         if self.mode == 'rest':
             if self._bar_is_full():
                 # Full bar: no duration fits (each overshoots);
@@ -1072,11 +1186,12 @@ class PrefixState:
                     allow.add(vm[t])
             return allow, False
         if self.mode == 'rest-tail':
-            if self._dot_ok():
-                allow.add(vm[DOT])
-            allow.update(vm[t] for t in MODS)
+            if not bar_tok_capped:
+                if self._dot_ok():
+                    allow.add(vm[DOT])
+                allow.update(vm[t] for t in MODS)
             add_boundary()
-            return allow, True
+            return allow, eos_ok
         if self.mode == 'time-num':
             if self.comp_digits == 0:
                 allow.update(vm[t] for t in NONZERO_DIGITS if t in vm)
@@ -1104,7 +1219,7 @@ class PrefixState:
             if '6' in vm:
                 allow.add(vm['6'])
             add_boundary()
-            return allow, True
+            return allow, eos_ok
         if self.mode == 'tuplet-a':
             if self.comp_digits == 0:
                 allow.update(vm[t] for t in NONZERO_DIGITS if t in vm)
@@ -1122,7 +1237,7 @@ class PrefixState:
                 return allow, False
             allow.update(vm[t] for t in DIGITS if t in vm)
             add_boundary()
-            return allow, True
+            return allow, eos_ok
         if self.mode == 'multi-rest':
             if self.comp_digits == 0:
                 allow.update(vm[t] for t in NONZERO_DIGITS if t in vm)

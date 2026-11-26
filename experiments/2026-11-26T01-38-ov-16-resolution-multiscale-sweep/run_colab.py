@@ -301,7 +301,17 @@ def _run_arm(
     args.multi_scale = bool(arm["multi_scale"])
 
     # Patch split_train_val so validation always runs on exact held-out proxy_val.jsonl
-    val_pairs = uni_omr.discover_fullpage_pairs([], manifest=str(val_manifest))
+    val_pairs = []
+    for _raw_line in Path(val_manifest).read_text(encoding="utf-8").splitlines():
+        _raw_line = _raw_line.strip()
+        if not _raw_line:
+            continue
+        _rec = json.loads(_raw_line)
+        _img_p = Path(_rec["image"])
+        _beks = [Path(b) for b in _rec.get("bekerns", [])]
+        _dom = str(_rec.get("domain", "")).strip().lower()
+        if _img_p.is_file() and _beks:
+            val_pairs.append((_img_p, _beks, _dom))
     orig_split = train_uni_v2.split_train_val
 
     def _fixed_val_split(pairs: Any, val_count: int = 0, seed: int = 42) -> Tuple[Any, Any]:

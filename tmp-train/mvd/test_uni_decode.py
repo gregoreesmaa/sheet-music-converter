@@ -131,7 +131,9 @@ class TestUniDecodeCPU(unittest.TestCase):
         st_reset = ev._advance_grammar_state(st, uni_omr.SYS_ID, strict=False)
         self.assertTrue(st_reset.header_open)
         self.assertEqual(st_reset.mode, "bound")
-        self.assertEqual(st_reset.recent, [])
+        # Loophole-B fix: recent retains cross-system history (up to RECENT_WINDOW_KEEP) ending with <sys>
+        self.assertEqual(st_reset.recent[-1], "<sys>")
+        self.assertLessEqual(len(st_reset.recent), grammar.RECENT_WINDOW_KEEP)
 
     def test_constrained_all_false_fallback_never_crashes(self) -> None:
         """All-NaN or empty-mask logits safely fall back to unconstrained argmax without crashing."""
@@ -599,35 +601,36 @@ class TestUniDecodeCPU(unittest.TestCase):
         """Iter-9 guards: >3x 8..16-token repeat blocked; mid-bar key/time blocked in incomplete bars."""
         # 1. 8..16-token pattern: 3 consecutive repeats allowed, 4th blocked.
         ostinato_12 = [
-            "eighth", "C", "4",
-            "eighth", "D", "4",
-            "eighth", "E", "4",
-            "eighth", "F", "4",
+            "16th", "C", "4",
+            "16th", "D", "4",
+            "16th", "E", "4",
+            "16th", "F", "4",
         ]
         self.assertEqual(len(ostinato_12), 12)
         st = grammar.PrefixState(strict=False)
         for tok in ("clef-G-2", "key+0", "time-4-4"):
             st.step(tok)
-        # 1st and 2nd repeats: cycle_forbidden must still be None
-        for rep in range(2):
+        # 1. Non-bar 8..16-token ostinato: up to 7 repeats allowed (legitimate arpeggios),
+        # 8th repeat triggers non_bar_ngram_repeats=8 guard.
+        for rep in range(7):
             for tok in ostinato_12:
                 st.step(tok)
             self.assertIsNone(st.cycle_forbidden(), f"Blocked too early after {rep + 1} repeats")
-        # 3rd repeat completes -> 4th repeat's opening token ('eighth') must now be forbidden
+        # 8th repeat completes -> 9th repeat's opening token ('16th') must now be forbidden
         for tok in ostinato_12:
             st.step(tok)
-        self.assertEqual(st.cycle_forbidden(), "eighth")
+        self.assertEqual(st.cycle_forbidden(), "16th")
         allowed = ev._allowed_ids_for_state(st, uni_omr.VOCAB_SIZE)
-        self.assertNotIn(data.TOKEN_TO_ID["eighth"], allowed)
+        self.assertNotIn(data.TOKEN_TO_ID["16th"], allowed)
 
-        # 2. Tight note loop `eighth C 4` (period 9 = 3x3) blocked after 9 notes (3x period-9)
+        # 2. Tight note loop `16th C 4` (period 9 = 3x3) blocked after 24 notes (8x period-9)
         st_note = grammar.PrefixState(strict=False)
         for tok in ("clef-G-2", "key+0", "time-4-4"):
             st_note.step(tok)
-        for _ in range(9):
-            for tok in ("eighth", "C", "4"):
+        for _ in range(24):
+            for tok in ("16th", "C", "4"):
                 st_note.step(tok)
-        self.assertEqual(st_note.cycle_forbidden(), "eighth")
+        self.assertEqual(st_note.cycle_forbidden(), "16th")
 
         # 3. Verbatim multi-bar loop (21 tokens containing 'bar') blocked after 3 bars
         bar_21 = [
@@ -644,39 +647,44 @@ class TestUniDecodeCPU(unittest.TestCase):
                 st_bar.step(tok)
         self.assertEqual(st_bar.cycle_forbidden(), "voice-1")
 
-        # 4. Mid-bar time-* / key* forbidden in incomplete bar; allowed in header, after bar, and at full-bar courtesy
+        # 4. Mid-bar time-* / key* forbidden in strict mode incomplete bar; allowed in header, after bar, and at full-bar courtesy
         t68_id = data.TOKEN_TO_ID["time-6-8"]
         t58_id = data.TOKEN_TO_ID["time-5-8"]
         k_m2_id = data.TOKEN_TO_ID["key-2"]
-        for strict in (False, True):
-            st_h = grammar.PrefixState(strict=strict)
-            # System header: allowed
-            self.assertIn(t68_id, st_h.allowed()[0])
-            self.assertIn(k_m2_id, st_h.allowed()[0])
-            for tok in ("clef-G-2", "key+0", "time-4-4", "quarter", "C", "4"):
-                st_h.step(tok)
-            # Incomplete bar (1.0 / 4.0 beats): time-* and key* forbidden
-            allow_mid = st_h.allowed()[0]
-            self.assertNotIn(t68_id, allow_mid)
-            self.assertNotIn(t58_id, allow_mid)
-            self.assertNotIn(k_m2_id, allow_mid)
-            with self.assertRaises(ValueError):
-                st_h.step("time-6-8")
-            with self.assertRaises(ValueError):
-                st_h.step("key-2")
-            # Complete the bar (4.0 / 4.0 beats): courtesy key/time allowed
-            for tok in ("half", "D", "4", "quarter", "E", "4"):
-                st_h.step(tok)
-            allow_full = st_h.allowed()[0]
-            self.assertIn(t68_id, allow_full)
-            self.assertIn(k_m2_id, allow_full)
-            # Immediately after barline: allowed
-            st_h.step("bar")
-            allow_bar = st_h.allowed()[0]
-            self.assertIn(t68_id, allow_bar)
-            self.assertIn(k_m2_id, allow_bar)
-            st_h.step("key-2")
+        st_h = grammar.PrefixState(strict=True)
+        # System header: allowed
+        self.assertIn(t68_id, st_h.allowed()[0])
+        self.assertIn(k_m2_id, st_h.allowed()[0])
+        for tok in ("clef-G-2", "key+0", "time-4-4", "quarter", "C", "4"):
+            st_h.step(tok)
+        # Incomplete bar (1.0 / 4.0 beats): time-* and key* forbidden in strict mode
+        allow_mid = st_h.allowed()[0]
+        self.assertNotIn(t68_id, allow_mid)
+        self.assertNotIn(t58_id, allow_mid)
+        self.assertNotIn(k_m2_id, allow_mid)
+        with self.assertRaises(ValueError):
             st_h.step("time-6-8")
+        with self.assertRaises(ValueError):
+            st_h.step("key-2")
+        # Complete the bar (4.0 / 4.0 beats): courtesy key/time allowed
+        for tok in ("half", "D", "4", "quarter", "E", "4"):
+            st_h.step(tok)
+        allow_full = st_h.allowed()[0]
+        self.assertIn(t68_id, allow_full)
+        self.assertIn(k_m2_id, allow_full)
+        # Lax mode (strict=False) permits legitimate mid-bar key/time changes
+        st_lax = grammar.PrefixState(strict=False)
+        for tok in ("clef-G-2", "key+0", "time-4-4", "quarter", "C", "4"):
+            st_lax.step(tok)
+        self.assertIn(t68_id, st_lax.allowed()[0])
+        self.assertIn(k_m2_id, st_lax.allowed()[0])
+        # Immediately after barline: allowed
+        st_h.step("bar")
+        allow_bar = st_h.allowed()[0]
+        self.assertIn(t68_id, allow_bar)
+        self.assertIn(k_m2_id, allow_bar)
+        st_h.step("key-2")
+        st_h.step("time-6-8")
 
     def test_iter9_measure_beam_and_tok_lcs_metrics(self) -> None:
         """Violation-triggered measure-scoped beam search, TokLCS, and CLI flag."""

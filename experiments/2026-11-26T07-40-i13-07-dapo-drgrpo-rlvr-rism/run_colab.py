@@ -396,9 +396,9 @@ def _evaluate_pieces_python(
             img_p = piece[dom]
             with Image.open(img_p) as im:
                 rgb = im.convert("RGB")
-            img_t = uni_omr.prepare_image_tensor(rgb, max_dim=max_dim).unsqueeze(0).to(device)
+            img_t = uni_omr._pil_to_chw_tensor(uni_omr._resize_fullpage_pil(rgb, max_dim)).unsqueeze(0).to(device)
             with torch.no_grad(), torch.amp.autocast("cuda", dtype=amp_dtype, enabled=amp_dtype is not None):
-                seq = model.generate(img_t, max_len=max_len, use_grammar=True)
+                seq = eval_s31.generate_constrained(model, img_t, max_len=max_len, strict=False)
             ids = seq[0].tolist()
             toks: List[str] = []
             for tid in ids[1:]:
@@ -492,7 +492,7 @@ def _run_arm(
             img_p = rng.choice(rism_paths)
             with Image.open(img_p) as im:
                 rgb = im.convert("RGB")
-            img_t = uni_omr.prepare_image_tensor(rgb, max_dim=ROLLOUT_MAX_DIM).unsqueeze(0).to(device)
+            img_t = uni_omr._pil_to_chw_tensor(uni_omr._resize_fullpage_pil(rgb, ROLLOUT_MAX_DIM)).unsqueeze(0).to(device)
             with torch.amp.autocast("cuda", dtype=amp_dtype, enabled=amp_dtype is not None):
                 rollouts = rlvr_grpo.sample_rollouts(
                     model,
@@ -617,7 +617,7 @@ def main() -> None:
 
         ckpt_path, ckpt_hf_used, rism_dir, manifest_path = _ensure_assets(hf_token)
         rism_paths = rlvr_grpo.collect_unlabeled_image_paths(rism_dir)
-        all_pieces = eval_s31.load_suite31_manifest(manifest_path)
+        _, all_pieces = eval_s31.resolve_manifest_pieces(manifest_path)
         eval_pieces = _select_sweep_pieces(all_pieces, n_printed=12)
 
         raw_ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)

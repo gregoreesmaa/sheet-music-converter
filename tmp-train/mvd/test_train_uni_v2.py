@@ -32,11 +32,13 @@ from uni_omr import (  # noqa: E402
 )
 from uni_omr_v2 import QATInt4ControllerV2, UniOMRv2Net  # noqa: E402
 from train_uni_v2 import (  # noqa: E402
+    ArchivalStratifiedFullPageSampler,
     TopKTeacherCache,
     atomic_save_v2_latest,
     build_arg_parser,
     build_optimizer_v2,
     build_v2_config,
+    classify_fullpage_bucket_v2,
     compute_generalized_jsd_loss,
     compute_sparse_topk_jsd_loss,
     ensure_v2_best_checkpoints,
@@ -49,6 +51,7 @@ from train_uni_v2 import (  # noqa: E402
     load_v2_checkpoint,
     partition_muon_adamw_params,
     run_train_v2,
+    split_fullpage_train_val_with_hw,
 )
 
 
@@ -571,6 +574,500 @@ class TestTrainUniV2(unittest.TestCase):
         self.assertGreater(float(losses["kd_loss"].item()), 0.0)
         losses["loss"].backward()
         self.assertIsNotNone(student.lm_head.weight.grad)
+
+    def test_10_teacher_ce_gated_kd_and_hw_scale(self) -> None:
+        """Teacher-CE gating masks high-CE teacher tokens accurately; kd_hw_scale skips HW teacher forward."""
+        import math
+        import torch.nn.functional as F
+
+        torch.manual_seed(201)
+        B, T, V = 2, 10, VOCAB_SIZE
+        targets = torch.randint(0, PAD_ID, (B, T), dtype=torch.long)
+        targets[:, -2:] = PAD_ID  # 8 non-PAD tokens per row = 16 total
+
+        s_base = torch.randn((B, T, V), dtype=torch.float32)
+        t_base = torch.zeros((B, T, V), dtype=torch.float32)
+        # First 4 tokens per row: teacher is confident & right (CE << 1.0)
+        # Next 4 tokens per row: teacher is confident & wrong (CE >> 1.0)
+        for b in range(B):
+            for pos in range(4):
+                t_base[b, pos, targets[b, pos]] = 10.0
+            for pos in range(4, 8):
+                wrong_tok = (int(targets[b, pos].item()) + 1) % PAD_ID
+                t_base[b, pos, wrong_tok] = 10.0
+
+        ce_cap = 1.0
+        s_opt = s_base.clone().requires_grad_(True)
+        loss_opt, gate_frac = compute_generalized_jsd_loss(
+            s_opt, t_base, targets, beta=0.5, temp=2.0, teacher_ce_cap=ce_cap, return_gate_frac=True
+        )
+        self.assertAlmostEqual(float(gate_frac.item()), 0.5, places=6)
+
+        # Reference PyTorch implementation with F.cross_entropy mask
+        s_ref = s_base.clone().requires_grad_(True)
+        t_ce = F.cross_entropy(
+            t_base.reshape(-1, V), targets.reshape(-1), reduction="none", ignore_index=PAD_ID
+        ).reshape(B, T)
+        ref_mask = ((targets != PAD_ID) & (t_ce <= ce_cap)).float()
+        tau = 2.0
+        log_ps = F.log_softmax(s_ref / tau, dim=-1)
+        log_pt = F.log_softmax(t_base / tau, dim=-1)
+        log_m = torch.logaddexp(math.log(0.5) + log_pt, math.log(0.5) + log_ps)
+        per_tok = 0.5 * (log_pt.exp() * (log_pt - log_m)).sum(-1) + 0.5 * (log_ps.exp() * (log_ps - log_m)).sum(-1)
+        loss_ref = ((per_tok * ref_mask).sum() / ref_mask.sum().clamp(min=1.0)) * (tau * tau)
+
+        self.assertLess(abs(float(loss_opt.item()) - float(loss_ref.item())), 1e-5)
+        loss_opt.backward()
+        loss_ref.backward()
+        assert s_opt.grad is not None and s_ref.grad is not None
+        self.assertLess(float((s_opt.grad - s_ref.grad).abs().max().item()), 1e-5)
+        # Gated-out tokens (pos 4..7) and PAD tokens (pos 8..9) must receive exact 0 gradient
+        self.assertEqual(float(s_opt.grad[:, 4:, :].abs().max().item()), 0.0)
+        self.assertGreater(float(s_opt.grad[:, :4, :].abs().max().item()), 0.0)
+
+        # Extreme cap where 0 tokens pass -> 0 loss, 0 grad, 0 gate_frac, finite
+        s_zero = s_base.clone().requires_grad_(True)
+        l_zero, gf_zero = compute_generalized_jsd_loss(
+            s_zero, t_base, targets, beta=0.5, temp=2.0, teacher_ce_cap=1e-6, return_gate_frac=True
+        )
+        self.assertEqual(float(gf_zero.item()), 0.0)
+        self.assertEqual(float(l_zero.item()), 0.0)
+        l_zero.backward()
+        assert s_zero.grad is not None
+        self.assertEqual(float(s_zero.grad.abs().max().item()), 0.0)
+
+        # Sparse Top-K CE gating parity
+        vals_k, idx_k = torch.topk(t_base, k=8, dim=-1)
+        l_sp, gf_sp = compute_sparse_topk_jsd_loss(
+            s_base.clone().requires_grad_(True),
+            vals_k.to(torch.float16),
+            idx_k.to(torch.uint8),
+            targets,
+            beta=0.5,
+            temp=2.0,
+            teacher_ce_cap=ce_cap,
+            return_gate_frac=True,
+        )
+        self.assertAlmostEqual(float(gf_sp.item()), 0.5, places=6)
+        self.assertTrue(torch.isfinite(l_sp).item())
+        self.assertGreater(float(l_sp.item()), 0.0)
+
+        # kd_hw_scale == 0.0 skips teacher forward completely on hw_strip and HW sample_ids
+        student = _make_tiny_v2(grad_checkpoint=False)
+        teacher = _make_tiny_v1_teacher()
+        images, seq = _make_dummy_batch(batch_size=2, h=64, w=96, seq_len=14)
+        calls: list[int] = []
+        orig_fwd = teacher.forward
+
+        def _spy(*a, **kw):
+            calls.append(1)
+            return orig_fwd(*a, **kw)
+
+        teacher.forward = _spy  # type: ignore[method-assign]
+        losses_hw, _ = forward_and_loss_v2(
+            student,
+            images,
+            seq,
+            teacher_v1=teacher,
+            kd_alpha=0.35,
+            kd_teacher_ce_cap=1.5,
+            kd_hw_scale=0.0,
+            kind="hw_strip",
+            device=torch.device("cpu"),
+        )
+        self.assertEqual(len(calls), 0, "Teacher forward must be skipped when kd_hw_scale=0.0 on hw_strip")
+        self.assertEqual(float(losses_hw["kd_loss"].item()), 0.0)
+
+        losses_hw_fp, _ = forward_and_loss_v2(
+            student,
+            images,
+            seq,
+            teacher_v1=teacher,
+            sample_ids=["debussy_p1", "real_hw_p2"],
+            kd_alpha=0.35,
+            kd_hw_scale=0.0,
+            kind="fullpage",
+            device=torch.device("cpu"),
+        )
+        self.assertEqual(len(calls), 0, "Teacher forward must be skipped when all fullpage sample_ids are HW and kd_hw_scale=0")
+        self.assertEqual(float(losses_hw_fp["kd_loss"].item()), 0.0)
+
+    def test_11_explicit_strip_grad_accum_and_strip_loss_logging(self) -> None:
+        """--strip-grad-accum overrides legacy collapsed formula and strip steps are logged in window."""
+        import contextlib
+        import io
+
+        parser = build_arg_parser()
+
+        # Legacy auto mode (strip_grad_accum=0): (bs=1 * ga=4) // strip_bs=8 -> 1
+        args_auto = parser.parse_args([
+            "--preset", "tiny",
+            "--device", "cpu",
+            "--no-bf16",
+            "--steps", "2",
+            "--batch-size", "1",
+            "--grad-accum", "4",
+            "--strip-batch-size", "8",
+            "--strip-grad-accum", "0",
+            "--seq-len", "12",
+            "--eval-every", "0",
+            "--gpu-ema-decay", "0.0",
+        ])
+        res_auto = run_train_v2(args_auto)
+        self.assertEqual(res_auto["strip_grad_accum"], 1)
+
+        # Explicit --strip-grad-accum 4 with mixed curriculum & log_every=4
+        buf = io.StringIO()
+        args_exp = parser.parse_args([
+            "--preset", "tiny",
+            "--device", "cpu",
+            "--no-bf16",
+            "--curriculum", "mixed",
+            "--steps", "4",
+            "--batch-size", "1",
+            "--grad-accum", "2",
+            "--strip-batch-size", "2",
+            "--strip-grad-accum", "3",
+            "--seq-len", "12",
+            "--log-every", "4",
+            "--eval-every", "0",
+            "--gpu-ema-decay", "0.0",
+        ])
+        with contextlib.redirect_stdout(buf):
+            res_exp = run_train_v2(args_exp)
+        out_txt = buf.getvalue()
+        self.assertEqual(res_exp["strip_grad_accum"], 3)
+        self.assertIn("strip_grad_accum=3", out_txt)
+        self.assertIn("strip_loss=", out_txt, f"Expected strip_loss summary in periodic log, got:\n{out_txt}")
+
+    def test_12_skip_dead_aux_head_forwards(self) -> None:
+        """sys_y_head and staff_seg_head do not execute when their targets are None or weights are 0."""
+        torch.manual_seed(203)
+        student = _make_tiny_v2(grad_checkpoint=False)
+        student.train()
+        images, seq = _make_dummy_batch(batch_size=2, h=64, w=96, seq_len=14)
+
+        assert student.sys_y_head is not None
+        assert student.staff_seg_head is not None
+        assert student.sys_count_head is not None
+
+        counts = {"sys_y": 0, "staff_seg": 0, "sys_count": 0}
+        orig_sys_y = student.sys_y_head.forward
+        orig_staff_seg = student.staff_seg_head.forward
+        orig_sys_count = student.sys_count_head.forward
+
+        def _spy_sys_y(*a, **kw):
+            counts["sys_y"] += 1
+            return orig_sys_y(*a, **kw)
+
+        def _spy_staff_seg(*a, **kw):
+            counts["staff_seg"] += 1
+            return orig_staff_seg(*a, **kw)
+
+        def _spy_sys_count(*a, **kw):
+            counts["sys_count"] += 1
+            return orig_sys_count(*a, **kw)
+
+        student.sys_y_head.forward = _spy_sys_y  # type: ignore[method-assign]
+        student.staff_seg_head.forward = _spy_staff_seg  # type: ignore[method-assign]
+        student.sys_count_head.forward = _spy_sys_count  # type: ignore[method-assign]
+
+        # 1) Default training call (sys_y_target=None, staff_seg_target=None) -> both skipped!
+        losses, out = forward_and_loss_v2(
+            student,
+            images,
+            seq,
+            cass_prob=0.0,
+            device=torch.device("cpu"),
+        )
+        self.assertEqual(counts["sys_y"], 0, "Dead sys_y_head should not run when sys_y_target is None")
+        self.assertEqual(counts["staff_seg"], 0, "Dead staff_seg_head should not run when staff_seg_target is None")
+        self.assertEqual(counts["sys_count"], 1, "Active sys_count_head should run")
+        self.assertIsNone(out["sys_y_pred"])
+        self.assertIsNone(out["staff_seg_logits"])
+        # Submodules must be restored cleanly in state_dict
+        self.assertIsNotNone(student.sys_y_head)
+        self.assertIsNotNone(student.staff_seg_head)
+        self.assertTrue(any(k.startswith("sys_y_head.") for k in student.state_dict()))
+        self.assertTrue(any(k.startswith("staff_seg_head.") for k in student.state_dict()))
+
+        # 2) CASS branch also skips dead aux heads
+        losses_cass, _ = forward_and_loss_v2(
+            student,
+            images,
+            seq,
+            cass_prob=0.5,
+            device=torch.device("cpu"),
+        )
+        self.assertEqual(counts["sys_y"], 0)
+        self.assertEqual(counts["staff_seg"], 0)
+        self.assertEqual(counts["sys_count"], 2)
+        self.assertTrue(torch.isfinite(losses_cass["loss"]).item())
+
+        # 3) When targets ARE provided, both heads execute and produce positive losses
+        B, T = seq.shape[0], seq.shape[1] - 1
+        sys_y_tgt = torch.rand((B, T), dtype=torch.float32)
+        staff_seg_tgt = torch.randint(0, 2, (B, 1, 16, 24), dtype=torch.float32)
+        losses_act, out_act = forward_and_loss_v2(
+            student,
+            images,
+            seq,
+            sys_y_target=sys_y_tgt,
+            staff_seg_target=staff_seg_tgt,
+            device=torch.device("cpu"),
+        )
+        self.assertEqual(counts["sys_y"], 1)
+        self.assertEqual(counts["staff_seg"], 1)
+        self.assertIsNotNone(out_act["sys_y_pred"])
+        self.assertIsNotNone(out_act["staff_seg_logits"])
+        self.assertGreater(float(losses_act["sys_y_loss"].item()), 0.0)
+        self.assertGreater(float(losses_act["staff_seg_loss"].item()), 0.0)
+
+        # 4) CLI --no-use-sys-y-aux / --no-use-staff-seg-aux flags
+        parser = build_arg_parser()
+        args = parser.parse_args(["--no-use-sys-y-aux", "--no-use-staff-seg-aux", "--no-use-sys-count-aux"])
+        self.assertFalse(args.use_sys_y_aux)
+        self.assertFalse(args.use_staff_seg_aux)
+        self.assertFalse(args.use_sys_count_aux)
+
+    def test_13_archival_hw_stratified_sampler_and_hw_val_split(self) -> None:
+        """ArchivalStratifiedFullPageSampler splits archival vs stitched real_hw; HW val split has zero piece leak."""
+        import random
+
+        pairs = []
+        # 40 legacy printed, 30 multi-renderer, 10 rare, 20 synth_hw, 20 stitched real_hw, 10 archival real_hw
+        for i in range(40):
+            pairs.append((Path(f"D:/tmp/printed/piece_leg_{i}_p1.png"), [Path(f"b_leg_{i}.bekern")], "printed"))
+        for i in range(30):
+            pairs.append((Path(f"D:/tmp/verovio/piece_ver_{i}_p1.png"), [Path(f"b_ver_{i}.bekern")], "multi_renderer_printed"))
+        for i in range(10):
+            pairs.append((Path(f"D:/tmp/rare/piece_c-8vb_{i}_p1.png"), [Path(f"b_rare_{i}.bekern")], "rare_printed"))
+        for i in range(20):
+            pairs.append((Path(f"D:/tmp/hw-sim-v05/piece_shw_{i}_p1.png"), [Path(f"b_shw_{i}.bekern")], "synth_hw"))
+        for i in range(20):
+            pairs.append((
+                Path(f"D:/tmp/uni-synth-1s2s-pages/real_hw/rhw_2s_hw_debussy_st_{i}-1.png"),
+                [Path(f"b_rhw_st_{i}.bekern")],
+                "real_hw",
+            ))
+        for i in range(10):
+            pairs.append((
+                Path(f"D:/tmp/debussy-omr/train_pages/12148_btv1b5500{i:04d}_f{i}.png"),
+                [Path(f"b_rhw_arch_{i}.bekern")],
+                "real_hw",
+            ))
+
+        # Classification check
+        self.assertEqual(
+            classify_fullpage_bucket_v2(pairs[-1][0], "real_hw", split_archival_hw=True),
+            "real_hw_archival",
+        )
+        self.assertEqual(
+            classify_fullpage_bucket_v2(pairs[-15][0], "real_hw", split_archival_hw=True),
+            "real_hw_stitched",
+        )
+        self.assertEqual(
+            classify_fullpage_bucket_v2(pairs[-1][0], "real_hw", split_archival_hw=False),
+            "real_hw",
+        )
+
+        # Sampler gives real_hw_archival ~10% of epoch steps (in [0.08, 0.12])
+        sampler = ArchivalStratifiedFullPageSampler(pairs, epoch_size=1000)
+        counts = sampler.bucket_counts()
+        self.assertEqual(counts["real_hw_archival"], 10)
+        self.assertEqual(counts["real_hw_stitched"], 20)
+        epoch_idxs = sampler.sample_epoch(random.Random(42))
+        self.assertEqual(len(epoch_idxs), 1000)
+        arch_hits = sum(
+            1 for idx in epoch_idxs
+            if classify_fullpage_bucket_v2(pairs[idx][0], pairs[idx][2], split_archival_hw=True) == "real_hw_archival"
+        )
+        stitched_hits = sum(
+            1 for idx in epoch_idxs
+            if classify_fullpage_bucket_v2(pairs[idx][0], pairs[idx][2], split_archival_hw=True) == "real_hw_stitched"
+        )
+        self.assertGreaterEqual(arch_hits / 1000.0, 0.08)
+        self.assertLessEqual(arch_hits / 1000.0, 0.12)
+        self.assertGreaterEqual(stitched_hits / 1000.0, 0.04)
+
+        # Validation split with val_real_hw_count > 0 reserves real_hw without piece overlap
+        fp_tr, fp_va, fp_hw_va = split_fullpage_train_val_with_hw(
+            pairs, val_count=8, val_real_hw_count=4, seed=42
+        )
+        self.assertGreater(len(fp_hw_va), 0)
+        self.assertGreater(len(fp_va), 0)
+        self.assertGreater(len(fp_tr), 0)
+        for item in fp_hw_va:
+            self.assertEqual(item[2], "real_hw")
+        import data as _data
+        tr_keys = {_data.piece_key(p[0].stem) for p in fp_tr}
+        va_keys = {_data.piece_key(p[0].stem) for p in fp_va}
+        hw_va_keys = {_data.piece_key(p[0].stem) for p in fp_hw_va}
+        self.assertEqual(len(tr_keys & hw_va_keys), 0, "real_hw val piece leaked into train")
+        self.assertEqual(len(tr_keys & va_keys), 0, "val piece leaked into train")
+
+        # Backward compat: val_real_hw_count=0 returns empty fp_hw_va
+        _, _, fp_hw_empty = split_fullpage_train_val_with_hw(pairs, val_count=8, val_real_hw_count=0, seed=42)
+        self.assertEqual(fp_hw_empty, [])
+
+    def test_14_no_decay_1d_and_configurable_grad_clip(self) -> None:
+        """--no-decay-1d routes 1D/0D norms, biases, and embeddings to weight_decay=0.0; --grad-clip works."""
+        student = _make_tiny_v2(grad_checkpoint=False)
+        all_trainable = {id(p): (n, p) for n, p in student.named_parameters() if p.requires_grad}
+
+        # 1) Muon + AdamW with no_decay_1d=True
+        opt_m = build_optimizer_v2(
+            student,
+            optimizer_name="muon",
+            lr=3e-4,
+            weight_decay=0.01,
+            device_type="cpu",
+            allow_cpu_muon=True,
+            no_decay_1d=True,
+        )
+        self.assertEqual(opt_m.mode, "muon+adamw")
+        self.assertIn("tok_emb.weight", opt_m.no_decay_param_names)
+        self.assertIn("dec_norm.weight", opt_m.no_decay_param_names)
+        self.assertNotIn("lm_head.weight", opt_m.no_decay_param_names)
+        self.assertNotIn("backbone.stage1.down.0.weight", opt_m.no_decay_param_names)
+
+        # Verify Muon keeps only 2D Transformer weights with wd=0.01 and AdamW has 2 groups (0.01 & 0.0)
+        muon_opt, _ = opt_m._opts[0]
+        adamw_opt, _ = opt_m._opts[1]
+        self.assertEqual(len(muon_opt.param_groups), 1)
+        self.assertAlmostEqual(muon_opt.param_groups[0]["weight_decay"], 0.01)
+        for p in muon_opt.param_groups[0]["params"]:
+            self.assertEqual(p.ndim, 2)
+
+        self.assertEqual(len(adamw_opt.param_groups), 2)
+        wds = {pg["weight_decay"]: pg["params"] for pg in adamw_opt.param_groups}
+        self.assertIn(0.01, wds)
+        self.assertIn(0.0, wds)
+
+        # Every param in no_decay group must be ndim<2 or embed/bias; none in decay group
+        for p in wds[0.0]:
+            name, _ = all_trainable[id(p)]
+            self.assertTrue(
+                p.ndim < 2 or "emb" in name.lower() or name.lower().endswith(".bias"),
+                f"Unexpected param in no_decay group: {name} (ndim={p.ndim})",
+            )
+        for p in wds[0.01]:
+            name, _ = all_trainable[id(p)]
+            self.assertGreaterEqual(p.ndim, 2, f"1D/0D param {name} wrongly placed in decay group")
+            self.assertNotIn("tok_emb", name.lower())
+
+        # Zero dropped / zero duplicated params across Muon + AdamW groups
+        seen_ids = [id(p) for opt_i, _ in opt_m._opts for pg in opt_i.param_groups for p in pg["params"]]
+        self.assertEqual(len(seen_ids), len(all_trainable))
+        self.assertEqual(set(seen_ids), set(all_trainable.keys()))
+
+        # 2) Pure AdamW with no_decay_1d=True
+        opt_a = build_optimizer_v2(
+            student,
+            optimizer_name="adamw",
+            lr=3e-4,
+            weight_decay=0.02,
+            device_type="cpu",
+            no_decay_1d=True,
+        )
+        self.assertEqual(opt_a.mode, "adamw")
+        self.assertEqual(len(opt_a._opts[0][0].param_groups), 2)
+        seen_a = [id(p) for pg in opt_a._opts[0][0].param_groups for p in pg["params"]]
+        self.assertEqual(len(seen_a), len(all_trainable))
+        self.assertEqual(set(seen_a), set(all_trainable.keys()))
+
+        # 3) CLI defaults & end-to-end run with --no-decay-1d --grad-clip 0.5
+        parser = build_arg_parser()
+        default_args = parser.parse_args([])
+        self.assertFalse(default_args.no_decay_1d)
+        self.assertEqual(default_args.grad_clip, 1.0)
+        self.assertEqual(default_args.kd_teacher_ce_cap, 0.0)
+        self.assertEqual(default_args.kd_hw_scale, 1.0)
+        self.assertEqual(default_args.strip_grad_accum, 0)
+        self.assertFalse(default_args.split_archival_hw)
+        self.assertEqual(default_args.val_real_hw_count, 0)
+
+        args = parser.parse_args([
+            "--preset", "tiny",
+            "--device", "cpu",
+            "--no-bf16",
+            "--steps", "2",
+            "--batch-size", "2",
+            "--grad-accum", "1",
+            "--seq-len", "12",
+            "--no-decay-1d",
+            "--grad-clip", "0.5",
+            "--eval-every", "0",
+            "--gpu-ema-decay", "0.0",
+        ])
+        res = run_train_v2(args)
+        self.assertEqual(len(res["history"]), 2)
+        self.assertGreater(res["history"][-1]["loss"], 0.0)
+
+    def test_15_rism_fda_adain_cli_and_dataset_wiring(self) -> None:
+        """i13-05 RISM FDA/Color-AdaIN CLI flags have safe 0.0 defaults and wire cleanly into training datasets."""
+        from PIL import Image
+
+        parser = build_arg_parser()
+
+        # 1) Safe backward-compatible defaults
+        default_args = parser.parse_args([])
+        self.assertEqual(default_args.rism_style_dir, "")
+        self.assertEqual(default_args.rism_fda_prob, 0.0)
+        self.assertEqual(default_args.rism_adain_prob, 0.0)
+        self.assertAlmostEqual(default_args.rism_fda_beta, 0.02, places=6)
+
+        # 2) Explicit CLI flag parsing + 2-step CPU training smoke with temp strips & RISM style dir
+        with tempfile.TemporaryDirectory() as td:
+            td_path = Path(td)
+            st_dir = td_path / "strips"
+            rism_dir = td_path / "rism_hw"
+            st_dir.mkdir()
+            rism_dir.mkdir()
+
+            bek_txt = "clef-G-2\nquarter\nC\n4\nbar\n"
+            for i in range(4):
+                arr = np.full((64, 128, 3), 248, dtype=np.uint8)
+                arr[20:44, 12:116, :] = 20
+                Image.fromarray(arr, mode="RGB").save(st_dir / f"piece{i}_p1_s0.png")
+                (st_dir / f"piece{i}_p1_s0-bekern.txt").write_text(bek_txt, encoding="utf-8")
+
+            for i in range(3):
+                ref = np.full((96, 96, 3), (210, 180, 130), dtype=np.uint8)
+                ref[20:76:14, 10:86, :] = (90, 72, 50)
+                Image.fromarray(ref, mode="RGB").save(rism_dir / f"rism_{i}.png")
+
+            args = parser.parse_args([
+                "--preset", "tiny",
+                "--device", "cpu",
+                "--no-bf16",
+                "--curriculum", "strip",
+                "--strip-dirs", str(st_dir),
+                "--strip-height", "64",
+                "--max-strip-width", "128",
+                "--max-seq-len", "32",
+                "--augment",
+                "--aug-prob", "1.0",
+                "--rism-style-dir", str(rism_dir),
+                "--rism-fda-prob", "0.5",
+                "--rism-adain-prob", "0.5",
+                "--rism-fda-beta", "0.02",
+                "--steps", "2",
+                "--batch-size", "2",
+                "--grad-accum", "1",
+                "--val-count", "1",
+                "--eval-every", "0",
+                "--prefetch-threads", "0",
+                "--gpu-ema-decay", "0.0",
+            ])
+            self.assertEqual(args.rism_style_dir, str(rism_dir))
+            self.assertAlmostEqual(args.rism_fda_prob, 0.5, places=6)
+            self.assertAlmostEqual(args.rism_adain_prob, 0.5, places=6)
+            self.assertAlmostEqual(args.rism_fda_beta, 0.02, places=6)
+
+            res = run_train_v2(args)
+            self.assertEqual(len(res["history"]), 2)
+            self.assertGreater(res["history"][-1]["loss"], 0.0)
 
 
 if __name__ == "__main__":

@@ -74,6 +74,19 @@ VERIFIED_T4_SAFE_TAGS: Dict[str, str] = {
     "ov-37b": "RLVR GRPO scale200 len512 sweep (cc>=8 guard -> FP16+GradScaler on T4, pure Python)",
     "ov-38": "SCRIBE/DocTTT per-manuscript TTA sweep (cc>=8 guard -> FP32 on T4, pure Python)",
     "ov-39": "RISM pseudo-label + 60-step FT sweep (cc>=8 guard -> FP32 on T4, pure Python)",
+    # Iter 13 Wave 9 verified T4-safe pure-inference/eval experiments (cc>=8 guard, zero Rust)
+    "i13-10": "inference-only OEMER staff dewarp + unit-size normalization (cc>=8 guard, zero Rust)",
+    "i13-11": "inference-only Audiveris/Humdrum post-processing sweep (cc>=8 guard, zero Rust)",
+    "i13-16": "inference-only Mathpix confidence-gated re-decode (cc>=8 guard, zero Rust)",
+    "i13-17": "inference-only PaddleOCR VRFM band router sweep (cc>=8 guard, zero Rust)",
+    "i13-18": "inference-only TrOCR/PyLaia VCD + ILMS decoding sweep (cc>=8 guard, zero Rust)",
+    # Iter 13 Wave 9 verified T4-safe light training/RLVR (cc>=8 + FP16 GradScaler, zero Rust)
+    "i13-07": "DAPO/Dr.GRPO RLVR on RISM-5707 (cc>=8 + FP16 GradScaler, zero Rust)",
+    "i13-08": "EAGLE-3 FSA speculative decode scout (cc>=8 + FP16 GradScaler, zero Rust)",
+    "i13-09": "ParetoQ/AWQ edge QAT scout (cc>=8 + FP16 GradScaler, zero Rust)",
+    "i13-22": "self-play error-inject repair scout (cc>=8 + FP16 GradScaler, zero Rust)",
+    "i13-23": "per-measure process-GRPO curriculum (cc>=8 + FP16 GradScaler, zero Rust)",
+    "i13-24": "multi-teacher disagreement KD scout (cc>=8 + FP16 GradScaler, zero Rust)",
 }
 
 PRINT_LOCK = threading.Lock()
@@ -90,7 +103,7 @@ def _log_console(msg: str) -> None:
 
 
 def _short_tag(exp_id: str) -> str:
-    m = re.search(r"(ov-\d+[a-z]*)", exp_id)
+    m = re.search(r"(ov-\d+[a-z]*|i13-\d+[a-z]*)", exp_id)
     if m:
         return m.group(1)
     slug = re.sub(r"[^a-z0-9-]+", "-", exp_id.lower()).strip("-")

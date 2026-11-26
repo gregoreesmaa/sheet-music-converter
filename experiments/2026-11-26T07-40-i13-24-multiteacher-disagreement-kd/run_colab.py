@@ -538,7 +538,8 @@ def main() -> None:
             p for p in rism_dir.rglob("*")
             if p.is_file() and p.suffix.lower() in {".png", ".jpg", ".jpeg", ".webp"}
         )
-        s31_pieces = _select_sweep_pieces(eval_s31.load_suite31_manifest(s31_manifest), n_printed=12)
+        _, _all_s31_pieces = eval_s31.resolve_manifest_pieces(s31_manifest)
+        s31_pieces = _select_sweep_pieces(_all_s31_pieces, n_printed=12)
 
         api = HfApi(token=hf_token)
         ledger_tmp = CACHE_ROOT / f"{EXP_ID}_run.json"

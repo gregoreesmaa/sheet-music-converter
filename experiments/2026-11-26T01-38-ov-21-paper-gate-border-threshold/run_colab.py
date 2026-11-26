@@ -223,6 +223,8 @@ def _collect_eval_pages(manifest_path: Path, rism_paths: List[Path]) -> List[Dic
         is_hw = bool(piece.get("handwritten", False))
         for domain in ("clean", "photo"):
             rel = piece.get(domain) or piece.get(f"{domain}_image")
+            if isinstance(rel, dict):
+                rel = rel.get("file") or rel.get("path")
             if not rel:
                 continue
             p = Path(rel)

@@ -540,11 +540,11 @@ def main() -> int:
         for idx, piece in enumerate(all_pieces, start=1):
             slug = str(piece["slug"])
             is_hw = bool(piece["handwritten"])
-            ref_notes = _extract_musicxml_notes(Path(piece["gt_xml"]))
+            ref_notes = _extract_musicxml_notes(Path(piece["gt"]))
             for domain in ("clean", "photo"):
                 if (slug, domain) in done_keys:
                     continue
-                img_path = Path(piece["clean_img"] if domain == "clean" else piece["photo_img"])
+                img_path = Path(piece["clean"] if domain == "clean" else piece["photo"])
                 img_pil = Image.open(img_path).convert("RGB")
                 arm_res: Dict[str, Any] = {}
                 for arm in ARMS:

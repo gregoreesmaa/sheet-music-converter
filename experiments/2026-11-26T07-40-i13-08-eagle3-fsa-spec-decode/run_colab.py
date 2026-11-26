@@ -189,7 +189,7 @@ def _load_train_batch(
         img_p, beks = rng.choice(pairs)
         with Image.open(img_p) as im:
             rgb = im.convert("RGB")
-        imgs.append(uni_omr.prepare_image_tensor(rgb, max_dim=FULLPAGE_MAX_DIM))
+        imgs.append(uni_omr._pil_to_chw_tensor(uni_omr._resize_fullpage_pil(rgb, FULLPAGE_MAX_DIM)))
         toks: List[str] = []
         for idx, bp in enumerate(beks):
             if idx > 0:
@@ -456,7 +456,7 @@ def main() -> None:
             train_pairs, device, amp_dtype, use_scaler, ckpt_dir
         )
 
-        all_pieces = eval_s31.load_suite31_manifest(manifest_path)
+        _, all_pieces = eval_s31.resolve_manifest_pieces(manifest_path)
         hw_p = [p for p in all_pieces if p["handwritten"]][:8]
         pr_p = [p for p in all_pieces if not p["handwritten"]][:8]
         bench_pages: List[Tuple[str, bool, Path]] = []
@@ -485,13 +485,17 @@ def main() -> None:
             for idx, (slug, _is_hw, img_p) in enumerate(bench_pages):
                 with Image.open(img_p) as im:
                     rgb = im.convert("RGB")
-                img_t = uni_omr.prepare_image_tensor(rgb, max_dim=FULLPAGE_MAX_DIM).unsqueeze(0).to(device)
+                img_t = uni_omr._pil_to_chw_tensor(uni_omr._resize_fullpage_pil(rgb, FULLPAGE_MAX_DIM)).unsqueeze(0).to(device)
                 if device.type == "cuda":
                     torch.cuda.synchronize()
                 t_p = time.perf_counter()
                 with torch.no_grad(), torch.amp.autocast("cuda", dtype=amp_dtype, enabled=amp_dtype is not None):
                     if arm["mode"] == "greedy":
-                        seq_t = model.generate(img_t, max_len=BENCH_MAX_LEN, use_grammar=arm["use_grammar"])
+                        seq_t = (
+                            eval_s31.generate_constrained(model, img_t, max_len=BENCH_MAX_LEN, strict=False)
+                            if arm["use_grammar"]
+                            else model.generate(img_t, max_len=BENCH_MAX_LEN)
+                        )
                         seq = seq_t[0].tolist()
                         stats = {"accept_rate": 1.0, "mean_accepted_per_round": 1.0}
                     elif arm["mode"] == "mtp4":

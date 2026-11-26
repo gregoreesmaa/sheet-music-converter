@@ -203,7 +203,7 @@ def _load_batch(
         img_p, beks = rng.choice(pairs)
         with Image.open(img_p) as im:
             rgb = im.convert("RGB")
-        imgs.append(uni_omr.prepare_image_tensor(rgb, max_dim=FULLPAGE_MAX_DIM))
+        imgs.append(uni_omr._pil_to_chw_tensor(uni_omr._resize_fullpage_pil(rgb, FULLPAGE_MAX_DIM)))
         toks: List[str] = []
         for idx, bp in enumerate(beks):
             if idx > 0:
@@ -423,7 +423,7 @@ def _eval_val_metrics(
         for idx, (img_p, beks) in enumerate(val_pairs[:KL_MAX_PAGES]):
             with Image.open(img_p) as im:
                 rgb = im.convert("RGB")
-            img_t = uni_omr.prepare_image_tensor(rgb, max_dim=FULLPAGE_MAX_DIM).unsqueeze(0).to(device)
+            img_t = uni_omr._pil_to_chw_tensor(uni_omr._resize_fullpage_pil(rgb, FULLPAGE_MAX_DIM)).unsqueeze(0).to(device)
             toks: List[str] = []
             for bi, bp in enumerate(beks):
                 if bi > 0:

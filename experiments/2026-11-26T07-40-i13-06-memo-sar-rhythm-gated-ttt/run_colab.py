@@ -581,7 +581,7 @@ def main() -> None:
                     max_len=max_len, use_bf16=use_bf16, device=device,
                     eval_s31=eval_s31, rlvr_grpo=rlvr_grpo,
                 )
-                pseudo_cache = pseudo_helper._build_pseudo_cache(img_t)
+                pseudo_cache = pseudo_helper._fast_constrained_pseudo_decode(img_t, max_len=ttt_max_decode_len)
                 rel_info = _compute_reliability_gate(
                     model, cfg, img_t, pseudo_cache, eval_s31=eval_s31, rlvr_grpo=rlvr_grpo
                 )
@@ -657,7 +657,7 @@ def main() -> None:
                     max_len=max_len, use_bf16=use_bf16, device=device,
                     eval_s31=eval_s31, rlvr_grpo=rlvr_grpo,
                 )
-                pseudo_cache = pseudo_helper._build_pseudo_cache(img_t)
+                pseudo_cache = pseudo_helper._fast_constrained_pseudo_decode(img_t, max_len=ttt_max_decode_len)
                 rel_info = _compute_reliability_gate(
                     model, cfg, img_t, pseudo_cache, eval_s31=eval_s31, rlvr_grpo=rlvr_grpo
                 )

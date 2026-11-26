@@ -77,6 +77,7 @@ from uni_omr import (  # noqa: E402
     AsyncThreadPrefetcher,
     GPUEmaShadow,
     MultiScaleBatchSampler,
+    RismStylePool,
     StratifiedFullPageSampler,
     StripDomainMixer,
     UniFullPageDataset,
@@ -89,6 +90,7 @@ from uni_omr import (  # noqa: E402
     _lr_for_step,
     _make_synthetic_batch,
     _strip_group_key,
+    classify_fullpage_bucket,
     collate_uni_batch,
     compute_token_f1,
     decode_uni,
@@ -287,6 +289,8 @@ class _GeneralizedJSDAutograd(torch.autograd.Function):
     Computes forward loss and exact analytic ``dL/dz_S`` in a single ``no_grad`` pass with
     in-place FP32 buffer reuse, saving only one ``(B, T, V)`` gradient tensor in
     ``student_logits.dtype`` (eliminating 10+ FP32 intermediate autograd tensors).
+    Optionally gates KD to tokens where teacher CE (at ``tau=1``) ``<= teacher_ce_cap``
+    using ``O(B*T)`` memory (``logsumexp - gather`` on the existing FP32 teacher buffer).
     """
 
     @staticmethod
@@ -298,27 +302,43 @@ class _GeneralizedJSDAutograd(torch.autograd.Function):
         beta: float,
         temp: float,
         ignore_index: int,
-    ) -> torch.Tensor:
+        teacher_ce_cap: float = 0.0,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
         tau = float(max(1e-4, temp))
         inv_tau = 1.0 / tau
         b = float(max(0.0, min(1.0, beta)))
+        ce_cap = float(max(0.0, teacher_ce_cap))
         need_grad = bool(ctx.needs_input_grad[0])
 
         with torch.no_grad():
-            s_buf = student_logits.detach().to(torch.float32, copy=True)
-            if tau != 1.0:
-                s_buf.mul_(inv_tau)
-            log_p_s = F.log_softmax(s_buf, dim=-1)
-            del s_buf
-
             t_buf = teacher_logits.detach().to(torch.float32, copy=True)
+
+            base_valid = targets != ignore_index
+            if ce_cap > 0.0:
+                safe_tgt = torch.where(base_valid, targets, torch.zeros_like(targets))
+                t_lse = torch.logsumexp(t_buf, dim=-1)
+                t_tgt = t_buf.gather(dim=-1, index=safe_tgt.unsqueeze(-1)).squeeze(-1)
+                teacher_ce = t_lse - t_tgt
+                gate_mask = base_valid & (teacher_ce <= ce_cap)
+                base_count = base_valid.to(torch.float32).sum().clamp(min=1.0)
+                gate_frac = gate_mask.to(torch.float32).sum() / base_count
+                valid = gate_mask.to(torch.float32)
+                del safe_tgt, t_lse, t_tgt, teacher_ce, gate_mask
+            else:
+                gate_frac = student_logits.new_ones((), dtype=torch.float32)
+                valid = base_valid.to(torch.float32)
+            denom = valid.sum().clamp(min=1.0)
+
             if tau != 1.0:
                 t_buf.mul_(inv_tau)
             log_p_t = F.log_softmax(t_buf, dim=-1)
             del t_buf
 
-            valid = (targets != ignore_index).to(torch.float32)
-            denom = valid.sum().clamp(min=1.0)
+            s_buf = student_logits.detach().to(torch.float32, copy=True)
+            if tau != 1.0:
+                s_buf.mul_(inv_tau)
+            log_p_s = F.log_softmax(s_buf, dim=-1)
+            del s_buf
 
             if b <= 1e-6:
                 # Pure reverse KL: KL(P_S || P_T)
@@ -374,14 +394,15 @@ class _GeneralizedJSDAutograd(torch.autograd.Function):
 
         if need_grad:
             ctx.save_for_backward(grad_s)
-        return loss.to(student_logits.dtype)
+        ctx.mark_non_differentiable(gate_frac)
+        return loss.to(student_logits.dtype), gate_frac
 
     @staticmethod
     def backward(
-        ctx: Any, grad_output: torch.Tensor
-    ) -> Tuple[Optional[torch.Tensor], None, None, None, None, None]:
+        ctx: Any, grad_output: torch.Tensor, _grad_gate: Optional[torch.Tensor]
+    ) -> Tuple[Optional[torch.Tensor], None, None, None, None, None, None]:
         (grad_s,) = ctx.saved_tensors
-        return grad_s * grad_output.to(grad_s.dtype), None, None, None, None, None
+        return grad_s * grad_output.to(grad_s.dtype), None, None, None, None, None, None
 
 
 def compute_generalized_jsd_loss(
@@ -391,21 +412,28 @@ def compute_generalized_jsd_loss(
     beta: float = 0.5,
     temp: float = 2.0,
     ignore_index: int = PAD_ID,
-) -> torch.Tensor:
+    teacher_ce_cap: float = 0.0,
+    return_gate_frac: bool = False,
+) -> Any:
     """Generalized Jensen-Shannon Divergence ``G-JSD_beta(P_T || P_S) * temp^2``.
 
     Numerically stable in float32 using ``log_softmax`` + ``logaddexp`` with analytic
     backward (eliminates intermediate ``(B, T, V)`` autograd tensors).
-    Masked over ``targets != ignore_index`` with zero CUDA-CPU syncs.
+    Masked over ``targets != ignore_index`` (and optionally ``teacher_ce <= teacher_ce_cap``)
+    with zero CUDA-CPU syncs.
     """
-    return _GeneralizedJSDAutograd.apply(
+    loss, gate_frac = _GeneralizedJSDAutograd.apply(
         student_logits,
         teacher_logits,
         targets,
         float(beta),
         float(temp),
         int(ignore_index),
+        float(teacher_ce_cap),
     )
+    if return_gate_frac:
+        return loss, gate_frac
+    return loss
 
 
 def compute_sparse_topk_jsd_loss(
@@ -417,7 +445,9 @@ def compute_sparse_topk_jsd_loss(
     temp: float = 2.0,
     valid_mask: Optional[torch.Tensor] = None,
     ignore_index: int = PAD_ID,
-) -> torch.Tensor:
+    teacher_ce_cap: float = 0.0,
+    return_gate_frac: bool = False,
+) -> Any:
     """Sparse Top-K Generalized JSD over cached ``(B, T, K)`` teacher logits & indices.
 
     Gathers student logits at ``teacher_topk_idx`` (``uint8``/``long``), normalizes both
@@ -452,9 +482,25 @@ def compute_sparse_topk_jsd_loss(
     mask = targets != ignore_index
     if valid_mask is not None:
         mask = mask & valid_mask.to(device=student_logits.device, dtype=torch.bool, non_blocking=nb)
+    ce_cap = float(max(0.0, teacher_ce_cap))
+    if ce_cap > 0.0:
+        with torch.no_grad():
+            tgt_match = idx_long == targets.unsqueeze(-1)
+            in_topk = tgt_match.any(dim=-1)
+            t_lse_k = torch.logsumexp(t_topk, dim=-1)
+            t_tgt_k = (t_topk * tgt_match.to(torch.float32)).sum(dim=-1)
+            t_ce_k = t_lse_k - t_tgt_k
+            base_mask = mask
+            mask = base_mask & in_topk & (t_ce_k <= ce_cap)
+            gate_frac = mask.to(torch.float32).sum() / base_mask.to(torch.float32).sum().clamp(min=1.0)
+    else:
+        gate_frac = student_logits.new_ones((), dtype=torch.float32)
     mask_f = mask.float()
     loss = (per_tok * mask_f).sum() / mask_f.sum().clamp(min=1.0)
-    return (loss * (tau * tau)).to(student_logits.dtype)
+    out_loss = (loss * (tau * tau)).to(student_logits.dtype)
+    if return_gate_frac:
+        return out_loss, gate_frac
+    return out_loss
 
 
 class TopKTeacherCache:
@@ -722,6 +768,21 @@ def partition_muon_adamw_params(
     return muon_named, adamw_named
 
 
+def _is_no_decay_param(name: str, p: nn.Parameter) -> bool:
+    """Return True for 1D/0D params (norms, biases, scalar gates) and token/pos embeddings."""
+    if p.ndim < 2:
+        return True
+    low = name.lower()
+    return (
+        "tok_emb" in low
+        or "embed" in low
+        or "pos_emb" in low
+        or "pos_embed" in low
+        or low.endswith(".bias")
+        or low == "bias"
+    )
+
+
 class HybridOptimizerV2:
     """Unified wrapper over ``Muon + AdamW`` (or pure ``AdamW`` fallback)."""
 
@@ -731,11 +792,13 @@ class HybridOptimizerV2:
         mode: str,
         muon_param_names: Sequence[str] = (),
         adamw_param_names: Sequence[str] = (),
+        no_decay_param_names: Sequence[str] = (),
     ) -> None:
         self._opts: List[Tuple[torch.optim.Optimizer, float]] = list(optimizers)
         self.mode = mode
         self.muon_param_names = list(muon_param_names)
         self.adamw_param_names = list(adamw_param_names)
+        self.no_decay_param_names = list(no_decay_param_names)
 
     def zero_grad(self, set_to_none: bool = True) -> None:
         for opt, _ in self._opts:
@@ -761,6 +824,7 @@ def build_optimizer_v2(
     weight_decay: float = 0.01,
     device_type: str = "cpu",
     allow_cpu_muon: bool = False,
+    no_decay_1d: bool = False,
 ) -> HybridOptimizerV2:
     """Build native ``torch.optim.Muon`` (2D Transformer matrices) + ``AdamW`` (rest).
 
@@ -768,21 +832,42 @@ def build_optimizer_v2(
     adjust_lr_fn="match_rms_adamw", momentum=0.95, nesterov=True, ns_steps=5)``
     plus ``AdamW(fused=True)``. Cleanly falls back to ``AdamW`` on CPU (unless
     ``allow_cpu_muon=True``) or when ``optimizer_name="adamw"``.
+    When ``no_decay_1d=True``, routes all ``ndim < 2`` params (norms, biases, scalar
+    gates) and embedding params into a ``weight_decay=0.0`` AdamW param group.
     """
     muon_named, adamw_named = partition_muon_adamw_params(model)
     muon_params = [p for _, p in muon_named]
-    adamw_params = [p for _, p in adamw_named]
     muon_names = [n for n, _ in muon_named]
     adamw_names = [n for n, _ in adamw_named]
-    all_params = muon_params + adamw_params
 
-    def _make_adamw(params: List[nn.Parameter], cur_lr: float) -> torch.optim.Optimizer:
+    def _build_adamw_groups(
+        named_params: Sequence[Tuple[str, nn.Parameter]],
+    ) -> Tuple[Any, List[str]]:
+        if not no_decay_1d:
+            return [p for _, p in named_params], []
+        decay_p: List[nn.Parameter] = []
+        nodecay_p: List[nn.Parameter] = []
+        nodecay_names: List[str] = []
+        for n, p in named_params:
+            if _is_no_decay_param(n, p):
+                nodecay_p.append(p)
+                nodecay_names.append(n)
+            else:
+                decay_p.append(p)
+        groups: List[Dict[str, Any]] = []
+        if decay_p:
+            groups.append({"params": decay_p, "weight_decay": float(weight_decay)})
+        if nodecay_p:
+            groups.append({"params": nodecay_p, "weight_decay": 0.0})
+        return groups, nodecay_names
+
+    def _make_adamw(param_or_groups: Any, cur_lr: float) -> torch.optim.Optimizer:
         if device_type == "cuda":
             try:
-                return torch.optim.AdamW(params, lr=cur_lr, weight_decay=weight_decay, fused=True)
+                return torch.optim.AdamW(param_or_groups, lr=cur_lr, weight_decay=weight_decay, fused=True)
             except (RuntimeError, TypeError):
                 pass
-        return torch.optim.AdamW(params, lr=cur_lr, weight_decay=weight_decay)
+        return torch.optim.AdamW(param_or_groups, lr=cur_lr, weight_decay=weight_decay)
 
     want_muon = (
         str(optimizer_name).strip().lower() == "muon"
@@ -803,22 +888,28 @@ def build_optimizer_v2(
                 adjust_lr_fn="match_rms_adamw",
             )
             opts: List[Tuple[torch.optim.Optimizer, float]] = [(opt_muon, eff_muon_lr)]
-            if adamw_params:
-                opts.append((_make_adamw(adamw_params, float(lr)), float(lr)))
+            nodecay_names: List[str] = []
+            if adamw_named:
+                adamw_groups, nodecay_names = _build_adamw_groups(adamw_named)
+                opts.append((_make_adamw(adamw_groups, float(lr)), float(lr)))
             return HybridOptimizerV2(
                 opts,
                 mode="muon+adamw",
                 muon_param_names=muon_names,
                 adamw_param_names=adamw_names,
+                no_decay_param_names=nodecay_names,
             )
         except (RuntimeError, TypeError):
             pass
 
+    all_named = list(muon_named) + list(adamw_named)
+    all_groups, all_nodecay = _build_adamw_groups(all_named)
     return HybridOptimizerV2(
-        [(_make_adamw(all_params, float(lr)), float(lr))],
+        [(_make_adamw(all_groups, float(lr)), float(lr))],
         mode="adamw",
         muon_param_names=[],
         adamw_param_names=muon_names + adamw_names,
+        no_decay_param_names=all_nodecay,
     )
 
 
@@ -935,6 +1026,52 @@ def ensure_v2_best_checkpoints(
 # 5. Single Training Forward + Loss Helper (Used by Train Loop & Tests)
 # ---------------------------------------------------------------------------
 
+_HW_SAMPLE_ID_MARKERS: Tuple[str, ...] = (
+    "real_hw",
+    "debussy",
+    "hw_strip",
+    "hw-sim",
+    "hw_sim",
+    "rhw_",
+    "hw-",
+)
+
+
+def _is_hw_sample_id(sample_id: str) -> bool:
+    low = str(sample_id).replace("\\", "/").lower()
+    return any(tok in low for tok in _HW_SAMPLE_ID_MARKERS)
+
+
+@contextlib.contextmanager
+def _skip_dead_aux_heads(
+    model: nn.Module,
+    *,
+    skip_sys_y: bool = False,
+    skip_sys_count: bool = False,
+    skip_staff_seg: bool = False,
+    skip_stroke_hog: bool = False,
+) -> Iterator[None]:
+    """Temporarily bypass unused aux head submodules during forward without mutating state_dict."""
+    saved: List[Tuple[str, Any]] = []
+    mods = getattr(model, "_modules", None)
+    if isinstance(mods, dict):
+        for attr, should_skip in (
+            ("sys_y_head", skip_sys_y),
+            ("sys_count_head", skip_sys_count),
+            ("staff_seg_head", skip_staff_seg),
+            ("stroke_hog_head", skip_stroke_hog),
+        ):
+            if should_skip and attr in mods and mods[attr] is not None:
+                saved.append((attr, mods[attr]))
+                mods[attr] = None
+    try:
+        yield
+    finally:
+        if isinstance(mods, dict):
+            for attr, orig in saved:
+                mods[attr] = orig
+
+
 def forward_and_loss_v2(
     model: UniOMRv2Net,
     images: torch.Tensor,
@@ -946,6 +1083,8 @@ def forward_and_loss_v2(
     kd_alpha: float = 0.0,
     kd_beta: float = 0.5,
     kd_temp: float = 2.0,
+    kd_teacher_ce_cap: float = 0.0,
+    kd_hw_scale: float = 1.0,
     cass_prob: float = 0.0,
     kind: str = "fullpage",
     mtp_loss_weight: float = 0.30,
@@ -969,6 +1108,13 @@ def forward_and_loss_v2(
     # Derive exact system count target from <sys> separator occurrences (0 syncs).
     sys_count_target = (seq == SYS_ID).sum(dim=1).to(torch.float32) + 1.0
 
+    # Determine which aux heads actually have active targets & weights so dead heads are skipped.
+    need_sys_y = (sys_y_target is not None) and (sys_y_loss_weight > 0.0)
+    need_sys_count = sys_count_loss_weight > 0.0
+    need_staff_seg = (staff_seg_target is not None) and (staff_seg_loss_weight > 0.0)
+    need_stroke_hog = stroke_hog_weight > 0.0
+    need_any_enc_aux = need_sys_count or need_staff_seg or need_stroke_hog
+
     amp_ctx = (
         torch.autocast(device_type=dev.type, dtype=torch.bfloat16)
         if (use_bf16 and dev.type == "cuda")
@@ -976,43 +1122,57 @@ def forward_and_loss_v2(
     )
 
     with amp_ctx:
-        if cass_prob > 0.0 and kind != "strip" and tgt_in.shape[1] > 1:
-            mem_levels, aux_enc, router_info = model.encode_image(images, return_aux=True)
-            mem_det = tuple(m.detach() for m in mem_levels)
-            with torch.no_grad():
-                draft_logits, _, _ = model.decode_tokens(
-                    tgt_in, mem_det, return_mtp=False, return_aux=False, apply_tok_dropout=False
+        with _skip_dead_aux_heads(
+            model,
+            skip_sys_y=not need_sys_y,
+            skip_sys_count=not need_sys_count,
+            skip_staff_seg=not need_staff_seg,
+            skip_stroke_hog=not need_stroke_hog,
+        ):
+            if cass_prob > 0.0 and kind != "strip" and tgt_in.shape[1] > 1:
+                mem_levels, aux_enc, router_info = model.encode_image(
+                    images, return_aux=need_any_enc_aux
                 )
-                pred_ids = draft_logits.argmax(dim=-1)
-                tail_in = tgt_in[:, 1:]
-                cass_mask = (
-                    (torch.rand_like(tail_in, dtype=torch.float32) < cass_prob)
-                    & (tail_in != PAD_ID)
-                    & (tail_in != BOS_ID)
-                    & (pred_ids[:, :-1] != EOS_ID)
+                mem_det = tuple(m.detach() for m in mem_levels)
+                with torch.no_grad():
+                    draft_logits, _, _ = model.decode_tokens(
+                        tgt_in, mem_det, return_mtp=False, return_aux=False, apply_tok_dropout=False
+                    )
+                    pred_ids = draft_logits.argmax(dim=-1)
+                    tail_in = tgt_in[:, 1:]
+                    cass_mask = (
+                        (torch.rand_like(tail_in, dtype=torch.float32) < cass_prob)
+                        & (tail_in != PAD_ID)
+                        & (tail_in != BOS_ID)
+                        & (pred_ids[:, :-1] != EOS_ID)
+                    )
+                    dec_in = torch.cat(
+                        [tgt_in[:, :1], torch.where(cass_mask, pred_ids[:, :-1], tail_in)],
+                        dim=1,
+                    )
+                logits, mtp_logits, sys_y_pred = model.decode_tokens(
+                    dec_in,
+                    mem_levels,
+                    return_mtp=(model.cfg.mtp_k > 1),
+                    return_aux=need_sys_y,
+                    apply_tok_dropout=False,
                 )
-                dec_in = torch.cat(
-                    [tgt_in[:, :1], torch.where(cass_mask, pred_ids[:, :-1], tail_in)],
-                    dim=1,
+                out: Dict[str, Any] = {
+                    "logits": logits,
+                    "mtp_logits": mtp_logits,
+                    "sys_y_pred": sys_y_pred,
+                    "sys_count_pred": aux_enc["sys_count_pred"],
+                    "staff_seg_logits": aux_enc["staff_seg_logits"],
+                    "stroke_hog_pred": aux_enc["stroke_hog_pred"],
+                    "router_info": router_info,
+                }
+            else:
+                out = model(
+                    images,
+                    tgt_in,
+                    return_aux=(need_any_enc_aux or need_sys_y),
+                    return_mtp=(model.cfg.mtp_k > 1),
                 )
-            logits, mtp_logits, sys_y_pred = model.decode_tokens(
-                dec_in,
-                mem_levels,
-                return_mtp=(model.cfg.mtp_k > 1),
-                return_aux=True,
-                apply_tok_dropout=False,
-            )
-            out: Dict[str, Any] = {
-                "logits": logits,
-                "mtp_logits": mtp_logits,
-                "sys_y_pred": sys_y_pred,
-                "sys_count_pred": aux_enc["sys_count_pred"],
-                "staff_seg_logits": aux_enc["staff_seg_logits"],
-                "stroke_hog_pred": aux_enc["stroke_hog_pred"],
-                "router_info": router_info,
-            }
-        else:
-            out = model(images, tgt_in, return_aux=True, return_mtp=(model.cfg.mtp_k > 1))
 
         losses = model.compute_loss(
             out,
@@ -1032,16 +1192,29 @@ def forward_and_loss_v2(
         )
 
         # Hybrid KD: prefer offline Top-K cache hits, otherwise fall back to online frozen v1 teacher.
-        # Completely skip teacher forward & KD graph node when kd_alpha <= 0.
+        # Optionally downweight/skip KD on HW batches (--kd-hw-scale) and gate per-token KD by
+        # teacher cross-entropy (--kd-teacher-ce-cap). Completely skip teacher forward when eff_kd_alpha <= 0.
+        eff_kd_alpha = float(kd_alpha)
+        hw_scale = float(kd_hw_scale)
+        if eff_kd_alpha > 0.0 and hw_scale != 1.0:
+            if kind == "hw_strip":
+                eff_kd_alpha *= hw_scale
+            elif sample_ids:
+                n_hw_ids = sum(1 for sid in sample_ids if _is_hw_sample_id(sid))
+                if n_hw_ids > 0:
+                    hw_frac_batch = float(n_hw_ids) / float(len(sample_ids))
+                    eff_kd_alpha *= (1.0 - hw_frac_batch) + hw_frac_batch * hw_scale
+
         kd_loss = out["logits"].new_zeros(())
-        if kd_alpha > 0.0:
+        kd_gate_frac = out["logits"].new_ones((), dtype=torch.float32)
+        if eff_kd_alpha > 0.0:
             used_cache = False
             if teacher_cache is not None and sample_ids is not None:
                 c_vals, c_idx, c_mask, n_hits = teacher_cache.get_batch(
                     sample_ids, seq_len=tgt_out.shape[1], device=dev
                 )
                 if n_hits > 0:
-                    kd_loss = compute_sparse_topk_jsd_loss(
+                    kd_loss, kd_gate_frac = compute_sparse_topk_jsd_loss(
                         out["logits"],
                         c_vals,
                         c_idx,
@@ -1049,6 +1222,8 @@ def forward_and_loss_v2(
                         beta=kd_beta,
                         temp=kd_temp,
                         valid_mask=c_mask,
+                        teacher_ce_cap=kd_teacher_ce_cap,
+                        return_gate_frac=True,
                     )
                     used_cache = True
                 del c_vals, c_idx, c_mask
@@ -1062,18 +1237,21 @@ def forward_and_loss_v2(
                     del t_out, t_images
                 # _GeneralizedJSDAutograd consumes teacher_logits inside no_grad without saving it,
                 # so no extra (B, T, V) clone is needed.
-                kd_loss = compute_generalized_jsd_loss(
+                kd_loss, kd_gate_frac = compute_generalized_jsd_loss(
                     out["logits"],
                     t_logits_inf,
                     tgt_out,
                     beta=kd_beta,
                     temp=kd_temp,
+                    teacher_ce_cap=kd_teacher_ce_cap,
+                    return_gate_frac=True,
                 )
                 del t_logits_inf
 
-            losses["loss"] = losses["loss"] + float(kd_alpha) * kd_loss
+            losses["loss"] = losses["loss"] + eff_kd_alpha * kd_loss
 
         losses["kd_loss"] = kd_loss
+        losses["kd_gate_frac"] = kd_gate_frac
 
     return losses, out
 
@@ -1345,8 +1523,120 @@ def eval_dataset_v2(
 
 
 # ---------------------------------------------------------------------------
-# 6. Full Training Loop
+# 6. Full Training Loop + Archival HW Stratification & Val Split
 # ---------------------------------------------------------------------------
+
+STRATIFIED_FULLPAGE_WEIGHTS_V2: Dict[str, float] = {
+    "legacy_printed": 0.30,
+    "multi_renderer_printed": 0.26,
+    "rare_printed": 0.06,
+    "synth_hw": 0.22,
+    "real_hw_stitched": 0.06,
+    "real_hw_archival": 0.10,
+}
+
+_STITCHED_HW_MARKERS: Tuple[str, ...] = (
+    "1s2s",
+    "stitched",
+    "concat",
+    "synth_page",
+    "composed",
+)
+
+
+def classify_fullpage_bucket_v2(
+    img_path: Any,
+    domain: str = "",
+    split_archival_hw: bool = False,
+) -> str:
+    """Classify a full-page sample, optionally splitting ``real_hw`` into archival vs stitched."""
+    base = classify_fullpage_bucket(img_path, domain)
+    if split_archival_hw and base == "real_hw":
+        p_str = str(img_path).replace("\\", "/").lower()
+        dom = str(domain or "").strip().lower()
+        if any(tok in p_str or tok in dom for tok in _STITCHED_HW_MARKERS):
+            return "real_hw_stitched"
+        return "real_hw_archival"
+    return base
+
+
+class ArchivalStratifiedFullPageSampler(StratifiedFullPageSampler):
+    """6-bucket stratified full-page sampler splitting ``real_hw_archival`` vs ``real_hw_stitched``."""
+
+    def __init__(
+        self,
+        pairs: Sequence[Tuple[Any, ...]],
+        weights: Optional[Dict[str, float]] = None,
+        epoch_size: Optional[int] = None,
+    ) -> None:
+        self.num_samples = len(pairs)
+        self.epoch_size = int(epoch_size) if epoch_size is not None else self.num_samples
+        raw_weights = dict(STRATIFIED_FULLPAGE_WEIGHTS_V2 if weights is None else weights)
+        self.buckets: Dict[str, List[int]] = {k: [] for k in raw_weights}
+        for idx, entry in enumerate(pairs):
+            dom = str(entry[2]) if len(entry) > 2 else ""
+            bname = classify_fullpage_bucket_v2(entry[0], dom, split_archival_hw=True)
+            self.buckets.setdefault(bname, []).append(idx)
+        active = {
+            k: raw_weights.get(k, 0.0)
+            for k, idxs in self.buckets.items()
+            if idxs and raw_weights.get(k, 0.0) > 0.0
+        }
+        w_sum = sum(active.values())
+        if w_sum <= 0.0:
+            non_empty = [k for k, idxs in self.buckets.items() if idxs]
+            self.active_weights: Dict[str, float] = {k: 1.0 / max(1, len(non_empty)) for k in non_empty}
+        else:
+            self.active_weights = {k: v / w_sum for k, v in active.items()}
+
+
+def split_fullpage_train_val_with_hw(
+    fp_pairs: Sequence[Tuple[Any, ...]],
+    val_count: int = 16,
+    val_real_hw_count: int = 0,
+    seed: int = 42,
+) -> Tuple[List[Tuple[Any, ...]], List[Tuple[Any, ...]], List[Tuple[Any, ...]]]:
+    """Split full-page pairs into ``(train, val, real_hw_val)`` with piece-level grouping.
+
+    When ``val_real_hw_count <= 0``, preserves exact legacy ``split_train_val`` behavior
+    and returns an empty ``real_hw_val`` list.
+    """
+    if not fp_pairs:
+        return [], [], []
+    if int(val_real_hw_count) <= 0:
+        fp_tr, fp_va = split_train_val(
+            fp_pairs,
+            key_fn=lambda p: data.piece_key(p[0].stem),
+            val_count=val_count,
+            seed=seed,
+        )
+        return fp_tr, fp_va, []
+
+    real_hw_rows: List[Tuple[Any, ...]] = []
+    other_rows: List[Tuple[Any, ...]] = []
+    for entry in fp_pairs:
+        dom = str(entry[2]) if len(entry) > 2 else ""
+        if classify_fullpage_bucket(entry[0], dom) == "real_hw":
+            real_hw_rows.append(entry)
+        else:
+            other_rows.append(entry)
+
+    other_tr, other_va = split_train_val(
+        other_rows,
+        key_fn=lambda p: data.piece_key(p[0].stem),
+        val_count=val_count,
+        seed=seed,
+    ) if other_rows else ([], [])
+
+    hw_tr, hw_va = split_train_val(
+        real_hw_rows,
+        key_fn=lambda p: data.piece_key(p[0].stem),
+        val_count=int(val_real_hw_count),
+        seed=seed + 17,
+    ) if real_hw_rows else ([], [])
+
+    return other_tr + hw_tr, other_va, hw_va
+
 
 def _build_datasets_and_iters(
     args: argparse.Namespace,
@@ -1362,6 +1652,7 @@ def _build_datasets_and_iters(
     hw_va: List[Tuple[Path, Path]] = []
     fp_tr: List[Tuple[Any, ...]] = []
     fp_va: List[Tuple[Any, ...]] = []
+    fp_hw_va: List[Tuple[Any, ...]] = []
 
     if args.strip_dirs:
         strip_pairs = discover_strip_pairs(args.strip_dirs)
@@ -1412,10 +1703,10 @@ def _build_datasets_and_iters(
                     flush=True,
                 )
         if fp_pairs:
-            fp_tr, fp_va = split_train_val(
+            fp_tr, fp_va, fp_hw_va = split_fullpage_train_val_with_hw(
                 fp_pairs,
-                key_fn=lambda p: data.piece_key(p[0].stem),
                 val_count=args.val_count,
+                val_real_hw_count=int(getattr(args, "val_real_hw_count", 0)),
                 seed=args.seed,
             )
 
@@ -1426,6 +1717,8 @@ def _build_datasets_and_iters(
     for p in hw_va:
         shared_val_keys.add(_strip_group_key(p[0].stem))
     for p in fp_va:
+        shared_val_keys.add(data.piece_key(p[0].stem))
+    for p in fp_hw_va:
         shared_val_keys.add(data.piece_key(p[0].stem))
 
     if shared_val_keys:
@@ -1449,7 +1742,21 @@ def _build_datasets_and_iters(
     strip_val_ds = None
     hw_strip_val_ds = None
     fullpage_val_ds = None
+    fullpage_hw_val_ds = None
     clean_datasets_for_cache: List[Tuple[str, Any]] = []
+
+    rism_style_dir = str(getattr(args, "rism_style_dir", "") or "").strip()
+    rism_fda_prob = float(getattr(args, "rism_fda_prob", 0.0) or 0.0)
+    rism_adain_prob = float(getattr(args, "rism_adain_prob", 0.0) or 0.0)
+    rism_fda_beta = float(getattr(args, "rism_fda_beta", 0.02) or 0.02)
+    rism_style_pool: Optional[RismStylePool] = None
+    if rism_style_dir and (rism_fda_prob > 0.0 or rism_adain_prob > 0.0):
+        rism_style_pool = RismStylePool(rism_style_dir, seed=args.seed)
+        print(
+            f"[UniOMRv2 data] RismStylePool: {len(rism_style_pool)} cached refs from {rism_style_dir} "
+            f"(fda_p={rism_fda_prob:.2f}, beta={rism_fda_beta:.3f}, adain_p={rism_adain_prob:.2f})",
+            flush=True,
+        )
 
     if st_tr or st_va:
         st_train_ds = UniStripDataset(
@@ -1461,6 +1768,10 @@ def _build_datasets_and_iters(
             aug_prob=args.aug_prob,
             kind="strip",
             return_uint8=True,
+            rism_style_pool=rism_style_pool,
+            rism_fda_prob=rism_fda_prob,
+            rism_adain_prob=rism_adain_prob,
+            rism_fda_beta=rism_fda_beta,
         )
         if st_tr:
             clean_datasets_for_cache.append((
@@ -1520,6 +1831,10 @@ def _build_datasets_and_iters(
             aug_prob=args.aug_prob,
             kind="hw_strip",
             return_uint8=True,
+            rism_style_pool=rism_style_pool,
+            rism_fda_prob=rism_fda_prob,
+            rism_adain_prob=rism_adain_prob,
+            rism_fda_beta=rism_fda_beta,
         )
         if hw_tr:
             clean_datasets_for_cache.append((
@@ -1569,12 +1884,20 @@ def _build_datasets_and_iters(
             )
         print(f"[UniOMRv2 data] hw_strips: {len(hw_tr)} train / {len(hw_va)} val", flush=True)
 
-    if fp_tr or fp_va:
-        fp_strat_sampler = (
-            StratifiedFullPageSampler(fp_tr)
-            if (args.stratified_fullpage and len(fp_tr) > 0)
-            else None
-        )
+    if fp_tr or fp_va or fp_hw_va:
+        if args.stratified_fullpage and len(fp_tr) > 0:
+            fp_strat_sampler: Optional[StratifiedFullPageSampler] = (
+                ArchivalStratifiedFullPageSampler(fp_tr)
+                if bool(getattr(args, "split_archival_hw", False))
+                else StratifiedFullPageSampler(fp_tr)
+            )
+            print(
+                f"[UniOMRv2 data] fullpage_strata={fp_strat_sampler.bucket_counts()} "
+                f"weights={ {k: round(v, 3) for k, v in fp_strat_sampler.active_weights.items()} }",
+                flush=True,
+            )
+        else:
+            fp_strat_sampler = None
         fp_train_ds = UniFullPageDataset(
             fp_tr,
             fullpage_max_dim=args.fullpage_max_dim,
@@ -1583,6 +1906,10 @@ def _build_datasets_and_iters(
             aug_prob=args.aug_prob,
             multi_scale=args.multi_scale,
             return_uint8=True,
+            rism_style_pool=rism_style_pool,
+            rism_fda_prob=rism_fda_prob,
+            rism_adain_prob=rism_adain_prob,
+            rism_fda_beta=rism_fda_beta,
         )
         if fp_tr:
             clean_datasets_for_cache.append((
@@ -1602,6 +1929,13 @@ def _build_datasets_and_iters(
             augment=False,
             return_uint8=True,
         ) if fp_va else None
+        fullpage_hw_val_ds = UniFullPageDataset(
+            fp_hw_va,
+            fullpage_max_dim=args.fullpage_max_dim,
+            max_seq_len=args.max_seq_len,
+            augment=False,
+            return_uint8=True,
+        ) if fp_hw_va else None
         if prefetch_threads > 0 and args.num_workers == 0 and len(fp_tr) > 0:
             pf = AsyncThreadPrefetcher(
                 fp_train_ds,
@@ -1645,7 +1979,8 @@ def _build_datasets_and_iters(
                     pin_memory=(device.type == "cuda"),
                 )
             )
-        print(f"[UniOMRv2 data] fullpage: {len(fp_tr)} train / {len(fp_va)} val", flush=True)
+        hw_val_note = f" / {len(fp_hw_va)} real_hw_val" if fp_hw_va else ""
+        print(f"[UniOMRv2 data] fullpage: {len(fp_tr)} train / {len(fp_va)} val{hw_val_note}", flush=True)
 
     return {
         "strip_train_iter": strip_train_iter,
@@ -1654,6 +1989,7 @@ def _build_datasets_and_iters(
         "strip_val_ds": strip_val_ds,
         "hw_strip_val_ds": hw_strip_val_ds,
         "fullpage_val_ds": fullpage_val_ds,
+        "fullpage_hw_val_ds": fullpage_hw_val_ds,
         "prefetchers": prefetchers,
         "clean_datasets_for_cache": clean_datasets_for_cache,
     }
@@ -1679,9 +2015,9 @@ def run_train_v2(args: argparse.Namespace) -> Dict[str, Any]:
         dynamic_routing=bool(args.dynamic_routing),
         max_mem_tokens=int(args.max_mem_tokens),
         mtp_k=int(args.mtp_k),
-        use_sys_y_aux=bool(args.use_sys_y_aux),
-        use_sys_count_aux=bool(args.use_sys_count_aux),
-        use_staff_seg_aux=bool(args.use_staff_seg_aux),
+        use_sys_y_aux=bool(args.use_sys_y_aux and float(args.sys_y_loss_weight) > 0.0),
+        use_sys_count_aux=bool(args.use_sys_count_aux and float(args.sys_count_loss_weight) > 0.0),
+        use_staff_seg_aux=bool(args.use_staff_seg_aux and float(args.staff_seg_loss_weight) > 0.0),
         use_stroke_hog_head=bool(args.stroke_hog_weight > 0.0),
     )
 
@@ -1764,16 +2100,26 @@ def run_train_v2(args: argparse.Namespace) -> Dict[str, Any]:
         muon_lr=args.muon_lr,
         weight_decay=float(args.weight_decay),
         device_type=device.type,
-    )
-    print(
-        f"[UniOMRv2 opt] mode={opt.mode} | muon_params={len(opt.muon_param_names)} | "
-        f"adamw_params={len(opt.adamw_param_names)} | lr={args.lr:.2e} | schedule={args.lr_schedule}",
-        flush=True,
+        no_decay_1d=bool(getattr(args, "no_decay_1d", False)),
     )
 
     steps = min(args.steps, 2) if args.dry_run else int(args.steps)
     grad_accum = max(1, int(args.grad_accum))
-    strip_grad_accum = max(1, (max(1, int(args.batch_size)) * grad_accum) // strip_batch_size)
+    req_strip_ga = int(getattr(args, "strip_grad_accum", 0))
+    if req_strip_ga > 0:
+        strip_grad_accum = req_strip_ga
+    else:
+        strip_grad_accum = max(1, (max(1, int(args.batch_size)) * grad_accum) // strip_batch_size)
+    grad_clip = float(getattr(args, "grad_clip", 1.0))
+    kd_teacher_ce_cap = float(getattr(args, "kd_teacher_ce_cap", 0.0))
+    kd_hw_scale = float(getattr(args, "kd_hw_scale", 1.0))
+    print(
+        f"[UniOMRv2 opt] mode={opt.mode} | muon_params={len(opt.muon_param_names)} | "
+        f"adamw_params={len(opt.adamw_param_names)} | no_decay_params={len(opt.no_decay_param_names)} | "
+        f"lr={args.lr:.2e} | schedule={args.lr_schedule} | grad_clip={grad_clip:.2f} | "
+        f"grad_accum={grad_accum} | strip_grad_accum={strip_grad_accum} (strip_bs={strip_batch_size})",
+        flush=True,
+    )
     log_every = max(1, int(args.log_every))
     eval_batch_size = (
         (8 if (device.type == "cuda" and not args.dry_run) else max(1, int(args.batch_size)))
@@ -1812,6 +2158,7 @@ def run_train_v2(args: argparse.Namespace) -> Dict[str, Any]:
         "strip_val_ds": None,
         "hw_strip_val_ds": None,
         "fullpage_val_ds": None,
+        "fullpage_hw_val_ds": None,
         "prefetchers": [],
     }
     if use_real_data:
@@ -1825,6 +2172,7 @@ def run_train_v2(args: argparse.Namespace) -> Dict[str, Any]:
     strip_val_ds = ds_bundle["strip_val_ds"]
     hw_strip_val_ds = ds_bundle["hw_strip_val_ds"]
     fullpage_val_ds = ds_bundle["fullpage_val_ds"]
+    fullpage_hw_val_ds = ds_bundle.get("fullpage_hw_val_ds")
     prefetchers: List[AsyncThreadPrefetcher] = ds_bundle["prefetchers"]
 
     strip_mixer = StripDomainMixer(hw_frac=float(args.hw_frac))
@@ -1948,6 +2296,7 @@ def run_train_v2(args: argparse.Namespace) -> Dict[str, Any]:
                 ("strip_val", strip_val_ds, eval_batch_size),
                 ("hw_strip_val", hw_strip_val_ds, eval_batch_size),
                 ("fullpage_val", fullpage_val_ds, min(eval_batch_size, 2)),
+                ("fullpage_hw_val", fullpage_hw_val_ds, min(eval_batch_size, 2)),
             ):
                 if val_ds is None:
                     continue
@@ -1976,6 +2325,7 @@ def run_train_v2(args: argparse.Namespace) -> Dict[str, Any]:
     save_every_sec = max(0.0, float(args.save_every_minutes) * 60.0)
     last_time_save = time.perf_counter()
     last_empty_cache_step = -25
+    last_logged_hist_idx = 0
     trainable_params = [p for p in model.parameters() if p.requires_grad]
 
     _acc_keys: Tuple[str, ...] = (
@@ -1985,6 +2335,7 @@ def run_train_v2(args: argparse.Namespace) -> Dict[str, Any]:
         "saliency_loss",
         "stroke_hog_loss",
         "kd_loss",
+        "kd_gate_frac",
     )
     pending_history_meta: List[Tuple[int, str, float, float, int, int]] = []
     pending_history_vals: List[torch.Tensor] = []
@@ -2061,6 +2412,8 @@ def run_train_v2(args: argparse.Namespace) -> Dict[str, Any]:
                         kd_alpha=cur_kd_alpha,
                         kd_beta=float(args.kd_beta),
                         kd_temp=float(args.kd_temp),
+                        kd_teacher_ce_cap=kd_teacher_ce_cap,
+                        kd_hw_scale=kd_hw_scale,
                         cass_prob=float(args.cass_prob),
                         kind=kind,
                         mtp_loss_weight=float(args.mtp_loss_weight),
@@ -2096,7 +2449,8 @@ def run_train_v2(args: argparse.Namespace) -> Dict[str, Any]:
             if oom_hit:
                 continue
 
-            torch.nn.utils.clip_grad_norm_(trainable_params, 1.0)
+            if grad_clip > 0.0:
+                torch.nn.utils.clip_grad_norm_(trainable_params, grad_clip)
             opt.step()
             if qat_ctrl is not None and qat_ctrl.enabled:
                 qat_ctrl.refresh_cache()
@@ -2115,13 +2469,28 @@ def run_train_v2(args: argparse.Namespace) -> Dict[str, Any]:
             pending_history_vals.append(acc_t)
             if step == 1 or (step % log_every == 0) or step == steps:
                 _flush_pending_history()
+                recent_rows = history[last_logged_hist_idx:]
+                last_logged_hist_idx = len(history)
                 last_row = history[-1]
+                strip_rows = [
+                    r for r in recent_rows
+                    if r.get("kind") in ("strip", "hw_strip", "mixed_strip")
+                ]
+                strip_note = ""
+                if strip_rows:
+                    mean_strip_loss = sum(float(r["loss"]) for r in strip_rows) / len(strip_rows)
+                    strip_note = f" | strip_loss={mean_strip_loss:.4f} (n={len(strip_rows)})"
+                kd_gate_note = (
+                    f", kd_gate={last_row['kd_gate_frac']:.2f}"
+                    if kd_teacher_ce_cap > 0.0
+                    else ""
+                )
                 print(
                     f"[UniOMRv2 {'dry-run' if args.dry_run else 'train'} | {last_kind}] "
                     f"step {step}/{steps} | lr={cur_lr:.2e} | loss={last_row['loss']:.4f} "
                     f"(ce={last_row['ce_loss']:.4f}, mtp={last_row['mtp_loss']:.4f}, "
-                    f"hog={last_row['stroke_hog_loss']:.4f}, kd={last_row['kd_loss']:.4f}) | "
-                    f"tokens {last_n_in}->{last_n_out}",
+                    f"hog={last_row['stroke_hog_loss']:.4f}, kd={last_row['kd_loss']:.4f}{kd_gate_note})"
+                    f"{strip_note} | tokens {last_n_in}->{last_n_out}",
                     flush=True,
                 )
 
@@ -2150,7 +2519,12 @@ def run_train_v2(args: argparse.Namespace) -> Dict[str, Any]:
                 use_real_data
                 and args.eval_every > 0
                 and (step % args.eval_every == 0 or step == steps)
-                and (strip_val_ds is not None or hw_strip_val_ds is not None or fullpage_val_ds is not None)
+                and (
+                    strip_val_ds is not None
+                    or hw_strip_val_ds is not None
+                    or fullpage_val_ds is not None
+                    or fullpage_hw_val_ds is not None
+                )
             )
             if should_eval:
                 if device.type == "cuda":
@@ -2228,6 +2602,7 @@ def run_train_v2(args: argparse.Namespace) -> Dict[str, Any]:
         "best_val_ser": best_val_ser if eval_history else None,
         "best_ema_ser": best_ema_ser if eval_history else None,
         "optimizer_mode": opt.mode,
+        "strip_grad_accum": strip_grad_accum,
         "params": model.param_summary(),
     }
 
@@ -2254,8 +2629,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--max-mem-tokens", type=int, default=10240)
     p.add_argument("--mtp-k", type=int, default=4)
     p.add_argument("--use-sys-y-aux", action="store_true", default=True)
+    p.add_argument("--no-use-sys-y-aux", dest="use_sys_y_aux", action="store_false")
     p.add_argument("--use-sys-count-aux", action="store_true", default=True)
+    p.add_argument("--no-use-sys-count-aux", dest="use_sys_count_aux", action="store_false")
     p.add_argument("--use-staff-seg-aux", action="store_true", default=True)
+    p.add_argument("--no-use-staff-seg-aux", dest="use_staff_seg_aux", action="store_false")
 
     # Hybrid v1 -> v2 distillation
     p.add_argument("--teacher-ckpt", type=str, default=None, help="Frozen v1 UniOMRNet teacher checkpoint")
@@ -2265,12 +2643,36 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--kd-beta", type=float, default=0.5, help="Generalized JSD beta in [0, 1]")
     p.add_argument("--kd-alpha", type=float, default=0.35, help="KD loss weight (cosine-annealed over last 25%%)")
     p.add_argument("--kd-temp", type=float, default=2.0, help="KD softmax temperature")
+    p.add_argument(
+        "--kd-teacher-ce-cap",
+        type=float,
+        default=0.0,
+        help="Mask per-token KD to tokens where teacher CE <= cap (0.0 = disabled)",
+    )
+    p.add_argument(
+        "--kd-hw-scale",
+        type=float,
+        default=1.0,
+        help="Optional multiplier for kd_alpha on handwritten batches (default 1.0)",
+    )
 
     # Optimizer & WSD schedule
     p.add_argument("--optimizer", choices=["muon", "adamw"], default="muon")
     p.add_argument("--lr", type=float, default=3e-4)
     p.add_argument("--muon-lr", type=float, default=None, help="Optional separate LR for Muon 2D weights")
     p.add_argument("--weight-decay", type=float, default=0.01)
+    p.add_argument(
+        "--no-decay-1d",
+        action="store_true",
+        default=False,
+        help="Exclude 1D/0D params (norms, biases) and embeddings from AdamW weight decay",
+    )
+    p.add_argument(
+        "--grad-clip",
+        type=float,
+        default=1.0,
+        help="Max gradient norm for clip_grad_norm_ (default 1.0; <= 0 disables clipping)",
+    )
     p.add_argument("--lr-schedule", choices=["wsd", "cosine"], default="wsd")
     p.add_argument("--warmup-steps", type=int, default=500)
     p.add_argument("--wsd-decay-frac", type=float, default=0.25)
@@ -2300,6 +2702,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--batch-size", type=int, default=2)
     p.add_argument("--strip-batch-size", type=int, default=None)
     p.add_argument("--grad-accum", type=int, default=4)
+    p.add_argument(
+        "--strip-grad-accum",
+        type=int,
+        default=0,
+        help="Explicit grad accumulation steps for strip batches (0 = auto legacy formula)",
+    )
     p.add_argument("--curriculum", choices=["strip", "fullpage", "mixed"], default="mixed")
     p.add_argument("--fullpage-frac", type=float, default=0.65)
     p.add_argument("--hw-frac", type=float, default=0.30)
@@ -2316,9 +2724,45 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--augment", action="store_true", default=True)
     p.add_argument("--no-augment", dest="augment", action="store_false")
     p.add_argument("--aug-prob", type=float, default=0.75)
+    p.add_argument(
+        "--rism-style-dir",
+        type=str,
+        default="",
+        help="Optional directory of unpaired archival RISM images for online FDA / Color-AdaIN transfer",
+    )
+    p.add_argument(
+        "--rism-fda-prob",
+        type=float,
+        default=0.0,
+        help="Probability of applying RISM 2D-FFT FDA transfer during online augmentation (default 0.0)",
+    )
+    p.add_argument(
+        "--rism-adain-prob",
+        type=float,
+        default=0.0,
+        help="Probability of applying RISM Color-AdaIN transfer during online augmentation (default 0.0)",
+    )
+    p.add_argument(
+        "--rism-fda-beta",
+        type=float,
+        default=0.02,
+        help="Low-frequency amplitude swap bandwidth beta for RISM FDA transfer (default 0.02)",
+    )
     p.add_argument("--multi-scale", action="store_true", default=True)
     p.add_argument("--stratified-fullpage", action="store_true", default=True)
+    p.add_argument(
+        "--split-archival-hw",
+        action="store_true",
+        default=False,
+        help="Split real_hw into real_hw_archival (10%%) vs real_hw_stitched (6%%) in stratified full-page sampler",
+    )
     p.add_argument("--val-count", type=int, default=16)
+    p.add_argument(
+        "--val-real-hw-count",
+        type=int,
+        default=0,
+        help="Deterministic count of real_hw full-page items reserved for fullpage_hw_val (0 = disabled)",
+    )
     p.add_argument("--eval-every", type=int, default=500)
     p.add_argument("--eval-max-len", type=int, default=256)
     p.add_argument("--eval-batch-size", type=int, default=None)
