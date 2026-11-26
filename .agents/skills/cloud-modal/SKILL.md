@@ -127,3 +127,6 @@ Use **both** cleanly — they solve different problems:
     - Any Modal image importing `eval_uni_suite31` / `marker_tracks.py` MUST include `"scipy"` in `pip_install`.
     - Any Modal image running `export_uni_v2_onnx.py` INT4 WebGPU quantization (`matmul_nbits_quantizer`) MUST include `"onnx-ir"` alongside `onnx==1.23.2` and `onnxruntime==1.31.1`.
     - `modal app stop` requires `-y` (`--yes`) in non-interactive shells.
+- **2026-11-26 (Exp 3 `ablation-vir-vico-router` post-run scrutiny):**
+  - **5-min resume completeness:** When resuming from `/vol/ckpts/.../uni_omr_v2_latest.pt`, always save & restore `opt.state_dict()` alongside `model` and `gpu_ema` (otherwise Muon/AdamW momentum resets on container retry).
+  - **Short proxy EMA half-life:** `GPUEmaShadow(decay=0.997, update_every=5)` has a `1,155`-step half-life (`231` updates), causing EMA to lag Raw by `~7–9 pp` Token F1 on `<= 1,200`-step scratch proxy runs. Use `decay=0.99` (or lower) for `500–1,200`-step proxy ablations and always compare BOTH Raw and EMA metrics.

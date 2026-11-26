@@ -1,6 +1,6 @@
 # `2026-11-26T00-54-ablation-vir-vico-router` — ViRTwoTierRouter + ViCO vs InkTokenRouterV2 (1-Variable Ablation)
 
-- **Status:** `RUNNING` (launched `2026-11-26 00:59 EET` / `2026-11-25T23:00:20Z`, Modal `app_id`: `ap-s2HoXUXOCRrpAI3CMHFQJF`)
+- **Status:** `COMPLETED` (`ITERATE` — Keep `InkTokenRouterV2` for Iter 11; Modal `app_id`: `ap-8ZDdiVYjK1SGxUf0v43qH7`, stopped `2026-11-26T00:12:30Z`)
 - **Baseline:** Commit `9d73170` | Architecture: `UniOMRv2Net` (`small_45m`, ~43M params) with standard binary `InkTokenRouterV2` (`n_bg_summary=4`)
 - **Platform:** Modal `2× L4` (`24 GB`, native BF16, parallel arms) — profile `gregoreesmaa1`
 
@@ -14,7 +14,7 @@ Isolate a **single architectural variable** on `UniOMR v2 small_45m` (`1,200` st
 ## Quick Links
 - Launcher script: [run_modal.py](./run_modal.py)
 - Plan, Live Query IDs & Decision Tree: [PLAN.md](./PLAN.md)
-- Outcome: `OUTCOME.md` *(to be written immediately after both L4 arms complete and HF eval JSON lands)*
+- Outcome: [OUTCOME.md](./OUTCOME.md) (`ITERATE` — `InkTokenRouterV2` won on all accuracy metrics; successor [`2026-11-26T02-18-ablation-vir-router-bucket-parity`](../2026-11-26T02-18-ablation-vir-router-bucket-parity/) queued)
 - Hugging Face Eval Summary: `gregoreesmaa/sheet-music-converter-omr` → `evals/2026-11-26T00-54-ablation-vir-vico-router.json`
 - Hugging Face Run Ledger: `gregoreesmaa/sheet-music-converter-omr` → `runs/2026-11-26T00-54-ablation-vir-vico-router.json`
 - Hugging Face Checkpoints: `gregoreesmaa/sheet-music-converter-omr` → `checkpoints/2026-11-26T00-54-ablation-vir-vico-router/{baseline,vir_vico}/uni_omr_v2_ema_best.pt`

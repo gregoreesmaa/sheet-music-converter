@@ -113,14 +113,17 @@
     "id": "2026-11-26T01-38-ov-21-paper-gate-border-threshold",
     "wave": 5,
     "priority": 9,
-    "provider": "colab_l4",
-    "gpu": "L4",
+    "provider": "kaggle",
+    "gpu": "2xT4",
     "est_minutes": 20,
     "est_cu": 1.7,
     "script": "experiments/2026-11-26T01-38-ov-21-paper-gate-border-threshold/run_colab.py",
     "hf_eval_target": "evals/2026-11-26T01-38-ov-21-paper-gate-border-threshold.json",
-    "status": "QUEUED",
-    "depends_on": []
+    "status": "RUNNING",
+    "depends_on": [],
+    "kernel_id": "gregoreesmaa/omr-ov-21",
+    "started_at": "2026-11-26T00:19:01Z",
+    "log_path": "D:\\tmp\\overnight-queue-logs\\2026-11-26T01-38-ov-21-paper-gate-border-threshold.kaggle.log"
   },
   {
     "id": "2026-11-26T01-38-ov-19-router-saliency-keep-sweep",
@@ -282,16 +285,19 @@
     "id": "2026-11-26T01-38-ov-38-scribe-ttt-lr-steps-sweep",
     "wave": 7,
     "priority": 22,
-    "provider": "colab_l4",
-    "gpu": "L4",
+    "provider": "kaggle",
+    "gpu": "2xT4",
     "est_minutes": 30,
     "est_cu": 2.4,
     "script": "experiments/2026-11-26T01-38-ov-38-scribe-ttt-lr-steps-sweep/run_colab.py",
     "hf_eval_target": "evals/2026-11-26T01-38-ov-38-scribe-ttt-lr-steps-sweep.json",
-    "status": "QUEUED",
+    "status": "RUNNING",
     "depends_on": [
       "2026-11-26T00-55-trial-scribe-ttt-suite31-hw"
-    ]
+    ],
+    "kernel_id": "gregoreesmaa/omr-ov-38",
+    "started_at": "2026-11-26T00:19:01Z",
+    "log_path": "D:\\tmp\\overnight-queue-logs\\2026-11-26T01-38-ov-38-scribe-ttt-lr-steps-sweep.kaggle.log"
   },
   {
     "id": "2026-11-26T01-38-ov-37-rlvr-kl-group-sweep",
@@ -400,5 +406,20 @@
     "hf_eval_target": "evals/2026-11-26T01-38-ov-42-v1-to-v2-distill-temp-jsd.json",
     "status": "QUEUED",
     "depends_on": []
+  },
+  {
+    "id": "2026-11-26T02-18-ablation-vir-router-bucket-parity",
+    "wave": 5,
+    "priority": 11,
+    "provider": "colab_l4",
+    "gpu": "L4",
+    "est_minutes": 32,
+    "est_cu": 2.5,
+    "script": "experiments/2026-11-26T02-18-ablation-vir-router-bucket-parity/run_colab.py",
+    "hf_eval_target": "evals/2026-11-26T02-18-ablation-vir-router-bucket-parity.json",
+    "status": "QUEUED",
+    "depends_on": [
+      "2026-11-26T00-54-ablation-vir-vico-router"
+    ]
   }
 ]
