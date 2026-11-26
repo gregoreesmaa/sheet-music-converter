@@ -65,9 +65,13 @@ DEFAULT_KAGGLE_EXE = REPO_ROOT / ".venv" / "Scripts" / "kaggle.exe"
 VERIFIED_T4_SAFE_TAGS: Dict[str, str] = {
     "ov-21": "pure FP32 flood-fill paper_gate border sweep (290 pages, no training, no Rust)",
     "ov-34": "inference-only measure-beam x header-guard sweep (cc>=8 guard -> FP32 on T4)",
+    "ov-34b": "inference-only budgeted logprob measure-beam sweep (cc>=8 guard -> FP32 on T4)",
     "ov-35": "inference-only max_len x resolution sweep (cc>=8 guard -> FP32 on T4)",
+    "ov-35b": "inference-only lower-res x tight-maxlen sweep (cc>=8 guard -> FP32 on T4)",
     "ov-36": "inference-only HW multi-view TTA + voting (cc>=8 guard -> FP32 on T4)",
+    "ov-36b": "inference-only multiscale logprob FSA TTA (cc>=8 guard -> FP32 on T4)",
     "ov-37": "6-arm RLVR GRPO sweep (cc>=8 guard -> FP32 on T4, pure Python)",
+    "ov-37b": "RLVR GRPO scale200 len512 sweep (cc>=8 guard -> FP16+GradScaler on T4, pure Python)",
     "ov-38": "SCRIBE/DocTTT per-manuscript TTA sweep (cc>=8 guard -> FP32 on T4, pure Python)",
     "ov-39": "RISM pseudo-label + 60-step FT sweep (cc>=8 guard -> FP32 on T4, pure Python)",
 }
@@ -86,7 +90,7 @@ def _log_console(msg: str) -> None:
 
 
 def _short_tag(exp_id: str) -> str:
-    m = re.search(r"(ov-\d+)", exp_id)
+    m = re.search(r"(ov-\d+[a-z]*)", exp_id)
     if m:
         return m.group(1)
     slug = re.sub(r"[^a-z0-9-]+", "-", exp_id.lower()).strip("-")
@@ -558,8 +562,10 @@ def main() -> int:
             _ensure_symlink(Path("/workspace/mscz-rs"), mscz_root)
             _ensure_symlink(Path("/content/workspace/mscz-rs"), mscz_root)
 
-        # 7. Materialize embedded experiment script
-        run_script = Path("/tmp/run_exp.py")
+        # 7. Materialize embedded experiment script inside repo_root/experiments/<exp_id>/
+        # so scripts using Path(__file__).resolve().parents[2] resolve cleanly to repo_root.
+        run_script = repo_root / "experiments" / EXP_ID / "run_exp.py"
+        run_script.parent.mkdir(parents=True, exist_ok=True)
         run_script.write_bytes(base64.b64decode(EMBEDDED_SCRIPT_B64))
 
         env = os.environ.copy()
@@ -1122,18 +1128,29 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     with ThreadPoolExecutor(max_workers=max(1, int(args.max_parallel))) as pool:
         running: Dict[object, str] = {}
         while True:
-            # Always re-read queue.json fresh so we see Colab's latest RUNNING/COMPLETED updates!
+            # Always re-read queue.json fresh so we see Colab's latest RUNNING/COMPLETED
+            # updates AND any newly appended T4-safe follow-up entries!
             live_queue = _read_queue(queue_path)
             queue_by_id = {str(e["id"]): e for e in live_queue}
 
+            live_eligible = [
+                e for e in live_queue if _is_t4_eligible(e, allow_tags=allow_tags)[0]
+            ]
+            if args.order == "reverse":
+                live_eligible.sort(
+                    key=lambda x: (-int(x.get("priority", 0)), int(x.get("est_minutes", 999)), str(x["id"]))
+                )
+            else:
+                live_eligible.sort(
+                    key=lambda x: (int(x.get("priority", 999)), int(x.get("est_minutes", 999)), str(x["id"]))
+                )
+
             waiting_deps = 0
-            for exp_id in eligible_ids:
+            for row in live_eligible:
+                exp_id = str(row["id"])
                 if len(running) >= max(1, int(args.max_parallel)):
                     break
                 if exp_id in attempted_ids or exp_id in running.values():
-                    continue
-                row = queue_by_id.get(exp_id)
-                if row is None:
                     continue
                 st = str(row.get("status", "QUEUED")).upper()
                 if st in {"RUNNING", "COMPLETED", "FAILED", "BLOCKED"}:

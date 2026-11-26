@@ -57,39 +57,131 @@ def _log_console(msg: str) -> None:
 
 
 def _session_name_for(exp_id: str) -> str:
-    m = re.search(r"(ov-\d+)", exp_id)
+    m = re.search(r"(ov-\d+[a-z]*)", exp_id)
     if m:
         return m.group(1)
     slug = re.sub(r"[^a-z0-9-]+", "-", exp_id.lower()).strip("-")
     return slug[:24] or "ov-run"
 
 
-def _load_queue(path: Path) -> List[Dict[str, Any]]:
-    data = json.loads(path.read_text(encoding="utf-8"))
-    if not isinstance(data, list):
-        raise ValueError(f"Expected JSON list in {path}")
-    return data
+def _acquire_file_lock(lock_path: Path, timeout_s: float = 30.0) -> int:
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    deadline = time.monotonic() + timeout_s
+    while True:
+        try:
+            fd = os.open(str(lock_path), os.O_CREAT | os.O_EXCL | os.O_RDWR)
+            os.write(fd, f"pid={os.getpid()} ts={_utc_now()}\n".encode("utf-8"))
+            return fd
+        except FileExistsError:
+            # Break stale lock older than 120s
+            try:
+                age = time.time() - lock_path.stat().st_mtime
+                if age > 120.0:
+                    lock_path.unlink(missing_ok=True)
+                    continue
+            except OSError:
+                pass
+            if time.monotonic() >= deadline:
+                raise TimeoutError(f"Timed out waiting for lock {lock_path}")
+            time.sleep(0.1)
 
 
-def _save_queue_atomic(path: Path, queue: List[Dict[str, Any]]) -> None:
+def _release_file_lock(fd: int, lock_path: Path) -> None:
+    try:
+        os.close(fd)
+    except OSError:
+        pass
+    try:
+        lock_path.unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
+def _load_queue_unlocked(path: Path) -> List[Dict[str, Any]]:
+    for attempt in range(10):
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+            if not isinstance(data, list):
+                raise ValueError(f"Expected JSON list in {path}")
+            return data
+        except (PermissionError, json.JSONDecodeError):
+            if attempt == 9:
+                raise
+            time.sleep(0.15)
+    raise RuntimeError(f"Failed to read {path}")
+
+
+def _save_queue_atomic_unlocked(path: Path, queue: List[Dict[str, Any]]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_name(path.name + ".tmp")
+    tmp = path.with_name(f"{path.name}.colab.{os.getpid()}.{threading.get_ident()}.tmp")
     tmp.write_text(json.dumps(queue, indent=2) + "\n", encoding="utf-8")
-    os.replace(tmp, path)
+    for attempt in range(10):
+        try:
+            os.replace(tmp, path)
+            return
+        except PermissionError:
+            if attempt == 9:
+                tmp.unlink(missing_ok=True)
+                raise
+            time.sleep(0.15)
+
+
+def _read_queue(queue_path: Path) -> List[Dict[str, Any]]:
+    lock_path = queue_path.with_name(".queue.lock")
+    with QUEUE_LOCK:
+        fd = _acquire_file_lock(lock_path)
+        try:
+            return _load_queue_unlocked(queue_path)
+        finally:
+            _release_file_lock(fd, lock_path)
+
+
+def _claim_experiment_atomic(
+    queue_path: Path,
+    exp_id: str,
+    claim_updates: Dict[str, Any],
+) -> bool:
+    """Atomically re-read queue.json and claim exp_id ONLY if not RUNNING/COMPLETED."""
+    lock_path = queue_path.with_name(".queue.lock")
+    with QUEUE_LOCK:
+        fd = _acquire_file_lock(lock_path)
+        try:
+            queue = _load_queue_unlocked(queue_path)
+            for row in queue:
+                if str(row.get("id")) == exp_id:
+                    st = str(row.get("status", "QUEUED")).upper()
+                    if st in {"RUNNING", "COMPLETED"}:
+                        return False
+                    row.update(claim_updates)
+                    _save_queue_atomic_unlocked(queue_path, queue)
+                    return True
+            return False
+        finally:
+            _release_file_lock(fd, lock_path)
 
 
 def _update_experiment_record(
     queue_path: Path,
-    queue: List[Dict[str, Any]],
     exp_id: str,
     updates: Dict[str, Any],
 ) -> None:
+    """Re-read queue.json fresh under cross-process lock and update only exp_id."""
+    lock_path = queue_path.with_name(".queue.lock")
     with QUEUE_LOCK:
-        for row in queue:
-            if row.get("id") == exp_id:
-                row.update(updates)
-                break
-        _save_queue_atomic(queue_path, queue)
+        fd = _acquire_file_lock(lock_path)
+        try:
+            queue = _load_queue_unlocked(queue_path)
+            for row in queue:
+                if str(row.get("id")) == exp_id:
+                    row.update(updates)
+                    break
+            _save_queue_atomic_unlocked(queue_path, queue)
+        finally:
+            _release_file_lock(fd, lock_path)
+
+
+def _local_outcome_exists(exp_id: str) -> bool:
+    return (REPO_ROOT / "experiments" / exp_id / "OUTCOME.md").is_file()
 
 
 def _resolve_hf_token_file() -> Tuple[Optional[Path], Optional[Path]]:
@@ -259,9 +351,15 @@ def main() -> int:
         if str(mvd_root) not in sys.path:
             sys.path.insert(0, str(mvd_root))
 
-        print(f"[bootstrap:{{EXP_ID}}] Launching {{RUN_SCRIPT}} (mvd={{mvd_root}})", flush=True)
+        # Copy uploaded script into repo_root/experiments/<EXP_ID>/run_exp.py so
+        # scripts using Path(__file__).resolve().parents[2] resolve to repo_root.
+        exec_script = repo_root / "experiments" / EXP_ID / "run_exp.py"
+        exec_script.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(RUN_SCRIPT, exec_script)
+
+        print(f"[bootstrap:{{EXP_ID}}] Launching {{exec_script}} (mvd={{mvd_root}})", flush=True)
         proc = subprocess.run(
-            [sys.executable, "-u", str(RUN_SCRIPT)],
+            [sys.executable, "-u", str(exec_script)],
             cwd=str(repo_root),
             env=env,
             check=False,
@@ -312,7 +410,6 @@ def _run_one_experiment(
     exp: Dict[str, Any],
     *,
     queue_path: Path,
-    queue: List[Dict[str, Any]],
     colab_exe: Path,
     gpu: str,
     bundle_path: Path,
@@ -329,7 +426,6 @@ def _run_one_experiment(
         _log_console(f"[SKIP] {exp_id} already exists on HF ({hf_eval_target})")
         _update_experiment_record(
             queue_path,
-            queue,
             exp_id,
             {
                 "status": "COMPLETED",
@@ -343,7 +439,6 @@ def _run_one_experiment(
         _log_console(f"[FAIL] {exp_id} missing script {script_path}")
         _update_experiment_record(
             queue_path,
-            queue,
             exp_id,
             {"status": "FAILED", "returncode": -2, "completed_at": _utc_now()},
         )
@@ -354,18 +449,23 @@ def _run_one_experiment(
     started_at = _utc_now()
     t0 = time.monotonic()
 
-    _update_experiment_record(
+    claimed = _claim_experiment_atomic(
         queue_path,
-        queue,
         exp_id,
         {
             "status": "RUNNING",
+            "provider": "colab_l4",
             "session": session,
             "gpu": gpu,
             "started_at": started_at,
             "log_path": str(log_path),
         },
     )
+    if not claimed:
+        _log_console(
+            f"[SKIP-CLAIMED] {exp_id} is already RUNNING/COMPLETED in queue.json"
+        )
+        return {"id": exp_id, "status": "SKIPPED", "skipped": True, "returncode": 0}
     _log_console(f"[START] {exp_id} (wave={exp['wave']}, session={session}, gpu={gpu})")
 
     bootstrap_tmp: Optional[Path] = None
@@ -488,7 +588,6 @@ def _run_one_experiment(
     status = "COMPLETED" if rc == 0 else "FAILED"
     _update_experiment_record(
         queue_path,
-        queue,
         exp_id,
         {
             "status": status,
@@ -606,7 +705,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     args = parser.parse_args(argv)
 
     queue_path = args.queue if args.queue.is_absolute() else (REPO_ROOT / args.queue)
-    queue = _load_queue(queue_path)
+    queue = _read_queue(queue_path)
     wave_filter = _parse_waves(args.waves)
 
     selected = [
@@ -646,95 +745,118 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     from concurrent.futures import FIRST_COMPLETED, wait as fut_wait
 
-    # Build DAG state: any experiment whose `depends_on` predecessors are all COMPLETED
-    # (either in this queue or already present on HF `evals/<dep>.json`) may start immediately!
-    queue_ids = {str(e["id"]) for e in selected}
-    completed_ids = {
-        str(e["id"]) for e in selected if str(e.get("status", "QUEUED")) == "COMPLETED"
-    }
-    failed_ids = set()
+    # Dynamic DAG scheduler: re-reads queue.json fresh on every tick under .queue.lock
+    # so newly appended QUEUED follow-ups and cooperative Kaggle updates are picked up
+    # automatically without restarting or clobbering queue.json.
     ext_dep_cache: Dict[str, bool] = {}
+    attempted_ids: set[str] = set()
 
-    def _dep_satisfied(dep_id: str) -> bool:
-        if dep_id in completed_ids:
+    def _dep_satisfied(dep_id: str, queue_by_id: Dict[str, Dict[str, Any]]) -> bool:
+        row = queue_by_id.get(dep_id)
+        if row is not None and str(row.get("status", "")).upper() == "COMPLETED":
             return True
-        if dep_id in queue_ids:
+        if _local_outcome_exists(dep_id):
+            return True
+        if row is not None:
             return False
         if ext_dep_cache.get(dep_id):
             return True
-        ok = _hf_eval_exists(f"evals/{dep_id}.json", hf_token_str)
+        ok = _hf_target_exists(f"evals/{dep_id}.json", token=hf_token_str)
         if ok:
             ext_dep_cache[dep_id] = True
         return ok
 
-    pending = [
-        e for e in selected if str(e.get("status", "QUEUED")) != "COMPLETED"
+    init_queued = [
+        e for e in selected if str(e.get("status", "QUEUED")).upper() == "QUEUED"
     ]
-    pending.sort(key=lambda e: (int(e.get("priority", 999)), int(e["est_minutes"]), str(e["id"])))
-
+    init_done = [
+        e for e in selected if str(e.get("status", "QUEUED")).upper() == "COMPLETED"
+    ]
     _log_console(
-        f"=== Starting DAG Dependency-Chain Scheduler: {len(pending)} pending / {len(completed_ids)} already done (max_parallel={args.max_parallel}) ==="
+        f"=== Starting Dynamic DAG Dependency-Chain Scheduler: {len(init_queued)} queued / {len(init_done)} already done (max_parallel={args.max_parallel}) ==="
     )
     failures = 0
     try:
         with ThreadPoolExecutor(max_workers=max(1, int(args.max_parallel))) as pool:
             running: Dict[object, Dict[str, Any]] = {}
-            while pending or running:
-                # 1. Fail-fast any node whose in-queue predecessor FAILED
-                still_pending = []
-                for exp in pending:
+            while True:
+                # Re-read queue.json fresh on every tick so newly appended follow-ups
+                # and Kaggle completions are picked up immediately.
+                live_queue = _read_queue(queue_path)
+                queue_by_id = {str(e["id"]): e for e in live_queue}
+                failed_ids = {
+                    str(e["id"])
+                    for e in live_queue
+                    if str(e.get("status", "")).upper() in {"FAILED", "BLOCKED"}
+                }
+
+                live_queued = [
+                    e
+                    for e in live_queue
+                    if (wave_filter is None or int(e.get("wave", 0)) in wave_filter)
+                    and str(e.get("status", "QUEUED")).upper() == "QUEUED"
+                    and str(e["id"]) not in attempted_ids
+                    and all(str(r["id"]) != str(e["id"]) for r in running.values())
+                ]
+                live_queued.sort(
+                    key=lambda e: (
+                        int(e.get("priority", 999)),
+                        int(e.get("est_minutes", 999)),
+                        str(e["id"]),
+                    )
+                )
+
+                # 1. Fail-fast any QUEUED node whose in-queue predecessor FAILED/BLOCKED
+                actionable: List[Dict[str, Any]] = []
+                for exp in live_queued:
                     deps = [str(d) for d in exp.get("depends_on", [])]
                     bad_deps = [d for d in deps if d in failed_ids]
                     if bad_deps:
                         _log_console(
                             f"[BLOCKED] {exp['id']}: predecessor(s) failed: {bad_deps}"
                         )
-                        _update_queue_entry(
+                        _update_experiment_record(
                             queue_path,
-                            queue,
-                            exp["id"],
+                            str(exp["id"]),
                             {"status": "BLOCKED", "blocked_by": bad_deps},
                         )
                         failed_ids.add(str(exp["id"]))
                         failures += 1
                     else:
-                        still_pending.append(exp)
-                pending = still_pending
+                        actionable.append(exp)
 
                 # 2. Launch any ready experiment whose predecessors are all finished
                 launched_any = False
-                if len(running) < max(1, int(args.max_parallel)):
-                    next_pending = []
-                    for exp in pending:
-                        deps = [str(d) for d in exp.get("depends_on", [])]
-                        if len(running) < max(1, int(args.max_parallel)) and all(
-                            _dep_satisfied(d) for d in deps
-                        ):
-                            fut = pool.submit(
-                                _run_one_experiment,
-                                exp,
-                                queue_path=queue_path,
-                                queue=queue,
-                                colab_exe=args.colab_exe,
-                                gpu=args.gpu,
-                                bundle_path=bundle_path,
-                                hf_token_file=hf_token_file,
-                                hf_token_str=hf_token_str,
-                                log_dir=args.log_dir,
-                            )
-                            running[fut] = exp
-                            launched_any = True
-                        else:
-                            next_pending.append(exp)
-                    pending = next_pending
+                waiting_deps = 0
+                for exp in actionable:
+                    if len(running) >= max(1, int(args.max_parallel)):
+                        break
+                    deps = [str(d) for d in exp.get("depends_on", [])]
+                    if all(_dep_satisfied(d, queue_by_id) for d in deps):
+                        exp_id = str(exp["id"])
+                        attempted_ids.add(exp_id)
+                        fut = pool.submit(
+                            _run_one_experiment,
+                            dict(exp),
+                            queue_path=queue_path,
+                            colab_exe=args.colab_exe,
+                            gpu=args.gpu,
+                            bundle_path=bundle_path,
+                            hf_token_file=hf_token_file,
+                            hf_token_str=hf_token_str,
+                            log_dir=args.log_dir,
+                        )
+                        running[fut] = exp
+                        launched_any = True
+                    else:
+                        waiting_deps += 1
 
                 if not running:
-                    if not pending:
+                    if waiting_deps == 0 and not actionable:
                         break
                     if not launched_any:
-                        # Waiting on external HF predecessor(s) (e.g. Modal Exp 2)
                         _log_console(
-                            f"[WAIT-DEPS] {len(pending)} experiment(s) waiting on external predecessor(s); re-checking HF in 30s..."
+                            f"[WAIT-DEPS] {waiting_deps or len(actionable)} experiment(s) waiting on predecessor(s); re-checking in 30s..."
                         )
                         time.sleep(30)
                     continue
@@ -745,10 +867,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 for fut in done:
                     exp = running.pop(fut)
                     res = fut.result()
-                    if res.get("status") == "COMPLETED":
-                        completed_ids.add(str(exp["id"]))
-                    else:
-                        failed_ids.add(str(exp["id"]))
+                    if res.get("status") not in {"COMPLETED", "SKIPPED"}:
                         failures += 1
     finally:
         if temp_tok_to_del and temp_tok_to_del.exists():
