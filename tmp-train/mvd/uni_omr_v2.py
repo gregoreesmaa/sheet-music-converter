@@ -52,6 +52,7 @@ from __future__ import annotations
 
 import math
 import sys
+from collections import OrderedDict
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
@@ -141,6 +142,55 @@ def _group_count(channels: int, max_groups: int = 16) -> int:
     while g > 1 and (channels % g != 0):
         g -= 1
     return g
+
+
+def _lru_get(cache: "OrderedDict[Any, Any]", key: Any) -> Any:
+    val = cache.get(key)
+    if val is not None:
+        cache.move_to_end(key)
+    return val
+
+
+def _lru_put(cache: "OrderedDict[Any, Any]", key: Any, value: Any, max_size: int) -> None:
+    cache[key] = value
+    cache.move_to_end(key)
+    while len(cache) > max_size:
+        cache.popitem(last=False)
+
+
+_SOBEL_KXY_CACHE: Dict[torch.device, torch.Tensor] = {}
+_CAUSAL_MASK_CACHE: "OrderedDict[Tuple[int, int, torch.device], torch.Tensor]" = OrderedDict()
+_CAUSAL_MASK_CACHE_MAX: int = 32
+
+
+def _get_sobel_kxy(device: torch.device) -> torch.Tensor:
+    kxy = _SOBEL_KXY_CACHE.get(device)
+    if kxy is None:
+        kxy = (
+            torch.tensor(
+                [
+                    [[[-1.0, 0.0, 1.0], [-2.0, 0.0, 2.0], [-1.0, 0.0, 1.0]]],
+                    [[[-1.0, -2.0, -1.0], [0.0, 0.0, 0.0], [1.0, 2.0, 1.0]]],
+                ],
+                device=device,
+                dtype=torch.float32,
+            )
+            * 0.25
+        )
+        _SOBEL_KXY_CACHE[device] = kxy
+    return kxy
+
+
+def _get_causal_offset_mask(lq: int, past_len: int, device: torch.device) -> torch.Tensor:
+    key = (lq, past_len, device)
+    mask = _lru_get(_CAUSAL_MASK_CACHE, key)
+    if mask is None:
+        total_k = past_len + lq
+        row_idx = torch.arange(lq, device=device).unsqueeze(1) + past_len
+        col_idx = torch.arange(total_k, device=device).unsqueeze(0)
+        mask = col_idx <= row_idx
+        _lru_put(_CAUSAL_MASK_CACHE, key, mask, _CAUSAL_MASK_CACHE_MAX)
+    return mask
 
 
 def _sdpa(
@@ -447,22 +497,38 @@ class AspectNormalizedRoPE1D(nn.Module):
         self.rope_jitter = float(max(0.0, rope_jitter))
         inv_freq = 1.0 / (base ** (torch.arange(0, head_dim, 2, dtype=torch.float32) / head_dim))
         self.register_buffer("inv_freq", inv_freq, persistent=False)
+        self._cos_sin_cache: "OrderedDict[Tuple[int, torch.device, torch.dtype], Tuple[torch.Tensor, torch.Tensor]]" = OrderedDict()
+        self._pos_cache: "OrderedDict[Tuple[int, torch.device], torch.Tensor]" = OrderedDict()
+        self._max_cache_size: int = 64
 
     def forward(self, seq_len: int, device: torch.device, dtype: torch.dtype) -> Tuple[torch.Tensor, torch.Tensor]:
-        if seq_len <= 1:
-            pos_norm = torch.zeros(seq_len, device=device, dtype=torch.float32)
-        else:
-            pos_norm = torch.linspace(0.0, 1.0, steps=seq_len, device=device, dtype=torch.float32)
-        if self.training and self.rope_jitter > 0.0:
+        use_jitter = self.training and self.rope_jitter > 0.0
+        if not use_jitter:
+            cached = _lru_get(self._cos_sin_cache, (seq_len, device, dtype))
+            if cached is not None:
+                return cached
+
+        pos_norm = _lru_get(self._pos_cache, (seq_len, device))
+        if pos_norm is None:
+            if seq_len <= 1:
+                pos_norm = torch.zeros(seq_len, device=device, dtype=torch.float32)
+            else:
+                pos_norm = torch.linspace(0.0, 1.0, steps=seq_len, device=device, dtype=torch.float32)
+            _lru_put(self._pos_cache, (seq_len, device), pos_norm, self._max_cache_size)
+
+        if use_jitter:
             j = self.rope_jitter
             scale = 1.0 + (torch.rand((), device=device, dtype=torch.float32) * 2.0 - 1.0) * j
             shift = (torch.rand((), device=device, dtype=torch.float32) * 2.0 - 1.0) * (0.5 * j)
             pos_norm = pos_norm * scale + shift
         pos = pos_norm * self.coord_scale
-        freqs = torch.outer(pos, self.inv_freq.to(device))  # (L, D/2)
+        inv_f = self.inv_freq if self.inv_freq.device == device else self.inv_freq.to(device)
+        freqs = torch.outer(pos, inv_f)  # (L, D/2)
         emb = torch.cat([freqs, freqs], dim=-1)             # (L, D)
         cos = emb.cos().to(dtype)[None, None, :, :]
         sin = emb.sin().to(dtype)[None, None, :, :]
+        if not use_jitter:
+            _lru_put(self._cos_sin_cache, (seq_len, device, dtype), (cos, sin), self._max_cache_size)
         return cos, sin
 
 
@@ -490,6 +556,79 @@ class AspectNormalizedRoPE2D(nn.Module):
         half_dim = head_dim // 2
         inv_freq = 1.0 / (base ** (torch.arange(0, half_dim, 2, dtype=torch.float32) / half_dim))
         self.register_buffer("inv_freq", inv_freq, persistent=False)
+        self._grid_cache: "OrderedDict[Tuple[int, int, torch.device, torch.dtype], Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]]" = OrderedDict()
+        self._max_cache_size: int = 32
+
+    def _get_grid_cos_sin(
+        self,
+        h_p: int,
+        w_p: int,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        key = (h_p, w_p, device, dtype)
+        cached = _lru_get(self._grid_cache, key)
+        if cached is not None:
+            return cached
+        with torch.no_grad():
+            inv_f = (
+                self.inv_freq
+                if (self.inv_freq.device == device and self.inv_freq.dtype == torch.float32)
+                else self.inv_freq.to(device, dtype=torch.float32)
+            )
+            ys = torch.arange(h_p, device=device, dtype=torch.float32)
+            xs = torch.arange(w_p, device=device, dtype=torch.float32)
+            y_norm = ys / float(max(1, h_p - 1))
+            x_norm = xs / float(max(1, w_p - 1))
+            fy = (y_norm * self.coord_scale).unsqueeze(-1) * inv_f
+            fx = (x_norm * self.coord_scale).unsqueeze(-1) * inv_f
+            fy_2d = fy[:, None, :].expand(h_p, w_p, -1)
+            fx_2d = fx[None, :, :].expand(h_p, w_p, -1)
+            emb_half = torch.stack([fy_2d, fx_2d], dim=-1).flatten(-2)
+            emb = torch.cat([emb_half, emb_half], dim=-1).reshape(h_p * w_p, -1)
+            cos_grid = emb.cos().to(dtype)
+            sin_grid = emb.sin().to(dtype)
+
+            cy = torch.tensor([(h_p - 1) * 0.5], device=device, dtype=torch.float32) / float(max(1, h_p - 1))
+            cx = torch.tensor([(w_p - 1) * 0.5], device=device, dtype=torch.float32) / float(max(1, w_p - 1))
+            fyc = (cy * self.coord_scale).unsqueeze(-1) * inv_f
+            fxc = (cx * self.coord_scale).unsqueeze(-1) * inv_f
+            emb_c_half = torch.stack([fyc, fxc], dim=-1).flatten(-2)
+            emb_c = torch.cat([emb_c_half, emb_c_half], dim=-1)
+            cos_center = emb_c.cos().to(dtype)
+            sin_center = emb_c.sin().to(dtype)
+
+            val = (cos_grid, sin_grid, cos_center, sin_center)
+            _lru_put(self._grid_cache, key, val, self._max_cache_size)
+            return val
+
+    def forward_indexed(
+        self,
+        kept_idx: torch.Tensor,
+        grid_hw: Tuple[int, int],
+        n_bg_summary: int,
+        dtype: torch.dtype,
+        coords: Optional[torch.Tensor] = None,
+        is_full_grid: bool = False,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Fast cached 2D-RoPE lookup for router-indexed grid tokens (exact parity with ``forward``)."""
+        if self.training and self.rope_jitter > 0.0:
+            if coords is None:
+                raise ValueError("coords must be provided when rope_jitter > 0 during training")
+            return self.forward(coords, grid_hw=grid_hw, dtype=dtype)
+        h_p, w_p = int(grid_hw[0]), int(grid_hw[1])
+        cos_grid, sin_grid, cos_center, sin_center = self._get_grid_cos_sin(h_p, w_p, kept_idx.device, dtype)
+        B = kept_idx.shape[0]
+        if is_full_grid and n_bg_summary == 0:
+            cos = cos_grid.unsqueeze(0).expand(B, -1, -1)
+            sin = sin_grid.unsqueeze(0).expand(B, -1, -1)
+        else:
+            cos = cos_grid[kept_idx]
+            sin = sin_grid[kept_idx]
+            if n_bg_summary > 0:
+                cos = torch.cat([cos, cos_center.expand(B, n_bg_summary, -1)], dim=1)
+                sin = torch.cat([sin, sin_center.expand(B, n_bg_summary, -1)], dim=1)
+        return cos.unsqueeze(1), sin.unsqueeze(1)
 
     def forward(
         self,
@@ -498,9 +637,14 @@ class AspectNormalizedRoPE2D(nn.Module):
         dtype: torch.dtype,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         h_p, w_p = int(grid_hw[0]), int(grid_hw[1])
-        inv_f = self.inv_freq.to(coords.device, dtype=torch.float32)
-        y_norm = coords[..., 0].to(torch.float32) / float(max(1, h_p - 1))
-        x_norm = coords[..., 1].to(torch.float32) / float(max(1, w_p - 1))
+        inv_f = (
+            self.inv_freq
+            if (self.inv_freq.device == coords.device and self.inv_freq.dtype == torch.float32)
+            else self.inv_freq.to(coords.device, dtype=torch.float32)
+        )
+        coords_f = coords if coords.dtype == torch.float32 else coords.to(torch.float32)
+        y_norm = coords_f[..., 0] / float(max(1, h_p - 1))
+        x_norm = coords_f[..., 1] / float(max(1, w_p - 1))
         if self.training and self.rope_jitter > 0.0:
             j = self.rope_jitter
             if y_norm.ndim >= 2:
@@ -547,7 +691,7 @@ class _SelfAttention(nn.Module):
         v = v.view(B, L, self.n_heads, self.head_dim).transpose(1, 2)
         q, k = apply_rope(q, k, rope_cos, rope_sin)
         out = _sdpa(q, k, v, attn_mask=None, is_causal=False)
-        out = out.transpose(1, 2).contiguous().view(B, L, self.d_model)
+        out = out.transpose(1, 2).reshape(B, L, self.d_model)
         return self.o_proj(out)
 
 
@@ -656,9 +800,11 @@ class InkTokenRouterV2(nn.Module):
         self.bg_key_proj = nn.Linear(d_model, d_model, bias=False)
         self.bg_val_proj = nn.Linear(d_model, d_model, bias=False)
         self.bg_out_norm = RMSNorm(d_model)
-        self._grid_cache: Dict[Tuple[int, int, torch.device], Tuple[torch.Tensor, torch.Tensor]] = {}
+        self._grid_cache: "OrderedDict[Tuple[int, int, torch.device], Tuple[torch.Tensor, torch.Tensor]]" = OrderedDict()
+        self._grid_cache_max: int = 64
 
     @staticmethod
+    @torch.no_grad()
     def _compute_ink_and_paper_gate(
         images: torch.Tensor, h_p: int, w_p: int
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -672,15 +818,14 @@ class InkTokenRouterV2(nn.Module):
         grid. Interior shadows and dense dark ink on aged/shadowed real HW photos
         are NEVER masked out.
         """
-        img_f = images.float()
-        if img_f.shape[1] == 3:
+        if images.shape[1] == 3:
             luma = (
-                0.299 * img_f[:, 0:1]
-                + 0.587 * img_f[:, 1:2]
-                + 0.114 * img_f[:, 2:3]
+                0.299 * images[:, 0:1].float()
+                + 0.587 * images[:, 1:2].float()
+                + 0.114 * images[:, 2:3].float()
             )
         else:
-            luma = img_f.mean(dim=1, keepdim=True)
+            luma = images.float().mean(dim=1, keepdim=True)
 
         # Edge-connected dark-border mask: 4-edge inward scan stopping at first bright pixel (luma >= 0.45)
         bright_i = (luma >= 0.45).to(torch.int32)
@@ -727,6 +872,7 @@ class InkTokenRouterV2(nn.Module):
         feat_2d: torch.Tensor,
         images: Optional[torch.Tensor] = None,
         keep_ratio_override: Optional[float] = None,
+        feat_nhwc: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, Dict[str, Any]]:
         B, D, H_p, W_p = feat_2d.shape
         N = H_p * W_p
@@ -762,10 +908,14 @@ class InkTokenRouterV2(nn.Module):
             score = saliency_prob
 
         score_flat = score.flatten(1)
-        tokens_flat = feat_2d.permute(0, 2, 3, 1).reshape(B, N, D)
+        tokens_flat = (
+            feat_nhwc.reshape(B, N, D)
+            if feat_nhwc is not None
+            else feat_2d.permute(0, 2, 3, 1).reshape(B, N, D)
+        )
 
         gkey = (H_p, W_p, feat_2d.device)
-        cached_grid = self._grid_cache.get(gkey)
+        cached_grid = _lru_get(self._grid_cache, gkey)
         if cached_grid is None:
             ys = torch.arange(H_p, device=feat_2d.device, dtype=torch.float32)
             xs = torch.arange(W_p, device=feat_2d.device, dtype=torch.float32)
@@ -776,7 +926,7 @@ class InkTokenRouterV2(nn.Module):
                 device=feat_2d.device,
                 dtype=torch.float32,
             )
-            self._grid_cache[gkey] = (base_coords, base_center)
+            _lru_put(self._grid_cache, gkey, (base_coords, base_center), self._grid_cache_max)
         else:
             base_coords, base_center = cached_grid
         grid_coords = base_coords.expand(B, -1, -1)
@@ -812,6 +962,7 @@ class InkTokenRouterV2(nn.Module):
                 "ink_target": ink_target,
                 "ink_recall": 1.0,
                 "grid_hw": (H_p, W_p),
+                "is_full_grid": True,
             }
             return out_tokens, grid_coords, info
 
@@ -851,8 +1002,7 @@ class InkTokenRouterV2(nn.Module):
         else:
             ink_recall = 1.0
 
-        bg_q = self.bg_queries.expand(B, -1, -1)
-        bg_q_proj = F.linear(bg_q, self.bg_key_proj.weight.t()).to(tokens_flat.dtype)
+        bg_q_proj = F.linear(self.bg_queries, self.bg_key_proj.weight.t()).to(tokens_flat.dtype).expand(B, -1, -1)
         bg_logits = torch.bmm(bg_q_proj, tokens_flat.transpose(1, 2)) / math.sqrt(D)
         bg_logits = bg_logits - score_flat.unsqueeze(1)
         bg_logits = bg_logits.masked_fill(kept_mask.unsqueeze(1), -1e4)
@@ -875,6 +1025,7 @@ class InkTokenRouterV2(nn.Module):
             "ink_target": ink_target,
             "ink_recall": ink_recall,
             "grid_hw": (H_p, W_p),
+            "is_full_grid": False,
         }
         return out_tokens, out_coords, info
 
@@ -954,6 +1105,71 @@ class HybridAxialMergerEncoder(nn.Module):
             for _ in range(cfg.n_global_layers)
         ])
         self.enc_norm = RMSNorm(d_model)
+        self._pos2d_grid_cache: "OrderedDict[Tuple[int, int, torch.device, torch.dtype], Tuple[torch.Tensor, torch.Tensor]]" = OrderedDict()
+        self._pos2d_cache_max: int = 32
+        self._reg_rope_cache: "OrderedDict[Tuple[torch.device, torch.dtype, int], Tuple[torch.Tensor, torch.Tensor]]" = OrderedDict()
+        self._reg_rope_cache_max: int = 8
+
+    def _get_pos2d_grid(
+        self,
+        h_p: int,
+        w_p: int,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        key = (h_p, w_p, device, dtype)
+        cached = _lru_get(self._pos2d_grid_cache, key)
+        if cached is not None:
+            return cached
+        with torch.no_grad():
+            d = self.cfg.d_model
+            q = d // 4
+            freqs = torch.exp(
+                torch.arange(0, q, device=device, dtype=torch.float32) * (-math.log(10000.0) / max(1, q))
+            )
+            ys = torch.arange(h_p, device=device, dtype=torch.float32)
+            xs = torch.arange(w_p, device=device, dtype=torch.float32)
+            y_norm = ys / float(max(1, h_p - 1))
+            x_norm = xs / float(max(1, w_p - 1))
+            fy = (y_norm * self.cfg.rope_coord_scale).unsqueeze(-1) * freqs
+            fx = (x_norm * self.cfg.rope_coord_scale).unsqueeze(-1) * freqs
+            fy_2d = fy[:, None, :].expand(h_p, w_p, -1)
+            fx_2d = fx[None, :, :].expand(h_p, w_p, -1)
+            pe = torch.cat([fy_2d.sin(), fy_2d.cos(), fx_2d.sin(), fx_2d.cos()], dim=-1).reshape(h_p * w_p, -1)
+            if pe.shape[-1] < d:
+                pe = F.pad(pe, (0, d - pe.shape[-1]))
+            pe_grid = pe.to(dtype)
+
+            cy = torch.tensor([(h_p - 1) * 0.5], device=device, dtype=torch.float32) / float(max(1, h_p - 1))
+            cx = torch.tensor([(w_p - 1) * 0.5], device=device, dtype=torch.float32) / float(max(1, w_p - 1))
+            fyc = (cy * self.cfg.rope_coord_scale).unsqueeze(-1) * freqs
+            fxc = (cx * self.cfg.rope_coord_scale).unsqueeze(-1) * freqs
+            pe_c = torch.cat([fyc.sin(), fyc.cos(), fxc.sin(), fxc.cos()], dim=-1)
+            if pe_c.shape[-1] < d:
+                pe_c = F.pad(pe_c, (0, d - pe_c.shape[-1]))
+            pe_center = pe_c.to(dtype)
+
+            val = (pe_grid, pe_center)
+            _lru_put(self._pos2d_grid_cache, key, val, self._pos2d_cache_max)
+            return val
+
+    def _sinusoidal_pos2d_indexed(
+        self,
+        kept_idx: torch.Tensor,
+        grid_hw: Tuple[int, int],
+        n_bg_summary: int,
+        dtype: torch.dtype,
+        is_full_grid: bool = False,
+    ) -> torch.Tensor:
+        h_p, w_p = int(grid_hw[0]), int(grid_hw[1])
+        pe_grid, pe_center = self._get_pos2d_grid(h_p, w_p, kept_idx.device, dtype)
+        B = kept_idx.shape[0]
+        if is_full_grid and n_bg_summary == 0:
+            return pe_grid.unsqueeze(0).expand(B, -1, -1)
+        pe = pe_grid[kept_idx]
+        if n_bg_summary > 0:
+            pe = torch.cat([pe, pe_center.expand(B, n_bg_summary, -1)], dim=1)
+        return pe
 
     def _sinusoidal_pos2d(
         self,
@@ -1007,11 +1223,11 @@ class HybridAxialMergerEncoder(nn.Module):
 
         # 2x2 MLP Patch Merger (/8 -> /16)
         merged = self.patch_merger(x)  # (B, H_m, W_m, D)
-        merged_2d = merged.permute(0, 3, 1, 2).contiguous()
+        merged_2d = merged.permute(0, 3, 1, 2)
 
         # InkTokenRouter with 2-patch eroded paper_gate + max_mem_tokens cap
         routed_tokens, routed_coords, router_info = self.router(
-            merged_2d, images=images, keep_ratio_override=keep_ratio_override
+            merged_2d, images=images, keep_ratio_override=keep_ratio_override, feat_nhwc=merged
         )
         router_info["axial_grid_hw"] = (H_p, W_p)
 
@@ -1022,8 +1238,22 @@ class HybridAxialMergerEncoder(nn.Module):
         # Prepend RoPE-exempt ViT-5 / DINOv3 register tokens (cos=1, sin=0 -> identity rotation)
         # and slice them off after global layers so DeepStack/decoder shapes remain identical.
         grid_hw = router_info["grid_hw"]
-        pos2d = self.pos2d_proj(self._sinusoidal_pos2d(routed_coords, grid_hw=grid_hw, dtype=routed_tokens.dtype))
-        cos2d, sin2d = self.rope2d(routed_coords, grid_hw=grid_hw, dtype=routed_tokens.dtype)
+        kept_idx = router_info["kept_idx"]
+        n_bg = int(router_info["n_bg_summary"])
+        is_full_grid = bool(router_info.get("is_full_grid", False))
+        pos2d = self.pos2d_proj(
+            self._sinusoidal_pos2d_indexed(
+                kept_idx, grid_hw=grid_hw, n_bg_summary=n_bg, dtype=routed_tokens.dtype, is_full_grid=is_full_grid
+            )
+        )
+        cos2d, sin2d = self.rope2d.forward_indexed(
+            kept_idx,
+            grid_hw=grid_hw,
+            n_bg_summary=n_bg,
+            dtype=routed_tokens.dtype,
+            coords=routed_coords,
+            is_full_grid=is_full_grid,
+        )
         mem = routed_tokens + pos2d
 
         n_reg = int(self.cfg.n_register_tokens) if self.register_tokens is not None else 0
@@ -1031,10 +1261,17 @@ class HybridAxialMergerEncoder(nn.Module):
             B = mem.shape[0]
             reg = self.register_tokens.expand(B, -1, -1).to(mem.dtype)
             mem = torch.cat([reg, mem], dim=1)
-            ones_c = torch.ones((B, 1, n_reg, cos2d.shape[-1]), device=cos2d.device, dtype=cos2d.dtype)
-            zeros_s = torch.zeros((B, 1, n_reg, sin2d.shape[-1]), device=sin2d.device, dtype=sin2d.dtype)
-            cos2d = torch.cat([ones_c, cos2d], dim=2)
-            sin2d = torch.cat([zeros_s, sin2d], dim=2)
+            rkey = (cos2d.device, cos2d.dtype, cos2d.shape[-1])
+            reg_cs = _lru_get(self._reg_rope_cache, rkey)
+            if reg_cs is None:
+                ones_c = torch.ones((1, 1, n_reg, cos2d.shape[-1]), device=cos2d.device, dtype=cos2d.dtype)
+                zeros_s = torch.zeros((1, 1, n_reg, sin2d.shape[-1]), device=sin2d.device, dtype=sin2d.dtype)
+                reg_cs = (ones_c, zeros_s)
+                _lru_put(self._reg_rope_cache, rkey, reg_cs, self._reg_rope_cache_max)
+            else:
+                ones_c, zeros_s = reg_cs
+            cos2d = torch.cat([ones_c.expand(B, -1, -1, -1), cos2d], dim=2)
+            sin2d = torch.cat([zeros_s.expand(B, -1, -1, -1), sin2d], dim=2)
 
         n_global = len(self.global_layers)
         mid_idx = max(0, (n_global // 2) - 1)
@@ -1155,35 +1392,29 @@ def compute_stroke_hog_target(
 
     Zero CUDA-CPU syncs; outputs L2-normalized ``(B, n_bins, H_t, W_t)`` float32 targets.
     """
-    img_f = img.float()
-    if img_f.shape[1] == 3:
-        luma = 0.299 * img_f[:, 0:1] + 0.587 * img_f[:, 1:2] + 0.114 * img_f[:, 2:3]
-    else:
-        luma = img_f.mean(dim=1, keepdim=True)
-
-    device = luma.device
+    device = img.device
     with torch.amp.autocast(device_type=device.type, enabled=False):
-        luma_f = luma.float()
-        kx = torch.tensor(
-            [[[[-1.0, 0.0, 1.0], [-2.0, 0.0, 2.0], [-1.0, 0.0, 1.0]]]],
-            device=device,
-            dtype=torch.float32,
-        ) * 0.25
-        ky = torch.tensor(
-            [[[[-1.0, -2.0, -1.0], [0.0, 0.0, 0.0], [1.0, 2.0, 1.0]]]],
-            device=device,
-            dtype=torch.float32,
-        ) * 0.25
+        if img.shape[1] == 3:
+            luma_f = (
+                0.299 * img[:, 0:1].float()
+                + 0.587 * img[:, 1:2].float()
+                + 0.114 * img[:, 2:3].float()
+            )
+        else:
+            luma_f = img.float().mean(dim=1, keepdim=True)
 
-        gx = F.conv2d(luma_f, kx, padding=1)
-        gy = F.conv2d(luma_f, ky, padding=1)
+        kxy = _get_sobel_kxy(device)
+        gxy = F.conv2d(luma_f, kxy, padding=1)
+        gx = gxy[:, 0:1]
+        gy = gxy[:, 1:2]
         mag = torch.sqrt(gx * gx + gy * gy + 1e-8)
         angle = torch.remainder(torch.atan2(gy, gx), math.pi)
 
         bin_f = angle * (float(n_bins) / math.pi)
-        bin_lo = torch.floor(bin_f).to(torch.long) % n_bins
+        bin_floor = torch.floor(bin_f)
+        bin_lo = bin_floor.to(torch.long) % n_bins
         bin_hi = (bin_lo + 1) % n_bins
-        w_hi = bin_f - torch.floor(bin_f)
+        w_hi = bin_f - bin_floor
         w_lo = 1.0 - w_hi
 
         B, _, H, W = luma_f.shape
@@ -1345,10 +1576,7 @@ class GroupedQueryAttention(nn.Module):
             if Lq == 1:
                 use_causal_flag = False
             else:
-                total_k = past_len + Lq
-                row_idx = torch.arange(Lq, device=q.device).unsqueeze(1) + past_len
-                col_idx = torch.arange(total_k, device=q.device).unsqueeze(0)
-                eff_mask = col_idx <= row_idx
+                eff_mask = _get_causal_offset_mask(Lq, past_len, q.device)
                 use_causal_flag = False
 
         if self.use_native_gqa and self.n_rep > 1:
@@ -1357,7 +1585,7 @@ class GroupedQueryAttention(nn.Module):
             k_exp = self._expand_kv(k)
             v_exp = self._expand_kv(v)
             out = _sdpa(q, k_exp, v_exp, attn_mask=eff_mask, is_causal=use_causal_flag, enable_gqa=False)
-        out = out.transpose(1, 2).contiguous().view(B, Lq, self.d_model)
+        out = out.transpose(1, 2).reshape(B, Lq, self.d_model)
         out = self.o_proj(out)
         if use_cache:
             return out, present_kv

@@ -45,6 +45,7 @@ import data  # noqa: E402
 import eval_sys_gate as esg  # noqa: E402
 import grammar  # noqa: E402
 import uni_omr  # noqa: E402
+import uni_omr_v2  # noqa: E402
 
 
 DEFAULT_MANIFEST = REPO_ROOT / "data-gen" / "score-corpus" / "suite31" / "suite31_hw_manifest.json"
@@ -499,24 +500,40 @@ def _beam_repair_measure(
     return best_toks, best_state, kv0, float(best_score)
 
 
+def _get_model_router(model: Any) -> Any:
+    """Return the ink-token router module for both UniOMR v1 and v2 models."""
+    router = getattr(model, "router", None)
+    if router is not None:
+        return router
+    encoder = getattr(model, "encoder", None)
+    if encoder is not None:
+        return getattr(encoder, "router", None)
+    return None
+
+
 @contextlib.contextmanager
 def override_max_keep_ratio(
-    model: uni_omr.UniOMRNet,
+    model: Any,
     max_keep_ratio: Optional[float],
 ) -> Iterator[None]:
-    """Temporarily override ``model.router.max_keep_ratio`` for eval-time ablations."""
+    """Temporarily override router ``max_keep_ratio`` for eval-time ablations (v1 & v2)."""
     if max_keep_ratio is None:
         yield
         return
     val = float(max_keep_ratio)
     if not (0.0 < val <= 1.0):
         raise ValueError(f"max_keep_ratio_override must be in (0, 1], got {val}")
-    orig = float(model.router.max_keep_ratio)
-    model.router.max_keep_ratio = val
+    router = _get_model_router(model)
+    if router is None or not hasattr(router, "max_keep_ratio"):
+        raise AttributeError(
+            f"Model {type(model).__name__} has no router with max_keep_ratio"
+        )
+    orig = float(router.max_keep_ratio)
+    router.max_keep_ratio = val
     try:
         yield
     finally:
-        model.router.max_keep_ratio = orig
+        router.max_keep_ratio = orig
 
 
 # ---------------------------------------------------------------------------
@@ -1066,7 +1083,10 @@ def generate_beam(
     lp_exp = float(length_penalty)
 
     for b in range(B):
-        mem_b = mem[b : b + 1]  # (1, L_mem, D)
+        if isinstance(mem, (tuple, list)):
+            mem_b: Any = tuple(m[b : b + 1] for m in mem)
+        else:
+            mem_b = mem[b : b + 1]  # (1, L_mem, D)
         bos_b = torch.full((1, 1), bos_id, dtype=torch.long, device=device)
 
         # Prefill BOS once to populate cross-attn K/V cache.
@@ -1299,27 +1319,297 @@ def stitch_uni_tokens(pred_toks: Sequence[str]) -> Tuple[List[str], int]:
     return esg.stitch_page_toks(chunks), len(chunks)
 
 
+_V2_CONFIG_KEYS = frozenset({
+    "n_axial_layers",
+    "n_global_layers",
+    "n_kv_heads",
+    "backbone_channels",
+    "backbone_blocks",
+    "backbone_expand",
+    "axial_ffn_mult",
+    "irope_nope_every",
+    "n_register_tokens",
+    "rope_coord_scale",
+    "use_sys_y_aux",
+    "use_sys_count_aux",
+    "use_staff_seg_aux",
+    "use_stroke_hog_head",
+})
+
+_V2_STATE_PREFIXES = (
+    "encoder.axial_layers.",
+    "encoder.patch_merger.",
+    "encoder.global_layers.",
+    "deepstack_fusions.",
+    "backbone.p2_to_p3.",
+    "backbone.p2_to_p4.",
+)
+
+
+def _is_v2_checkpoint(
+    ck: Any,
+    sd: Dict[str, Any],
+    cfg_dict: Dict[str, Any],
+) -> bool:
+    """Detect whether a loaded checkpoint payload belongs to ``UniOMRv2Net``."""
+    if isinstance(ck, dict):
+        arch = str(ck.get("arch", "")).strip().lower()
+        if arch in ("uni_omr_v2", "uniomr_v2", "v2"):
+            return True
+        if arch in ("uni_omr", "uni_omr_v1", "uniomr_v1", "v1"):
+            return False
+    if any(k in _V2_CONFIG_KEYS for k in cfg_dict):
+        return True
+    for k in sd.keys():
+        if isinstance(k, str) and k.startswith(_V2_STATE_PREFIXES):
+            return True
+    return False
+
+
 def load_uni_checkpoint(
     ckpt_path: str | Path,
     device: torch.device,
-) -> Tuple[uni_omr.UniOMRNet, uni_omr.UniOMRConfig, Dict[str, Any]]:
-    """Load a ``UniOMRNet`` checkpoint onto ``device`` in eval mode."""
+) -> Tuple[Any, Any, Dict[str, Any]]:
+    """Load a ``UniOMRNet`` (v1) or ``UniOMRv2Net`` (v2) checkpoint onto ``device`` in eval mode.
+
+    Auto-detects ``UniOMRv2Net`` via ``ck["arch"] == "uni_omr_v2"``, v2 config keys
+    (e.g. ``n_axial_layers``, ``n_kv_heads``, ``backbone_channels``), or v2 state-dict
+    prefixes (e.g. ``encoder.axial_layers.*``, ``deepstack_fusions.*``).
+    """
     ck = torch.load(str(ckpt_path), map_location="cpu", weights_only=True)
-    cfg_dict = ck.get("config", {}) if isinstance(ck, dict) else {}
-    valid_fields = {f.name for f in fields(uni_omr.UniOMRConfig)}
-    filtered_cfg = {k: v for k, v in cfg_dict.items() if k in valid_fields}
-    cfg = uni_omr.UniOMRConfig(**filtered_cfg)
-    model = uni_omr.UniOMRNet(cfg)
-    sd = ck["model"] if isinstance(ck, dict) and "model" in ck else ck
+    raw_cfg: Any = {}
+    if isinstance(ck, dict):
+        raw_cfg = ck.get("config") or ck.get("cfg") or {}
+    if isinstance(raw_cfg, (uni_omr.UniOMRConfig, uni_omr_v2.UniOMRv2Config)):
+        cfg_dict = asdict(raw_cfg)
+    elif isinstance(raw_cfg, dict):
+        cfg_dict = dict(raw_cfg)
+    else:
+        cfg_dict = {}
+
+    if isinstance(ck, dict) and "model" in ck and isinstance(ck["model"], dict):
+        sd = ck["model"]
+    elif isinstance(ck, dict) and "state_dict" in ck and isinstance(ck["state_dict"], dict):
+        sd = ck["state_dict"]
+    elif isinstance(ck, dict):
+        sd = ck
+    else:
+        raise ValueError(f"Unsupported checkpoint payload type: {type(ck)!r}")
+
+    is_v2 = _is_v2_checkpoint(ck, sd, cfg_dict)
+    if is_v2:
+        valid_fields = {f.name for f in fields(uni_omr_v2.UniOMRv2Config)}
+        filtered_cfg = {k: v for k, v in cfg_dict.items() if k in valid_fields}
+        for tup_k in ("backbone_channels", "backbone_blocks"):
+            if tup_k in filtered_cfg and isinstance(filtered_cfg[tup_k], list):
+                filtered_cfg[tup_k] = tuple(int(x) for x in filtered_cfg[tup_k])
+        cfg: Any = uni_omr_v2.UniOMRv2Config(**filtered_cfg)
+        model: Any = uni_omr_v2.UniOMRv2Net(cfg)
+        arch_name = "uni_omr_v2"
+    else:
+        valid_fields = {f.name for f in fields(uni_omr.UniOMRConfig)}
+        filtered_cfg = {k: v for k, v in cfg_dict.items() if k in valid_fields}
+        cfg = uni_omr.UniOMRConfig(**filtered_cfg)
+        model = uni_omr.UniOMRNet(cfg)
+        arch_name = "uni_omr_v1"
+
     inc = model.load_state_dict(sd, strict=False)
     model.to(device).eval()
     meta = {
+        "arch": arch_name,
         "step": ck.get("step") if isinstance(ck, dict) else None,
         "val_ser": ck.get("val_ser") if isinstance(ck, dict) else None,
         "missing_keys": list(inc.missing_keys),
         "unexpected_keys": list(inc.unexpected_keys),
     }
     return model, cfg, meta
+
+
+# ---------------------------------------------------------------------------
+# 3b. Scale-Only Multi-View TTA & best_fsa_beat View Selection
+# ---------------------------------------------------------------------------
+
+def parse_tta_scales(raw: Optional[str]) -> List[int]:
+    """Parse ``--tta-scales`` (e.g. ``'1152,1280,1536'``) into unique positive ints."""
+    if raw is None:
+        return []
+    text = str(raw).strip()
+    if not text:
+        return []
+    scales: List[int] = []
+    seen: set[int] = set()
+    for part in text.split(","):
+        tok = part.strip()
+        if not tok:
+            continue
+        dim = int(tok)
+        if dim < 64:
+            raise ValueError(f"--tta-scales dimensions must be >= 64, got {dim}")
+        if dim not in seen:
+            seen.add(dim)
+            scales.append(dim)
+    return scales
+
+
+def detect_token_loop(
+    toks: Sequence[str],
+    min_ngram: int = 4,
+    max_ngram: int = 24,
+    min_repeats: int = 4,
+    max_single_run: int = 8,
+) -> bool:
+    """Detect degenerate consecutive token loops (repeated n-grams or stuck single tokens)."""
+    n = len(toks)
+    if n < min_ngram * min_repeats:
+        # Still check stuck single-token runs on short sequences.
+        run = 1
+        for i in range(1, n):
+            if toks[i] == toks[i - 1] and toks[i] not in grammar.BAR_LIKES and toks[i] != grammar.BAR_REST:
+                run += 1
+                if run >= max_single_run:
+                    return True
+            else:
+                run = 1
+        return False
+
+    # 1. Single non-bar/non-rest token stuck >= max_single_run consecutive times.
+    run = 1
+    for i in range(1, n):
+        if toks[i] == toks[i - 1] and toks[i] not in grammar.BAR_LIKES and toks[i] != grammar.BAR_REST:
+            run += 1
+            if run >= max_single_run:
+                return True
+        else:
+            run = 1
+
+    # 2. Consecutive n-gram repeat >= min_repeats times (e.g. A B C D repeated 4x).
+    tok_list = list(toks)
+    hi_k = min(max_ngram, n // min_repeats)
+    for k in range(min_ngram, hi_k + 1):
+        limit = n - k * min_repeats + 1
+        i = 0
+        while i < limit:
+            pat = tok_list[i : i + k]
+            reps = 1
+            j = i + k
+            while j + k <= n and tok_list[j : j + k] == pat:
+                reps += 1
+                j += k
+                if reps >= min_repeats:
+                    return True
+            i = j if reps > 1 else (i + 1)
+    return False
+
+
+def compute_fsa_beat_metrics(
+    hyp_page_toks: Sequence[str],
+    hit_eos: bool,
+    bekern_decode_ok: bool,
+) -> Dict[str, Any]:
+    """Compute exact FSA beat-conservation, parse, and loop metrics for ``best_fsa_beat``.
+
+    Matches the proven ``ov-36``/``ov-36b`` ``fsa_beat_score`` formula, augmented with
+    explicit degenerate-loop detection (``has_loop``).
+    """
+    st = grammar.PrefixState(strict=False)
+    n_bars = 0
+    n_both_ok = 0
+    meter_errs: List[float] = []
+    voice_errs: List[float] = []
+    broken_steps = 0
+
+    for tok in hyp_page_toks:
+        if tok == uni_omr.SYS_TOKEN:
+            st = grammar.PrefixState(strict=False)
+            continue
+        if tok in grammar.BAR_LIKES:
+            m_err, v_err = _measure_violation_errors(st)
+            n_bars += 1
+            meter_errs.append(min(4.0, float(m_err)))
+            voice_errs.append(min(4.0, float(v_err)))
+            if m_err <= 1e-3 and v_err <= 1e-3:
+                n_both_ok += 1
+        try:
+            st.step(tok)
+        except ValueError:
+            broken_steps += 1
+
+    has_loop = detect_token_loop(hyp_page_toks)
+    beat_ok_rate = (float(n_both_ok) / float(n_bars)) if n_bars > 0 else 0.0
+    mean_m_err = (sum(meter_errs) / len(meter_errs)) if meter_errs else 1.0
+    mean_v_err = (sum(voice_errs) / len(voice_errs)) if voice_errs else 1.0
+    broken_rate = float(broken_steps) / float(max(1, len(hyp_page_toks)))
+
+    score = (
+        (1.0 if bekern_decode_ok else -2.0)
+        + (0.25 if hit_eos else -0.5)
+        + (0.0 if not has_loop else -1.0)
+        + 1.5 * beat_ok_rate
+        - 0.5 * mean_m_err
+        - 0.5 * mean_v_err
+        - 0.25 * broken_rate
+    )
+    return {
+        "n_bars": n_bars,
+        "beat_conservation_rate": round(beat_ok_rate, 6),
+        "mean_meter_err": round(mean_m_err, 6),
+        "mean_voice_err": round(mean_v_err, 6),
+        "broken_steps": broken_steps,
+        "has_loop": bool(has_loop),
+        "fsa_beat_score": round(float(score), 6),
+    }
+
+
+@torch.no_grad()
+def compute_sequence_mean_logprob(
+    model: Any,
+    img_t: torch.Tensor,
+    seq: torch.Tensor,
+    pad_id: int,
+) -> float:
+    """Compute teacher-forced length-normalized mean log-probability for ``seq`` (B=1)."""
+    if seq.ndim != 2 or seq.shape[1] < 2:
+        return -10.0
+    tf_out = model(
+        img_t,
+        seq[:, :-1],
+        return_aux=False,
+        return_mtp=False,
+    )
+    logits_f = tf_out["logits"].float()
+    log_probs = F.log_softmax(logits_f, dim=-1)
+    targets = seq[:, 1:]
+    tok_lp = log_probs.gather(-1, targets.unsqueeze(-1)).squeeze(-1)
+    valid = targets != int(pad_id)
+    if not bool(valid.any()):
+        return -10.0
+    return float(tok_lp[valid].mean().item())
+
+
+def select_best_fsa_beat_view(candidates: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
+    """Select the winning scale-TTA view using ``best_fsa_beat``.
+
+    Ranking priority (higher is better):
+      1. ``bekern_decode_ok`` (valid Rust bekern parse beats failed parse)
+      2. ``not has_loop`` (non-looping decode beats degenerate token loop)
+      3. ``fsa_beat_score`` (exact FSA beat validity + EOS + meter/voice errors)
+      4. ``mean_logprob`` (length-normalized teacher-forced log-prob tiebreak)
+      5. Earlier scale in ``--tta-scales`` (deterministic final tiebreak)
+    """
+    if not candidates:
+        raise ValueError("select_best_fsa_beat_view requires at least one candidate")
+
+    best_idx = max(
+        range(len(candidates)),
+        key=lambda i: (
+            1 if bool(candidates[i].get("bekern_decode_ok", False)) else 0,
+            0 if bool(candidates[i].get("has_loop", False)) else 1,
+            round(float(candidates[i].get("fsa_beat_score", float("-inf"))), 6),
+            float(candidates[i].get("mean_logprob", float("-inf"))),
+            -i,
+        ),
+    )
+    return candidates[best_idx]
 
 
 # ---------------------------------------------------------------------------
@@ -1365,6 +1655,75 @@ def _summarize_slice(rows: Sequence[Dict[str, Any]], domain: str) -> Dict[str, A
     }
 
 
+def _decode_single_view(
+    model: Any,
+    cfg: Any,
+    img_t: torch.Tensor,
+    args: argparse.Namespace,
+    device: torch.device,
+    use_bf16: bool,
+    beam_size: int,
+    beam_length_penalty: float,
+    measure_beam_size: int,
+    compute_logprob: bool = False,
+) -> Tuple[torch.Tensor, Optional[Dict[str, Any]], float, Optional[float]]:
+    """Decode one ``(1, 3, H, W)`` image tensor using the configured decoder mode."""
+    pad_id, _, _, _, _, _ = _vocab_spec(int(cfg.vocab_size))
+    t0 = time.perf_counter()
+    mtp_stats: Optional[Dict[str, Any]] = None
+    mean_lp: Optional[float] = None
+    with torch.no_grad():
+        ctx = (
+            torch.autocast(device_type="cuda", dtype=torch.bfloat16)
+            if use_bf16
+            else _nullcontext()
+        )
+        with ctx:
+            if beam_size > 1:
+                seq = generate_beam(
+                    model,
+                    img_t,
+                    max_len=args.max_len,
+                    beam_size=beam_size,
+                    length_penalty=beam_length_penalty,
+                    use_grammar=args.use_grammar,
+                    strict_grammar=args.strict_grammar,
+                )
+            elif args.use_mtp_spec or measure_beam_size > 1:
+                seq, mtp_stats = generate_mtp_spec(
+                    model,
+                    img_t,
+                    max_len=args.max_len,
+                    use_grammar=args.use_grammar,
+                    strict_grammar=args.strict_grammar,
+                    return_stats=True,
+                    measure_beam_size=measure_beam_size,
+                )
+            elif args.use_grammar:
+                seq = generate_constrained(
+                    model,
+                    img_t,
+                    max_len=args.max_len,
+                    strict=args.strict_grammar,
+                )
+            elif int(cfg.vocab_size) != uni_omr.VOCAB_SIZE:
+                seq = generate_mtp_spec(
+                    model,
+                    img_t,
+                    max_len=args.max_len,
+                    use_grammar=False,
+                    return_stats=False,
+                )
+            else:
+                seq = model.generate(img_t, max_len=args.max_len)
+            if compute_logprob:
+                mean_lp = compute_sequence_mean_logprob(model, img_t, seq, pad_id=pad_id)
+    if device.type == "cuda":
+        torch.cuda.synchronize()
+    elapsed = max(1e-6, time.perf_counter() - t0)
+    return seq, mtp_stats, elapsed, mean_lp
+
+
 def evaluate_suite31(args: argparse.Namespace) -> Dict[str, Any]:
     device = torch.device(args.device)
     model, cfg, ckpt_meta = load_uni_checkpoint(args.ckpt, device=device)
@@ -1385,6 +1744,7 @@ def evaluate_suite31(args: argparse.Namespace) -> Dict[str, Any]:
     if measure_beam_size < 0:
         raise ValueError(f"--measure-beam-size must be >= 0, got {measure_beam_size}")
     max_keep_ratio_override = getattr(args, "max_keep_ratio_override", None)
+    tta_scales = parse_tta_scales(getattr(args, "tta_scales", None))
 
     if beam_size > 1:
         mode_tag = (
@@ -1399,20 +1759,28 @@ def evaluate_suite31(args: argparse.Namespace) -> Dict[str, Any]:
             + ("(strict)" if (args.use_grammar and args.strict_grammar) else "")
             + (f"+mbeam{measure_beam_size}" if measure_beam_size > 1 else "")
         )
+    if tta_scales:
+        mode_tag += f"+tta({','.join(str(s) for s in tta_scales)}:best_fsa_beat)"
     mkr_str = (
         f" | max_keep_ratio_override={float(max_keep_ratio_override):g}"
         if max_keep_ratio_override is not None
         else ""
     )
+    dim_str = (
+        f"tta_scales={','.join(str(s) for s in tta_scales)}"
+        if tta_scales
+        else f"max_dim={args.max_dim}"
+    )
     print(
-        f"[UniOMR suite31_hw] ckpt={args.ckpt} (step={ckpt_meta['step']}) | "
-        f"device={device} | mode={mode_tag} | max_dim={args.max_dim} | "
+        f"[UniOMR suite31_hw] ckpt={args.ckpt} (arch={ckpt_meta['arch']}, step={ckpt_meta['step']}) | "
+        f"device={device} | mode={mode_tag} | {dim_str} | "
         f"max_len={args.max_len} | pieces={len(pieces)}{mkr_str}",
         flush=True,
     )
 
     workdir = Path(tempfile.mkdtemp(prefix="uni_s31_"))
     piece_rows: List[Dict[str, Any]] = []
+    _, _, eos_id, _, _, _ = _vocab_spec(int(cfg.vocab_size))
 
     with override_max_keep_ratio(model, max_keep_ratio_override):
         for idx, piece in enumerate(pieces, start=1):
@@ -1438,68 +1806,120 @@ def evaluate_suite31(args: argparse.Namespace) -> Dict[str, Any]:
 
             for domain in ("clean", "photo"):
                 img_path: Path = piece[domain]
-                with Image.open(img_path) as raw_im:
-                    pil_im = uni_omr._resize_fullpage_pil(raw_im.convert("RGB"), args.max_dim)
-                img_t = uni_omr._pil_to_chw_tensor(pil_im).unsqueeze(0).to(device)
+                tta_selected_scale: Optional[int] = None
+                tta_views_summary: Optional[List[Dict[str, Any]]] = None
 
-                t0 = time.perf_counter()
-                mtp_stats: Optional[Dict[str, Any]] = None
-                with torch.no_grad():
-                    ctx = (
-                        torch.autocast(device_type="cuda", dtype=torch.bfloat16)
-                        if use_bf16
-                        else _nullcontext()
+                if not tta_scales:
+                    with Image.open(img_path) as raw_im:
+                        pil_im = uni_omr._resize_fullpage_pil(raw_im.convert("RGB"), args.max_dim)
+                    img_t = uni_omr._pil_to_chw_tensor(pil_im).unsqueeze(0).to(device)
+                    seq, mtp_stats, elapsed, _ = _decode_single_view(
+                        model=model,
+                        cfg=cfg,
+                        img_t=img_t,
+                        args=args,
+                        device=device,
+                        use_bf16=use_bf16,
+                        beam_size=beam_size,
+                        beam_length_penalty=beam_length_penalty,
+                        measure_beam_size=measure_beam_size,
+                        compute_logprob=False,
                     )
-                    with ctx:
-                        if beam_size > 1:
-                            seq = generate_beam(
-                                model,
-                                img_t,
-                                max_len=args.max_len,
-                                beam_size=beam_size,
-                                length_penalty=beam_length_penalty,
-                                use_grammar=args.use_grammar,
-                                strict_grammar=args.strict_grammar,
-                            )
-                        elif args.use_mtp_spec or measure_beam_size > 1:
-                            seq, mtp_stats = generate_mtp_spec(
-                                model,
-                                img_t,
-                                max_len=args.max_len,
-                                use_grammar=args.use_grammar,
-                                strict_grammar=args.strict_grammar,
-                                return_stats=True,
-                                measure_beam_size=measure_beam_size,
-                            )
-                        elif args.use_grammar:
-                            seq = generate_constrained(
-                                model,
-                                img_t,
-                                max_len=args.max_len,
-                                strict=args.strict_grammar,
-                            )
-                        elif int(cfg.vocab_size) != uni_omr.VOCAB_SIZE:
-                            seq = generate_mtp_spec(
-                                model,
-                                img_t,
-                                max_len=args.max_len,
-                                use_grammar=False,
-                                return_stats=False,
-                            )
-                        else:
-                            seq = model.generate(img_t, max_len=args.max_len)
-                if device.type == "cuda":
-                    torch.cuda.synchronize()
-                elapsed = max(1e-6, time.perf_counter() - t0)
+                    seq_ids = seq[0].detach().cpu().tolist()
+                    pred_raw_toks = decode_uni_compat(
+                        seq_ids, vocab_size=int(cfg.vocab_size), skip_special=True
+                    )
+                    if eos_id not in seq_ids[1:]:
+                        pred_raw_toks = trim_truncated_tokens(pred_raw_toks)
+                    hyp_page_toks, n_sys = stitch_uni_tokens(pred_raw_toks)
 
-                seq_ids = seq[0].detach().cpu().tolist()
-                _, _, eos_id, _, _, _ = _vocab_spec(int(cfg.vocab_size))
-                pred_raw_toks = decode_uni_compat(
-                    seq_ids, vocab_size=int(cfg.vocab_size), skip_special=True
-                )
-                if eos_id not in seq_ids[1:]:
-                    pred_raw_toks = trim_truncated_tokens(pred_raw_toks)
-                hyp_page_toks, n_sys = stitch_uni_tokens(pred_raw_toks)
+                    hyp_txt = workdir / f"uni-{slug}-{domain}-hyp-bekern.txt"
+                    hyp_txt.write_text(" ".join(hyp_page_toks) + "\n", encoding="utf-8")
+                    hyp_notes = workdir / f"uni-{slug}-{domain}-hyp-notes.json"
+                    p_dec = esg.run_cli([
+                        esg.ASER, "bekern-decode", "--input", str(hyp_txt), "--out", str(hyp_notes),
+                    ])
+                    bekern_decode_ok = (p_dec.returncode == 0) and hyp_notes.exists()
+                    dec_rc = int(p_dec.returncode)
+                else:
+                    with Image.open(img_path) as raw_im:
+                        raw_rgb = raw_im.convert("RGB")
+                    view_candidates: List[Dict[str, Any]] = []
+                    total_elapsed = 0.0
+                    for scale_dim in tta_scales:
+                        pil_im = uni_omr._resize_fullpage_pil(raw_rgb, scale_dim)
+                        img_t = uni_omr._pil_to_chw_tensor(pil_im).unsqueeze(0).to(device)
+                        v_seq, v_mtp_stats, v_elapsed, v_mean_lp = _decode_single_view(
+                            model=model,
+                            cfg=cfg,
+                            img_t=img_t,
+                            args=args,
+                            device=device,
+                            use_bf16=use_bf16,
+                            beam_size=beam_size,
+                            beam_length_penalty=beam_length_penalty,
+                            measure_beam_size=measure_beam_size,
+                            compute_logprob=True,
+                        )
+                        total_elapsed += v_elapsed
+                        v_seq_ids = v_seq[0].detach().cpu().tolist()
+                        v_hit_eos = eos_id in v_seq_ids[1:]
+                        v_pred_raw = decode_uni_compat(
+                            v_seq_ids, vocab_size=int(cfg.vocab_size), skip_special=True
+                        )
+                        if not v_hit_eos:
+                            v_pred_raw = trim_truncated_tokens(v_pred_raw)
+                        v_hyp_page_toks, v_n_sys = stitch_uni_tokens(v_pred_raw)
+
+                        v_hyp_txt = workdir / f"uni-{slug}-{domain}-s{scale_dim}-hyp-bekern.txt"
+                        v_hyp_txt.write_text(" ".join(v_hyp_page_toks) + "\n", encoding="utf-8")
+                        v_hyp_notes = workdir / f"uni-{slug}-{domain}-s{scale_dim}-hyp-notes.json"
+                        v_dec = esg.run_cli([
+                            esg.ASER, "bekern-decode", "--input", str(v_hyp_txt), "--out", str(v_hyp_notes),
+                        ])
+                        v_bekern_ok = (v_dec.returncode == 0) and v_hyp_notes.exists()
+                        v_fsa = compute_fsa_beat_metrics(
+                            v_hyp_page_toks, hit_eos=v_hit_eos, bekern_decode_ok=v_bekern_ok
+                        )
+                        view_candidates.append({
+                            "scale": int(scale_dim),
+                            "pred_raw_toks": v_pred_raw,
+                            "hyp_page_toks": v_hyp_page_toks,
+                            "n_sys": v_n_sys,
+                            "hyp_notes": v_hyp_notes,
+                            "bekern_decode_ok": v_bekern_ok,
+                            "dec_rc": int(v_dec.returncode),
+                            "hit_eos": v_hit_eos,
+                            "mtp_stats": v_mtp_stats,
+                            "elapsed_secs": v_elapsed,
+                            "mean_logprob": float(v_mean_lp) if v_mean_lp is not None else -10.0,
+                            **v_fsa,
+                        })
+
+                    winner = select_best_fsa_beat_view(view_candidates)
+                    pred_raw_toks = winner["pred_raw_toks"]
+                    hyp_page_toks = winner["hyp_page_toks"]
+                    n_sys = int(winner["n_sys"])
+                    hyp_notes = winner["hyp_notes"]
+                    bekern_decode_ok = bool(winner["bekern_decode_ok"])
+                    dec_rc = int(winner["dec_rc"])
+                    mtp_stats = winner["mtp_stats"]
+                    elapsed = max(1e-6, total_elapsed)
+                    tta_selected_scale = int(winner["scale"])
+                    tta_views_summary = [
+                        {
+                            "scale": c["scale"],
+                            "fsa_beat_score": c["fsa_beat_score"],
+                            "mean_logprob": round(float(c["mean_logprob"]), 6),
+                            "beat_conservation_rate": c["beat_conservation_rate"],
+                            "has_loop": c["has_loop"],
+                            "hit_eos": c["hit_eos"],
+                            "bekern_decode_ok": c["bekern_decode_ok"],
+                            "n_pred_toks": len(c["hyp_page_toks"]),
+                            "elapsed_secs": round(float(c["elapsed_secs"]), 4),
+                        }
+                        for c in view_candidates
+                    ]
 
                 # 1. Token-level F1, ordered TokLCS F1, canonical voice-major TokLCS & SER
                 tok_edits = uni_omr.levenshtein_distance(ref_page_toks, hyp_page_toks)
@@ -1512,21 +1932,15 @@ def evaluate_suite31(args: argparse.Namespace) -> Dict[str, Any]:
                 )
 
                 # 2. Note-level F1 & SER via assembly-serialize + eval-harness
-                hyp_txt = workdir / f"uni-{slug}-{domain}-hyp-bekern.txt"
-                hyp_txt.write_text(" ".join(hyp_page_toks) + "\n", encoding="utf-8")
-                hyp_notes = workdir / f"uni-{slug}-{domain}-hyp-notes.json"
-                p_dec = esg.run_cli([
-                    esg.ASER, "bekern-decode", "--input", str(hyp_txt), "--out", str(hyp_notes),
-                ])
                 ref_notes_cnt: Optional[int] = None
                 hyp_notes_cnt: Optional[int] = None
                 note_hr_ratio: Optional[float] = None
-                if p_dec.returncode != 0 or not hyp_notes.exists():
+                if not bekern_decode_ok:
                     note_f1 = 0.0
                     note_ser = 1.0
                     proxy_fixes = None
                     decode_ok = False
-                    zero_reason = f"bekern-decode-rc-{p_dec.returncode}"
+                    zero_reason = f"bekern-decode-rc-{dec_rc}"
                 else:
                     sc = esg.score_notes_pair(
                         page_ref_notes,
@@ -1566,6 +1980,9 @@ def evaluate_suite31(args: argparse.Namespace) -> Dict[str, Any]:
                 prow[pfx + "n_pred_toks"] = len(hyp_page_toks)
                 prow[pfx + "elapsed_secs"] = round(elapsed, 4)
                 prow[pfx + "tok_per_sec"] = round(tok_per_sec, 2)
+                if tta_selected_scale is not None:
+                    prow[pfx + "tta_selected_scale"] = tta_selected_scale
+                    prow[pfx + "tta_views"] = tta_views_summary
                 if mtp_stats is not None:
                     prow[pfx + "draft_proposed"] = mtp_stats["draft_proposed"]
                     prow[pfx + "draft_accepted"] = mtp_stats["draft_accepted"]
@@ -1583,13 +2000,14 @@ def evaluate_suite31(args: argparse.Namespace) -> Dict[str, Any]:
                     if (mtp_stats is not None and measure_beam_size > 1)
                     else ""
                 )
+                tta_str = f" tta={tta_selected_scale}" if tta_selected_scale is not None else ""
                 hr_str = f" H/R={note_hr_ratio:.2f}" if note_hr_ratio is not None else ""
                 dec_str = "OK" if decode_ok else f"FAIL({zero_reason})"
                 print(
                     f"[{idx:02d}/{len(pieces):02d}] {slug:34s} [{tag}|{domain:5s}] "
                     f"tokF1={tok_f1:.3f} tokLCS={tok_lcs:.3f} tokSER={tok_ser:.3f} | "
                     f"noteF1={note_f1:.3f} noteSER={note_ser:.3f}{hr_str} ({dec_str}) | "
-                    f"sys={n_sys} tok={len(hyp_page_toks):4d} {tok_per_sec:5.1f}tok/s{mtp_str}{mb_str}",
+                    f"sys={n_sys} tok={len(hyp_page_toks):4d} {tok_per_sec:5.1f}tok/s{mtp_str}{mb_str}{tta_str}",
                     flush=True,
                 )
 
@@ -1628,6 +2046,8 @@ def evaluate_suite31(args: argparse.Namespace) -> Dict[str, Any]:
                 if max_keep_ratio_override is not None
                 else None
             ),
+            "tta_scales": tta_scales if tta_scales else None,
+            "tta_selector": "best_fsa_beat" if tta_scales else None,
             "device": str(device),
         },
         "summary": summary,
@@ -1722,6 +2142,17 @@ def build_arg_parser() -> argparse.ArgumentParser:
         type=float,
         default=None,
         help="Temporarily override model.router.max_keep_ratio at eval time (e.g. 0.55 or 0.65)",
+    )
+    ap.add_argument(
+        "--tta-scales",
+        type=str,
+        default=None,
+        help=(
+            "Opt-in comma-separated scale-only Multi-View TTA max dimensions "
+            "(e.g. 1152,1280,1536 or 1280,1536). Default off (single-scale --max-dim). "
+            "Selects winning view via best_fsa_beat (exact FSA beat validity + no-loop + "
+            "parse score + mean log-prob tiebreak; zero clahe/deskew)."
+        ),
     )
     ap.add_argument(
         "--device",

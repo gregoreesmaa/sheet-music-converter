@@ -33,14 +33,17 @@ from uni_omr_v2 import QATInt4ControllerV2, UniOMRv2Net  # noqa: E402
 from train_uni_v2 import (  # noqa: E402
     TopKTeacherCache,
     atomic_save_v2_latest,
+    build_arg_parser,
     build_optimizer_v2,
     build_v2_config,
     compute_sparse_topk_jsd_loss,
+    ensure_v2_best_checkpoints,
     extract_topk_from_logits,
     forward_and_loss_v2,
     kd_alpha_for_step,
     load_v2_checkpoint,
     partition_muon_adamw_params,
+    run_train_v2,
 )
 
 
@@ -317,6 +320,96 @@ class TestTrainUniV2(unittest.TestCase):
         self.assertAlmostEqual(kd_alpha_for_step(750, 1000, 0.35, 0.25), 0.35, places=6)
         self.assertAlmostEqual(kd_alpha_for_step(875, 1000, 0.35, 0.25), 0.175, places=6)
         self.assertAlmostEqual(kd_alpha_for_step(1000, 1000, 0.35, 0.25), 0.0, places=6)
+
+    def test_5_teacher_kd_inference_mode_and_zero_alpha_skip(self) -> None:
+        """Online v1 teacher runs in inference_mode when kd_alpha>0 and is skipped when kd_alpha<=0."""
+        torch.manual_seed(29)
+        student = _make_tiny_v2(grad_checkpoint=False)
+        student.train()
+        teacher = _make_tiny_v1_teacher()
+        images, seq = _make_dummy_batch(batch_size=2, h=64, w=96, seq_len=14)
+
+        call_log: list[bool] = []
+        orig_forward = teacher.forward
+
+        def _spy_forward(*args, **kwargs):
+            call_log.append(torch.is_inference_mode_enabled())
+            return orig_forward(*args, **kwargs)
+
+        teacher.forward = _spy_forward  # type: ignore[method-assign]
+
+        # 1) kd_alpha == 0.0 -> teacher forward must be skipped completely.
+        losses_zero, _ = forward_and_loss_v2(
+            student,
+            images,
+            seq,
+            teacher_v1=teacher,
+            kd_alpha=0.0,
+            use_bf16=False,
+            device=torch.device("cpu"),
+        )
+        self.assertEqual(len(call_log), 0, "Teacher forward should be skipped when kd_alpha <= 0")
+        self.assertEqual(float(losses_zero["kd_loss"].item()), 0.0)
+
+        # 2) kd_alpha > 0.0 -> teacher runs under torch.inference_mode() and backward succeeds.
+        student.zero_grad(set_to_none=True)
+        losses_kd, _ = forward_and_loss_v2(
+            student,
+            images,
+            seq,
+            teacher_v1=teacher,
+            kd_alpha=0.35,
+            use_bf16=False,
+            device=torch.device("cpu"),
+        )
+        self.assertEqual(call_log, [True], "Teacher forward must run under torch.inference_mode()")
+        self.assertGreater(float(losses_kd["kd_loss"].item()), 0.0)
+        losses_kd["loss"].backward()
+        self.assertIsNotNone(student.lm_head.weight.grad)
+
+    def test_6_handoff_best_checkpoints_and_deferred_history_flush(self) -> None:
+        """run_train_v2 flushes deferred loss history and always guarantees uni_omr_v2_ema_best.pt."""
+        with tempfile.TemporaryDirectory() as td:
+            out_dir = Path(td)
+            parser = build_arg_parser()
+            args = parser.parse_args([
+                "--preset", "tiny",
+                "--device", "cpu",
+                "--no-bf16",
+                "--steps", "3",
+                "--batch-size", "2",
+                "--grad-accum", "2",
+                "--seq-len", "16",
+                "--log-every", "10",
+                "--eval-every", "0",
+                "--gpu-ema-decay", "0.99",
+                "--gpu-ema-every", "1",
+                "--out-dir", str(out_dir),
+            ])
+            res = run_train_v2(args)
+            self.assertEqual(len(res["history"]), 3)
+            for idx, row in enumerate(res["history"], start=1):
+                self.assertEqual(row["step"], idx)
+                self.assertGreater(row["loss"], 0.0)
+
+            for fname in (
+                "uni_omr_v2_latest.pt",
+                "uni_omr_v2_ema_latest.pt",
+                "uni_omr_v2_best.pt",
+                "uni_omr_v2_ema_best.pt",
+                "train_log.json",
+            ):
+                self.assertTrue((out_dir / fname).is_file(), f"Missing expected handoff file: {fname}")
+
+            # Verify ensure_v2_best_checkpoints never overwrites an existing ema_best.pt.
+            marker_ckpt = torch.load(str(out_dir / "uni_omr_v2_ema_best.pt"), map_location="cpu", weights_only=True)
+            marker_ckpt["step"] = 999
+            torch.save(marker_ckpt, str(out_dir / "uni_omr_v2_ema_best.pt"))
+
+            student = _make_tiny_v2(grad_checkpoint=False)
+            ensure_v2_best_checkpoints(out_dir, student, student.cfg, step=1234)
+            reloaded = torch.load(str(out_dir / "uni_omr_v2_ema_best.pt"), map_location="cpu", weights_only=True)
+            self.assertEqual(reloaded["step"], 999, "Existing uni_omr_v2_ema_best.pt must not be overwritten")
 
 
 if __name__ == "__main__":

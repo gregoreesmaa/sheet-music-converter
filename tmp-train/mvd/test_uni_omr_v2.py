@@ -559,6 +559,99 @@ def test_frontier_2025_2026_upgrades() -> None:
     assert out_ev["stroke_hog_pred"] is None
 
 
+def test_iter12_compute_memory_optimizations() -> None:
+    """Verify Iter-12 RoPE2D/RoPE1D/pos2d LRU caches, router zero-copy NHWC, fused HOG, and causal mask cache."""
+    torch.manual_seed(1212)
+
+    # 1. AspectNormalizedRoPE1D exact cached parity (max_abs_diff == 0.0) & bounded LRU eviction
+    rope1d = AspectNormalizedRoPE1D(head_dim=16, rope_jitter=0.08).eval()
+    rope1d._max_cache_size = 4
+    c1, s1 = rope1d(24, torch.device("cpu"), torch.float32)
+    c2, s2 = rope1d(24, torch.device("cpu"), torch.float32)
+    assert float((c1 - c2).abs().max().item()) == 0.0
+    assert float((s1 - s2).abs().max().item()) == 0.0
+    for L in (10, 12, 14, 16, 18, 20):
+        rope1d(L, torch.device("cpu"), torch.float32)
+    assert len(rope1d._cos_sin_cache) <= 4
+    assert len(rope1d._pos_cache) <= 4
+
+    # 2. AspectNormalizedRoPE2D.forward_indexed exact parity (max_abs_diff == 0.0) vs forward()
+    rope2d = AspectNormalizedRoPE2D(head_dim=16, rope_jitter=0.08).eval()
+    rope2d._max_cache_size = 3
+    h_p, w_p = 10, 8
+    N = h_p * w_p
+    B, K, n_bg = 2, 24, 4
+    ys = torch.arange(h_p, dtype=torch.float32)
+    xs = torch.arange(w_p, dtype=torch.float32)
+    gy, gx = torch.meshgrid(ys, xs, indexing="ij")
+    all_coords = torch.stack([gy.reshape(-1), gx.reshape(-1)], dim=-1).unsqueeze(0).expand(B, -1, -1)
+    kept_idx = torch.sort(torch.randperm(N)[:K]).values.unsqueeze(0).expand(B, -1)
+    kept_coords = torch.gather(all_coords, 1, kept_idx.unsqueeze(-1).expand(-1, -1, 2))
+    center = torch.tensor([[[(h_p - 1) * 0.5, (w_p - 1) * 0.5]]], dtype=torch.float32).expand(B, n_bg, 2)
+    routed_coords = torch.cat([kept_coords, center], dim=1)
+
+    cos_ref, sin_ref = rope2d(routed_coords, (h_p, w_p), dtype=torch.float32)
+    cos_idx, sin_idx = rope2d.forward_indexed(kept_idx, (h_p, w_p), n_bg_summary=n_bg, dtype=torch.float32)
+    assert float((cos_ref - cos_idx).abs().max().item()) == 0.0
+    assert float((sin_ref - sin_idx).abs().max().item()) == 0.0
+
+    # Full-grid fast path parity
+    full_idx = torch.arange(N).unsqueeze(0).expand(B, -1)
+    cos_full_ref, sin_full_ref = rope2d(all_coords, (h_p, w_p), dtype=torch.float32)
+    cos_full_idx, sin_full_idx = rope2d.forward_indexed(
+        full_idx, (h_p, w_p), n_bg_summary=0, dtype=torch.float32, is_full_grid=True
+    )
+    assert float((cos_full_ref - cos_full_idx).abs().max().item()) == 0.0
+    assert float((sin_full_ref - sin_full_idx).abs().max().item()) == 0.0
+
+    # Bounded LRU eviction on RoPE2D
+    for gh in (6, 8, 12, 14):
+        rope2d._get_grid_cos_sin(gh, 8, torch.device("cpu"), torch.float32)
+    assert len(rope2d._grid_cache) <= 3
+
+    # 3. HybridAxialMergerEncoder._sinusoidal_pos2d_indexed exact parity (max_abs_diff == 0.0)
+    cfg = _tiny_cfg(n_register_tokens=4, rope_jitter=0.08, dropout=0.0)
+    model = UniOMRv2Net(cfg).eval()
+    pe_ref = model.encoder._sinusoidal_pos2d(routed_coords, (h_p, w_p), dtype=torch.float32)
+    pe_idx = model.encoder._sinusoidal_pos2d_indexed(kept_idx, (h_p, w_p), n_bg_summary=n_bg, dtype=torch.float32)
+    assert float((pe_ref - pe_idx).abs().max().item()) == 0.0
+
+    # 4. InkTokenRouterV2 feat_nhwc zero-copy parity & bounded _grid_cache
+    router = model.encoder.router
+    router._grid_cache_max = 3
+    merged_nhwc = torch.randn(2, 8, 6, cfg.d_model)
+    merged_nchw = merged_nhwc.permute(0, 3, 1, 2).contiguous()
+    img = torch.rand(2, 3, 128, 96)
+    with torch.no_grad():
+        tok_a, coord_a, _ = router(merged_nchw, images=img)
+        tok_b, coord_b, _ = router(merged_nhwc.permute(0, 3, 1, 2), images=img, feat_nhwc=merged_nhwc)
+    assert float((tok_a - tok_b).abs().max().item()) < 1e-5
+    assert float((coord_a - coord_b).abs().max().item()) == 0.0
+
+    # 5. Fused Sobel-HOG target BF16-input safety & finite output
+    hog_fp32 = compute_stroke_hog_target(img, target_hw=(32, 24), n_bins=8)
+    hog_bf16 = compute_stroke_hog_target(img.to(torch.bfloat16), target_hw=(32, 24), n_bins=8)
+    assert hog_fp32.dtype == torch.float32 and hog_bf16.dtype == torch.float32
+    assert torch.isfinite(hog_fp32).all() and torch.isfinite(hog_bf16).all()
+    assert float((hog_fp32 - hog_bf16).abs().max().item()) < 0.05
+
+    # 6. Chunked-prefill causal offset mask cache parity (past_len > 0, Lq > 1)
+    tgt = torch.randint(0, VOCAB_SIZE - 4, (2, 10))
+    tgt[:, 0] = BOS_ID
+    with torch.no_grad():
+        mem_levels, _, _ = model.encode_image(img, return_aux=False)
+        full_logits, _, _ = model.decode_tokens(tgt, mem_levels, return_mtp=False, return_aux=False)
+        l1, _, kvs = model.decode_tokens(tgt[:, :4], mem_levels, return_mtp=False, return_aux=False, use_cache=True)
+        l2, _, kvs = model.decode_tokens(tgt[:, 4:], None, return_mtp=False, return_aux=False, past_kvs=kvs, use_cache=True)
+        chunked_logits = torch.cat([l1, l2], dim=1)
+    assert float((full_logits - chunked_logits).abs().max().item()) < 1e-4
+
+    # 7. Zero state_dict drift after populating all caches
+    sd_keys_after = list(model.state_dict().keys())
+    fresh_keys = list(UniOMRv2Net(cfg).state_dict().keys())
+    assert sd_keys_after == fresh_keys
+
+
 def main() -> None:
     summaries = _check_presets_param_counts_and_byte_budgets()
     test_aspect_normalized_rope2d_resolution_invariance()
@@ -567,6 +660,7 @@ def main() -> None:
     n_qat = _check_qat_int4_controller_v2_and_zero_schema_change()
     test_iter11_optimizations()
     test_frontier_2025_2026_upgrades()
+    test_iter12_compute_memory_optimizations()
 
     print("=== UniOMR v2 CPU Unit Tests PASSED ===")
     for name, s in summaries.items():

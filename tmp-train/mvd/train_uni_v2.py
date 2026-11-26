@@ -325,9 +325,10 @@ def compute_sparse_topk_jsd_loss(
     tau = float(max(1e-4, temp))
     b = float(max(0.0, min(1.0, beta)))
 
-    idx_long = teacher_topk_idx.to(device=student_logits.device, dtype=torch.long)
+    nb = student_logits.device.type == "cuda"
+    idx_long = teacher_topk_idx.to(device=student_logits.device, dtype=torch.long, non_blocking=nb)
     s_topk = torch.gather(student_logits.float(), dim=-1, index=idx_long)
-    t_topk = teacher_topk_vals.to(device=student_logits.device, dtype=torch.float32)
+    t_topk = teacher_topk_vals.to(device=student_logits.device, dtype=torch.float32, non_blocking=nb)
 
     log_p_s = F.log_softmax(s_topk / tau, dim=-1)
     log_p_t = F.log_softmax(t_topk / tau, dim=-1)
@@ -348,7 +349,7 @@ def compute_sparse_topk_jsd_loss(
 
     mask = targets != ignore_index
     if valid_mask is not None:
-        mask = mask & valid_mask.to(device=student_logits.device, dtype=torch.bool)
+        mask = mask & valid_mask.to(device=student_logits.device, dtype=torch.bool, non_blocking=nb)
     mask_f = mask.float()
     loss = (per_tok * mask_f).sum() / mask_f.sum().clamp(min=1.0)
     return (loss * (tau * tau)).to(student_logits.dtype)
@@ -498,7 +499,7 @@ class TopKTeacherCache:
         return cls(out)
 
 
-@torch.no_grad()
+@torch.inference_mode()
 def extract_topk_from_logits(
     logits: torch.Tensor,
     k: int = 8,
@@ -511,7 +512,7 @@ def extract_topk_from_logits(
     )
 
 
-@torch.no_grad()
+@torch.inference_mode()
 def precompute_teacher_cache(
     teacher: UniOMRNet,
     datasets: Sequence[Tuple[str, Any]],
@@ -768,6 +769,62 @@ def atomic_save_v2_latest(
     return latest_path, ema_path
 
 
+def ensure_v2_best_checkpoints(
+    out_dir: Path,
+    model: UniOMRv2Net,
+    cfg: UniOMRv2Config,
+    step: int,
+    best_val_ser: float = float("inf"),
+    gpu_ema: Optional[GPUEmaShadow] = None,
+    best_ema_ser: float = float("inf"),
+) -> Tuple[Path, Path]:
+    """Guarantee ``uni_omr_v2_best.pt`` and ``uni_omr_v2_ema_best.pt`` exist on disk before exit.
+
+    Never overwrites an existing best checkpoint written by an earlier improving eval;
+    writes atomic fallback checkpoints from the final weights/EMA if missing so downstream
+    stages (e.g. ``--init-from .../uni_omr_v2_ema_best.pt``) can never hit ``FileNotFoundError``.
+    """
+    cfg_dict = asdict(cfg)
+    best_path = out_dir / "uni_omr_v2_best.pt"
+    ema_best_path = out_dir / "uni_omr_v2_ema_best.pt"
+
+    if not best_path.is_file():
+        atomic_save_checkpoint(
+            best_path,
+            {
+                "step": int(step),
+                "val_ser": float(best_val_ser),
+                "cfg": cfg_dict,
+                "config": cfg_dict,
+                "vocab": list(data.VOCAB),
+                "model": {k: v.detach().cpu() for k, v in model.state_dict().items()},
+            },
+        )
+        print(f"  [handoff] saved fallback {best_path.name} at step {step}", flush=True)
+
+    if not ema_best_path.is_file():
+        ema_state = (
+            gpu_ema.cpu_state_dict(model)
+            if gpu_ema is not None
+            else {k: v.detach().cpu() for k, v in model.state_dict().items()}
+        )
+        atomic_save_checkpoint(
+            ema_best_path,
+            {
+                "step": int(step),
+                "val_ser": float(best_ema_ser),
+                "ema_decay": float(gpu_ema.decay) if gpu_ema is not None else 0.0,
+                "cfg": cfg_dict,
+                "config": cfg_dict,
+                "vocab": list(data.VOCAB),
+                "model": ema_state,
+            },
+        )
+        print(f"  [handoff] saved fallback {ema_best_path.name} at step {step}", flush=True)
+
+    return best_path, ema_best_path
+
+
 # ---------------------------------------------------------------------------
 # 5. Single Training Forward + Loss Helper (Used by Train Loop & Tests)
 # ---------------------------------------------------------------------------
@@ -869,6 +926,7 @@ def forward_and_loss_v2(
         )
 
         # Hybrid KD: prefer offline Top-K cache hits, otherwise fall back to online frozen v1 teacher.
+        # Completely skip teacher forward & KD graph node when kd_alpha <= 0.
         kd_loss = out["logits"].new_zeros(())
         if kd_alpha > 0.0:
             used_cache = False
@@ -887,19 +945,27 @@ def forward_and_loss_v2(
                         valid_mask=c_mask,
                     )
                     used_cache = True
+                del c_vals, c_idx, c_mask
             if (not used_cache) and teacher_v1 is not None:
-                with torch.no_grad():
+                with torch.inference_mode():
                     t_out = teacher_v1(images, tgt_in, return_aux=False, return_mtp=False)
+                    t_logits_inf = t_out["logits"]
+                    del t_out
+                # Clone outside inference_mode so autograd can safely save tensors for backward.
+                t_logits = t_logits_inf.clone()
+                del t_logits_inf
                 kd_loss = compute_generalized_jsd_loss(
                     out["logits"],
-                    t_out["logits"],
+                    t_logits,
                     tgt_out,
                     beta=kd_beta,
                     temp=kd_temp,
                 )
+                del t_logits
+
+            losses["loss"] = losses["loss"] + float(kd_alpha) * kd_loss
 
         losses["kd_loss"] = kd_loss
-        losses["loss"] = losses["loss"] + float(kd_alpha) * kd_loss
 
     return losses, out
 
@@ -1303,7 +1369,9 @@ def run_train_v2(args: argparse.Namespace) -> Dict[str, Any]:
 
     # Optional online frozen v1 teacher & offline Top-K cache
     teacher_v1: Optional[UniOMRNet] = (
-        load_v1_teacher(args.teacher_ckpt, device=device) if args.teacher_ckpt else None
+        load_v1_teacher(args.teacher_ckpt, device=device)
+        if (args.teacher_ckpt and float(args.kd_alpha) > 0.0)
+        else None
     )
     teacher_cache: Optional[TopKTeacherCache] = (
         TopKTeacherCache(args.teacher_cache_dir) if args.teacher_cache_dir else None
@@ -1437,8 +1505,11 @@ def run_train_v2(args: argparse.Namespace) -> Dict[str, Any]:
 
         if want_fp and fullpage_train_iter is not None:
             b = next(fullpage_train_iter)
+            imgs = _images_to_device_float(b["images"], device, non_blocking=(device.type == "cuda"))
+            if args.channels_last:
+                imgs = imgs.to(memory_format=torch.channels_last)
             return (
-                _images_to_device_float(b["images"], device, non_blocking=(device.type == "cuda")),
+                imgs,
                 b["seq"].to(device, non_blocking=(device.type == "cuda")),
                 list(b.get("sample_ids", [])),
                 "fullpage",
@@ -1455,8 +1526,11 @@ def run_train_v2(args: argparse.Namespace) -> Dict[str, Any]:
                     picked.append(_pop_strip(pr_strip_pool, strip_train_iter, "strip"))
             b = collate_uni_batch(picked)
             kind = "mixed_strip" if (0 < n_hw < strip_batch_size) else ("hw_strip" if n_hw > 0 else "strip")
+            imgs = _images_to_device_float(b["images"], device, non_blocking=(device.type == "cuda"))
+            if args.channels_last:
+                imgs = imgs.to(memory_format=torch.channels_last)
             return (
-                _images_to_device_float(b["images"], device, non_blocking=(device.type == "cuda")),
+                imgs,
                 b["seq"].to(device, non_blocking=(device.type == "cuda")),
                 list(b.get("sample_ids", [])),
                 kind,
@@ -1469,8 +1543,11 @@ def run_train_v2(args: argparse.Namespace) -> Dict[str, Any]:
             else:
                 b = next(strip_train_iter)
                 kind = "strip"
+            imgs = _images_to_device_float(b["images"], device, non_blocking=(device.type == "cuda"))
+            if args.channels_last:
+                imgs = imgs.to(memory_format=torch.channels_last)
             return (
-                _images_to_device_float(b["images"], device, non_blocking=(device.type == "cuda")),
+                imgs,
                 b["seq"].to(device, non_blocking=(device.type == "cuda")),
                 list(b.get("sample_ids", [])),
                 kind,
@@ -1479,8 +1556,11 @@ def run_train_v2(args: argparse.Namespace) -> Dict[str, Any]:
         kind = "hw_strip" if hw_strip_train_iter is not None else "strip"
         assert it is not None
         b = next(it)
+        imgs = _images_to_device_float(b["images"], device, non_blocking=(device.type == "cuda"))
+        if args.channels_last:
+            imgs = imgs.to(memory_format=torch.channels_last)
         return (
-            _images_to_device_float(b["images"], device, non_blocking=(device.type == "cuda")),
+            imgs,
             b["seq"].to(device, non_blocking=(device.type == "cuda")),
             list(b.get("sample_ids", [])),
             kind,
@@ -1489,28 +1569,29 @@ def run_train_v2(args: argparse.Namespace) -> Dict[str, Any]:
     def _run_eval_suite(step_label: Any) -> Dict[str, Any]:
         eval_rec: Dict[str, Any] = {"step": step_label}
         val_sers: List[float] = []
-        for tag, val_ds, bs in (
-            ("strip_val", strip_val_ds, eval_batch_size),
-            ("hw_strip_val", hw_strip_val_ds, eval_batch_size),
-            ("fullpage_val", fullpage_val_ds, min(eval_batch_size, 2)),
-        ):
-            if val_ds is None:
-                continue
-            m = eval_dataset(
-                model,  # type: ignore[arg-type]
-                val_ds,
-                device=device,
-                max_len=args.eval_max_len,
-                batch_size=bs,
-                use_bf16=use_bf16,
-            )
-            eval_rec[tag] = m
-            val_sers.append(float(m["ser"]))
-            print(
-                f"  [eval {tag} @ {step_label}] SER={m['ser']:.4f} F1={m['token_f1']:.4f} "
-                f"sys_exact={m['sys_count_exact']:.3f} comp={m['mean_compression_x']:.2f}x",
-                flush=True,
-            )
+        with torch.inference_mode():
+            for tag, val_ds, bs in (
+                ("strip_val", strip_val_ds, eval_batch_size),
+                ("hw_strip_val", hw_strip_val_ds, eval_batch_size),
+                ("fullpage_val", fullpage_val_ds, min(eval_batch_size, 2)),
+            ):
+                if val_ds is None:
+                    continue
+                m = eval_dataset(
+                    model,  # type: ignore[arg-type]
+                    val_ds,
+                    device=device,
+                    max_len=args.eval_max_len,
+                    batch_size=bs,
+                    use_bf16=use_bf16,
+                )
+                eval_rec[tag] = m
+                val_sers.append(float(m["ser"]))
+                print(
+                    f"  [eval {tag} @ {step_label}] SER={m['ser']:.4f} F1={m['token_f1']:.4f} "
+                    f"sys_exact={m['sys_count_exact']:.3f} comp={m['mean_compression_x']:.2f}x",
+                    flush=True,
+                )
         eval_rec["mean_val_ser"] = round(float(np.mean(val_sers)) if val_sers else float("inf"), 6)
         return eval_rec
 
@@ -1521,6 +1602,39 @@ def run_train_v2(args: argparse.Namespace) -> Dict[str, Any]:
     save_every_sec = max(0.0, float(args.save_every_minutes) * 60.0)
     last_time_save = time.perf_counter()
     last_empty_cache_step = -25
+    trainable_params = [p for p in model.parameters() if p.requires_grad]
+
+    _acc_keys: Tuple[str, ...] = (
+        "loss",
+        "ce_loss",
+        "mtp_loss",
+        "saliency_loss",
+        "stroke_hog_loss",
+        "kd_loss",
+    )
+    pending_history_meta: List[Tuple[int, str, float, float, int, int]] = []
+    pending_history_vals: List[torch.Tensor] = []
+
+    def _flush_pending_history() -> None:
+        if not pending_history_vals:
+            return
+        # Single batched D2H transfer for all steps accumulated since the last log.
+        vals_cpu = torch.stack(pending_history_vals, dim=0).cpu().tolist()
+        for meta, row_vals in zip(pending_history_meta, vals_cpu):
+            s_idx, s_kind, s_lr, s_kd, s_nin, s_nout = meta
+            row: Dict[str, Any] = {
+                "step": s_idx,
+                "kind": s_kind,
+                "lr": s_lr,
+                "kd_alpha": s_kd,
+                "n_in": s_nin,
+                "n_out": s_nout,
+            }
+            for k_name, v in zip(_acc_keys, row_vals):
+                row[k_name] = float(v)
+            history.append(row)
+        pending_history_meta.clear()
+        pending_history_vals.clear()
 
     try:
         for step in range(1, steps + 1):
@@ -1553,14 +1667,8 @@ def run_train_v2(args: argparse.Namespace) -> Dict[str, Any]:
             inv_ga = 1.0 / float(step_ga)
 
             opt.zero_grad(set_to_none=True)
-            acc = {
-                "loss": 0.0,
-                "ce_loss": 0.0,
-                "mtp_loss": 0.0,
-                "saliency_loss": 0.0,
-                "stroke_hog_loss": 0.0,
-                "kd_loss": 0.0,
-            }
+            # Accumulate loss scalars on-device to avoid per-micro-batch GPU-CPU sync stalls.
+            acc_t = torch.zeros(len(_acc_keys), device=device, dtype=torch.float32)
             last_n_in = 0
             last_n_out = 0
             last_kind = args.curriculum
@@ -1592,12 +1700,16 @@ def run_train_v2(args: argparse.Namespace) -> Dict[str, Any]:
                         device=device,
                     )
                     (losses["loss"] * inv_ga).backward()
-                    for k_name in acc:
-                        acc[k_name] += float(losses[k_name].detach().item()) * inv_ga
+                    with torch.no_grad():
+                        acc_t.add_(
+                            torch.stack([losses[k_name].detach().float() for k_name in _acc_keys]),
+                            alpha=inv_ga,
+                        )
                     rinfo = out["router_info"]
                     last_n_in = int(rinfo["n_in"])
                     last_n_out = int(rinfo["n_out"])
                     last_kind = kind
+                    del losses, out, images, seq
                 except Exception as e:
                     if device.type == "cuda" and "out of memory" in str(e).lower():
                         print(f"  [WARN OOM skip] step {step} micro {micro} kind={kind}", flush=True)
@@ -1610,7 +1722,7 @@ def run_train_v2(args: argparse.Namespace) -> Dict[str, Any]:
             if oom_hit:
                 continue
 
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            torch.nn.utils.clip_grad_norm_(trainable_params, 1.0)
             opt.step()
             if qat_ctrl is not None and qat_ctrl.enabled:
                 qat_ctrl.refresh_cache()
@@ -1625,22 +1737,16 @@ def run_train_v2(args: argparse.Namespace) -> Dict[str, Any]:
             if gpu_ema is not None:
                 gpu_ema.update(model, step)
 
-            row = {
-                "step": step,
-                "kind": last_kind,
-                "lr": cur_lr,
-                "kd_alpha": cur_kd_alpha,
-                "n_in": last_n_in,
-                "n_out": last_n_out,
-                **acc,
-            }
-            history.append(row)
+            pending_history_meta.append((step, last_kind, cur_lr, cur_kd_alpha, last_n_in, last_n_out))
+            pending_history_vals.append(acc_t)
             if step == 1 or (step % log_every == 0) or step == steps:
+                _flush_pending_history()
+                last_row = history[-1]
                 print(
                     f"[UniOMRv2 {'dry-run' if args.dry_run else 'train'} | {last_kind}] "
-                    f"step {step}/{steps} | lr={cur_lr:.2e} | loss={acc['loss']:.4f} "
-                    f"(ce={acc['ce_loss']:.4f}, mtp={acc['mtp_loss']:.4f}, "
-                    f"hog={acc['stroke_hog_loss']:.4f}, kd={acc['kd_loss']:.4f}) | "
+                    f"step {step}/{steps} | lr={cur_lr:.2e} | loss={last_row['loss']:.4f} "
+                    f"(ce={last_row['ce_loss']:.4f}, mtp={last_row['mtp_loss']:.4f}, "
+                    f"hog={last_row['stroke_hog_loss']:.4f}, kd={last_row['kd_loss']:.4f}) | "
                     f"tokens {last_n_in}->{last_n_out}",
                     flush=True,
                 )
@@ -1711,6 +1817,7 @@ def run_train_v2(args: argparse.Namespace) -> Dict[str, Any]:
                         )
                 eval_history.append(eval_rec)
     finally:
+        _flush_pending_history()
         for pf in prefetchers:
             pf.close()
         if teacher_cache is not None:
@@ -1718,6 +1825,15 @@ def run_train_v2(args: argparse.Namespace) -> Dict[str, Any]:
 
     if out_dir is not None and not args.dry_run:
         atomic_save_v2_latest(
+            out_dir,
+            model,
+            cfg,
+            step=steps,
+            best_val_ser=best_val_ser,
+            gpu_ema=gpu_ema,
+            best_ema_ser=best_ema_ser,
+        )
+        ensure_v2_best_checkpoints(
             out_dir,
             model,
             cfg,
