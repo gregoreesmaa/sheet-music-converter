@@ -814,7 +814,7 @@ def _train_and_eval_arm(
 
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         optimizer.step()
-        gpu_ema.update(model)
+        gpu_ema.update(model, step)
 
         step_ms = (time.perf_counter() - t_step0) * 1000.0
         buf_loss.append(step_loss)
@@ -823,6 +823,16 @@ def _train_and_eval_arm(
         if step_eq > 0.0:
             buf_eq.append(step_eq)
         buf_ms.append(step_ms)
+
+        if step % 25 == 0 and step % 100 != 0 and step != TRAIN_STEPS:
+            alpha_val = gr.get_gauge_alpha(model)
+            print(
+                f"  [{arm_name}] step {step:4d}/{TRAIN_STEPS} | "
+                f"loss={float(np.mean(buf_loss)):.4f} ce={float(np.mean(buf_ce)):.4f} "
+                f"eq={float(np.mean(buf_eq)) if buf_eq else 0.0:.4f} | "
+                f"alpha={alpha_val:+.5f} | {float(np.mean(buf_ms)):.0f} ms/step",
+                flush=True,
+            )
 
         if step % 100 == 0 or step == TRAIN_STEPS:
             alpha_val = gr.get_gauge_alpha(model)

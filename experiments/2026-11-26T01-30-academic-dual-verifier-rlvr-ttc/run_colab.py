@@ -11,6 +11,7 @@ from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
+import importlib
 import json
 import math
 import os
@@ -63,6 +64,7 @@ def _setup_env() -> Tuple[Path, Path]:
             missing_pkgs.append(pkg)
     if missing_pkgs:
         _run([sys.executable, "-m", "pip", "install", "-q", *missing_pkgs])
+        importlib.invalidate_caches()
 
     # Build Rust assembly-serialize & eval-harness if not already built
     aser_bin = WORK_ROOT / "sheet-music-converter" / "converter" / "assembly-serialize" / "target" / "release" / "assembly-serialize"
@@ -390,6 +392,14 @@ def main() -> None:
         verifier = dv.DualVerifier(
             dv.DualVerifierConfig(aser_bin=aser_bin, use_python_musicxml_fallback=True)
         )
+        # Mandatory startup visual-render smoke test (fail-fast if verovio/resvg_py missing)
+        assert dv.verovio is not None, "verovio failed to import after pip install!"
+        assert dv.resvg_py is not None or dv.cairosvg is not None, "resvg_py/cairosvg failed to import!"
+        _smoke_img = verifier.render(
+            "clef-G-2 key+0 time-4-4 quarter C 4 quarter D 4 quarter E 4 quarter F 4 bar"
+        )
+        assert _smoke_img is not None and _smoke_img.ndim == 2, "DualVerifier visual render smoke test failed!"
+        print(f"[acad-a] DualVerifier visual render smoke test OK: shape={_smoke_img.shape}", flush=True)
         workdir = Path(tempfile.mkdtemp(prefix="acad_a_s31_"))
         partial_path = Path("/content/exp_a_partial.jsonl")
 
@@ -503,33 +513,32 @@ def main() -> None:
                     if eos_id not in g_ids[1:]:
                         g_toks = eval_s31.trim_truncated_tokens(g_toks)
 
-                    # 2. K=16 diverse FSA-constrained rollouts (2 chunks of G=8)
+                    # 2. K=16 diverse FSA-constrained rollouts (single batched G=16 pass on L4/A100)
                     sampled_toks_list: List[List[str]] = []
-                    for chunk_i in range(2):
-                        torch.manual_seed(1000 + page_counter * 10 + chunk_i)
-                        with torch.no_grad():
-                            ctx = (
-                                torch.autocast(device_type="cuda", dtype=torch.bfloat16)
-                                if use_bf16
-                                else eval_s31._nullcontext()
+                    torch.manual_seed(1000 + page_counter * 10)
+                    with torch.no_grad():
+                        ctx = (
+                            torch.autocast(device_type="cuda", dtype=torch.bfloat16)
+                            if use_bf16
+                            else eval_s31._nullcontext()
+                        )
+                        with ctx:
+                            rb = rlvr_grpo.sample_rollouts(
+                                model,
+                                img_t,
+                                group_size=16,
+                                max_len=1536,
+                                temperature=0.7,
+                                top_p=0.92,
+                                use_grammar=True,
+                                strict_grammar=False,
                             )
-                            with ctx:
-                                rb = rlvr_grpo.sample_rollouts(
-                                    model,
-                                    img_t,
-                                    group_size=8,
-                                    max_len=1536,
-                                    temperature=0.7,
-                                    top_p=0.92,
-                                    use_grammar=True,
-                                    strict_grammar=False,
-                                )
-                        for g_i in range(8):
-                            toks_i = list(rb.decoded_tokens[0][g_i])
-                            hit_eos = bool(rb.terminated_eos[0, g_i].item()) if rb.terminated_eos is not None else True
-                            if not hit_eos:
-                                toks_i = eval_s31.trim_truncated_tokens(toks_i)
-                            sampled_toks_list.append(toks_i)
+                    for g_i in range(16):
+                        toks_i = list(rb.decoded_tokens[0][g_i])
+                        hit_eos = bool(rb.terminated_eos[0, g_i].item()) if rb.terminated_eos is not None else True
+                        if not hit_eos:
+                            toks_i = eval_s31.trim_truncated_tokens(toks_i)
+                        sampled_toks_list.append(toks_i)
 
                     if device.type == "cuda":
                         torch.cuda.synchronize()

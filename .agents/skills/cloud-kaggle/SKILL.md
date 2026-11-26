@@ -31,7 +31,18 @@ description: >-
   .\.venv\Scripts\kaggle.exe kernels status <username>/<kernel-slug>
   .\.venv\Scripts\kaggle.exe kernels output <username>/<kernel-slug> -p <out_dir>
   ```
-- **Passing `HF_TOKEN` into Kaggle kernels:** Store `HF_TOKEN` in **Kaggle User Secrets** (Settings → Secrets → `HF_TOKEN`) and read it inside the script via `kaggle_secrets.UserSecretsClient().get_secret("HF_TOKEN")` (with `os.environ.get("HF_TOKEN")` fallback). Never hardcode it in the pushed `.py` file.
+- **Passing `HF_TOKEN` into Kaggle kernels:** Kaggle CLI has no `secrets` API, so we maintain a **strictly private** Kaggle Dataset `gregoreesmaa/omr-hf-auth` containing `hf_token.txt`. Attach `"dataset_sources": ["gregoreesmaa/omr-hf-auth"]` in `"is_private": true` kernels, and read the token cleanly without ever logging it:
+  ```python
+  import glob, os
+  tok = os.environ.get("HF_TOKEN", "").strip()
+  if not tok:
+      for p in glob.glob("/kaggle/input/**/hf_token.txt", recursive=True):
+          tok = open(p).read().strip()
+          if tok:
+              break
+  ```
+  (Alternatively, if added in Web UI Settings → Secrets, `kaggle_secrets.UserSecretsClient().get_secret("HF_TOKEN")` also works.) **NEVER** print the token or set `"is_private": false` on any kernel attaching `omr-hf-auth`.
+- **Check weekly quota anytime:** `.\.venv\Scripts\kaggle.exe quota`
 
 ---
 
@@ -95,3 +106,9 @@ Place this alongside your entrypoint script (e.g. `train_kaggle.py`) inside `<ke
   - **CRITICAL BF16 emulation trap on Kaggle T4:** `torch.cuda.is_bf16_supported()` returns **`True`** on Kaggle's T4 (`cc=7.5`) under PyTorch `2.11.0+cu130` via slow software emulation! ALWAYS check `torch.cuda.get_device_capability()[0] >= 8` (or `including_emulation=False`) and force **FP16 + `GradScaler`** on T4!
   - **Output log format:** `kaggle kernels output` downloads `<slug>.log` as a **JSON array** of `{stream_name, time, data}` objects (not plain text).
   - **Billing safety:** Kaggle free tier (`30 hrs/wk`) has **no card on file** and enforces a hard `$0` cutoff (GPU sessions simply refuse to start once weekly quota is reached). Never link a GCP billing account under *Add-ons → Google Cloud Services*.
+- **2026-11-26 (Kernel slug/title mismatch causing `Permission 'kernels.get' was denied` on `ov-37` / `ov-39`):**
+  - **Root cause:** `kaggle kernels push` derives the actual created kernel slug from `kernel-metadata.json`'s **`title`** field, **NOT** from `id`! When `id` was `gregoreesmaa/omr-ov-39-...` and `title` was `"Omr Omr Ov 39 ..."` (accidentally double-prefixing `OMR ` onto an `omr-` slug), Kaggle printed a warning (`Your kernel title does not resolve to the specified id`) and silently created `gregoreesmaa/omr-omr-ov-39-...` instead. Subsequent `kaggle kernels status gregoreesmaa/omr-ov-39-...` calls then failed with `Permission 'kernels.get' was denied` because that slug did not exist.
+  - **Fix & invariant:** Always keep slugs short (e.g. `omr-ov-37`, `omr-ov-39`), set `"title": slug` (exact 1:1 match with `id` after `<username>/`), verify `rc == 0` and `"successfully pushed"` in `kernels push` stdout, parse the canonical `<user>/<slug>` from the pushed URL (`https://www.kaggle.com/code/<user>/<slug>`) before polling, and fail fast after consecutive `UNKNOWN` / permission errors instead of polling until timeout.
+- **2026-11-26 (GPU slot limit returns `rc=0` on `kernels push`):**
+  - When both concurrent free-tier GPU slots are already occupied, `kaggle kernels push` exits with **`rc=0`** and prints `Kernel push error: Maximum batch GPU session count of 2 reached.` to stdout (no non-zero exit code).
+  - Always inspect stdout for `"Maximum batch GPU session count"` and treat it as a transient `[WAIT-SLOT]` (sleep 60s & retry) rather than a hard failure, and never rely solely on `rc == 0` to assume a push succeeded.

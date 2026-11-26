@@ -1,15 +1,16 @@
 ---
 name: test-in-cloud
 description: >-
-  Master round-robin cloud experimentation orchestrator and ground rules for
-  sheet-music-converter across Modal, Kaggle, Local RTX 4080 SUPER, and Hugging
-  Face Private Dataset Hub. Activate whenever planning, dispatching, monitoring,
-  or resuming cloud OMR training, ablations, data prep, or OOD evaluation runs.
+  Master round-robin & DAG cloud experimentation orchestrator and ground rules for
+  sheet-music-converter across Google Colab (L4/A100), Modal (L4/A10G/A100),
+  Kaggle (2x T4), Local RTX 4080 SUPER, and Hugging Face Private Dataset Hub.
+  Activate whenever planning, dispatching, monitoring, or resuming cloud OMR
+  training, ablations, data prep, or OOD evaluation runs.
 ---
 
-# Test in Cloud — Master Round-Robin Orchestration & Ground Rules
+# Test in Cloud — Master Multi-Provider DAG Orchestration & Ground Rules
 
-**Trigger:** Activate this skill whenever dispatching or resuming any OMR training run, proxy ablation, or data job on cloud GPUs (`Modal` / `Kaggle`) or coordinating parallel runs alongside the local `RTX 4080 SUPER`. Always pair with the provider-specific skill (`cloud-modal`, `cloud-kaggle`, `cloud-huggingface`) and follow up every finished run with `learn-from-suite31`.
+**Trigger:** Activate this skill whenever dispatching or resuming any OMR training run, proxy ablation, or data job on cloud GPUs (`Colab` / `Modal` / `Kaggle`) or coordinating parallel runs alongside the local `RTX 4080 SUPER`. Always pair with the provider-specific skill (`cloud-colab`, `cloud-modal`, `cloud-kaggle`, `cloud-huggingface`), `running-an-experiment`, and `experiment-finished` (plus `learn-from-suite31` after `suite31_hw` evals).
 
 ---
 
@@ -47,10 +48,23 @@ All compute providers pull identical sharded datasets/manifests from and push ch
 
 | Provider | Free / Cost | Hardware & Precision | Best Workload | Avoid For |
 |---|---|---|---|---|
-| **Modal** (`cloud-modal`) | `$30/mo` free credit | `L4` (24 GB), `A10G` (24 GB), `A100` (40/80 GB), `H100` (80 GB) — **BF16 native** | Fast `15–45 min` parallel bursts (3–5 ablations at once), `UniOMR v2` BF16/Muon trials, heavy `1536px` full-page sweeps | Idle interactive debugging; burning `$30/mo` on slow 12h runs that fit on Kaggle/Local |
-| **Kaggle** (`cloud-kaggle`) | `30 hrs/wk` free | `2× T4` (32 GB total, Turing SM 7.5) — **FP16 ONLY (NO native BF16!)** | Long `2–8 h` background ablations, CPU+GPU data prep / style-transfer, FP16-compatible `v1`/`v2` runs while Modal/Local are busy | Anything requiring `--bf16` or >20 GB local scratch disk |
+| **Google Colab** (`cloud-colab`) | `~1,478 CU` Pro+ pool (`~2.33 CU/hr` on `L4` ≈ `635` L4-hrs) | `2× L4` (24 GB, `cc=8.9`) + independent `A100` (40 GB, `cc=8.0`) — **BF16 native**, `torch 2.14.1+cu130` pre-installed | Primary overnight DAG runner (`run_queue_colab.py --max-parallel 2`), `15–60 min` BF16 ablations, academic frontier runs (`A100`), fast Rust+ONNX builds | Leaving named sessions idle (ALWAYS `colab stop -s <name>` in `finally`) |
+| **Modal** (`cloud-modal`) | `$30/mo` free credit | `L4` (24 GB), `A10G` (24 GB), `A100` (40/80 GB), `H100` (80 GB) — **BF16 native** (up to 7 concurrent `L4`s verified) | High-fanout parallel bursts (`fn.spawn()` via `modal run --detach`), `UniOMR v2` BF16/Muon/V-JEPA/CUT-RISM trials | Idle interactive debugging; burning `$30/mo` on jobs that fit on Colab/Kaggle |
+| **Kaggle** (`cloud-kaggle`) | `30 hrs/wk` free (`2× T4`, refreshes weekly) | `2× T4` (14.56 GiB × 2, Turing SM 7.5) — **FP16/FP32 ONLY (NO native BF16!)**, HF auth via private dataset `gregoreesmaa/omr-hf-auth` | Cooperative parallel DAG worker (`run_queue_kaggle.py --max-parallel 2`, tail-first) for T4/FP16-safe eval, decoding, TTA, RLVR/pseudo-label sweeps & data prep | Anything requiring `--bf16` or >20 GB `/kaggle/working` disk (unpack to `/tmp`) |
 | **Local RTX 4080 SUPER** | `~$0.05/hr` electricity | `1× 4080 SUPER` (16 GB, Ada SM 8.9) — **BF16 native** | Primary overnight production runs (`Iter 10.5`, `Iter 11`, `Iter 12`) and fast interactive `suite31_hw` OOD evals | Parallel 4-way hyperparameter sweeps |
-| **Hugging Face Hub** (`cloud-huggingface`) | `$0` private dataset storage & bandwidth | Private Dataset Repo (`datasets/`, `manifests/`, `checkpoints/`, `evals/`, `runs/`) | Single source of truth for sharded data, rolling checkpoints, run ledger, and `suite31_hw` eval JSONs | Uploading 50k tiny raw PNGs (always tar/zip into 1–2 GB shards) or per-step commits |
+| **Hugging Face Hub** (`cloud-huggingface`) | `$0` private dataset storage & bandwidth | Private Dataset Repo (`datasets/`, `manifests/`, `checkpoints/`, `evals/`, `code/`, `runs/`) | Single source of truth for sharded data, code bundles, rolling checkpoints, and `suite31_hw` eval JSONs | Uploading 50k tiny raw PNGs (always tar/zip into 1–2 GB shards) or per-step commits |
+
+---
+
+## Cooperative Multi-Provider DAG Scheduling (No Wave Barriers!)
+
+**Think in dependency chains (`depends_on`), NEVER waves.** Any experiment whose `depends_on` predecessors are all satisfied (`COMPLETED` in `queue.json`, local `OUTCOME.md`, or `evals/<dep>.json` on HF) may start immediately on any compatible provider:
+
+1. **Shared queue & atomic locking:** All overnight/follow-up experiments live in `experiments/overnight_queue/queue.json`. Workers coordinate via an atomic `.queue.lock` file + `tmp + os.replace` writes AND check HF `evals/<exp_id>.json` before launching (auto-skipping already-completed jobs).
+2. **Opposite-end multi-provider fan-out:**
+   - `run_queue_colab.py --max-parallel 2` works **front-to-back** across all BF16 `L4` jobs (with 60s `[WAIT-SLOT]` retry on Colab's 2-L4 cap).
+   - `run_queue_kaggle.py --max-parallel 2` works **tail-first (`--order reverse`)** across T4/FP16-safe jobs (with 60s `[WAIT-SLOT]` retry on Kaggle's 2-GPU cap and `title == slug` `omr-ov-XX` metadata).
+3. **Mandatory `experiment-finished` loop:** Whenever any cloud/local job finishes, immediately run `experiment-finished` (pull HF JSON, scrutinize, write `OUTCOME.md`, amend provider skills, and on **`ITERATE`** immediately formulate, implement, and append a follow-up experiment with `depends_on: [<parent_id>]` to `queue.json`).
 
 ---
 
