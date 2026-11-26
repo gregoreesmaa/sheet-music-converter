@@ -193,6 +193,12 @@ resolves to the WSL stub and fails. Each crate also runs standalone —
     batches — NEVER force `CUDNN_ATTENTION` (cuDNN 9.10 recompiles a CPU
     execution plan ~640 ms/shape, causing a 49× slowdown under dynamic routing
     + multi-scale + variable sequence lengths).
+  - **NEVER combine `--channels-last` + `cudnn.enabled=True` on variable `(H, W)`
+    multi-scale full-page batches on Windows cuDNN 9.10** — cuDNN 9.10 spends
+    `~5.12 s` of CPU time per unseen `(H, W)` shape recompiling
+    `convolution_backward` / `cudnn_convolution` plans (`5.20 s` vs `0.156 s`
+    with `--no-cudnn` and NCHW = **33.3× slower**). Always pass `--no-cudnn`
+    (and omit `--channels-last`) for multi-scale full-page runs on Windows.
   - NEVER call `.pin_memory()` inside `ThreadPoolExecutor` background threads
     on Windows WDDM (`cudaHostAlloc` takes a global CUDA driver lock and stalls
     the main GPU thread).

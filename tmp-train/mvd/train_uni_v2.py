@@ -2114,6 +2114,8 @@ def run_train_v2(args: argparse.Namespace) -> Dict[str, Any]:
     if device.type == "cuda":
         torch.backends.cuda.matmul.allow_tf32 = True
         torch.backends.cudnn.allow_tf32 = True
+        if bool(getattr(args, "no_cudnn", False)):
+            torch.backends.cudnn.enabled = False
         # Force CUTLASS EFFICIENT_ATTENTION globally (covers frozen v1 teacher SDPA too;
         # avoids cuDNN 9.10's ~640ms/shape CPU plan recompilation on variable (mem, T) shapes).
         if hasattr(torch.backends.cuda, "enable_cudnn_sdp"):
@@ -2753,6 +2755,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--init-encoder-from", type=str, default=None, help="Load I-JEPA v2 encoder weights (strict=False)")
     p.add_argument("--grad-checkpoint", action="store_true", help="Enable axial-only selective checkpointing")
     p.add_argument("--channels-last", action="store_true", help="Use channels_last on backbone")
+    p.add_argument("--no-cudnn", action="store_true", help="Disable cuDNN (avoids cuDNN 9.10 33x conv plan recompilation stall on variable HxW shapes on Windows)")
     p.add_argument("--dropout", type=float, default=0.1)
     p.add_argument("--mixstyle-prob", type=float, default=0.3)
     p.add_argument("--tok-dropout", type=float, default=0.05)
