@@ -50,6 +50,7 @@ If any new cloud, hardware, PyTorch, or tooling quirk was discovered, **immediat
 ### 6. Update Ledgers & DAG Queue
 - Update `experiments/README.md` (and `experiments/overnight_queue/queue.json` status to `COMPLETED` / `FAILED`) so any downstream DAG experiments whose `depends_on` predecessors are now satisfied immediately unlock and start.
 - For major `suite31_hw` model runs, update `progress.md` and `todo.md` and run the 6-scout `learn-from-suite31` loop before launching the next major training iteration.
+- **OMR-NorthStar trigger:** Whenever ANY `eval-northstar-*` run completes (for UniOMR or a competitor baseline), **immediately activate `learn-from-northstar`** (`.agents/skills/learn-from-northstar/SKILL.md`) to log the full NorthStar ledger, run the 6-scout CPU forensic swarm, categorize fixes (`Model` / `Export` / `Inference` / `Harness`), and feed them into the next iteration.
 
 ### 7. Git Commit & Push
 - Commit `OUTCOME.md`, any skill amendments, and any newly queued `ITERATE` follow-up experiment (`Gregor Eesmaa <6941817+gregoreesmaa@users.noreply.github.com>`) and push to `origin master`.

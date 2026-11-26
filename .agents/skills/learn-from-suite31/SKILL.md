@@ -15,6 +15,9 @@ description: >-
 
 **Trigger:** Activate this skill **automatically** the moment ANY OMR training run finishes (starting at Step 0) OR whenever a `suite31_hw` benchmark finishes (starting at Step 1). Never launch a new training run without completing this loop + committing & pushing first.
 
+> [!TIP]
+> **Running alongside OMR-NorthStar:** Whenever an **OMR-NorthStar** (`eval_northstar_runner.py` / `eval-northstar-*`) evaluation also runs alongside `suite31_hw`, activate **`learn-from-northstar`** (`.agents/skills/learn-from-northstar/SKILL.md`) in tandem so `CDR`/`ALS`/`RWP`/`HWM`, expressive/structural axes (`S_expr`/`S_struct`/`S_play`), human utility (`wFPP`/`NTSR`/`NUPR`), negative controls (`NMHR`), and competitor differentials (`homr`/`Audiveris`/`oemer`) receive the same 6-scout forensic autopsy before the next training iteration.
+
 ## Core Principles (Standing Rules)
 
 1. **Strict Musical `Note F1` is the only real scoreboard.** Never let flattering in-distribution val `Tok F1` mask OOD `suite31_hw` `Note F1`. Always report all 4 slices (`printed_clean`, `printed_photo`, `hw_clean`, `hw_photo`) side-by-side against the previous iteration and our best 2-stage baseline.
