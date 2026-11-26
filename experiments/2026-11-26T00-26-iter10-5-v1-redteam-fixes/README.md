@@ -1,6 +1,6 @@
 # `2026-11-26T00-26-iter10-5-v1-redteam-fixes` — Iter 10.5 (`v1` Architecture With All Red-Team & Data Fixes)
 
-- **Status:** `RUNNING` (started `2026-11-26 00:26`, Local RTX 4080 SUPER)
+- **Status:** `COMPLETED (PROMOTE)` (Local RTX 4080 SUPER, `2026-11-26 00:26 → 02:25 EET`, `8,000` steps — new all-time `suite31_hw` record: `all45_clean 0.6984` / `0.7004` clean_gt, `all45_photo 0.6832` / `0.6850` clean_gt, `hw_photo 0.2174` / `0.2232` clean_gt, printed fixes median `12.0`)
 - **Baseline:** Commit `052e210` | Warm-start checkpoint: `D:\tmp\mvd-runs\uni-omr-iter10-v1\uni_omr_soup.pt` (`printed_clean 0.8895`, `printed_photo 0.8738`, `hw_clean 0.2550`, `hw_photo 0.1516`, `all45_clean 0.6921`)
 - **Reference Best (Iter 10 `step 12k`):** `printed_clean 0.8993`, `printed_photo 0.8942`, `hw_clean 0.1953`, `hw_photo 0.1376`, `all45_clean 0.6802`
 
@@ -11,4 +11,4 @@ Isolate and validate all 15 silent training, router, augmentation, grammar, and 
 
 ## Links
 - Plan & Query IDs: [PLAN.md](./PLAN.md)
-- Outcome: `OUTCOME.md` *(to be written immediately after step-8,000 `suite31_hw` OOD eval completes)*
+- Outcome: [OUTCOME.md](./OUTCOME.md) (**`PROMOTE`** — new `v1` teacher for Iter 11 [`2026-11-26T02-40-iter11-v2-24k`](../2026-11-26T02-40-iter11-v2-24k/README.md))

@@ -27,7 +27,7 @@ experiments/
 
 | # | Experiment / Slug | Platform | Wave | Status |
 |---|---|---|---|---|
-| 0 | [2026-11-26T00-26-iter10-5-v1-redteam-fixes](./2026-11-26T00-26-iter10-5-v1-redteam-fixes/) | Local RTX 4080 SUPER | Active | `RUNNING` (`task-1383`, 8k steps) |
+| 0 | [2026-11-26T00-26-iter10-5-v1-redteam-fixes](./2026-11-26T00-26-iter10-5-v1-redteam-fixes/OUTCOME.md) | Local RTX 4080 SUPER | Active | `COMPLETED (PROMOTE)` — new record `all45_clean=0.6984` (`0.7004` clean_gt), `all45_photo=0.6832`, `hw_photo=0.2174`, printed fixes `12.0`; promoted as Iter 11 `v1` teacher |
 | 1 | `cut-rism-real-ink-v06` (`train_cut_rism.py` + translate `hw-sim-v06`) | Kaggle `2× T4` (FP16) | Wave 1 | `QUEUED` (waiting on HF shards) |
 | 2 | [2026-11-26T00-54-vjepa21-gram-rism-v2](./2026-11-26T00-54-vjepa21-gram-rism-v2/OUTCOME.md) (`pretrain_ijepa_rism_v2.py`, 1.5k steps) | Modal `L4` (BF16) | Wave 1 | `COMPLETED (ITERATE)` — rank collapse (`mem_erank=2.6`); DO NOT warm-start Iter 11 |
 | 2b | [2026-11-26T02-20-vjepa21-vicreg-anticollapse-rism-v2](./2026-11-26T02-20-vjepa21-vicreg-anticollapse-rism-v2/) (`VICReg + KL-router + no-random-gram` + `suite31_hw` transfer) | Colab `L4` (BF16) | Wave 7 | `QUEUED` (successor to Exp 2) |
