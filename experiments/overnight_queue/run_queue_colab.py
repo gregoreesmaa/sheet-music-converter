@@ -378,14 +378,23 @@ def _run_one_experiment(
             )
             log_f.flush()
 
-            rc_new = _run_subprocess_logged(
-                [str(colab_exe), "new", "-s", session, "--gpu", gpu],
-                log_f,
-                label="colab-new",
-            )
+            rc_new = 1
+            for attempt in range(1, 361):
+                rc_new = _run_subprocess_logged(
+                    [str(colab_exe), "new", "-s", session, "--gpu", gpu],
+                    log_f,
+                    label="colab-new",
+                )
+                if rc_new == 0:
+                    break
+                if attempt == 1 or attempt % 10 == 0:
+                    _log_console(
+                        f"[WAIT-SLOT] {exp_id} ({session}): Colab {gpu} busy (attempt {attempt}/360), retrying in 60s..."
+                    )
+                time.sleep(60)
             if rc_new != 0:
                 rc = rc_new
-                raise RuntimeError(f"colab new failed (rc={rc_new})")
+                raise RuntimeError(f"colab new failed after retries (rc={rc_new})")
             session_created = True
 
             rc_up1 = _run_subprocess_logged(
@@ -635,40 +644,111 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     bundle_path = temp_dir / "ov_mvd_bundle.tar.gz"
     _build_shared_bundle(bundle_path)
 
-    waves = sorted({int(e["wave"]) for e in selected})
+    from concurrent.futures import FIRST_COMPLETED, wait as fut_wait
+
+    # Build DAG state: any experiment whose `depends_on` predecessors are all COMPLETED
+    # (either in this queue or already present on HF `evals/<dep>.json`) may start immediately!
+    queue_ids = {str(e["id"]) for e in selected}
+    completed_ids = {
+        str(e["id"]) for e in selected if str(e.get("status", "QUEUED")) == "COMPLETED"
+    }
+    failed_ids = set()
+    ext_dep_cache: Dict[str, bool] = {}
+
+    def _dep_satisfied(dep_id: str) -> bool:
+        if dep_id in completed_ids:
+            return True
+        if dep_id in queue_ids:
+            return False
+        if ext_dep_cache.get(dep_id):
+            return True
+        ok = _hf_eval_exists(f"evals/{dep_id}.json", hf_token_str)
+        if ok:
+            ext_dep_cache[dep_id] = True
+        return ok
+
+    pending = [
+        e for e in selected if str(e.get("status", "QUEUED")) != "COMPLETED"
+    ]
+    pending.sort(key=lambda e: (int(e.get("priority", 999)), int(e["est_minutes"]), str(e["id"])))
+
+    _log_console(
+        f"=== Starting DAG Dependency-Chain Scheduler: {len(pending)} pending / {len(completed_ids)} already done (max_parallel={args.max_parallel}) ==="
+    )
     failures = 0
     try:
-        for wave in waves:
-            wave_exps = [
-                e
-                for e in selected
-                if int(e["wave"]) == wave and str(e.get("status", "QUEUED")) != "COMPLETED"
-            ]
-            if not wave_exps:
-                _log_console(f"=== Wave {wave}: all experiments already COMPLETED ===")
-                continue
-            _log_console(
-                f"=== Starting Wave {wave}: {len(wave_exps)} experiments (max_parallel={args.max_parallel}) ==="
-            )
-            with ThreadPoolExecutor(max_workers=max(1, int(args.max_parallel))) as pool:
-                futs = [
-                    pool.submit(
-                        _run_one_experiment,
-                        exp,
-                        queue_path=queue_path,
-                        queue=queue,
-                        colab_exe=args.colab_exe,
-                        gpu=args.gpu,
-                        bundle_path=bundle_path,
-                        hf_token_file=hf_token_file,
-                        hf_token_str=hf_token_str,
-                        log_dir=args.log_dir,
-                    )
-                    for exp in wave_exps
-                ]
-                for fut in as_completed(futs):
+        with ThreadPoolExecutor(max_workers=max(1, int(args.max_parallel))) as pool:
+            running: Dict[object, Dict[str, Any]] = {}
+            while pending or running:
+                # 1. Fail-fast any node whose in-queue predecessor FAILED
+                still_pending = []
+                for exp in pending:
+                    deps = [str(d) for d in exp.get("depends_on", [])]
+                    bad_deps = [d for d in deps if d in failed_ids]
+                    if bad_deps:
+                        _log_console(
+                            f"[BLOCKED] {exp['id']}: predecessor(s) failed: {bad_deps}"
+                        )
+                        _update_queue_entry(
+                            queue_path,
+                            queue,
+                            exp["id"],
+                            {"status": "BLOCKED", "blocked_by": bad_deps},
+                        )
+                        failed_ids.add(str(exp["id"]))
+                        failures += 1
+                    else:
+                        still_pending.append(exp)
+                pending = still_pending
+
+                # 2. Launch any ready experiment whose predecessors are all finished
+                launched_any = False
+                if len(running) < max(1, int(args.max_parallel)):
+                    next_pending = []
+                    for exp in pending:
+                        deps = [str(d) for d in exp.get("depends_on", [])]
+                        if len(running) < max(1, int(args.max_parallel)) and all(
+                            _dep_satisfied(d) for d in deps
+                        ):
+                            fut = pool.submit(
+                                _run_one_experiment,
+                                exp,
+                                queue_path=queue_path,
+                                queue=queue,
+                                colab_exe=args.colab_exe,
+                                gpu=args.gpu,
+                                bundle_path=bundle_path,
+                                hf_token_file=hf_token_file,
+                                hf_token_str=hf_token_str,
+                                log_dir=args.log_dir,
+                            )
+                            running[fut] = exp
+                            launched_any = True
+                        else:
+                            next_pending.append(exp)
+                    pending = next_pending
+
+                if not running:
+                    if not pending:
+                        break
+                    if not launched_any:
+                        # Waiting on external HF predecessor(s) (e.g. Modal Exp 2)
+                        _log_console(
+                            f"[WAIT-DEPS] {len(pending)} experiment(s) waiting on external predecessor(s); re-checking HF in 30s..."
+                        )
+                        time.sleep(30)
+                    continue
+
+                done, _ = fut_wait(
+                    running.keys(), timeout=30.0, return_when=FIRST_COMPLETED
+                )
+                for fut in done:
+                    exp = running.pop(fut)
                     res = fut.result()
-                    if res.get("status") != "COMPLETED":
+                    if res.get("status") == "COMPLETED":
+                        completed_ids.add(str(exp["id"]))
+                    else:
+                        failed_ids.add(str(exp["id"]))
                         failures += 1
     finally:
         if temp_tok_to_del and temp_tok_to_del.exists():

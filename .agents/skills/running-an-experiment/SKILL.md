@@ -84,11 +84,19 @@ Must record:
    ```
    *(If the remote branch is `master` or `main`, push cleanly so every launched experiment maps to a pushed commit SHA!)*
 3. **Launch & Record Query IDs:** Launch the run with `--save-every-minutes 5.0`. If cloud launch returns a new `app_id` / kernel URL, immediately record it in `PLAN.md` (and commit/push).
-4. **Evaluate & Learn:** When the run completes, run the 45-piece `suite31_hw` OOD evaluation (and `learn-from-suite31` forensic audit for any training run).
-5. **Write `OUTCOME.md`, Amend Skills, Commit & Push:**
-   - Write `experiments/YYYY-MM-DDTHH-MM-<slug>/OUTCOME.md`, update `README.md` status, amend provider skills if any new platform learning occurred, and commit + push!
+4. **Mandatory Early Health Check-In (3–5 min after launch):** Within **3–5 minutes** of launching ANY local or cloud experiment, inspect live logs & GPU state (`modal app logs <app_id>`, `kaggle kernels status <slug>`, or `manage_task status` + `nvidia-smi`) to verify:
+   - Zero startup/auth/import/OOM crashes or silent hangs.
+   - GPU is actively running at expected precision (`BF16` on `cc >= 8`, `FP16` on T4), loss is finite and moving cleanly, and the 5-minute checkpointing loop is healthy.
+   - Catching a broken run at minute 3 saves hours of wasted GPU quota!
+5. **On Completion — Activate `experiment-finished` Skill Immediately:** Whenever ANY local or cloud experiment finishes, follow `.agents/skills/experiment-finished/SKILL.md`:
+   - Pull & verify artifacts (`evals/<exp_id>.json`, `runs/<exp_id>.json`, checkpoints) and verify remote VMs are stopped (zero idle burn).
+   - **Scrutinize results** (`## Scrutiny & Anomaly Check`) — never trust numbers blindly (check truncated `max_len`, silent FP32/CPU fallback, NaNs, domain asymmetry, missing keys).
+   - Write `experiments/YYYY-MM-DDTHH-MM-<slug>/OUTCOME.md` with clear verdict (`PROMOTE` / `ITERATE` / `DISCARD`) and amend relevant provider skills immediately with any new empirical learnings.
+   - **Mandatory `ITERATE` Continuation Rule:** Whenever the verdict is **`ITERATE`**, **ALWAYS immediately formulate, implement, and queue a follow-up experiment** (`depends_on: ["<this_exp_id>"]`) directly targeting the diagnosed bottleneck/asymmetry — never leave an `ITERATE` verdict dangling without a queued successor!
+6. **DAG Dependency-Chain Scheduling (Never Wave Barriers):** Think of queued experiments as a **DAG of dependency chains (`depends_on: [...]`)**, NOT rigid waves. As soon as all of an experiment's predecessors have finished (`COMPLETED` locally or on HF `evals/`), it is immediately eligible to launch on the next free GPU slot.
+7. **Commit & Push:**
    ```powershell
-   git add experiments/YYYY-MM-DDTHH-MM-<slug>/ .agents/skills/
-   git -c user.name="Gregor Eesmaa" -c user.email="6941817+gregoreesmaa@users.noreply.github.com" commit -m "exp(<slug>): record OUTCOME and verdict"
-   git push origin HEAD:main
+   git add experiments/ .agents/skills/
+   git -c user.name="Gregor Eesmaa" -c user.email="6941817+gregoreesmaa@users.noreply.github.com" commit -m "exp(<slug>): record OUTCOME, skill updates, and follow-up DAG experiment"
+   git push origin master
    ```
