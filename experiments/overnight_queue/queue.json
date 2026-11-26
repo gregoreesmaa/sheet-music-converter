@@ -776,13 +776,17 @@
     "est_cu": 2.1,
     "script": "experiments/2026-11-26T07-40-i13-13-cross-system-header-consensus/run_colab.py",
     "hf_eval_target": "evals/2026-11-26T07-40-i13-13-cross-system-header-consensus.json",
-    "status": "RUNNING",
+    "status": "FAILED",
     "depends_on": [],
     "session": "i13-13",
     "started_at": "2026-11-26T17:47:27Z",
     "log_path": "D:\\tmp\\overnight-queue-logs\\2026-11-26T07-40-i13-13-cross-system-header-consensus.kaggle.log",
     "note": "re-queued after triage fix 2026-11-26 (round 3)",
-    "kernel_id": "gregoreesmaa/omr-i13-13"
+    "kernel_id": "gregoreesmaa/omr-i13-13",
+    "completed_at": "2026-11-26T19:09:20Z",
+    "elapsed_sec": 4913.17,
+    "returncode": 1,
+    "failure_reason": "kaggle_state=ERROR hf_eval_exists=False"
   },
   {
     "id": "2026-11-26T07-40-i13-14-photo-illum-flatten-autocrop",
@@ -1099,7 +1103,7 @@
     "plan": "experiments/2026-11-26T07-40-i13-26-gqa-kv-heads-sweep/PLAN.md",
     "hf_eval_target": "evals/2026-11-26T07-40-i13-26-gqa-kv-heads-sweep.json",
     "hf_run_target": "runs/2026-11-26T07-40-i13-26-gqa-kv-heads-sweep.json",
-    "status": "RUNNING",
+    "status": "COMPLETED",
     "depends_on": [],
     "datasets": [
       "datasets/iter10_5_proxy_2k.tar"
@@ -1126,7 +1130,10 @@
     "session": "i13-26",
     "started_at": "2026-11-26T18:01:45Z",
     "log_path": "D:\\tmp\\overnight-queue-logs\\2026-11-26T07-40-i13-26-gqa-kv-heads-sweep.log",
-    "note": "re-queued after triage fix 2026-11-26 (round 2)"
+    "note": "re-queued after triage fix 2026-11-26 (round 2)",
+    "completed_at": "2026-11-26T19:21:03Z",
+    "elapsed_sec": 4757.28,
+    "returncode": 0
   },
   {
     "id": "2026-11-26T07-40-i13-27-rope-coord-scale-sweep",
@@ -1144,7 +1151,7 @@
     "plan": "experiments/2026-11-26T07-40-i13-27-rope-coord-scale-sweep/PLAN.md",
     "hf_eval_target": "evals/2026-11-26T07-40-i13-27-rope-coord-scale-sweep.json",
     "hf_run_target": "runs/2026-11-26T07-40-i13-27-rope-coord-scale-sweep.json",
-    "status": "RUNNING",
+    "status": "COMPLETED",
     "depends_on": [],
     "datasets": [
       "datasets/iter10_5_proxy_2k.tar"
@@ -1171,7 +1178,10 @@
     "session": "i13-27",
     "started_at": "2026-11-26T18:08:48Z",
     "log_path": "D:\\tmp\\overnight-queue-logs\\2026-11-26T07-40-i13-27-rope-coord-scale-sweep.log",
-    "note": "re-queued after triage fix 2026-11-26 (round 2)"
+    "note": "re-queued after triage fix 2026-11-26 (round 2)",
+    "completed_at": "2026-11-26T19:27:05Z",
+    "elapsed_sec": 4696.3,
+    "returncode": 0
   },
   {
     "id": "2026-11-26T07-40-i13-28-decoupled-wd-norm-nodecay",
@@ -1460,16 +1470,14 @@
     "est_cu": 1.7,
     "script": "experiments/2026-11-26T14-30-i13-16b-mathpix-conf-gated-redecode-fixed/run_colab.py",
     "hf_eval_target": "evals/2026-11-26T14-30-i13-16b-mathpix-conf-gated-redecode-fixed.json",
-    "status": "FAILED",
+    "status": "QUEUED",
     "depends_on": [
       "2026-11-26T07-40-i13-16-mathpix-conf-gated-redecode"
     ],
     "session": "i13-16",
     "started_at": "2026-11-26T18:03:27Z",
     "log_path": "D:\\tmp\\overnight-queue-logs\\2026-11-26T14-30-i13-16b-mathpix-conf-gated-redecode-fixed.log",
-    "completed_at": "2026-11-26T18:08:48Z",
-    "elapsed_sec": 320.89,
-    "returncode": 1
+    "note": "re-queued after fixing _select_beam_kv cross_kv batch-dim mismatch bug (2026-11-26)"
   },
   {
     "id": "2026-11-26T14-30-i13-18b-conf-gated-ilms-blank",
@@ -1510,16 +1518,19 @@
     "id": "2026-11-26T16-20-i13-06c-sar-sam-tight-conf-skip",
     "wave": 10,
     "priority": 4,
-    "provider": "colab_l4",
-    "gpu": "L4",
+    "provider": "kaggle",
+    "gpu": "2xT4",
     "est_minutes": 32,
     "est_cu": 2.6,
     "script": "experiments/2026-11-26T16-20-i13-06c-sar-sam-tight-conf-skip/run_colab.py",
     "hf_eval_target": "evals/2026-11-26T16-20-i13-06c-sar-sam-tight-conf-skip.json",
-    "status": "QUEUED",
+    "status": "RUNNING",
     "depends_on": [
       "2026-11-26T14-30-i13-06b-sar-sam-conf-skip-ttt"
-    ]
+    ],
+    "kernel_id": "gregoreesmaa/omr-i13-06c",
+    "started_at": "2026-11-26T19:09:20Z",
+    "log_path": "D:\\tmp\\overnight-queue-logs\\2026-11-26T16-20-i13-06c-sar-sam-tight-conf-skip.kaggle.log"
   },
   {
     "id": "2026-11-26T16-20-ov-33b-vjepa-warmstart-fixed-eval",
@@ -1531,10 +1542,13 @@
     "est_cu": 3.6,
     "script": "experiments/2026-11-26T16-20-ov-33b-vjepa-warmstart-fixed-eval/run_colab.py",
     "hf_eval_target": "evals/2026-11-26T16-20-ov-33b-vjepa-warmstart-fixed-eval.json",
-    "status": "QUEUED",
+    "status": "RUNNING",
     "depends_on": [
       "2026-11-26T01-38-ov-33-vjepa-warmstart-vs-scratch"
-    ]
+    ],
+    "session": "ov-33b",
+    "started_at": "2026-11-26T19:21:03Z",
+    "log_path": "D:\\tmp\\overnight-queue-logs\\2026-11-26T16-20-ov-33b-vjepa-warmstart-fixed-eval.log"
   },
   {
     "id": "2026-11-26T16-20-ov-31b-vjepa-mask-curriculum-vicreg",
@@ -1546,10 +1560,13 @@
     "est_cu": 3.1,
     "script": "experiments/2026-11-26T16-20-ov-31b-vjepa-mask-curriculum-vicreg/run_colab.py",
     "hf_eval_target": "evals/2026-11-26T16-20-ov-31b-vjepa-mask-curriculum-vicreg.json",
-    "status": "QUEUED",
+    "status": "RUNNING",
     "depends_on": [
       "2026-11-26T01-38-ov-31-vjepa21-mask-ratio-sweep"
-    ]
+    ],
+    "session": "ov-31b",
+    "started_at": "2026-11-26T19:27:05Z",
+    "log_path": "D:\\tmp\\overnight-queue-logs\\2026-11-26T16-20-ov-31b-vjepa-mask-curriculum-vicreg.log"
   },
   {
     "id": "2026-11-26T16-20-ov-32b-gram-weight-high-vicreg",
@@ -1564,6 +1581,23 @@
     "status": "QUEUED",
     "depends_on": [
       "2026-11-26T01-38-ov-32-dinov3-gram-weight-sweep"
+    ]
+  },
+  {
+    "id": "2026-11-26T19-35-i13-26b-asymmetric-gqa-cross-mha",
+    "short_id": "i13-26b",
+    "title": "Asymmetric GQA (n_kv_heads_self=2, n_kv_heads_cross=8) vs 2/2 vs 8/8 at 800 Steps",
+    "wave": 10,
+    "priority": 8,
+    "provider": "colab_l4",
+    "gpu": "L4",
+    "est_minutes": 50,
+    "est_cu": 3.8,
+    "script": "experiments/2026-11-26T19-35-i13-26b-asymmetric-gqa-cross-mha/run_colab.py",
+    "hf_eval_target": "evals/2026-11-26T19-35-i13-26b-asymmetric-gqa-cross-mha.json",
+    "status": "QUEUED",
+    "depends_on": [
+      "2026-11-26T07-40-i13-26-gqa-kv-heads-sweep"
     ]
   }
 ]

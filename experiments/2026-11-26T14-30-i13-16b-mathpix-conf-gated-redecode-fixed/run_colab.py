@@ -253,7 +253,9 @@ def _select_beam_kv(past_kvs: Any, parent_indices: List[int]) -> List[Any]:
         self_kv, cross_kv = layer_kv
         sk = self_kv[0].index_select(0, idx)
         sv = self_kv[1].index_select(0, idx)
-        out.append(((sk, sv), cross_kv))
+        ck = cross_kv[0].index_select(0, idx)
+        cv = cross_kv[1].index_select(0, idx)
+        out.append(((sk, sv), (ck, cv)))
     return out
 
 

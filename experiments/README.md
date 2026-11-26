@@ -59,3 +59,6 @@ experiments/
 | NS-2 | [2026-11-26T14-40-eval-northstar-audiveris](./2026-11-26T14-40-eval-northstar-audiveris/) (Audiveris 5.3.1 black-box Docker AGPL-3.0 baseline on OMR-NorthStar) | Local CPU + Docker | NorthStar | `PLANNED` |
 | NS-3 | [2026-11-26T14-40-eval-northstar-oemer](./2026-11-26T14-40-eval-northstar-oemer/) (`oemer` MIT black-box CLI baseline on OMR-NorthStar) | Local CPU | NorthStar | `PLANNED` |
 | NS-4 | [2026-11-26T14-40-eval-northstar-homr](./2026-11-26T14-40-eval-northstar-homr/) (`homr` MIT isolated-venv neural OMR baseline on OMR-NorthStar) | Local CPU | NorthStar | `PLANNED` |
+| i13-26 | [2026-11-26T07-40-i13-26-gqa-kv-heads-sweep](./2026-11-26T07-40-i13-26-gqa-kv-heads-sweep/) (Decoder GQA `n_kv_heads` ∈ `{1,2,4,8}` sweep; `kv8_mha` +4.19 pp EMA F1) | Colab L4 | proxy_val | `ITERATE` -> `i13-26b` |
+| i13-27 | [2026-11-26T07-40-i13-27-rope-coord-scale-sweep](./2026-11-26T07-40-i13-27-rope-coord-scale-sweep/) (RoPE `rope_coord_scale` ∈ `{32,64,128,256}` sweep; 0.12 pp spread, retain 128.0) | Colab L4 | proxy_val | `DISCARD` |
+| i13-26b | [2026-11-26T19-35-i13-26b-asymmetric-gqa-cross-mha](./2026-11-26T19-35-i13-26b-asymmetric-gqa-cross-mha/) (Asymmetric GQA `self=2, cross=8` vs `2/2` vs `8/8` at 800 steps) | Colab L4 | proxy_val | `QUEUED` |
