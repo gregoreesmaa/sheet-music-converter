@@ -236,8 +236,14 @@ if (-not $SkipEval) {
     if ($LASTEXITCODE -ne 0) {
         throw "Iter 13 Eval Pass 2 failed with exit code $LASTEXITCODE"
     }
+
+    Write-Host "=== [Iter 13 Eval Pass 3] Full 125-page OMR-NorthStar (neg-control-gate + fixed mscz-rs export) ==="
+    & $Python -u "experiments/2026-11-26T14-40-eval-northstar-iter12-v2/run_eval.py" --ckpt $Stage2Ckpt --system-name "uni-omr-iter13-v2-24k-ema" --out-dir "D:\tmp\northstar-eval-runs\iter13-v2" --device cuda --bf16 --neg-control-gate
+    if ($LASTEXITCODE -ne 0) {
+        throw "Iter 13 Eval Pass 3 (OMR-NorthStar) failed with exit code $LASTEXITCODE"
+    }
 } else {
     Write-Host "=== [Iter 13 Eval] Skipped (-SkipEval) ==="
 }
 
-Write-Host "=== [Iter 13] Complete! Activate learn-from-suite31 and experiment-finished skills next. ==="
+Write-Host "=== [Iter 13] Complete! Activate learn-from-suite31, learn-from-northstar, and experiment-finished skills next. ==="

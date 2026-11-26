@@ -46,9 +46,10 @@ DEFAULT_PHOTO_DEGRADE_BINS: Tuple[Path, ...] = (
 # Realistic phone-photo profile weights per domain.
 DOMAIN_PROFILE_WEIGHTS: Dict[str, Tuple[Tuple[str, float], ...]] = {
     "printed": (
-        ("phone-photo", 0.45),
-        ("sheet-music", 0.30),
-        ("book-gutter-bend", 0.15),
+        ("phone-photo", 0.25),
+        ("archival-manuscript", 0.25),
+        ("book-gutter-bend", 0.25),
+        ("sheet-music", 0.15),
         ("office-scan", 0.10),
     ),
     "hw": (
@@ -262,6 +263,7 @@ def _build_cmd(
     max_width: int,
     scale_min: float,
     reduced: bool,
+    export_masks: bool = False,
 ) -> List[str]:
     cmd = [
         str(bin_path),
@@ -287,6 +289,8 @@ def _build_cmd(
     ]
     if reduced:
         cmd.append("--reduced")
+    if export_masks:
+        cmd.append("--export-masks")
     return cmd
 
 
@@ -298,6 +302,7 @@ def _run_one_job(
     max_width: int,
     scale_min: float,
     reduced: bool,
+    export_masks: bool = False,
     resume: bool,
 ) -> Tuple[DegradeJob, str, Optional[str]]:
     """Run one photo-degrade job on CPU. Returns (job, status, error_msg)."""
@@ -316,6 +321,7 @@ def _run_one_job(
         max_width=max_width,
         scale_min=scale_min,
         reduced=reduced,
+        export_masks=export_masks,
     )
     env = dict(os.environ)
     env["CUDA_VISIBLE_DEVICES"] = ""
@@ -362,6 +368,12 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     ap.add_argument("--strength-max", type=float, default=0.78, help="Maximum global degrade strength")
     ap.add_argument("--suffix", type=str, default="_pd", help="Output filename suffix")
     ap.add_argument("--reduced", action="store_true", help="Pass --reduced preset to photo-degrade.exe for faster CPU runs")
+    ap.add_argument(
+        "--export-masks",
+        action="store_true",
+        default=False,
+        help="Pass --export-masks to photo-degrade.exe (supervises UVFlowHead on ripple/spine warps)",
+    )
     ap.add_argument("--printed-frac", type=float, default=DEFAULT_DOMAIN_FRACS["printed"])
     ap.add_argument("--hw-frac", type=float, default=DEFAULT_DOMAIN_FRACS["hw"])
     ap.add_argument("--real-hw-frac", type=float, default=DEFAULT_DOMAIN_FRACS["real_hw"])
@@ -427,6 +439,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 max_width=args.max_width,
                 scale_min=args.scale_min,
                 reduced=args.reduced,
+                export_masks=args.export_masks,
             )
             print("  " + " ".join(cmd))
         return 0
@@ -446,6 +459,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 max_width=args.max_width,
                 scale_min=args.scale_min,
                 reduced=args.reduced,
+                export_masks=args.export_masks,
                 resume=resume,
             )
             for j in jobs

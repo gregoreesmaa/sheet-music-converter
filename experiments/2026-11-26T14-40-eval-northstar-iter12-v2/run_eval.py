@@ -91,6 +91,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--strict-grammar", action="store_true", default=False)
     parser.add_argument("--use-mtp-spec", action="store_true", default=True)
     parser.add_argument("--no-mtp-spec", dest="use_mtp_spec", action="store_false")
+    parser.add_argument("--neg-control-gate", action="store_true", default=True)
+    parser.add_argument("--no-neg-control-gate", dest="neg_control_gate", action="store_false")
     parser.add_argument("--resume", action="store_true")
     parser.add_argument("--limit", type=int, default=None)
     parser.add_argument("--skip-score", action="store_true")
@@ -101,6 +103,7 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     import eval_northstar_runner as ns_runner  # noqa: E402
     import eval_uni_suite31 as eus  # noqa: E402
+    import neg_control_gate  # noqa: E402
     import uni_omr  # noqa: E402
 
     if not args.ckpt.is_file():
@@ -156,6 +159,27 @@ def main(argv: Sequence[str] | None = None) -> int:
         img_path = pathlib.Path(rec["image_path"])
         t0 = time.perf_counter()
         with Image.open(img_path) as raw_im:
+            if args.neg_control_gate:
+                is_non_music, gate_info = neg_control_gate.is_non_music_page(raw_im)
+                if is_non_music:
+                    elapsed = time.perf_counter() - t0
+                    latencies[pid] = round(elapsed, 4)
+                    _atomic_write_text(bekern_dir / f"{pid}.txt", "\n")
+                    _atomic_write_text(out_mxml, ns_runner.EMPTY_VALID_MUSICXML)
+                    timing_payload: dict[str, Any] = {
+                        "system_name": args.system_name,
+                        "parameter_count": param_count,
+                        "peak_memory_gb": peak_mem_gb,
+                        "latencies_s": latencies,
+                    }
+                    _atomic_write_text(timing_path, json.dumps(timing_payload, indent=2) + "\n")
+                    print(
+                        f"[{idx:03d}/{len(pages):03d}] {pid:42s} toks=   0 "
+                        f"xml_ok=True  (neg-gate:{gate_info['reason']} "
+                        f"v={gate_info['v_frac']:.5f} h={gate_info['h_frac']:.5f}) {elapsed:.2f}s",
+                        flush=True,
+                    )
+                    continue
             pil_im = uni_omr._resize_fullpage_pil(raw_im.convert("RGB"), args.max_dim)
         img_t = uni_omr._pil_to_chw_tensor(pil_im).unsqueeze(0).to(device)
 

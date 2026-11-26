@@ -15,8 +15,8 @@ use assembly_serialize::{
         split_measures, staff_headers, staff_headers_at_measure, system_breaks,
     },
     is_empty_score_input, pack_mscz, parse_score, score_pitched_count, score_stem,
-    score_symbols, ser_for_symbols, to_mscx, to_musicxml, validate_mscz,
-    validate_musicxml, validate_notes, LossTable, Score, ScoreInput,
+    score_symbols, ser_for_symbols, to_empty_mscx, to_empty_musicxml, to_mscx, to_musicxml,
+    validate_mscz, validate_musicxml, validate_notes, LossTable, Score, ScoreInput,
 };
 use clap::{Args, Parser, Subcommand};
 
@@ -425,12 +425,40 @@ fn cmd_bekern2musicxml(a: &Bekern2MusicxmlArgs) -> Result<(), Err> {
     // segments, so every tie link must render as its own note.
     let input =
         decode_bekern_unmerged(&text).map_err(|e| format!("{}: {e}", a.input.display()))?;
-    let (score, mut losses) =
-        parse_score(&input).map_err(|e| format!("{}: {e}", a.input.display()))?;
     let stem = a
         .stem
         .clone()
         .unwrap_or_else(|| bekern_default_stem(&a.input));
+    if is_empty_score_input(&input) {
+        fs::create_dir_all(&a.out).map_err(|e| format!("mkdir {}: {e}", a.out.display()))?;
+        let title = input.title.as_deref().unwrap_or(&stem);
+        let xml = to_empty_musicxml(title);
+        let mscx = to_empty_mscx(title);
+        let empty_score = Score {
+            title: title.to_string(),
+            composer: input.composer.clone(),
+            divisions: input.divisions,
+            beats: input.time.map(|t| t.beats).unwrap_or(4),
+            beat_type: input.time.map(|t| t.beat_type).unwrap_or(4),
+            key_fifths: input.key_fifths,
+            parts: Vec::new(),
+            measure_attrs: Vec::new(),
+        };
+        let mscz = pack_mscz(&empty_score, &mscx)?;
+        let losses = LossTable::default();
+        write_file(&a.out.join(format!("{stem}.musicxml")), xml.as_bytes())?;
+        write_file(&a.out.join(format!("{stem}.mscx")), mscx.as_bytes())?;
+        write_file(&a.out.join(format!("{stem}.mscz")), &mscz)?;
+        write_file(
+            &a.out.join("loss.json"),
+            serde_json::to_string_pretty(&losses)?.as_bytes(),
+        )?;
+        write_file(&a.out.join("validation.json"), b"[]")?;
+        println!("wrote empty {stem}.musicxml (0 measures; abstained zero-note page)");
+        return write_lattice_sidecar(a.lattice_in.as_deref(), &stem, &a.out);
+    }
+    let (score, mut losses) =
+        parse_score(&input).map_err(|e| format!("{}: {e}", a.input.display()))?;
     write_pack_outputs(&score, &mut losses, &input, &stem, &a.out)?;
     write_lattice_sidecar(a.lattice_in.as_deref(), &stem, &a.out)
 }
