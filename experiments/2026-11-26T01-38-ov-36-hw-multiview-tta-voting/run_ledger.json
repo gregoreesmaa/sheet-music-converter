@@ -1,0 +1,166 @@
+{
+  "exp_id": "2026-11-26T01-38-ov-36-hw-multiview-tta-voting",
+  "status": "COMPLETED",
+  "started_utc": "2026-11-26T00:16:26.231637+00:00",
+  "completed_utc": "2026-11-26T00:46:17.365467+00:00",
+  "elapsed_secs": 1789.96,
+  "platform": "colab-NVIDIA L4",
+  "hf_eval_path": "evals/2026-11-26T01-38-ov-36-hw-multiview-tta-voting.json",
+  "ckpt_hf_path": "checkpoints/iter10_soup_baseline/uni_omr_soup.pt",
+  "summary": {
+    "hw_clean": {
+      "n_pages": 14,
+      "base_1536_note_f1": 0.261138,
+      "total_tta_decode_secs": 709.93,
+      "per_view": {
+        "base_1536": {
+          "note_f1": 0.261138,
+          "delta_vs_base": 0.0,
+          "tok_lcs": 0.388982,
+          "decode_ok_rate": 1.0
+        },
+        "scale_1280": {
+          "note_f1": 0.279443,
+          "delta_vs_base": 0.018305,
+          "tok_lcs": 0.426755,
+          "decode_ok_rate": 1.0
+        },
+        "scale_1792": {
+          "note_f1": 0.235907,
+          "delta_vs_base": -0.025231,
+          "tok_lcs": 0.369437,
+          "decode_ok_rate": 1.0
+        },
+        "clahe_1536": {
+          "note_f1": 0.24729,
+          "delta_vs_base": -0.013848,
+          "tok_lcs": 0.385676,
+          "decode_ok_rate": 1.0
+        },
+        "deskew_1536": {
+          "note_f1": 0.250879,
+          "delta_vs_base": -0.010259,
+          "tok_lcs": 0.395119,
+          "decode_ok_rate": 1.0
+        },
+        "deskew_clahe_1536": {
+          "note_f1": 0.232769,
+          "delta_vs_base": -0.028369,
+          "tok_lcs": 0.381603,
+          "decode_ok_rate": 1.0
+        }
+      },
+      "selectors": {
+        "best_fsa_beat": {
+          "note_f1": 0.27195,
+          "delta_vs_base": 0.010812,
+          "tok_lcs": 0.409529,
+          "wins": 6,
+          "ties": 2,
+          "losses": 6
+        },
+        "best_mbr_vote": {
+          "note_f1": 0.258092,
+          "delta_vs_base": -0.003046,
+          "tok_lcs": 0.409986,
+          "wins": 4,
+          "ties": 7,
+          "losses": 3
+        },
+        "best_combined": {
+          "note_f1": 0.264336,
+          "delta_vs_base": 0.003198,
+          "tok_lcs": 0.41878,
+          "wins": 4,
+          "ties": 5,
+          "losses": 5
+        },
+        "oracle_best_view": {
+          "note_f1": 0.303029,
+          "delta_vs_base": 0.041891,
+          "tok_lcs": 0.43027,
+          "wins": 9,
+          "ties": 5,
+          "losses": 0
+        }
+      }
+    },
+    "hw_photo": {
+      "n_pages": 14,
+      "base_1536_note_f1": 0.191617,
+      "total_tta_decode_secs": 755.84,
+      "per_view": {
+        "base_1536": {
+          "note_f1": 0.191617,
+          "delta_vs_base": 0.0,
+          "tok_lcs": 0.332653,
+          "decode_ok_rate": 1.0
+        },
+        "scale_1280": {
+          "note_f1": 0.186312,
+          "delta_vs_base": -0.005305,
+          "tok_lcs": 0.341731,
+          "decode_ok_rate": 1.0
+        },
+        "scale_1792": {
+          "note_f1": 0.184734,
+          "delta_vs_base": -0.006883,
+          "tok_lcs": 0.315376,
+          "decode_ok_rate": 1.0
+        },
+        "clahe_1536": {
+          "note_f1": 0.162638,
+          "delta_vs_base": -0.028979,
+          "tok_lcs": 0.280741,
+          "decode_ok_rate": 1.0
+        },
+        "deskew_1536": {
+          "note_f1": 0.160438,
+          "delta_vs_base": -0.031179,
+          "tok_lcs": 0.285997,
+          "decode_ok_rate": 1.0
+        },
+        "deskew_clahe_1536": {
+          "note_f1": 0.137866,
+          "delta_vs_base": -0.053751,
+          "tok_lcs": 0.23944,
+          "decode_ok_rate": 1.0
+        }
+      },
+      "selectors": {
+        "best_fsa_beat": {
+          "note_f1": 0.166846,
+          "delta_vs_base": -0.024771,
+          "tok_lcs": 0.295554,
+          "wins": 2,
+          "ties": 6,
+          "losses": 6
+        },
+        "best_mbr_vote": {
+          "note_f1": 0.182151,
+          "delta_vs_base": -0.009466,
+          "tok_lcs": 0.337881,
+          "wins": 2,
+          "ties": 7,
+          "losses": 5
+        },
+        "best_combined": {
+          "note_f1": 0.190716,
+          "delta_vs_base": -0.000901,
+          "tok_lcs": 0.328679,
+          "wins": 2,
+          "ties": 8,
+          "losses": 4
+        },
+        "oracle_best_view": {
+          "note_f1": 0.224272,
+          "delta_vs_base": 0.032655,
+          "tok_lcs": 0.346416,
+          "wins": 7,
+          "ties": 7,
+          "losses": 0
+        }
+      }
+    }
+  }
+}

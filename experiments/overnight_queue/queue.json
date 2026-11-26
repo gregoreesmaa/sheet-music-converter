@@ -412,5 +412,35 @@
     "hf_eval_target": "evals/2026-11-26T01-38-ov-42-v1-to-v2-distill-temp-jsd.json",
     "status": "QUEUED",
     "depends_on": []
+  },
+  {
+    "id": "2026-11-26T02-48-academic-gevt-vbkern-4k-converged",
+    "wave": 9,
+    "priority": 31,
+    "provider": "colab_l4",
+    "gpu": "L4",
+    "est_minutes": 100,
+    "est_cu": 8.0,
+    "script": "experiments/2026-11-26T02-48-academic-gevt-vbkern-4k-converged/run_colab.py",
+    "hf_eval_target": "evals/2026-11-26T02-48-academic-gevt-vbkern-4k-converged.json",
+    "status": "QUEUED",
+    "depends_on": [
+      "2026-11-26T01-30-academic-gevt-vbkern-mr"
+    ]
+  },
+  {
+    "id": "2026-11-26T03-08-ov-36b-multiscale-logprob-fsa-tta",
+    "wave": 4,
+    "priority": 2,
+    "provider": "colab_l4",
+    "gpu": "L4",
+    "est_minutes": 12,
+    "est_cu": 1.0,
+    "script": "experiments/2026-11-26T03-08-ov-36b-multiscale-logprob-fsa-tta/run_colab.py",
+    "hf_eval_target": "evals/2026-11-26T03-08-ov-36b-multiscale-logprob-fsa-tta.json",
+    "status": "QUEUED",
+    "depends_on": [
+      "2026-11-26T01-38-ov-36-hw-multiview-tta-voting"
+    ]
   }
 ]
