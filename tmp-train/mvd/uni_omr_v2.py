@@ -1974,7 +1974,7 @@ class UniOMRv2Net(nn.Module):
             self.training
             and self.cfg.grad_checkpoint
             and torch.is_grad_enabled()
-            and (x.shape[0] * x.shape[1] > 8000)
+            and (x.shape[0] * x.shape[1] > 4096)
         )
         new_past_kvs: List[Any] = []
         for idx, layer in enumerate(self.dec_layers):
@@ -2102,13 +2102,23 @@ class UniOMRv2Net(nn.Module):
         staff_seg_loss_weight: float = 0.20,
         stroke_hog_loss_weight: float = 0.15,
         label_smoothing: float = 0.0,
+        ce_token_weights: Optional[torch.Tensor] = None,
     ) -> Dict[str, torch.Tensor]:
         """Compute combined CE + MTP-4 + router saliency + layout & stroke-HOG aux losses."""
         logits: torch.Tensor = out["logits"]
         V = logits.shape[-1]
         ls = float(max(0.0, min(0.5, label_smoothing)))
+        ce_w = (
+            ce_token_weights.to(device=logits.device, dtype=logits.dtype)
+            if ce_token_weights is not None
+            else None
+        )
         ce_loss = F.cross_entropy(
-            logits.reshape(-1, V), targets.reshape(-1), ignore_index=PAD_ID, label_smoothing=ls
+            logits.reshape(-1, V),
+            targets.reshape(-1),
+            weight=ce_w,
+            ignore_index=PAD_ID,
+            label_smoothing=ls,
         )
 
         # MTP-4 auxiliary losses

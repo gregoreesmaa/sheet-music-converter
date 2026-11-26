@@ -553,6 +553,7 @@ class InkTokenRouter(nn.Module):
         feat_2d: torch.Tensor,
         images: Optional[torch.Tensor] = None,
         keep_ratio_override: Optional[float] = None,
+        compute_ink_recall: bool = True,
     ) -> Tuple[torch.Tensor, torch.Tensor, Dict[str, Any]]:
         """Route 2D feature grid into compact token sequence.
 
@@ -560,6 +561,8 @@ class InkTokenRouter(nn.Module):
             feat_2d: ``(B, D, H', W')`` encoder feature map.
             images: optional ``(B, 3, H, W)`` input images for local high-pass ink prior.
             keep_ratio_override: optional runtime keep_ratio in ``(0, 1]``.
+            compute_ink_recall: if False, skip ``has_ink.any()`` / ``.item()`` syncs and
+                return ``ink_recall = 0.0``.
 
         Returns:
             tokens: ``(B, K + n_bg_summary, D)`` (or ``(B, N, D)`` if ``keep_ratio == 1``).
@@ -659,7 +662,7 @@ class InkTokenRouter(nn.Module):
                 "saliency_map": score,
                 "saliency_logits": saliency_logits,
                 "ink_target": ink_target,
-                "ink_recall": 1.0,
+                "ink_recall": 1.0 if compute_ink_recall else 0.0,
                 "grid_hw": (H_p, W_p),
             }
             return out_tokens, grid_coords, info
@@ -681,7 +684,9 @@ class InkTokenRouter(nn.Module):
         kept_mask = torch.zeros(B, N, device=feat_2d.device, dtype=torch.bool)
         kept_mask.scatter_(1, kept_idx, True)
 
-        if ink_target is not None and not self.training:
+        if not compute_ink_recall:
+            ink_recall = 0.0
+        elif ink_target is not None and not self.training:
             with torch.no_grad():
                 tgt_mask = ink_target.flatten(1) > 0.5  # (B, N)
                 n_ink = tgt_mask.sum(dim=1)  # (B,)
@@ -1264,6 +1269,7 @@ class UniOMRNet(nn.Module):
         images: torch.Tensor,
         keep_ratio_override: Optional[float] = None,
         return_aux: Optional[bool] = None,
+        compute_ink_recall: bool = True,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Dict[str, Any]]:
         """Encode arbitrary-resolution ``(B, 3, H, W)`` images into routed memory tokens."""
         backbone_in = (
@@ -1273,7 +1279,10 @@ class UniOMRNet(nn.Module):
         )
         feat_2d = self.backbone(backbone_in)  # (B, D, H', W')
         routed_tokens, routed_coords, router_info = self.router(
-            feat_2d, images=images, keep_ratio_override=keep_ratio_override
+            feat_2d,
+            images=images,
+            keep_ratio_override=keep_ratio_override,
+            compute_ink_recall=compute_ink_recall,
         )
 
         pos2d = self.pos2d_proj(
@@ -1465,6 +1474,7 @@ class UniOMRNet(nn.Module):
         keep_ratio_override: Optional[float] = None,
         return_aux: Optional[bool] = None,
         return_mtp: Optional[bool] = None,
+        compute_ink_recall: bool = True,
     ) -> Dict[str, Any]:
         """Full encoder-decoder forward pass.
 
@@ -1478,6 +1488,7 @@ class UniOMRNet(nn.Module):
             images,
             keep_ratio_override=keep_ratio_override,
             return_aux=return_aux,
+            compute_ink_recall=compute_ink_recall,
         )
         logits, mtp_logits = self.decode_tokens(tgt_ids, mem, return_mtp=return_mtp)
         return {
@@ -4239,11 +4250,56 @@ class MultiScaleBatchSampler:
             yield [(idx, batch_dim) for idx in batch_idx]
 
 
-def collate_uni_batch(samples: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
+FIXED_HW_BUCKETS: Tuple[Tuple[int, int], ...] = (
+    # Portrait (H >= W)
+    (1152, 832),
+    (1408, 1024),
+    (1408, 1152),
+    # Landscape (W > H)
+    (832, 1152),
+    (1024, 1408),
+    (1152, 1408),
+)
+
+
+def _snap_to_fixed_hw_bucket(h: int, w: int) -> Tuple[int, int]:
+    """Snap ``(h, w)`` up to the smallest enclosing canonical ``FIXED_HW_BUCKETS`` entry.
+
+    Never crops: if ``(h, w)`` exceeds every canonical bucket, falls back to
+    multiple-of-64 ceiling padding.
+    """
+    is_portrait = h >= w
+    enclosing = [
+        (bh, bw) for bh, bw in FIXED_HW_BUCKETS if bh >= h and bw >= w
+    ]
+    if enclosing:
+        enclosing.sort(
+            key=lambda hw: (
+                hw[0] * hw[1],
+                0 if (hw[0] >= hw[1]) == is_portrait else 1,
+                hw[0],
+                hw[1],
+            )
+        )
+        return enclosing[0]
+    pad_h = max(64, ((int(h) + 63) // 64) * 64)
+    pad_w = max(64, ((int(w) + 63) // 64) * 64)
+    return pad_h, pad_w
+
+
+def collate_uni_batch(
+    samples: Sequence[Dict[str, Any]],
+    fixed_hw_buckets: bool = False,
+) -> Dict[str, Any]:
     """Pad variable-resolution images (white paper=1.0 or 255) and sequences (``PAD_ID``)."""
     B = len(samples)
-    max_h = _round_mult16(max(int(s["image"].shape[1]) for s in samples), min_val=16)
-    max_w = _round_mult16(max(int(s["image"].shape[2]) for s in samples), min_val=16)
+    raw_max_h = max(int(s["image"].shape[1]) for s in samples)
+    raw_max_w = max(int(s["image"].shape[2]) for s in samples)
+    if fixed_hw_buckets:
+        max_h, max_w = _snap_to_fixed_hw_bucket(raw_max_h, raw_max_w)
+    else:
+        max_h = _round_mult16(raw_max_h, min_val=16)
+        max_w = _round_mult16(raw_max_w, min_val=16)
     max_t = max(int(s["seq"].shape[0]) for s in samples)
 
     is_u8 = B > 0 and samples[0]["image"].dtype == torch.uint8
@@ -4363,6 +4419,7 @@ class AsyncThreadPrefetcher:
         seed: Optional[int] = None,
         stratified_sampler: Optional[StratifiedFullPageSampler] = None,
         length_window: int = 64,
+        fixed_hw_buckets: bool = False,
     ) -> None:
         self.dataset = dataset
         self.n_samples = len(dataset)  # type: ignore[arg-type]
@@ -4373,7 +4430,11 @@ class AsyncThreadPrefetcher:
         self.pin_memory = bool(pin_memory)
         self.max_workers = max(1, int(max_workers))
         self.prefetch_batches = max(6, min(16, max(int(prefetch_batches), self.max_workers * 2)))
-        self.collate_fn = collate_fn
+        self.fixed_hw_buckets = bool(fixed_hw_buckets)
+        if self.fixed_hw_buckets and collate_fn is collate_uni_batch:
+            self.collate_fn = lambda batch_samples: collate_uni_batch(batch_samples, fixed_hw_buckets=True)
+        else:
+            self.collate_fn = collate_fn
         self._rng = random.Random(seed) if seed is not None else random.Random()
         self._stratified_sampler = stratified_sampler
         self._length_window = max(self.batch_size, int(length_window))

@@ -23,7 +23,11 @@ param(
     [string]$RismStyleDir = "D:\tmp\unlabeled-10k-real\rism_hw",
     [string]$PrintedStrip = "tmp-train/mvd-sysdata-t32",
     [string]$HwStrip      = "D:\tmp\real-hw-strips-iter7",
-    [string]$HwStripV06   = "D:\tmp\hw-sim-v06-historical-clean\stage2_strips"
+    [string]$HwStripV06   = "D:\tmp\hw-sim-v06-historical-clean\stage2_strips",
+    [string]$Stage2InitFrom = "",
+    [int]$Stage2Steps = 24000,
+    [int]$Stage2Warmup = 300,
+    [switch]$UseCudnn
 )
 
 $ErrorActionPreference = "Stop"
@@ -105,16 +109,17 @@ if (-not $SkipStage1) {
     Write-Host "=== [Iter 13 Stage 1] Skipped (-SkipStage1) ==="
 }
 
-# Resolve Stage 1 handoff checkpoint (prefer ema_best, fallback to ema_latest)
+# Resolve Stage 1 handoff checkpoint (prefer explicit -Stage2InitFrom, else ema_best, else ema_latest)
 $Stage1Best   = Join-Path $Stage1OutDir "uni_omr_v2_ema_best.pt"
 $Stage1Latest = Join-Path $Stage1OutDir "uni_omr_v2_ema_latest.pt"
-$Stage1Ckpt   = if (Test-Path $Stage1Best) { $Stage1Best } elseif (Test-Path $Stage1Latest) { $Stage1Latest } else { $Stage1Best }
+$Stage1Ckpt   = if ($Stage2InitFrom) { $Stage2InitFrom } elseif (Test-Path $Stage1Best) { $Stage1Best } elseif (Test-Path $Stage1Latest) { $Stage1Latest } else { $Stage1Best }
 
 # ---------------------------------------------------------------------------
 # Stage 2: 24,000-step Pure Fullpage (1408px multi-scale + FDA/AdaIN + QAT-INT4)
 # ---------------------------------------------------------------------------
 $Stage2Args = @(
     "--preset", "small_45m",
+    "--max-mem-tokens", "3072",
     "--init-from", $Stage1Ckpt,
     "--curriculum", "fullpage",
     "--fullpage-frac", "1.00",
@@ -126,9 +131,10 @@ $Stage2Args = @(
     "--val-real-hw-count", "16",
     "--fullpage-max-dim", "1408",
     "--multi-scale",
+    "--fixed-hw-buckets",
     "--max-seq-len", "3840",
-    "--batch-size", "1",
-    "--grad-accum", "8",
+    "--batch-size", "2",
+    "--grad-accum", "4",
     "--optimizer", "muon",
     "--muon-lr", "4.0e-4",
     "--lr", "2.5e-4",
@@ -136,12 +142,13 @@ $Stage2Args = @(
     "--no-decay-1d",
     "--grad-clip", "1.0",
     "--lr-schedule", "wsd",
-    "--warmup-steps", "300",
+    "--warmup-steps", "$Stage2Warmup",
     "--wsd-decay-frac", "0.20",
     "--min-lr-ratio", "0.05",
-    "--steps", "24000",
+    "--steps", "$Stage2Steps",
     "--mixstyle-prob", "0.0",
-    "--cass-prob", "0.15",
+    "--cass-batch-prob", "0.5",
+    "--cass-prob", "0.30",
     "--augment",
     "--aug-prob", "0.75",
     "--rism-style-dir", $RismStyleDir,
@@ -154,6 +161,7 @@ $Stage2Args = @(
     "--kd-temp", "1.5",
     "--kd-teacher-ce-cap", "1.5",
     "--kd-hw-scale", "0.0",
+    "--kd-prob", "0.5",
     "--state-token-loss-weight", "2.5",
     "--qat-int4",
     "--qat-int4-last-frac", "0.15",
@@ -165,12 +173,14 @@ $Stage2Args = @(
     "--save-every-minutes", "5.0",
     "--bf16",
     "--grad-checkpoint",
-    "--no-cudnn",
     "--num-workers", "0",
-    "--prefetch-threads", "4",
+    "--prefetch-threads", "6",
     "--seed", "42",
     "--out-dir", $Stage2OutDir
 )
+if (-not $UseCudnn) {
+    $Stage2Args += "--no-cudnn"
+}
 
 if (-not $SkipStage2) {
     if (-not (Test-Path $Stage1Ckpt)) {

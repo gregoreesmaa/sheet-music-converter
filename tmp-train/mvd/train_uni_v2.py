@@ -1154,7 +1154,9 @@ def forward_and_loss_v2(
     kd_temp: float = 2.0,
     kd_teacher_ce_cap: float = 0.0,
     kd_hw_scale: float = 1.0,
+    kd_prob: float = 1.0,
     cass_prob: float = 0.0,
+    cass_batch_prob: float = 1.0,
     kind: str = "fullpage",
     mtp_loss_weight: float = 0.30,
     saliency_loss_weight: float = 0.10,
@@ -1199,7 +1201,14 @@ def forward_and_loss_v2(
             skip_staff_seg=not need_staff_seg,
             skip_stroke_hog=not need_stroke_hog,
         ):
-            if cass_prob > 0.0 and kind != "strip" and tgt_in.shape[1] > 1:
+            cass_bp = float(max(0.0, min(1.0, cass_batch_prob)))
+            run_cass = (
+                cass_prob > 0.0
+                and kind != "strip"
+                and tgt_in.shape[1] > 1
+                and (cass_bp >= 1.0 or (cass_bp > 0.0 and random.random() < cass_bp))
+            )
+            if run_cass:
                 mem_levels, aux_enc, router_info = model.encode_image(
                     images, return_aux=need_any_enc_aux
                 )
@@ -1244,6 +1253,17 @@ def forward_and_loss_v2(
                     return_mtp=(model.cfg.mtp_k > 1),
                 )
 
+        # Optional per-token CE upweighting on musical state tokens (time-*, key*, clef-*, tuplet-start-*).
+        # Passed directly into model.compute_loss so F.cross_entropy runs ONCE instead of twice.
+        # Default 1.0 leaves ce_token_weights=None (zero overhead & 100% bit-identical to unweighted CE).
+        st_w = float(state_token_loss_weight)
+        ce_token_weights: Optional[torch.Tensor] = None
+        if st_w > 1.0:
+            s_logits: torch.Tensor = out["logits"]
+            ce_token_weights = build_state_token_weights(
+                int(s_logits.shape[-1]), st_w, device=s_logits.device, dtype=s_logits.dtype
+            )
+
         losses = model.compute_loss(
             out,
             tgt_out,
@@ -1259,35 +1279,8 @@ def forward_and_loss_v2(
             staff_seg_loss_weight=staff_seg_loss_weight,
             stroke_hog_loss_weight=stroke_hog_weight,
             label_smoothing=label_smoothing,
+            ce_token_weights=ce_token_weights,
         )
-
-        # Optional per-token CE upweighting on musical state tokens (time-*, key*, clef-*, tuplet-start-*).
-        # Default 1.0 leaves weight=None (zero overhead & 100% bit-identical to unweighted CE).
-        st_w = float(state_token_loss_weight)
-        if st_w > 1.0:
-            s_logits: torch.Tensor = out["logits"]
-            V_ce = int(s_logits.shape[-1])
-            ls_ce = float(max(0.0, min(0.5, label_smoothing)))
-            state_tok_weights = build_state_token_weights(
-                V_ce, st_w, device=s_logits.device, dtype=s_logits.dtype
-            )
-            weighted_ce = F.cross_entropy(
-                s_logits.reshape(-1, V_ce),
-                tgt_out.reshape(-1),
-                weight=state_tok_weights,
-                ignore_index=PAD_ID,
-                label_smoothing=ls_ce,
-            )
-            losses["ce_loss"] = weighted_ce
-            losses["loss"] = (
-                weighted_ce
-                + mtp_loss_weight * losses["mtp_loss"]
-                + saliency_loss_weight * losses["saliency_loss"]
-                + sys_y_loss_weight * losses["sys_y_loss"]
-                + sys_count_loss_weight * losses["sys_count_loss"]
-                + staff_seg_loss_weight * losses["staff_seg_loss"]
-                + stroke_hog_weight * losses["stroke_hog_loss"]
-            )
 
         # Hybrid KD: prefer offline Top-K cache hits, otherwise fall back to online frozen v1 teacher.
         # Optionally downweight/skip KD on HW samples (--kd-hw-scale) using both batch domains and
@@ -1312,6 +1305,10 @@ def forward_and_loss_v2(
                     eff_kd_alpha *= hw_scale
                 elif n_hw_batch > 0:
                     sample_kd_weights = torch.tensor(per_sample_scales, device=dev, dtype=torch.float32)
+
+        kd_p = float(max(0.0, min(1.0, kd_prob)))
+        if eff_kd_alpha > 0.0 and (kd_p <= 0.0 or (kd_p < 1.0 and random.random() >= kd_p)):
+            eff_kd_alpha = 0.0
 
         kd_loss = out["logits"].new_zeros(())
         kd_gate_frac = out["logits"].new_ones((), dtype=torch.float32)
@@ -1341,7 +1338,14 @@ def forward_and_loss_v2(
                 t_dtype = t_first_param.dtype if t_first_param is not None else images.dtype
                 with torch.inference_mode():
                     t_images = images.to(dtype=t_dtype) if images.dtype != t_dtype else images
-                    t_out = teacher_v1(t_images, tgt_in, return_aux=False, return_mtp=False)
+                    t_out = teacher_v1(
+                        t_images,
+                        tgt_in,
+                        keep_ratio_override=0.45,
+                        return_aux=False,
+                        return_mtp=False,
+                        compute_ink_recall=False,
+                    )
                     t_logits_inf = t_out["logits"]
                     del t_out, t_images
                 # _GeneralizedJSDAutograd consumes teacher_logits inside no_grad without saving it,
@@ -2046,6 +2050,12 @@ def _build_datasets_and_iters(
             augment=False,
             return_uint8=True,
         ) if fp_hw_va else None
+        fixed_hw_buckets = bool(getattr(args, "fixed_hw_buckets", False))
+        fp_collate_fn: Any = (
+            (lambda batch_samples: collate_uni_batch(batch_samples, fixed_hw_buckets=True))
+            if fixed_hw_buckets
+            else collate_uni_batch
+        )
         if prefetch_threads > 0 and args.num_workers == 0 and len(fp_tr) > 0:
             pf = AsyncThreadPrefetcher(
                 fp_train_ds,
@@ -2057,6 +2067,7 @@ def _build_datasets_and_iters(
                 collate_fn=collate_uni_batch,
                 seed=args.seed + 303,
                 stratified_sampler=fp_strat_sampler,
+                fixed_hw_buckets=fixed_hw_buckets,
             )
             prefetchers.append(pf)
             fullpage_train_iter = pf
@@ -2074,7 +2085,7 @@ def _build_datasets_and_iters(
                     fp_train_ds,
                     batch_sampler=fp_bs,
                     num_workers=args.num_workers,
-                    collate_fn=collate_uni_batch,
+                    collate_fn=fp_collate_fn,
                     pin_memory=(device.type == "cuda"),
                 )
             )
@@ -2085,7 +2096,7 @@ def _build_datasets_and_iters(
                     batch_size=args.batch_size,
                     shuffle=True,
                     num_workers=args.num_workers,
-                    collate_fn=collate_uni_batch,
+                    collate_fn=fp_collate_fn,
                     pin_memory=(device.type == "cuda"),
                 )
             )
@@ -2125,32 +2136,39 @@ def run_train_v2(args: argparse.Namespace) -> Dict[str, Any]:
         if hasattr(torch.backends.cuda, "enable_mem_efficient_sdp"):
             torch.backends.cuda.enable_mem_efficient_sdp(True)
 
-    cfg = build_v2_config(
-        args.preset,
+    prefetch_threads = (
+        (6 if (device.type == "cuda" and not args.dry_run) else 0)
+        if args.prefetch_threads is None
+        else max(0, int(args.prefetch_threads))
+    )
+    cpu_threads_req = getattr(args, "cpu_threads", None)
+    if cpu_threads_req is not None:
+        torch.set_num_threads(max(1, int(cpu_threads_req)))
+    elif prefetch_threads > 0:
+        torch.set_num_threads(1)
+
+    cfg_overrides: Dict[str, Any] = dict(
         grad_checkpoint=bool(args.grad_checkpoint),
         dropout=float(args.dropout),
         mixstyle_prob=float(args.mixstyle_prob),
         tok_dropout=float(args.tok_dropout),
         keep_ratio=float(args.keep_ratio),
         dynamic_routing=bool(args.dynamic_routing),
-        max_mem_tokens=int(args.max_mem_tokens),
         mtp_k=int(args.mtp_k),
         use_sys_y_aux=bool(args.use_sys_y_aux and float(args.sys_y_loss_weight) > 0.0),
         use_sys_count_aux=bool(args.use_sys_count_aux and float(args.sys_count_loss_weight) > 0.0),
         use_staff_seg_aux=bool(args.use_staff_seg_aux and float(args.staff_seg_loss_weight) > 0.0),
         use_stroke_hog_head=bool(args.stroke_hog_weight > 0.0),
     )
+    if args.max_mem_tokens is not None:
+        cfg_overrides["max_mem_tokens"] = int(args.max_mem_tokens)
+    cfg = build_v2_config(args.preset, **cfg_overrides)
 
     use_bf16 = bool(args.bf16 and device.type == "cuda")
     strip_batch_size = (
         max(1, int(args.strip_batch_size))
         if args.strip_batch_size is not None
         else max(1, int(args.batch_size))
-    )
-    prefetch_threads = (
-        (6 if (device.type == "cuda" and not args.dry_run) else 0)
-        if args.prefetch_threads is None
-        else max(0, int(args.prefetch_threads))
     )
 
     use_real_data = (not args.dry_run) and (
@@ -2548,7 +2566,9 @@ def run_train_v2(args: argparse.Namespace) -> Dict[str, Any]:
                         kd_temp=float(args.kd_temp),
                         kd_teacher_ce_cap=kd_teacher_ce_cap,
                         kd_hw_scale=kd_hw_scale,
+                        kd_prob=float(getattr(args, "kd_prob", 1.0)),
                         cass_prob=float(args.cass_prob),
+                        cass_batch_prob=float(getattr(args, "cass_batch_prob", 1.0)),
                         kind=kind,
                         mtp_loss_weight=float(args.mtp_loss_weight),
                         saliency_loss_weight=float(args.saliency_loss_weight),
@@ -2762,7 +2782,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--keep-ratio", type=float, default=0.40)
     p.add_argument("--dynamic-routing", action="store_true", default=True)
     p.add_argument("--no-dynamic-routing", dest="dynamic_routing", action="store_false")
-    p.add_argument("--max-mem-tokens", type=int, default=10240)
+    p.add_argument(
+        "--max-mem-tokens",
+        type=int,
+        default=None,
+        help="Override preset max_mem_tokens (default: None = use preset value, e.g. 3072 for small_45m)",
+    )
     p.add_argument("--mtp-k", type=int, default=4)
     p.add_argument("--use-sys-y-aux", action="store_true", default=True)
     p.add_argument("--no-use-sys-y-aux", dest="use_sys_y_aux", action="store_false")
@@ -2790,6 +2815,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
         type=float,
         default=1.0,
         help="Optional multiplier for kd_alpha on handwritten batches (default 1.0)",
+    )
+    p.add_argument(
+        "--kd-prob",
+        type=float,
+        default=1.0,
+        help="Probability of running frozen teacher KD on eligible microbatches (default 1.0)",
     )
 
     # Optimizer & WSD schedule
@@ -2829,6 +2860,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Per-token CE loss weight for musical state tokens (time-*, key*, clef-*, tuplet-start-*); 1.0 = unweighted",
     )
     p.add_argument("--cass-prob", type=float, default=0.0)
+    p.add_argument(
+        "--cass-batch-prob",
+        type=float,
+        default=1.0,
+        help="Probability of running the CASS draft decoder pass on a microbatch (default 1.0)",
+    )
     p.add_argument("--qat-int4", action="store_true")
     p.add_argument("--qat-int4-last-frac", type=float, default=0.15)
     p.add_argument("--qat-int4-block-size", type=int, default=32)
@@ -2891,6 +2928,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Low-frequency amplitude swap bandwidth beta for RISM FDA transfer (default 0.02)",
     )
     p.add_argument("--multi-scale", action="store_true", default=True)
+    p.add_argument(
+        "--fixed-hw-buckets",
+        action="store_true",
+        default=False,
+        help="Snap full-page batch (H, W) up to 6 canonical buckets (never crops; falls back to mult-64)",
+    )
     p.add_argument("--stratified-fullpage", action="store_true", default=True)
     p.add_argument(
         "--split-archival-hw",
@@ -2910,6 +2953,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--eval-batch-size", type=int, default=None)
     p.add_argument("--num-workers", type=int, default=0)
     p.add_argument("--prefetch-threads", type=int, default=None)
+    p.add_argument(
+        "--cpu-threads",
+        type=int,
+        default=None,
+        help="PyTorch intra-op CPU thread count (default: 1 when prefetch_threads > 0, else unchanged)",
+    )
     p.add_argument("--log-every", type=int, default=10)
     p.add_argument("--out-dir", type=str, default=None)
     p.add_argument("--seed", type=int, default=42)

@@ -106,7 +106,55 @@ def _find_repo_root() -> Path:
     raise FileNotFoundError(f"Could not locate sheet-music-converter workspace or bundle at {BUNDLE_PATH}")
 
 
-def _setup_environment() -> Tuple[Path, Path, Path]:
+def _extract_musicxml_notes(xml_path: Path) -> List[Tuple[str, int, str, str, str]]:
+    import xml.etree.ElementTree as ET
+
+    notes: List[Tuple[str, int, str, str, str]] = []
+    try:
+        root = ET.parse(str(xml_path)).getroot()
+    except Exception:
+        return notes
+
+    def _strip(tag: str) -> str:
+        return tag.split("}", 1)[-1] if "}" in tag else tag
+
+    for elem in root.iter():
+        if _strip(elem.tag) != "note":
+            continue
+        is_rest = is_grace = False
+        step = octave = alter = dur = ""
+        n_dots = 0
+        for child in elem:
+            ctag = _strip(child.tag)
+            if ctag == "rest":
+                is_rest = True
+            elif ctag == "grace":
+                is_grace = True
+            elif ctag == "pitch":
+                for pc in child:
+                    ptag = _strip(pc.tag)
+                    text = (pc.text or "").strip()
+                    if ptag == "step":
+                        step = text.upper()
+                    elif ptag == "octave":
+                        octave = text
+                    elif ptag == "alter":
+                        try:
+                            av = int(round(float(text)))
+                            if av != 0:
+                                alter = f"a{av}"
+                        except ValueError:
+                            pass
+            elif ctag == "type":
+                dur = (child.text or "").strip().lower()
+            elif ctag == "dot":
+                n_dots += 1
+        if not is_rest and not is_grace and step and octave and dur:
+            notes.append((dur, n_dots, step, octave, alter))
+    return notes
+
+
+def _setup_environment() -> Path:
     repo_root = _find_repo_root()
     CACHE_ROOT.mkdir(parents=True, exist_ok=True)
     needed_pkgs = []
@@ -118,31 +166,7 @@ def _setup_environment() -> Tuple[Path, Path, Path]:
     if needed_pkgs:
         _run_cmd([sys.executable, "-m", "pip", "install", "-q", *needed_pkgs])
 
-    cargo_bin_dir = Path.home() / ".cargo" / "bin"
-    env = os.environ.copy()
-    env["PATH"] = f"{cargo_bin_dir}:{env.get('PATH', '')}"
-
-    aser_manifest = repo_root / "converter" / "assembly-serialize" / "Cargo.toml"
-    eharness_manifest = repo_root / "converter" / "eval-harness" / "Cargo.toml"
-    aser_bin = aser_manifest.parent / "target" / "release" / "assembly-serialize"
-    eharness_bin = eharness_manifest.parent / "target" / "release" / "eval-harness"
-
-    if not aser_bin.exists() or not eharness_bin.exists():
-        if shutil.which("cargo", path=env["PATH"]) is None:
-            _run_cmd(
-                "curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs "
-                "| sh -s -- -y --default-toolchain stable --profile minimal",
-                shell=True,
-                env=env,
-            )
-        if not aser_bin.exists():
-            _run_cmd(["cargo", "build", "--release", "--manifest-path", str(aser_manifest)], env=env)
-        if not eharness_bin.exists():
-            _run_cmd(["cargo", "build", "--release", "--manifest-path", str(eharness_manifest)], env=env)
-
-    assert aser_bin.exists(), f"Missing Linux binary: {aser_bin}"
-    assert eharness_bin.exists(), f"Missing Linux binary: {eharness_bin}"
-    return repo_root, aser_bin, eharness_bin
+    return repo_root
 
 
 def _compute_auroc(labels: Sequence[int], scores: Sequence[float]) -> float:
@@ -322,7 +346,7 @@ def run_experiment() -> Dict[str, Any]:
     started_iso = datetime.now(timezone.utc).isoformat()
     try:
         token = _read_and_purge_hf_token()
-        repo_root, aser_bin, eharness_bin = _setup_environment()
+        repo_root = _setup_environment()
 
         mvd_dir = repo_root / "tmp-train" / "mvd"
         if str(mvd_dir) not in sys.path:
@@ -330,13 +354,11 @@ def run_experiment() -> Dict[str, Any]:
 
         import torch
         from huggingface_hub import HfApi, hf_hub_download
-        import eval_sys_gate as esg
         import eval_uni_suite31 as ev
         import grammar
+        import rlvr_grpo
         import uni_omr
 
-        esg.ASER = str(aser_bin)
-        esg.EHARNESS = str(eharness_bin)
         if torch.cuda.is_available():
             torch.backends.cuda.enable_cudnn_sdp(False)
             torch.backends.cuda.enable_mem_efficient_sdp(True)
@@ -366,30 +388,26 @@ def run_experiment() -> Dict[str, Any]:
                 tf.extractall(path=suite_dir)
 
         manifest_path = suite_dir / "suite31" / "suite31_hw_manifest.json"
-        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-        pieces = manifest["pieces"]
-        suite_root = manifest_path.parent
+        _, pieces = ev.resolve_manifest_pieces(manifest_path)
 
         model, cfg, ckpt_meta = ev.load_uni_checkpoint(ckpt_local, device)
-        _, _, eos_id, _, _, _ = ev._vocab_spec(int(cfg.vocab_size))
+        _, _, eos_id, _, _, id_to_tok = ev._vocab_spec(int(cfg.vocab_size))
 
         workdir = CACHE_ROOT / EXP_ID
         workdir.mkdir(parents=True, exist_ok=True)
         partial_path = workdir / f"{EXP_ID}_partial.json"
         final_local_path = workdir / f"{EXP_ID}.json"
 
-        refs_cache: Dict[str, Tuple[List[str], Path]] = {}
+        refs_cache: Dict[str, List[Tuple[str, int, str, str, str]]] = {}
         for piece in pieces:
             slug = piece["slug"]
-            ref_bek = suite_root / piece["bekern"]
-            ref_toks = ref_bek.read_text(encoding="utf-8").strip().split()
-            ref_notes = workdir / f"ref-{slug}.json"
-            if not ref_notes.exists():
-                esg.run_cli([esg.ASER, "bekern-decode", "--input", str(ref_bek), "--out", str(ref_notes)])
-            refs_cache[slug] = (ref_toks, ref_notes)
+            refs_cache[slug] = _extract_musicxml_notes(Path(piece["gt"]))
 
         def _decode_and_score(slug: str, domain: str, img_p: Path, dim: int, tag: str) -> Dict[str, Any]:
-            img_t = uni_omr.load_fullpage_image(img_p, max_dim=dim).unsqueeze(0).to(device, non_blocking=True)
+            from PIL import Image
+            with Image.open(img_p) as raw_im:
+                pil_im = uni_omr._resize_fullpage_pil(raw_im.convert("RGB"), dim)
+            img_t = uni_omr._pil_to_chw_tensor(pil_im).unsqueeze(0).to(device, non_blocking=True)
             t0 = time.perf_counter()
             ctx = torch.autocast(device_type="cuda", dtype=torch.bfloat16) if use_bf16 else contextlib.nullcontext()
             with torch.no_grad(), ctx:
@@ -408,20 +426,15 @@ def run_experiment() -> Dict[str, Any]:
                 pred_raw = ev.trim_truncated_tokens(pred_raw)
             hyp_toks, _ = ev.stitch_uni_tokens(pred_raw)
 
-            ref_toks, ref_notes = refs_cache[slug]
-            hyp_txt = workdir / f"{tag}-{slug}-{domain}-hyp.txt"
-            hyp_txt.write_text(" ".join(hyp_toks) + "\n", encoding="utf-8")
-            hyp_notes = workdir / f"{tag}-{slug}-{domain}-notes.json"
-            p_dec = esg.run_cli([esg.ASER, "bekern-decode", "--input", str(hyp_txt), "--out", str(hyp_notes)])
-            bekern_ok = (p_dec.returncode == 0) and hyp_notes.exists()
+            ref_notes = refs_cache[slug]
+            hyp_notes = rlvr_grpo.extract_pitch_dur_notes(hyp_toks)
+            struct = rlvr_grpo.compute_unlabeled_structural_reward(
+                hyp_toks, vocab=id_to_tok, terminated_eos=hit_eos
+            )
+            bekern_ok = bool(len(hyp_notes) > 0 and float(struct.get("r_syntax", 0.0)) > 0.0)
             fsa_m = ev.compute_fsa_beat_metrics(hyp_toks, hit_eos, bekern_ok)
-
-            if not bekern_ok:
-                note_f1, decode_ok = 0.0, False
-            else:
-                sc = esg.score_notes_pair(ref_notes, hyp_notes, workdir, f"{tag}-{slug}-{domain}", esg.EHARNESS, esg.ASER)
-                note_f1 = float(sc.get("f1", 0.0))
-                decode_ok = not bool(sc.get("zeroed"))
+            note_f1 = float(rlvr_grpo.compute_sequence_f1(ref_notes, hyp_notes)) if bekern_ok else 0.0
+            decode_ok = bekern_ok
 
             return {
                 "seq_ids": seq_ids,
@@ -448,7 +461,7 @@ def run_experiment() -> Dict[str, Any]:
             slug = piece["slug"]
             prow: Dict[str, Any] = {"piece": slug, "handwritten": bool(piece.get("handwritten", False))}
             for domain in ("clean", "photo"):
-                res = _decode_and_score(slug, domain, suite_root / piece[domain], BASE_DIM, "base1280")
+                res = _decode_and_score(slug, domain, Path(piece[domain]), BASE_DIM, "base1280")
                 base_cache[(slug, domain)] = res
                 prow[f"{domain}_note_f1"] = res["note_f1"]
                 prow[f"{domain}_decode_ok"] = res["decode_ok"]
@@ -518,8 +531,8 @@ def run_experiment() -> Dict[str, Any]:
                         prow[f"{domain}_elapsed_secs"] = b["elapsed_secs"]
                         prow[f"{domain}_triggered"] = False
                         continue
-                    v1152 = _get_alt_view(slug, domain, suite_root / piece[domain], LORES_DIM)
-                    v1536 = _get_alt_view(slug, domain, suite_root / piece[domain], HIRES_DIM)
+                    v1152 = _get_alt_view(slug, domain, Path(piece[domain]), LORES_DIM)
+                    v1536 = _get_alt_view(slug, domain, Path(piece[domain]), HIRES_DIM)
                     cands = [b, v1152, v1536]
                     best = max(cands, key=lambda c: c["fsa_beat_score"] + 0.5 * c["mean_logprob"])
                     prow[f"{domain}_note_f1"] = best["note_f1"]
@@ -536,11 +549,11 @@ def run_experiment() -> Dict[str, Any]:
         sys_rows: List[Dict[str, Any]] = []
         for piece in pieces:
             slug = piece["slug"]
-            ref_toks, ref_notes = refs_cache[slug]
+            ref_notes = refs_cache[slug]
             prow = {"piece": slug, "handwritten": bool(piece.get("handwritten", False))}
             for domain in ("clean", "photo"):
                 b = base_cache[(slug, domain)]
-                img_hi = uni_omr.load_fullpage_image(suite_root / piece[domain], max_dim=HIRES_DIM).unsqueeze(0).to(device)
+                img_hi = uni_omr.load_fullpage_image(Path(piece[domain]), max_dim=HIRES_DIM).unsqueeze(0).to(device)
                 t0 = time.perf_counter()
                 ctx = torch.autocast(device_type="cuda", dtype=torch.bfloat16) if use_bf16 else contextlib.nullcontext()
                 with torch.no_grad(), ctx:
@@ -557,20 +570,17 @@ def run_experiment() -> Dict[str, Any]:
                     prow[f"{domain}_elapsed_secs"] = b["elapsed_secs"]
                     prow[f"{domain}_triggered"] = False
                 else:
+                    hit_eos = eos_id in new_ids[1:]
                     pred_raw = ev.decode_uni_compat(new_ids, vocab_size=int(cfg.vocab_size), skip_special=True)
-                    if eos_id not in new_ids[1:]:
+                    if not hit_eos:
                         pred_raw = ev.trim_truncated_tokens(pred_raw)
                     hyp_toks, _ = ev.stitch_uni_tokens(pred_raw)
-                    hyp_txt = workdir / f"syshi-{slug}-{domain}-hyp.txt"
-                    hyp_txt.write_text(" ".join(hyp_toks) + "\n", encoding="utf-8")
-                    hyp_notes = workdir / f"syshi-{slug}-{domain}-notes.json"
-                    p_dec = esg.run_cli([esg.ASER, "bekern-decode", "--input", str(hyp_txt), "--out", str(hyp_notes)])
-                    bekern_ok = (p_dec.returncode == 0) and hyp_notes.exists()
-                    if not bekern_ok:
-                        nf1, dok = 0.0, False
-                    else:
-                        sc = esg.score_notes_pair(ref_notes, hyp_notes, workdir, f"syshi-{slug}-{domain}", esg.EHARNESS, esg.ASER)
-                        nf1, dok = float(sc.get("f1", 0.0)), not bool(sc.get("zeroed"))
+                    hyp_notes = rlvr_grpo.extract_pitch_dur_notes(hyp_toks)
+                    struct = rlvr_grpo.compute_unlabeled_structural_reward(
+                        hyp_toks, vocab=id_to_tok, terminated_eos=hit_eos
+                    )
+                    dok = bool(len(hyp_notes) > 0 and float(struct.get("r_syntax", 0.0)) > 0.0)
+                    nf1 = float(rlvr_grpo.compute_sequence_f1(ref_notes, hyp_notes)) if dok else 0.0
                     prow[f"{domain}_note_f1"] = round(nf1, 6)
                     prow[f"{domain}_decode_ok"] = dok
                     prow[f"{domain}_elapsed_secs"] = round(b["elapsed_secs"] + extra_t, 4)
