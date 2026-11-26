@@ -8,6 +8,8 @@ import sys
 import tempfile
 import unittest
 
+import numpy as np
+from PIL import Image
 import torch
 
 _THIS_DIR = Path(__file__).resolve().parent
@@ -15,6 +17,8 @@ if str(_THIS_DIR) not in sys.path:
     sys.path.insert(0, str(_THIS_DIR))
 
 import eval_uni_suite31 as ev  # noqa: E402
+import grammar  # noqa: E402
+import preprocess_dewarp  # noqa: E402
 import uni_omr  # noqa: E402
 import uni_omr_v2  # noqa: E402
 
@@ -249,6 +253,122 @@ class TestEvalUniSuite31V2AndTTA(unittest.TestCase):
         c_eq1 = {"scale": 1280, "bekern_decode_ok": True, "has_loop": False, "fsa_beat_score": 2.75, "mean_logprob": -0.15}
         c_eq2 = {"scale": 1536, "bekern_decode_ok": True, "has_loop": False, "fsa_beat_score": 2.75, "mean_logprob": -0.15}
         self.assertEqual(ev.select_best_fsa_beat_view([c_eq1, c_eq2])["scale"], 1280)
+
+    def test_oemer_dewarp_flat_autoskip_and_curved_straighten(self) -> None:
+        # 1. Flat synthetic staff image -> must auto-skip and return bit-identical image
+        w, h = 640, 800
+        flat = np.full((h, w, 3), 255, dtype=np.uint8)
+        for sys_y in (160, 360, 560):
+            for k in range(5):
+                y = sys_y + k * 10
+                flat[y : y + 2, 40 : w - 40, :] = 20
+        flat_pil = Image.fromarray(flat, mode="RGB")
+
+        out_flat, meta_flat = preprocess_dewarp.oemer_staffline_vertical_dewarp(flat_pil)
+        self.assertTrue(meta_flat["skipped"])
+        self.assertLess(meta_flat["max_dy_px"], 1.5)
+        self.assertIs(out_flat, flat_pil)
+        self.assertTrue(np.array_equal(np.asarray(out_flat), flat))
+
+        # 2. Curved synthetic staff image (parabolic bow of ~16 px) -> must dewarp and flatten
+        curved = np.full((h, w, 3), 255, dtype=np.uint8)
+        xs = np.arange(w, dtype=np.float32)
+        bow = 16.0 * ((xs - (w / 2.0)) / (w / 2.0)) ** 2
+        for sys_y in (160, 360, 560):
+            for k in range(5):
+                for x in range(40, w - 40):
+                    y = int(round(sys_y + k * 10 + bow[x]))
+                    if 0 <= y < h - 1:
+                        curved[y : y + 2, x, :] = 20
+        curved_pil = Image.fromarray(curved, mode="RGB")
+
+        out_curved, meta_curved = preprocess_dewarp.oemer_staffline_vertical_dewarp(curved_pil)
+        self.assertFalse(meta_curved["skipped"])
+        self.assertGreater(meta_curved["max_dy_px"], 1.5)
+        self.assertEqual(out_curved.size, curved_pil.size)
+
+        # Measure vertical center-of-mass spread of the first staff across columns before vs after
+        def _staff_spread(arr_rgb: np.ndarray) -> float:
+            band = 255.0 - arr_rgb[130:240, 80 : w - 80, 0].astype(np.float32)
+            ys = np.arange(band.shape[0], dtype=np.float32)[:, None]
+            col_sum = band.sum(axis=0) + 1e-6
+            com = (band * ys).sum(axis=0) / col_sum
+            return float(com.max() - com.min())
+
+        spread_before = _staff_spread(curved)
+        spread_after = _staff_spread(np.asarray(out_curved))
+        self.assertLess(spread_after, spread_before * 0.5)
+
+    def test_estimate_unitsize_first_local_peak_no_lag4_pinning(self) -> None:
+        # 1. Synthetic staves with exact 10 px inter-staffline spacing at 1408px
+        w, h = 1100, 1408
+        arr = np.full((h, w, 3), 255, dtype=np.uint8)
+        for sys_y in (200, 450, 700, 950, 1200):
+            for k in range(5):
+                y = sys_y + k * 10
+                arr[y : y + 2, 60 : w - 60, :] = 15
+        pil = Image.fromarray(arr, mode="RGB")
+
+        target_dim, meta = preprocess_dewarp.estimate_unitsize_max_dim(
+            pil, base_max_dim=1408, min_dim=1152, max_dim=1600
+        )
+        self.assertAlmostEqual(meta["est_unit_px"], 10.0, delta=1.0)
+        self.assertGreater(meta["est_unit_px"], 4.5)
+        self.assertGreaterEqual(target_dim, 1152)
+        self.assertLessEqual(target_dim, 1600)
+        self.assertEqual(target_dim % 32, 0)
+
+        # 2. Monotonically decaying noisy vertical gradient (no staff lines) -> must NOT pin to 4.0
+        grad_y = np.linspace(240, 180, h, dtype=np.float32)[:, None]
+        noisy = np.clip(np.broadcast_to(grad_y, (h, w)), 0, 255).astype(np.uint8)
+        noisy_pil = Image.fromarray(np.stack([noisy, noisy, noisy], axis=-1), mode="RGB")
+        dim_fallback, meta_fb = preprocess_dewarp.estimate_unitsize_max_dim(
+            noisy_pil, base_max_dim=1408, min_dim=1152, max_dim=1600
+        )
+        self.assertGreater(meta_fb["est_unit_px"], 4.5)
+        self.assertEqual(dim_fallback, 1408)
+
+    def test_measure_beam_header_guard_cap_and_cli_defaults(self) -> None:
+        # 1. Trigger cap = 4 allows exactly 4 repairs then blocks further triggers
+        guard = ev.MeasureBeamHeaderGuard(const_offset_limit=10, max_triggers=4)
+        st = grammar.PrefixState(strict=False)
+        st.step("clef-G-2")
+        st.step("time-4-4")
+        st.step("quarter")
+        st.step("C")
+        st.step("4")
+        results = [guard.should_repair(st, meter_err=3.0, voice_err=0.0) for _ in range(6)]
+        self.assertEqual(results, [True, True, True, True, False, False])
+        self.assertEqual(guard.trigger_count, 4)
+
+        # 2. Promoted ov-35b / ov-34b / i13-10 CLI defaults
+        ap = ev.build_arg_parser()
+        args = ap.parse_args(["--ckpt", "dummy.pt"])
+        self.assertEqual(args.max_dim, 1408)
+        self.assertEqual(args.max_len, 3584)
+        self.assertEqual(args.measure_beam_size, 1)
+        self.assertEqual(args.measure_beam_cap, 4)
+        self.assertAlmostEqual(args.measure_beam_lp, 2.0, places=6)
+        self.assertEqual(args.measure_beam_max_window, 64)
+        self.assertFalse(args.oemer_dewarp)
+        self.assertFalse(args.unitsize_norm)
+
+        # 3. Explicit CLI flags parse cleanly
+        args_on = ap.parse_args([
+            "--ckpt", "dummy.pt",
+            "--oemer-dewarp",
+            "--unitsize-norm",
+            "--measure-beam-size", "2",
+            "--measure-beam-cap", "6",
+            "--measure-beam-lp", "1.5",
+            "--measure-beam-max-window", "96",
+        ])
+        self.assertTrue(args_on.oemer_dewarp)
+        self.assertTrue(args_on.unitsize_norm)
+        self.assertEqual(args_on.measure_beam_size, 2)
+        self.assertEqual(args_on.measure_beam_cap, 6)
+        self.assertAlmostEqual(args_on.measure_beam_lp, 1.5, places=6)
+        self.assertEqual(args_on.measure_beam_max_window, 96)
 
 
 if __name__ == "__main__":

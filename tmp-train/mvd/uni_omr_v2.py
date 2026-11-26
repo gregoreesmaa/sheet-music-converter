@@ -274,6 +274,7 @@ class UniOMRv2Config:
     n_bg_summary: int = 4
     use_ink_prior: bool = True
     router_hidden: int = 64
+    vrfm_band_alpha: float = 0.30
 
     # Training-only layout & stroke-gradient auxiliary heads (0% inference cost)
     use_sys_y_aux: bool = True
@@ -310,6 +311,7 @@ class UniOMRv2Config:
             raise ValueError(f"irope_nope_every ({self.irope_nope_every}) must be >= 0")
         self.rope_jitter = float(max(0.0, self.rope_jitter))
         self.mixstyle_prob = float(max(0.0, min(1.0, self.mixstyle_prob)))
+        self.vrfm_band_alpha = float(max(0.0, self.vrfm_band_alpha))
 
     @classmethod
     def small_45m(cls, **overrides: Any) -> "UniOMRv2Config":
@@ -803,6 +805,7 @@ class InkTokenRouterV2(nn.Module):
         saliency_thr: float = 0.05,
         max_mem_tokens: int = 10240,
         router_hidden: int = 64,
+        vrfm_band_alpha: float = 0.30,
     ) -> None:
         super().__init__()
         if not (0.0 < keep_ratio <= 1.0):
@@ -816,6 +819,7 @@ class InkTokenRouterV2(nn.Module):
         self.n_bg_summary = int(n_bg_summary)
         self.use_ink_prior = bool(use_ink_prior)
         self.max_mem_tokens = int(max_mem_tokens)
+        self.vrfm_band_alpha = float(max(0.0, vrfm_band_alpha))
 
         hidden = max(32, int(router_hidden))
         self.saliency_net = nn.Sequential(
@@ -842,7 +846,7 @@ class InkTokenRouterV2(nn.Module):
         """Compute edge-connected dark-border-masked high-pass ink map and soft paper_gate.
 
         Uses a fast vectorized 4-edge inward scan stopping at the first bright
-        pixel (``luma >= 0.45``) to isolate only dark exterior desk/scanner
+        pixel (``luma >= 0.35``) to isolate only dark exterior desk/scanner
         borders (``luma < 0.22`` connected to the outer boundary), dilates that
         outer border mask by 6px in pixel space (separable 1x13 + 13x1 max-pool)
         to eliminate the paper-to-desk transition halo without eroding tight
@@ -857,7 +861,7 @@ class InkTokenRouterV2(nn.Module):
 
         # Edge-connected dark-border mask: 2 cumsums (0 flips) — bit-identical to 4-edge scan.
         # Since (luma < 0.22) implies bright_i == 0, cs_y == cs_y[:, :, -1:, :] iff no bright pixel at y..H-1.
-        bright_i = (luma >= 0.45).to(torch.int32)
+        bright_i = (luma >= 0.35).to(torch.int32)
         cs_y = bright_i.cumsum(dim=2)
         cs_x = bright_i.cumsum(dim=3)
         edge_dark = (
@@ -910,6 +914,16 @@ class InkTokenRouterV2(nn.Module):
             raise ValueError(f"keep_ratio must be in (0, 1], got {ratio}")
 
         saliency_logits = self.saliency_net(feat_2d)
+        if self.vrfm_band_alpha > 0.0 and H_p >= 3:
+            row_mean = saliency_logits.mean(dim=3, keepdim=True)
+            row_smooth = F.avg_pool2d(
+                row_mean,
+                kernel_size=(3, 1),
+                stride=1,
+                padding=(1, 0),
+                count_include_pad=False,
+            )
+            saliency_logits = saliency_logits + self.vrfm_band_alpha * row_smooth
         saliency_prob = torch.sigmoid(saliency_logits)
 
         ink_target: Optional[torch.Tensor] = None
@@ -1120,6 +1134,7 @@ class HybridAxialMergerEncoder(nn.Module):
             saliency_thr=cfg.saliency_thr,
             max_mem_tokens=cfg.max_mem_tokens,
             router_hidden=cfg.router_hidden,
+            vrfm_band_alpha=cfg.vrfm_band_alpha,
         )
 
         self.rope2d = AspectNormalizedRoPE2D(

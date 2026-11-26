@@ -683,7 +683,7 @@ def test_iter12_kernel_speedups() -> None:
     ink_fast, gate_fast, eff_fast = InkTokenRouterV2._compute_ink_and_paper_gate(img, 12, 10)
     # Reference 4-edge flip scan
     luma_ref = 0.299 * img[:, 0:1] + 0.587 * img[:, 1:2] + 0.114 * img[:, 2:3]
-    bi = (luma_ref >= 0.45).to(torch.int32)
+    bi = (luma_ref >= 0.35).to(torch.int32)
     top_d = bi.cumsum(dim=2) == 0
     bot_d = bi.flip(dims=(2,)).cumsum(dim=2).flip(dims=(2,)) == 0
     left_d = bi.cumsum(dim=3) == 0
@@ -801,6 +801,140 @@ def test_router_p10_and_paper_gate_fixes() -> None:
     assert len(UniOMRv2Net(UniOMRv2Config.edge85m()).state_dict()) == 383
 
 
+def test_vrfm_band_router_and_ov21_luma_stop() -> None:
+    """Verify i13-17 VRFM 3-row horizontal band smoothing (alpha=0.30) and ov-21 luma_stop=0.35 parity."""
+    torch.manual_seed(20261126)
+
+    # 1. Config default and wiring into InkTokenRouterV2
+    cfg_default = _tiny_cfg()
+    assert cfg_default.vrfm_band_alpha == 0.30
+    m_default = UniOMRv2Net(cfg_default).eval()
+    assert m_default.encoder.router.vrfm_band_alpha == 0.30
+
+    # 2. Exact i13-17 3-row horizontal band smoothing boosts staff-band rows over isolated single-patch spikes
+    router_vrfm = InkTokenRouterV2(
+        d_model=16,
+        dynamic_routing=True,
+        min_keep_ratio=0.15,
+        max_keep_ratio=0.75,
+        use_ink_prior=True,
+        vrfm_band_alpha=0.30,
+    ).eval()
+    router_zero = InkTokenRouterV2(
+        d_model=16,
+        dynamic_routing=True,
+        min_keep_ratio=0.15,
+        max_keep_ratio=0.75,
+        use_ink_prior=True,
+        vrfm_band_alpha=0.0,
+    ).eval()
+    router_zero.load_state_dict(router_vrfm.state_dict())
+
+    # Construct synthetic saliency_net output with a 3-row horizontal staff band (rows 6..8)
+    # and an isolated noisy single-patch clutter spike at (row=1, col=10) with equal raw logit (+2.0).
+    H_p, W_p = 12, 16
+    raw_logits = torch.zeros(1, 1, H_p, W_p, dtype=torch.float32)
+    raw_logits[:, :, 6:9, :] = 2.0      # coherent 3-row horizontal staff band
+    raw_logits[:, :, 1, 10] = 2.0       # isolated single-patch noise spike
+
+    class _ConstSaliency(torch.nn.Module):
+        def forward(self, _x: torch.Tensor) -> torch.Tensor:
+            return raw_logits
+
+    router_vrfm.saliency_net = _ConstSaliency()
+    router_zero.saliency_net = _ConstSaliency()
+    feat_sp = torch.zeros(1, 16, H_p, W_p)
+
+    with torch.no_grad():
+        _, _, info_vrfm = router_vrfm(feat_sp, images=None)
+        _, _, info_zero = router_zero(feat_sp, images=None)
+
+    # Exact formula parity vs i13-17 run_colab.py
+    row_mean_ref = raw_logits.mean(dim=3, keepdim=True)
+    row_smooth_ref = torch.nn.functional.avg_pool2d(
+        row_mean_ref, kernel_size=(3, 1), stride=1, padding=(1, 0), count_include_pad=False
+    )
+    expected_logits = raw_logits + 0.30 * row_smooth_ref
+    assert float((info_vrfm["saliency_logits"] - expected_logits).abs().max().item()) < 1e-6
+    assert float((info_zero["saliency_logits"] - raw_logits).abs().max().item()) == 0.0
+
+    # Staff-band row center (row=7) must now strictly outrank the isolated single-patch spike (row=1, col=10)
+    band_logit = float(info_vrfm["saliency_logits"][0, 0, 7, 10].item())
+    spike_logit = float(info_vrfm["saliency_logits"][0, 0, 1, 10].item())
+    assert band_logit - spike_logit > 0.50, (
+        f"Expected VRFM band smoothing to separate staff band ({band_logit:.3f}) "
+        f"above isolated spike ({spike_logit:.3f})"
+    )
+
+    # 3. Dense ink page still achieves ink_recall >= 0.95 with vrfm_band_alpha=0.30 + ONNX export safety
+    router_dense = InkTokenRouterV2(
+        d_model=64,
+        dynamic_routing=True,
+        min_keep_ratio=0.15,
+        max_keep_ratio=0.75,
+        saliency_thr=0.05,
+        use_ink_prior=True,
+        max_mem_tokens=3072,
+        vrfm_band_alpha=0.30,
+    ).eval()
+    with torch.no_grad():
+        for p in router_dense.saliency_net.parameters():
+            p.zero_()
+    img_dense = torch.full((1, 3, 320, 320), 0.95, dtype=torch.float32)
+    for y in range(48, 272, 6):
+        img_dense[:, :, y : y + 2, 4:316] = 0.05
+    feat_dense = torch.zeros(1, 64, 20, 20)
+    with torch.no_grad():
+        _, _, info_dense = router_dense(feat_dense, images=img_dense)
+    assert info_dense["ink_recall"] >= 0.95, f"vrfm_band_alpha=0.30 broke ink_recall: {info_dense['ink_recall']:.3f}"
+
+    orig_onnx_fn = torch.onnx.is_in_onnx_export
+    orig_quantile = torch.quantile
+
+    def _forbid_quantile(*args, **kwargs):
+        raise AssertionError("torch.quantile must not be called during ONNX export")
+
+    try:
+        torch.onnx.is_in_onnx_export = lambda: True  # type: ignore[assignment]
+        torch.quantile = _forbid_quantile  # type: ignore[assignment]
+        with torch.no_grad():
+            _, _, info_onnx = router_dense(feat_dense, images=img_dense)
+        assert info_onnx["ink_recall"] >= 0.95
+    finally:
+        torch.onnx.is_in_onnx_export = orig_onnx_fn  # type: ignore[assignment]
+        torch.quantile = orig_quantile  # type: ignore[assignment]
+
+    # 4. ov-21 luma_stop=0.35 in both uni_omr_v2.py and vir_router_v2.py:
+    #    Dark aged parchment (luma=0.38, between 0.35 and 0.45) must STOP the edge-connected
+    #    flood-fill so dark interior ink (luma=0.10) behind it is NOT masked out.
+    img_parchment = torch.full((1, 3, 128, 128), 0.38, dtype=torch.float32)
+    img_parchment[:, :, :, :8] = 0.08          # dark exterior desk border on left
+    img_parchment[:, :, 40:88, 48:96] = 0.10   # dark interior ink on aged parchment
+    _, _, eff_v2 = InkTokenRouterV2._compute_ink_and_paper_gate(img_parchment, 8, 8)
+    assert not bool(eff_v2[0, 0, :, 0].any()), "Leftmost desk border column must still be masked"
+    assert bool(eff_v2[0, 0, 3:5, 3:6].all()), (
+        "Interior ink behind luma=0.38 aged parchment must NOT be masked with luma_stop=0.35"
+    )
+
+    vir_path = _THIS_DIR / "vir_router_v2.py"
+    if vir_path.is_file():
+        from vir_router_v2 import compute_ink_and_paper_gate_f32
+
+        _, _, eff_vir = compute_ink_and_paper_gate_f32(img_parchment, 8, 8)
+        assert not bool((eff_vir[0, 0, :, 0] > 0.5).any()), "vir_router_v2 must still mask leftmost desk border"
+        assert bool((eff_vir[0, 0, 3:5, 3:6] > 0.5).all()), (
+            "vir_router_v2 must stop flood-fill at luma=0.38 aged parchment (luma_stop=0.35)"
+        )
+
+    # 5. Zero state_dict drift (exact key counts & identical keys vs vrfm_band_alpha=0.0)
+    sd_small = UniOMRv2Net(UniOMRv2Config.small_45m()).state_dict()
+    sd_small_0 = UniOMRv2Net(UniOMRv2Config.small_45m(vrfm_band_alpha=0.0)).state_dict()
+    sd_edge = UniOMRv2Net(UniOMRv2Config.edge85m()).state_dict()
+    assert len(sd_small) == 349
+    assert len(sd_edge) == 383
+    assert list(sd_small.keys()) == list(sd_small_0.keys())
+
+
 def main() -> None:
     summaries = _check_presets_param_counts_and_byte_budgets()
     test_aspect_normalized_rope2d_resolution_invariance()
@@ -812,6 +946,7 @@ def main() -> None:
     test_iter12_compute_memory_optimizations()
     test_iter12_kernel_speedups()
     test_router_p10_and_paper_gate_fixes()
+    test_vrfm_band_router_and_ov21_luma_stop()
 
     print("=== UniOMR v2 CPU Unit Tests PASSED ===")
     for name, s in summaries.items():

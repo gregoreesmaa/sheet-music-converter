@@ -164,8 +164,8 @@ def compute_ink_and_paper_gate_f32(
         luma = img_f.mean(dim=1, keepdim=True)
 
     # Pure-float32 edge-connected dark-border mask (4-edge inward scan stopping
-    # at first bright pixel luma >= 0.45; interior dark shadows/ink are NEVER masked).
-    bright_f = (luma >= 0.45).to(torch.float32)
+    # at first bright pixel luma >= 0.35; interior dark shadows/ink are NEVER masked).
+    bright_f = (luma >= 0.35).to(torch.float32)
     top_dark = (bright_f.cumsum(dim=2) < 0.5).to(torch.float32)
     bot_dark = (bright_f.flip(dims=(2,)).cumsum(dim=2).flip(dims=(2,)) < 0.5).to(torch.float32)
     left_dark = (bright_f.cumsum(dim=3) < 0.5).to(torch.float32)

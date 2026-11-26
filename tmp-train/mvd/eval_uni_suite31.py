@@ -44,6 +44,7 @@ if str(_THIS_DIR) not in sys.path:
 import data  # noqa: E402
 import eval_sys_gate as esg  # noqa: E402
 import grammar  # noqa: E402
+import preprocess_dewarp  # noqa: E402
 import uni_omr  # noqa: E402
 import uni_omr_v2  # noqa: E402
 
@@ -310,9 +311,18 @@ class MeasureBeamHeaderGuard:
     mismatches (``voice_err > tol``) remain eligible for repair.
     """
 
-    def __init__(self, const_offset_limit: int = 3, tol: float = 1e-3) -> None:
+    def __init__(
+        self,
+        const_offset_limit: int = 3,
+        tol: float = 1e-3,
+        max_triggers: Optional[int] = None,
+    ) -> None:
         self.const_offset_limit = int(const_offset_limit)
         self.tol = float(tol)
+        self.max_triggers: Optional[int] = (
+            int(max_triggers) if max_triggers is not None else None
+        )
+        self.trigger_count: int = 0
         self.last_tsig: Optional[float] = None
         self.offset_counts: Dict[float, int] = {}
         self.tripped: bool = False
@@ -323,6 +333,8 @@ class MeasureBeamHeaderGuard:
         meter_err: float,
         voice_err: float,
     ) -> bool:
+        if self.max_triggers is not None and self.trigger_count >= self.max_triggers:
+            return False
         if meter_err <= self.tol and voice_err <= self.tol:
             return False
         if state.tsig != self.last_tsig:
@@ -331,6 +343,7 @@ class MeasureBeamHeaderGuard:
             self.tripped = False
         # Cross-voice mismatch is independent of the time-signature header.
         if voice_err > self.tol:
+            self.trigger_count += 1
             return True
         if self.tripped:
             return False
@@ -342,6 +355,7 @@ class MeasureBeamHeaderGuard:
             if cnt > self.const_offset_limit:
                 self.tripped = True
                 return False
+        self.trigger_count += 1
         return True
 
 
@@ -358,10 +372,17 @@ def _beam_repair_measure(
     use_grammar: bool,
     strict_grammar: bool,
     device: torch.device,
+    max_lp_drop: Optional[float] = 2.0,
+    meter_w: float = 6.0,
+    voice_w: float = 4.0,
 ) -> Tuple[Optional[List[int]], Optional[grammar.PrefixState], List[Any], float]:
     """Run a ``beam_size``-beam search over one measure starting after ``trigger_id``.
 
-    Scores each closed measure by ``log_prob - 6.0 * meter_err - 4.0 * voice_err``.
+    Scores each closed measure by ``log_prob - meter_w * meter_err - voice_w * voice_err``
+    (default ``6.0`` / ``4.0`` from promoted ``ov-34b`` ``mbeam2_cap4_lp2_w64``), with an
+    optional log-prob drop guardrail ``max_lp_drop`` (default ``2.0``) that rejects repairs
+    sacrificing more than ``max_lp_drop`` raw log-prob relative to the best-likelihood
+    closed bar in the measure.
     Returns ``(best_toks, best_state, kv0, best_score)`` where ``kv0`` covers
     ``kv_prefix + [trigger_id]`` (so caller can fast-prefill ``best_toks[:-1]``).
     If no beam closes a bar within ``max_bar_toks``, returns ``(None, None, kv0, -inf)``.
@@ -459,7 +480,7 @@ def _beam_repair_measure(
 
             if is_bar_close:
                 meter_err, voice_err = _measure_violation_errors(p_state)
-                score = raw_lp - 6.0 * meter_err - 4.0 * voice_err
+                score = raw_lp - float(meter_w) * meter_err - float(voice_w) * voice_err
                 end_state = _advance_grammar_state(
                     p_state.copy(), tok_id, strict=strict_grammar, vocab_size=vocab_size
                 )
@@ -494,8 +515,14 @@ def _beam_repair_measure(
     if not finished_bars:
         return None, None, kv0, float("-inf")
 
+    if max_lp_drop is not None and float(max_lp_drop) >= 0.0:
+        ref_lp = max(f[1] for f in finished_bars)
+        eligible = [f for f in finished_bars if f[1] >= ref_lp - float(max_lp_drop)]
+        pool = eligible if eligible else finished_bars
+    else:
+        pool = finished_bars
     best_score, _, best_toks, best_state = max(
-        finished_bars, key=lambda f: (f[0], f[1])
+        pool, key=lambda f: (f[0], f[1])
     )
     return best_toks, best_state, kv0, float(best_score)
 
@@ -619,7 +646,9 @@ def generate_mtp_spec(
     keep_ratio_override: Optional[float] = None,
     return_stats: bool = True,
     measure_beam_size: int = 0,
-    max_bar_toks: int = 120,
+    max_bar_toks: int = 64,
+    measure_beam_cap: Optional[int] = 4,
+    measure_beam_lp: Optional[float] = 2.0,
 ) -> Any:
     """MTP-k self-speculative KV-cached decoding using ``model.mtp_heads``.
 
@@ -665,6 +694,8 @@ def generate_mtp_spec(
                 return_stats=True,
                 measure_beam_size=measure_beam_size,
                 max_bar_toks=max_bar_toks,
+                measure_beam_cap=measure_beam_cap,
+                measure_beam_lp=measure_beam_lp,
             )
             seqs_b.append(s_b[0])
             tot_prop += int(st_b["draft_proposed"])
@@ -736,7 +767,11 @@ def generate_mtp_spec(
     )
     measure_beam_triggers = 0
     measure_beam_repaired = 0
-    header_guard = MeasureBeamHeaderGuard() if use_measure_beam else None
+    header_guard = (
+        MeasureBeamHeaderGuard(max_triggers=measure_beam_cap)
+        if use_measure_beam
+        else None
+    )
 
     def _pick_step(step_logits: torch.Tensor) -> torch.Tensor:
         if not use_grammar:
@@ -863,6 +898,7 @@ def generate_mtp_spec(
             use_grammar=use_grammar,
             strict_grammar=strict_grammar,
             device=device,
+            max_lp_drop=measure_beam_lp,
         )
         if best_toks is not None and best_state is not None:
             if best_toks != orig_bar_toks:
@@ -1665,6 +1701,9 @@ def _decode_single_view(
     beam_size: int,
     beam_length_penalty: float,
     measure_beam_size: int,
+    measure_beam_cap: Optional[int] = 4,
+    measure_beam_lp: Optional[float] = 2.0,
+    measure_beam_max_window: int = 64,
     compute_logprob: bool = False,
 ) -> Tuple[torch.Tensor, Optional[Dict[str, Any]], float, Optional[float]]:
     """Decode one ``(1, 3, H, W)`` image tensor using the configured decoder mode."""
@@ -1698,6 +1737,9 @@ def _decode_single_view(
                     strict_grammar=args.strict_grammar,
                     return_stats=True,
                     measure_beam_size=measure_beam_size,
+                    max_bar_toks=int(measure_beam_max_window),
+                    measure_beam_cap=measure_beam_cap,
+                    measure_beam_lp=measure_beam_lp,
                 )
             elif args.use_grammar:
                 seq = generate_constrained(
@@ -1740,9 +1782,14 @@ def evaluate_suite31(args: argparse.Namespace) -> Dict[str, Any]:
     if beam_size < 1:
         raise ValueError(f"--beam-size must be >= 1, got {beam_size}")
     beam_length_penalty = float(getattr(args, "beam_length_penalty", 0.6))
-    measure_beam_size = int(getattr(args, "measure_beam_size", 0))
+    measure_beam_size = int(getattr(args, "measure_beam_size", 1))
     if measure_beam_size < 0:
         raise ValueError(f"--measure-beam-size must be >= 0, got {measure_beam_size}")
+    measure_beam_cap = int(getattr(args, "measure_beam_cap", 4))
+    measure_beam_lp = float(getattr(args, "measure_beam_lp", 2.0))
+    measure_beam_max_window = int(getattr(args, "measure_beam_max_window", 64))
+    use_oemer_dewarp = bool(getattr(args, "oemer_dewarp", False))
+    use_unitsize_norm = bool(getattr(args, "unitsize_norm", False))
     max_keep_ratio_override = getattr(args, "max_keep_ratio_override", None)
     tta_scales = parse_tta_scales(getattr(args, "tta_scales", None))
 
@@ -1757,8 +1804,16 @@ def evaluate_suite31(args: argparse.Namespace) -> Dict[str, Any]:
             ("mtp-spec" if (args.use_mtp_spec or measure_beam_size > 1) else "greedy")
             + ("+grammar" if args.use_grammar else "")
             + ("(strict)" if (args.use_grammar and args.strict_grammar) else "")
-            + (f"+mbeam{measure_beam_size}" if measure_beam_size > 1 else "")
+            + (
+                f"+mbeam{measure_beam_size}(cap={measure_beam_cap},lp={measure_beam_lp:g},w={measure_beam_max_window})"
+                if measure_beam_size > 1
+                else ""
+            )
         )
+    if use_oemer_dewarp:
+        mode_tag += "+dewarp"
+    if use_unitsize_norm:
+        mode_tag += "+unitsize"
     if tta_scales:
         mode_tag += f"+tta({','.join(str(s) for s in tta_scales)}:best_fsa_beat)"
     mkr_str = (
@@ -1808,10 +1863,23 @@ def evaluate_suite31(args: argparse.Namespace) -> Dict[str, Any]:
                 img_path: Path = piece[domain]
                 tta_selected_scale: Optional[int] = None
                 tta_views_summary: Optional[List[Dict[str, Any]]] = None
+                pre_meta: Dict[str, Any] = {}
+
+                with Image.open(img_path) as raw_im:
+                    work_rgb = raw_im.convert("RGB")
+                if use_oemer_dewarp:
+                    work_rgb, dw_meta = preprocess_dewarp.oemer_staffline_vertical_dewarp(work_rgb)
+                    pre_meta.update(dw_meta)
 
                 if not tta_scales:
-                    with Image.open(img_path) as raw_im:
-                        pil_im = uni_omr._resize_fullpage_pil(raw_im.convert("RGB"), args.max_dim)
+                    if use_unitsize_norm:
+                        target_dim, us_meta = preprocess_dewarp.estimate_unitsize_max_dim(
+                            work_rgb, base_max_dim=int(args.max_dim)
+                        )
+                        pre_meta.update(us_meta)
+                    else:
+                        target_dim = int(args.max_dim)
+                    pil_im = uni_omr._resize_fullpage_pil(work_rgb, target_dim)
                     img_t = uni_omr._pil_to_chw_tensor(pil_im).unsqueeze(0).to(device)
                     seq, mtp_stats, elapsed, _ = _decode_single_view(
                         model=model,
@@ -1823,6 +1891,9 @@ def evaluate_suite31(args: argparse.Namespace) -> Dict[str, Any]:
                         beam_size=beam_size,
                         beam_length_penalty=beam_length_penalty,
                         measure_beam_size=measure_beam_size,
+                        measure_beam_cap=measure_beam_cap,
+                        measure_beam_lp=measure_beam_lp,
+                        measure_beam_max_window=measure_beam_max_window,
                         compute_logprob=False,
                     )
                     seq_ids = seq[0].detach().cpu().tolist()
@@ -1842,12 +1913,10 @@ def evaluate_suite31(args: argparse.Namespace) -> Dict[str, Any]:
                     bekern_decode_ok = (p_dec.returncode == 0) and hyp_notes.exists()
                     dec_rc = int(p_dec.returncode)
                 else:
-                    with Image.open(img_path) as raw_im:
-                        raw_rgb = raw_im.convert("RGB")
                     view_candidates: List[Dict[str, Any]] = []
                     total_elapsed = 0.0
                     for scale_dim in tta_scales:
-                        pil_im = uni_omr._resize_fullpage_pil(raw_rgb, scale_dim)
+                        pil_im = uni_omr._resize_fullpage_pil(work_rgb, scale_dim)
                         img_t = uni_omr._pil_to_chw_tensor(pil_im).unsqueeze(0).to(device)
                         v_seq, v_mtp_stats, v_elapsed, v_mean_lp = _decode_single_view(
                             model=model,
@@ -1859,6 +1928,9 @@ def evaluate_suite31(args: argparse.Namespace) -> Dict[str, Any]:
                             beam_size=beam_size,
                             beam_length_penalty=beam_length_penalty,
                             measure_beam_size=measure_beam_size,
+                            measure_beam_cap=measure_beam_cap,
+                            measure_beam_lp=measure_beam_lp,
+                            measure_beam_max_window=measure_beam_max_window,
                             compute_logprob=True,
                         )
                         total_elapsed += v_elapsed
@@ -1980,6 +2052,8 @@ def evaluate_suite31(args: argparse.Namespace) -> Dict[str, Any]:
                 prow[pfx + "n_pred_toks"] = len(hyp_page_toks)
                 prow[pfx + "elapsed_secs"] = round(elapsed, 4)
                 prow[pfx + "tok_per_sec"] = round(tok_per_sec, 2)
+                if pre_meta:
+                    prow[pfx + "preprocess"] = pre_meta
                 if tta_selected_scale is not None:
                     prow[pfx + "tta_selected_scale"] = tta_selected_scale
                     prow[pfx + "tta_views"] = tta_views_summary
@@ -2041,6 +2115,11 @@ def evaluate_suite31(args: argparse.Namespace) -> Dict[str, Any]:
             "beam_size": beam_size,
             "beam_length_penalty": beam_length_penalty,
             "measure_beam_size": measure_beam_size,
+            "measure_beam_cap": measure_beam_cap,
+            "measure_beam_lp": measure_beam_lp,
+            "measure_beam_max_window": measure_beam_max_window,
+            "oemer_dewarp": use_oemer_dewarp,
+            "unitsize_norm": use_unitsize_norm,
             "max_keep_ratio_override": (
                 float(max_keep_ratio_override)
                 if max_keep_ratio_override is not None
@@ -2114,8 +2193,18 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default=str(DEFAULT_MANIFEST),
         help="Path to suite31_hw_manifest.json",
     )
-    ap.add_argument("--max-dim", type=int, default=1024, help="Full-page resize max dimension")
-    ap.add_argument("--max-len", type=int, default=1024, help="Max autoregressive decode tokens")
+    ap.add_argument(
+        "--max-dim",
+        type=int,
+        default=1408,
+        help="Full-page resize max dimension (ov-35b universal default: 1408)",
+    )
+    ap.add_argument(
+        "--max-len",
+        type=int,
+        default=3584,
+        help="Max autoregressive decode tokens (ov-35b universal default: 3584)",
+    )
     ap.add_argument("--use-grammar", action="store_true", help="Enable FSA grammar-constrained decoding")
     ap.add_argument("--strict-grammar", action="store_true", help="Enable strict bar-duration grammar rules")
     ap.add_argument("--use-mtp-spec", action="store_true", help="Enable MTP-4 self-speculative decoding")
@@ -2134,8 +2223,36 @@ def build_arg_parser() -> argparse.ArgumentParser:
     ap.add_argument(
         "--measure-beam-size",
         type=int,
-        default=0,
-        help="Violation-triggered measure-scoped beam search width (0 = off, e.g. 4 when enabled)",
+        default=1,
+        help="Violation-triggered measure-scoped beam search width (1 = fast default off; 2 = promoted ov-34b budget)",
+    )
+    ap.add_argument(
+        "--measure-beam-cap",
+        type=int,
+        default=4,
+        help="Max measure-beam repair triggers per page (ov-34b default: 4)",
+    )
+    ap.add_argument(
+        "--measure-beam-lp",
+        type=float,
+        default=2.0,
+        help="Max log-prob drop guardrail for measure-beam repair vs best-likelihood closed bar (ov-34b default: 2.0)",
+    )
+    ap.add_argument(
+        "--measure-beam-max-window",
+        type=int,
+        default=64,
+        help="Max tokens per measure-beam repair window (ov-34b default: 64)",
+    )
+    ap.add_argument(
+        "--oemer-dewarp",
+        action="store_true",
+        help="Opt-in OEMER staffline-aware vertical dewarping (i13-10; auto-skips flat pages < 1.5 px)",
+    )
+    ap.add_argument(
+        "--unitsize-norm",
+        action="store_true",
+        help="Opt-in Homr unit_size inter-staffline spacing adaptive max_dim normalization (i13-10)",
     )
     ap.add_argument(
         "--max-keep-ratio-override",
