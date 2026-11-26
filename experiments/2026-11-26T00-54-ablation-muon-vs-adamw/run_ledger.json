@@ -1,0 +1,30 @@
+{
+  "exp_id": "2026-11-26T00-54-ablation-muon-vs-adamw",
+  "status": "COMPLETED",
+  "platform": "modal_l4",
+  "gpu": "NVIDIA L4",
+  "baseline_sha": "9d73170",
+  "started_at_utc": "2026-11-25T23:14:10.912418+00:00",
+  "finished_at_utc": "2026-11-26T01:04:59.648722+00:00",
+  "total_wall_time_s": 5504.37,
+  "eval_hf_path": "evals/2026-11-26T00-54-ablation-muon-vs-adamw.json",
+  "checkpoints_hf_dir": "checkpoints/2026-11-26T00-54-ablation-muon-vs-adamw/",
+  "comparison": {
+    "delta_muon_minus_adamw": {
+      "final_100_train_loss": -0.00143,
+      "final_100_train_ce": 0.02949,
+      "raw_val_ce": 0.025079,
+      "raw_val_mtp": 0.047537,
+      "raw_val_ser": -0.004399,
+      "raw_val_token_f1": -0.029357,
+      "ema_val_ce": 0.038844,
+      "ema_val_mtp": 0.057904,
+      "ema_val_ser": -0.143665,
+      "ema_val_token_f1": 0.158817,
+      "wall_time_s": 190.03,
+      "peak_vram_alloc_gb": -0.128
+    },
+    "winner_by_ema_val_ce": "adamw",
+    "winner_by_ema_val_ser": "muon"
+  }
+}

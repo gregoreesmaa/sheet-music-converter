@@ -442,5 +442,20 @@
     "depends_on": [
       "2026-11-26T01-38-ov-36-hw-multiview-tta-voting"
     ]
+  },
+  {
+    "id": "2026-11-26T03-31-exp4b-decoupled-muon-lr-sweep",
+    "wave": 4,
+    "priority": 5,
+    "provider": "colab_l4",
+    "gpu": "L4",
+    "est_minutes": 45,
+    "est_cu": 3.0,
+    "script": "experiments/2026-11-26T03-31-exp4b-decoupled-muon-lr-sweep/run_colab.py",
+    "hf_eval_target": "evals/2026-11-26T03-31-exp4b-decoupled-muon-lr-sweep.json",
+    "status": "QUEUED",
+    "depends_on": [
+      "2026-11-26T00-54-ablation-muon-vs-adamw"
+    ]
   }
 ]

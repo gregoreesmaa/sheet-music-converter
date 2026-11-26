@@ -100,3 +100,9 @@ Must record:
    git -c user.name="Gregor Eesmaa" -c user.email="6941817+gregoreesmaa@users.noreply.github.com" commit -m "exp(<slug>): record OUTCOME, skill updates, and follow-up DAG experiment"
    git push origin master
    ```
+
+---
+
+## 4. Empirical Learnings & Gotchas
+
+- **Short-proxy EMA lag trap (`2026-11-26`, Exp 4 `ablation-muon-vs-adamw`):** Using `--gpu-ema-decay 0.997 --gpu-ema-every 5` on short from-scratch proxy runs (`<= 1,500` steps) yields only `<= 300` EMA updates, leaving `0.997^240 = 48.6%` of the EMA checkpoint at random step-0 initialization (which collapsed `AdamW` EMA `token_f1` from `0.3609` RAW to `0.0865` EMA). For short proxy runs (`<= 2,000` steps), use `--gpu-ema-decay 0.99 --gpu-ema-every 1` (at `1,200` steps `0.99^1200 = 5.8e-6`) and ALWAYS compare both RAW and EMA checkpoints in `## Scrutiny & Anomaly Check`.
