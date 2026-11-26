@@ -49,8 +49,9 @@ import verifier_3tier  # noqa: E402
 import numpy as np  # noqa: E402
 from PIL import Image  # noqa: E402
 
-ASER = REPO_ROOT / 'converter' / 'assembly-serialize' / 'target' / 'release' / 'assembly-serialize.exe'
-EHARNESS = REPO_ROOT / 'converter' / 'eval-harness' / 'target' / 'release' / 'eval-harness.exe'
+_BIN_EXT = '.exe' if os.name == 'nt' else ''
+ASER = REPO_ROOT / 'converter' / 'assembly-serialize' / 'target' / 'release' / f'assembly-serialize{_BIN_EXT}'
+EHARNESS = REPO_ROOT / 'converter' / 'eval-harness' / 'target' / 'release' / f'eval-harness{_BIN_EXT}'
 GATE20 = REPO_ROOT / 'data-gen' / 'score-corpus' / 'gate20'
 SYS_DEV = GATE20 / 'sys-dev'
 

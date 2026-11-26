@@ -1622,6 +1622,44 @@ def compute_sequence_mean_logprob(
     return float(tok_lp[valid].mean().item())
 
 
+TTA_RERANK_MODES: Tuple[str, ...] = ("fsa_logprob", "fsa_logprob_mbr", "mbr")
+
+
+def compute_mbr_vote_scores(candidates: Sequence[Dict[str, Any]]) -> List[float]:
+    """Compute weighted pairwise token-LCS MBR vote scores across TTA candidates.
+
+    Matches the promoted ``ov-36b`` MBR formula: for each view ``i``, average
+    ``compute_token_lcs_f1(toks_i, toks_j)`` over all ``j != i`` with weight
+    ``1.0`` if view ``j`` passed ``bekern-decode`` else ``0.25``.
+    """
+    n = len(candidates)
+    if n == 0:
+        return []
+    if n == 1:
+        if "mbr_vote" in candidates[0] and "hyp_page_toks" not in candidates[0]:
+            return [float(candidates[0]["mbr_vote"])]
+        return [0.0]
+
+    has_toks = all("hyp_page_toks" in c for c in candidates)
+    if not has_toks:
+        return [float(c.get("mbr_vote", 0.0)) for c in candidates]
+
+    scores: List[float] = []
+    for i in range(n):
+        toks_i = candidates[i]["hyp_page_toks"]
+        w_sum = 0.0
+        s_sum = 0.0
+        for j in range(n):
+            if i == j:
+                continue
+            w = 1.0 if bool(candidates[j].get("bekern_decode_ok", False)) else 0.25
+            sim = compute_token_lcs_f1(toks_i, candidates[j]["hyp_page_toks"])
+            s_sum += w * sim
+            w_sum += w
+        scores.append(s_sum / max(1e-6, w_sum))
+    return scores
+
+
 def select_best_fsa_beat_view(candidates: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
     """Select the winning scale-TTA view using ``best_fsa_beat``.
 
@@ -1646,6 +1684,73 @@ def select_best_fsa_beat_view(candidates: Sequence[Dict[str, Any]]) -> Dict[str,
         ),
     )
     return candidates[best_idx]
+
+
+def select_tta_view(
+    candidates: Sequence[Dict[str, Any]],
+    rerank: str = "fsa_logprob_mbr",
+) -> Tuple[Dict[str, Any], List[float], List[float]]:
+    """Select the winning multi-scale TTA view using the promoted ``ov-36b`` reranker.
+
+    Supported ``rerank`` modes:
+      - ``fsa_logprob_mbr`` (promoted ``ov-36b`` default):
+        ``0.5 * fsa_beat_score + 1.5 * mean_logprob + 1.0 * mbr_vote``
+      - ``fsa_logprob``:
+        ``fsa_beat_score + 2.0 * mean_logprob``
+      - ``mbr``:
+        ``mbr_vote`` (weighted pairwise token-LCS consensus)
+      - ``fsa_beat``:
+        legacy ``select_best_fsa_beat_view`` priority ranking
+
+    Deterministic tie-breaking on equal rounded rerank score:
+      1. ``bekern_decode_ok`` (True > False)
+      2. ``not has_loop`` (False > True)
+      3. ``mean_logprob`` (higher is better)
+      4. Earlier scale in ``--tta-scales`` (``-i``)
+
+    Returns ``(winner_dict, mbr_votes, rerank_scores)``.
+    """
+    if not candidates:
+        raise ValueError("select_tta_view requires at least one candidate")
+
+    mode = str(rerank).strip().lower()
+    mbr_votes = compute_mbr_vote_scores(candidates)
+
+    if mode == "fsa_beat":
+        rerank_scores = [float(c.get("fsa_beat_score", float("-inf"))) for c in candidates]
+        return select_best_fsa_beat_view(candidates), mbr_votes, rerank_scores
+
+    if mode == "fsa_logprob_mbr":
+        rerank_scores = [
+            0.5 * float(c.get("fsa_beat_score", float("-inf")))
+            + 1.5 * float(c.get("mean_logprob", -10.0))
+            + 1.0 * float(mbr_votes[i])
+            for i, c in enumerate(candidates)
+        ]
+    elif mode == "fsa_logprob":
+        rerank_scores = [
+            float(c.get("fsa_beat_score", float("-inf")))
+            + 2.0 * float(c.get("mean_logprob", -10.0))
+            for c in candidates
+        ]
+    elif mode == "mbr":
+        rerank_scores = [float(mbr_votes[i]) for i in range(len(candidates))]
+    else:
+        raise ValueError(
+            f"Unsupported --tta-rerank={rerank!r} (expected one of {TTA_RERANK_MODES})"
+        )
+
+    best_idx = max(
+        range(len(candidates)),
+        key=lambda i: (
+            round(float(rerank_scores[i]), 6),
+            1 if bool(candidates[i].get("bekern_decode_ok", False)) else 0,
+            0 if bool(candidates[i].get("has_loop", False)) else 1,
+            float(candidates[i].get("mean_logprob", float("-inf"))),
+            -i,
+        ),
+    )
+    return candidates[best_idx], mbr_votes, rerank_scores
 
 
 # ---------------------------------------------------------------------------
@@ -1792,6 +1897,11 @@ def evaluate_suite31(args: argparse.Namespace) -> Dict[str, Any]:
     use_unitsize_norm = bool(getattr(args, "unitsize_norm", False))
     max_keep_ratio_override = getattr(args, "max_keep_ratio_override", None)
     tta_scales = parse_tta_scales(getattr(args, "tta_scales", None))
+    tta_rerank = str(getattr(args, "tta_rerank", "fsa_logprob_mbr")).strip().lower()
+    if tta_scales and tta_rerank not in TTA_RERANK_MODES:
+        raise ValueError(
+            f"--tta-rerank must be one of {TTA_RERANK_MODES}, got {tta_rerank!r}"
+        )
 
     if beam_size > 1:
         mode_tag = (
@@ -1815,7 +1925,7 @@ def evaluate_suite31(args: argparse.Namespace) -> Dict[str, Any]:
     if use_unitsize_norm:
         mode_tag += "+unitsize"
     if tta_scales:
-        mode_tag += f"+tta({','.join(str(s) for s in tta_scales)}:best_fsa_beat)"
+        mode_tag += f"+tta({','.join(str(s) for s in tta_scales)}:{tta_rerank})"
     mkr_str = (
         f" | max_keep_ratio_override={float(max_keep_ratio_override):g}"
         if max_keep_ratio_override is not None
@@ -1968,7 +2078,9 @@ def evaluate_suite31(args: argparse.Namespace) -> Dict[str, Any]:
                             **v_fsa,
                         })
 
-                    winner = select_best_fsa_beat_view(view_candidates)
+                    winner, mbr_votes, rerank_scores = select_tta_view(
+                        view_candidates, rerank=tta_rerank
+                    )
                     pred_raw_toks = winner["pred_raw_toks"]
                     hyp_page_toks = winner["hyp_page_toks"]
                     n_sys = int(winner["n_sys"])
@@ -1983,6 +2095,8 @@ def evaluate_suite31(args: argparse.Namespace) -> Dict[str, Any]:
                             "scale": c["scale"],
                             "fsa_beat_score": c["fsa_beat_score"],
                             "mean_logprob": round(float(c["mean_logprob"]), 6),
+                            "mbr_vote": round(float(mbr_votes[i]), 6),
+                            "tta_rerank_score": round(float(rerank_scores[i]), 6),
                             "beat_conservation_rate": c["beat_conservation_rate"],
                             "has_loop": c["has_loop"],
                             "hit_eos": c["hit_eos"],
@@ -1990,7 +2104,7 @@ def evaluate_suite31(args: argparse.Namespace) -> Dict[str, Any]:
                             "n_pred_toks": len(c["hyp_page_toks"]),
                             "elapsed_secs": round(float(c["elapsed_secs"]), 4),
                         }
-                        for c in view_candidates
+                        for i, c in enumerate(view_candidates)
                     ]
 
                 # 1. Token-level F1, ordered TokLCS F1, canonical voice-major TokLCS & SER
@@ -2126,7 +2240,8 @@ def evaluate_suite31(args: argparse.Namespace) -> Dict[str, Any]:
                 else None
             ),
             "tta_scales": tta_scales if tta_scales else None,
-            "tta_selector": "best_fsa_beat" if tta_scales else None,
+            "tta_rerank": tta_rerank if tta_scales else None,
+            "tta_selector": tta_rerank if tta_scales else None,
             "device": str(device),
         },
         "summary": summary,
@@ -2263,12 +2378,21 @@ def build_arg_parser() -> argparse.ArgumentParser:
     ap.add_argument(
         "--tta-scales",
         type=str,
-        default=None,
+        default="",
         help=(
-            "Opt-in comma-separated scale-only Multi-View TTA max dimensions "
-            "(e.g. 1152,1280,1536 or 1280,1536). Default off (single-scale --max-dim). "
-            "Selects winning view via best_fsa_beat (exact FSA beat validity + no-loop + "
-            "parse score + mean log-prob tiebreak; zero clahe/deskew)."
+            "Opt-in comma-separated clean scale-only Multi-View TTA max dimensions "
+            "(e.g. 1280,1408,1536 or 1024,1152,1280,1408,1536). Empty string = disabled "
+            "(default single-scale --max-dim unchanged)."
+        ),
+    )
+    ap.add_argument(
+        "--tta-rerank",
+        type=str,
+        default="fsa_logprob_mbr",
+        choices=TTA_RERANK_MODES,
+        help=(
+            "Multi-scale TTA candidate reranker when --tta-scales is non-empty "
+            "(promoted ov-36b default: fsa_logprob_mbr = 0.5*fsa + 1.5*mean_logprob + 1.0*mbr)."
         ),
     )
     ap.add_argument(

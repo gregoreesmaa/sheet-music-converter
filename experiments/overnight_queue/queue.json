@@ -487,13 +487,16 @@
     "est_cu": 3.5,
     "script": "experiments/2026-11-26T01-38-ov-33-vjepa-warmstart-vs-scratch/run_colab.py",
     "hf_eval_target": "evals/2026-11-26T01-38-ov-33-vjepa-warmstart-vs-scratch.json",
-    "status": "RUNNING",
+    "status": "COMPLETED",
     "depends_on": [
       "2026-11-26T00-54-vjepa21-gram-rism-v2"
     ],
     "session": "ov-33",
     "started_at": "2026-11-26T12:08:48Z",
-    "log_path": "D:\\tmp\\overnight-queue-logs\\2026-11-26T01-38-ov-33-vjepa-warmstart-vs-scratch.log"
+    "log_path": "D:\\tmp\\overnight-queue-logs\\2026-11-26T01-38-ov-33-vjepa-warmstart-vs-scratch.log",
+    "completed_at": "2026-11-26T13:06:12Z",
+    "elapsed_sec": 3443.77,
+    "returncode": 0
   },
   {
     "id": "2026-11-26T01-38-ov-41-qat-int4-blocksize-spinquant",
@@ -753,12 +756,15 @@
     "est_cu": 2.9,
     "script": "experiments/2026-11-26T07-40-i13-12-smt-unfolding-text-reject-v2/run_colab.py",
     "hf_eval_target": "evals/2026-11-26T07-40-i13-12-smt-unfolding-text-reject-v2.json",
-    "status": "RUNNING",
+    "status": "COMPLETED",
     "depends_on": [],
     "started_at": "2026-11-26T12:13:30Z",
     "log_path": "D:\\tmp\\overnight-queue-logs\\2026-11-26T07-40-i13-12-smt-unfolding-text-reject-v2.log",
     "note": "re-queued after triage fix 2026-11-26 (round 3)",
-    "session": "i13-12"
+    "session": "i13-12",
+    "completed_at": "2026-11-26T14:02:08Z",
+    "elapsed_sec": 6518.06,
+    "returncode": 0
   },
   {
     "id": "2026-11-26T07-40-i13-13-cross-system-header-consensus",
@@ -1276,7 +1282,7 @@
     "est_minutes": 30,
     "script": "experiments/2026-11-26T03-08-ov-36b-multiscale-logprob-fsa-tta/run_colab.py",
     "hf_eval_target": "evals/2026-11-26T03-08-ov-36b-multiscale-logprob-fsa-tta.json",
-    "status": "RUNNING",
+    "status": "COMPLETED",
     "depends_on": [
       "2026-11-26T01-38-ov-36-hw-multiview-tta-voting"
     ],
@@ -1284,7 +1290,10 @@
     "kernel_id": "gregoreesmaa/omr-ov-36b",
     "started_at": "2026-11-26T12:21:29Z",
     "log_path": "D:\\tmp\\overnight-queue-logs\\2026-11-26T03-08-ov-36b-multiscale-logprob-fsa-tta.kaggle.log",
-    "note": "re-queued after triage fix 2026-11-26 (round 2)"
+    "note": "re-queued after triage fix 2026-11-26 (round 2)",
+    "completed_at": "2026-11-26T12:52:22Z",
+    "elapsed_sec": 1852.28,
+    "returncode": 0
   },
   {
     "id": "2026-11-26T03-31-exp4b-decoupled-muon-lr-sweep",
@@ -1382,46 +1391,58 @@
     "id": "2026-11-26T14-30-i13-06b-sar-sam-conf-skip-ttt",
     "wave": 10,
     "priority": 1,
-    "provider": "modal_l4",
+    "provider": "colab_l4",
     "gpu": "L4",
     "est_minutes": 26,
     "est_cu": 2.2,
     "script": "experiments/2026-11-26T14-30-i13-06b-sar-sam-conf-skip-ttt/run_colab.py",
     "hf_eval_target": "evals/2026-11-26T14-30-i13-06b-sar-sam-conf-skip-ttt.json",
-    "status": "QUEUED",
+    "status": "COMPLETED",
     "depends_on": [
       "2026-11-26T07-40-i13-06-memo-sar-rhythm-gated-ttt"
-    ]
+    ],
+    "session": "i13-06",
+    "started_at": "2026-11-26T13:06:12Z",
+    "log_path": "D:\\tmp\\overnight-queue-logs\\2026-11-26T14-30-i13-06b-sar-sam-conf-skip-ttt.log",
+    "completed_at": "2026-11-26T13:42:59Z",
+    "elapsed_sec": 2207.05,
+    "returncode": 0
   },
   {
     "id": "2026-11-26T14-30-i13-11b-audiveris-voice-aware-rhythm-repair",
     "wave": 10,
     "priority": 2,
-    "provider": "modal_l4",
+    "provider": "colab_l4",
     "gpu": "L4",
     "est_minutes": 12,
     "est_cu": 1.0,
     "script": "experiments/2026-11-26T14-30-i13-11b-audiveris-voice-aware-rhythm-repair/run_colab.py",
     "hf_eval_target": "evals/2026-11-26T14-30-i13-11b-audiveris-voice-aware-rhythm-repair.json",
-    "status": "QUEUED",
+    "status": "RUNNING",
     "depends_on": [
       "2026-11-26T07-40-i13-11-audiveris-humdrum-postproc"
-    ]
+    ],
+    "session": "i13-11",
+    "started_at": "2026-11-26T13:42:59Z",
+    "log_path": "D:\\tmp\\overnight-queue-logs\\2026-11-26T14-30-i13-11b-audiveris-voice-aware-rhythm-repair.log"
   },
   {
     "id": "2026-11-26T14-30-i13-16b-mathpix-conf-gated-redecode-fixed",
     "wave": 10,
     "priority": 3,
-    "provider": "modal_l4",
+    "provider": "colab_l4",
     "gpu": "L4",
     "est_minutes": 20,
     "est_cu": 1.7,
     "script": "experiments/2026-11-26T14-30-i13-16b-mathpix-conf-gated-redecode-fixed/run_colab.py",
     "hf_eval_target": "evals/2026-11-26T14-30-i13-16b-mathpix-conf-gated-redecode-fixed.json",
-    "status": "QUEUED",
+    "status": "RUNNING",
     "depends_on": [
       "2026-11-26T07-40-i13-16-mathpix-conf-gated-redecode"
-    ]
+    ],
+    "session": "i13-16",
+    "started_at": "2026-11-26T14:02:08Z",
+    "log_path": "D:\\tmp\\overnight-queue-logs\\2026-11-26T14-30-i13-16b-mathpix-conf-gated-redecode-fixed.log"
   },
   {
     "id": "2026-11-26T14-30-i13-18b-conf-gated-ilms-blank",
@@ -1453,6 +1474,66 @@
     "depends_on": [
       "2026-11-26T01-38-ov-19-router-saliency-keep-sweep",
       "2026-11-26T07-15-iter12-v2-strip-warmup-24k"
+    ]
+  },
+  {
+    "id": "2026-11-26T16-20-i13-06c-sar-sam-tight-conf-skip",
+    "wave": 10,
+    "priority": 4,
+    "provider": "colab_l4",
+    "gpu": "L4",
+    "est_minutes": 32,
+    "est_cu": 2.6,
+    "script": "experiments/2026-11-26T16-20-i13-06c-sar-sam-tight-conf-skip/run_colab.py",
+    "hf_eval_target": "evals/2026-11-26T16-20-i13-06c-sar-sam-tight-conf-skip.json",
+    "status": "QUEUED",
+    "depends_on": [
+      "2026-11-26T14-30-i13-06b-sar-sam-conf-skip-ttt"
+    ]
+  },
+  {
+    "id": "2026-11-26T16-20-ov-33b-vjepa-warmstart-fixed-eval",
+    "wave": 10,
+    "priority": 5,
+    "provider": "colab_l4",
+    "gpu": "L4",
+    "est_minutes": 45,
+    "est_cu": 3.6,
+    "script": "experiments/2026-11-26T16-20-ov-33b-vjepa-warmstart-fixed-eval/run_colab.py",
+    "hf_eval_target": "evals/2026-11-26T16-20-ov-33b-vjepa-warmstart-fixed-eval.json",
+    "status": "QUEUED",
+    "depends_on": [
+      "2026-11-26T01-38-ov-33-vjepa-warmstart-vs-scratch"
+    ]
+  },
+  {
+    "id": "2026-11-26T16-20-ov-31b-vjepa-mask-curriculum-vicreg",
+    "wave": 10,
+    "priority": 6,
+    "provider": "colab_l4",
+    "gpu": "L4",
+    "est_minutes": 38,
+    "est_cu": 3.1,
+    "script": "experiments/2026-11-26T16-20-ov-31b-vjepa-mask-curriculum-vicreg/run_colab.py",
+    "hf_eval_target": "evals/2026-11-26T16-20-ov-31b-vjepa-mask-curriculum-vicreg.json",
+    "status": "QUEUED",
+    "depends_on": [
+      "2026-11-26T01-38-ov-31-vjepa21-mask-ratio-sweep"
+    ]
+  },
+  {
+    "id": "2026-11-26T16-20-ov-32b-gram-weight-high-vicreg",
+    "wave": 10,
+    "priority": 7,
+    "provider": "colab_l4",
+    "gpu": "L4",
+    "est_minutes": 40,
+    "est_cu": 3.2,
+    "script": "experiments/2026-11-26T16-20-ov-32b-gram-weight-high-vicreg/run_colab.py",
+    "hf_eval_target": "evals/2026-11-26T16-20-ov-32b-gram-weight-high-vicreg.json",
+    "status": "QUEUED",
+    "depends_on": [
+      "2026-11-26T01-38-ov-32-dinov3-gram-weight-sweep"
     ]
   }
 ]

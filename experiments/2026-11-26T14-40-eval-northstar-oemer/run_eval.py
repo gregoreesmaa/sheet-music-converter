@@ -9,14 +9,18 @@ with per-page timeout and atomic checkpointing, then scores with
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
 import json
 import os
 import pathlib
+import re
 import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import time
+import uuid
 from typing import Any, Sequence
 
 REPO_ROOT = pathlib.Path(__file__).resolve().parents[2]
@@ -47,9 +51,28 @@ def _docker_image_available(image_tag: str) -> bool:
 
 def _atomic_write_text(path: pathlib.Path, text: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp = path.with_name(f"{path.name}.{os.getpid()}.{threading.get_ident()}.tmp")
     tmp.write_text(text, encoding="utf-8")
     os.replace(tmp, path)
+
+
+def _ordered_latencies(
+    latencies: dict[str, float],
+    page_order: Sequence[str],
+) -> dict[str, float]:
+    ordered: dict[str, float] = {}
+    for pid in page_order:
+        if pid in latencies:
+            ordered[pid] = latencies[pid]
+    for pid in sorted(latencies):
+        if pid not in ordered:
+            ordered[pid] = latencies[pid]
+    return ordered
+
+
+def _docker_container_name(page_id: str) -> str:
+    slug = re.sub(r"[^a-zA-Z0-9_.-]+", "-", page_id).strip("-.")[:28] or "page"
+    return f"oemer-{slug}-{uuid.uuid4().hex[:8]}"
 
 
 def run_oemer_page_docker(
@@ -61,6 +84,7 @@ def run_oemer_page_docker(
     out_mxml_dir: pathlib.Path,
     timeout_s: int,
     memory_limit: str,
+    threads_per_worker: int,
     without_deskew: bool,
     empty_xml: str,
     is_neg: bool,
@@ -76,14 +100,24 @@ def run_oemer_page_docker(
         staged_img = in_dir / f"{page_id}{img_path.suffix}"
         shutil.copy2(img_path, staged_img)
 
+        container_name = _docker_container_name(page_id)
+        t_str = str(max(1, threads_per_worker))
         cmd = [
             "docker",
             "run",
             "--rm",
+            "--name",
+            container_name,
             "--memory",
             memory_limit,
             "-e",
             "CUDA_VISIBLE_DEVICES=",
+            "-e",
+            f"OMP_NUM_THREADS={t_str}",
+            "-e",
+            f"OPENBLAS_NUM_THREADS={t_str}",
+            "-e",
+            f"MKL_NUM_THREADS={t_str}",
             "-v",
             f"{in_dir.resolve()}:/in:ro",
             "-v",
@@ -110,6 +144,12 @@ def run_oemer_page_docker(
                 check=False,
             )
         except subprocess.TimeoutExpired:
+            subprocess.run(
+                ["docker", "rm", "-f", container_name],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
             elapsed = time.perf_counter() - t0
             _atomic_write_text(out_mxml_dir / f"{page_id}.musicxml", "")
             return False, f"timeout>{timeout_s}s", elapsed
@@ -140,6 +180,7 @@ def run_oemer_page(
     page_id: str,
     out_mxml_dir: pathlib.Path,
     timeout_s: int,
+    threads_per_worker: int,
     without_deskew: bool,
     empty_xml: str,
     is_neg: bool,
@@ -148,6 +189,10 @@ def run_oemer_page(
     t0 = time.perf_counter()
     env = os.environ.copy()
     env["CUDA_VISIBLE_DEVICES"] = ""
+    t_str = str(max(1, threads_per_worker))
+    env["OMP_NUM_THREADS"] = t_str
+    env["OPENBLAS_NUM_THREADS"] = t_str
+    env["MKL_NUM_THREADS"] = t_str
 
     with tempfile.TemporaryDirectory(prefix=f"oemer-{page_id[:16]}-") as td:
         td_path = pathlib.Path(td)
@@ -210,12 +255,17 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--manifest", type=pathlib.Path, default=DEFAULT_MANIFEST)
     parser.add_argument("--out-dir", type=pathlib.Path, default=DEFAULT_OUT_DIR)
     parser.add_argument("--system-name", type=str, default="oemer-cli")
-    parser.add_argument("--timeout-s", type=int, default=300)
+    parser.add_argument("--timeout-s", type=int, default=900)
+    parser.add_argument("--workers", type=int, default=1, help="Number of parallel page workers (default: 1).")
     parser.add_argument("--without-deskew", action="store_true")
     parser.add_argument("--resume", action="store_true")
     parser.add_argument("--limit", type=int, default=None)
     parser.add_argument("--skip-score", action="store_true")
     args = parser.parse_args(argv)
+
+    if args.workers < 1:
+        parser.error("--workers must be >= 1")
+    threads_per_worker = max(1, (os.cpu_count() or 8) // args.workers)
 
     import eval_northstar_runner as ns_runner  # noqa: E402
 
@@ -233,7 +283,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             )
         ckpt_dir = args.checkpoints_dir if (args.checkpoints_dir and args.checkpoints_dir.is_dir()) else None
         print(
-            f"[oemer] using Docker image {docker_image} (checkpoints={ckpt_dir})",
+            f"[oemer] using Docker image {docker_image} (checkpoints={ckpt_dir}, workers={args.workers})",
             flush=True,
         )
     else:
@@ -243,11 +293,13 @@ def main(argv: Sequence[str] | None = None) -> int:
                 f"oemer executable not found at {oemer_exe!r}. Install with `pip install oemer` "
                 "or pass --oemer-bin / --docker-image."
             )
+        print(f"[oemer] using local binary {oemer_exe} (workers={args.workers})", flush=True)
 
     manifest = json.loads(args.manifest.read_text(encoding="utf-8"))
     pages = list(manifest["pages"])
     if args.limit is not None:
         pages = pages[: args.limit]
+    page_order = [str(rec["page_id"]) for rec in pages]
 
     mxml_dir = args.out_dir / "musicxml"
     mxml_dir.mkdir(parents=True, exist_ok=True)
@@ -256,11 +308,19 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.resume and timing_path.is_file():
         latencies.update(json.loads(timing_path.read_text(encoding="utf-8")).get("latencies_s", {}))
 
-    for idx, rec in enumerate(pages, start=1):
+    todo_pages: list[dict[str, Any]] = []
+    for rec in pages:
         pid = str(rec["page_id"])
         if args.resume and ns_runner.find_prediction_file(mxml_dir, pid) is not None:
             continue
+        todo_pages.append(rec)
 
+    total_pages = len(pages)
+    done_count = total_pages - len(todo_pages)
+    state_lock = threading.Lock()
+
+    def _run_one(rec: dict[str, Any]) -> tuple[str, bool, str, float]:
+        pid = str(rec["page_id"])
         if use_docker:
             ok, status, elapsed = run_oemer_page_docker(
                 docker_image=docker_image,
@@ -270,6 +330,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 out_mxml_dir=mxml_dir,
                 timeout_s=args.timeout_s,
                 memory_limit=args.memory,
+                threads_per_worker=threads_per_worker,
                 without_deskew=args.without_deskew,
                 empty_xml=ns_runner.EMPTY_VALID_MUSICXML,
                 is_neg=bool(rec.get("is_negative_control", False)),
@@ -281,14 +342,38 @@ def main(argv: Sequence[str] | None = None) -> int:
                 page_id=pid,
                 out_mxml_dir=mxml_dir,
                 timeout_s=args.timeout_s,
+                threads_per_worker=threads_per_worker,
                 without_deskew=args.without_deskew,
                 empty_xml=ns_runner.EMPTY_VALID_MUSICXML,
                 is_neg=bool(rec.get("is_negative_control", False)),
             )
-        latencies[pid] = round(elapsed, 4)
-        payload: dict[str, Any] = {"system_name": args.system_name, "latencies_s": latencies}
-        _atomic_write_text(timing_path, json.dumps(payload, indent=2) + "\n")
-        print(f"[{idx:03d}/{len(pages):03d}] {pid:42s} ok={str(ok):5s} ({status}) {elapsed:.2f}s", flush=True)
+        return pid, ok, status, elapsed
+
+    def _record_result(pid: str, ok: bool, status: str, elapsed: float) -> None:
+        nonlocal done_count
+        with state_lock:
+            done_count += 1
+            latencies[pid] = round(elapsed, 4)
+            payload: dict[str, Any] = {
+                "system_name": args.system_name,
+                "latencies_s": _ordered_latencies(latencies, page_order),
+            }
+            _atomic_write_text(timing_path, json.dumps(payload, indent=2) + "\n")
+            print(
+                f"[{done_count:03d}/{total_pages:03d}] {pid:42s} ok={str(ok):5s} ({status}) {elapsed:.2f}s",
+                flush=True,
+            )
+
+    if args.workers == 1:
+        for rec in todo_pages:
+            pid, ok, status, elapsed = _run_one(rec)
+            _record_result(pid, ok, status, elapsed)
+    else:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=args.workers) as pool:
+            futures = [pool.submit(_run_one, rec) for rec in todo_pages]
+            for fut in concurrent.futures.as_completed(futures):
+                pid, ok, status, elapsed = fut.result()
+                _record_result(pid, ok, status, elapsed)
 
     if args.skip_score:
         return 0

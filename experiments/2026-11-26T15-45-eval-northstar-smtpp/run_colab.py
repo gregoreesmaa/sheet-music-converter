@@ -94,6 +94,9 @@ def _ensure_packages() -> None:
         ("cv2", "opencv-python-headless"),
         ("huggingface_hub", "huggingface_hub>=0.26"),
         ("safetensors", "safetensors"),
+        ("loguru", "loguru"),
+        ("einops", "einops"),
+        ("timm", "timm"),
     ):
         try:
             __import__(mod)

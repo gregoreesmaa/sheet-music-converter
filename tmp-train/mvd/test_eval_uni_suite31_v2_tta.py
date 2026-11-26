@@ -187,9 +187,25 @@ class TestEvalUniSuite31V2AndTTA(unittest.TestCase):
 
         ap = ev.build_arg_parser()
         args_default = ap.parse_args(["--ckpt", "dummy.pt"])
-        self.assertIsNone(args_default.tta_scales)
-        args_tta = ap.parse_args(["--ckpt", "dummy.pt", "--tta-scales", "1152,1280,1536"])
-        self.assertEqual(args_tta.tta_scales, "1152,1280,1536")
+        self.assertEqual(args_default.tta_scales, "")
+        self.assertEqual(ev.parse_tta_scales(args_default.tta_scales), [])
+        self.assertEqual(args_default.tta_rerank, "fsa_logprob_mbr")
+
+        args_tta = ap.parse_args([
+            "--ckpt", "dummy.pt",
+            "--tta-scales", "1024,1152,1280,1408,1536",
+            "--tta-rerank", "fsa_logprob",
+        ])
+        self.assertEqual(args_tta.tta_scales, "1024,1152,1280,1408,1536")
+        self.assertEqual(ev.parse_tta_scales(args_tta.tta_scales), [1024, 1152, 1280, 1408, 1536])
+        self.assertEqual(args_tta.tta_rerank, "fsa_logprob")
+
+        args_mbr = ap.parse_args([
+            "--ckpt", "dummy.pt",
+            "--tta-scales", "1280,1408,1536",
+            "--tta-rerank", "mbr",
+        ])
+        self.assertEqual(args_mbr.tta_rerank, "mbr")
 
     def test_detect_token_loop_and_fsa_beat_metrics(self) -> None:
         good_bar = [
@@ -253,6 +269,102 @@ class TestEvalUniSuite31V2AndTTA(unittest.TestCase):
         c_eq1 = {"scale": 1280, "bekern_decode_ok": True, "has_loop": False, "fsa_beat_score": 2.75, "mean_logprob": -0.15}
         c_eq2 = {"scale": 1536, "bekern_decode_ok": True, "has_loop": False, "fsa_beat_score": 2.75, "mean_logprob": -0.15}
         self.assertEqual(ev.select_best_fsa_beat_view([c_eq1, c_eq2])["scale"], 1280)
+
+    def test_select_tta_view_fsa_logprob_mbr_and_tiebreaking(self) -> None:
+        # 1. Realistic ov-36b scenario: 3 consensus views vs 1 hallucinated short valid bar
+        toks_a = ["clef-G-2", "time-4-4", "quarter", "C", "4", "quarter", "D", "4", "quarter", "E", "4", "quarter", "F", "4", "bar"]
+        toks_b = ["clef-G-2", "time-4-4", "quarter", "C", "4", "quarter", "D", "4", "quarter", "E", "4", "quarter", "G", "4", "bar"]
+        toks_outlier = ["clef-G-2", "time-4-4", "whole", "A", "5", "bar"]
+
+        cands = [
+            {
+                "scale": 1152,
+                "hyp_page_toks": toks_outlier,
+                "bekern_decode_ok": True,
+                "has_loop": False,
+                "fsa_beat_score": 2.75,   # high FSA on short hallucination
+                "mean_logprob": -0.35,    # lower confidence
+            },
+            {
+                "scale": 1280,
+                "hyp_page_toks": toks_a,
+                "bekern_decode_ok": True,
+                "has_loop": False,
+                "fsa_beat_score": 2.60,
+                "mean_logprob": -0.10,    # high confidence + strong consensus
+            },
+            {
+                "scale": 1408,
+                "hyp_page_toks": toks_a,
+                "bekern_decode_ok": True,
+                "has_loop": False,
+                "fsa_beat_score": 2.50,
+                "mean_logprob": -0.14,
+            },
+            {
+                "scale": 1536,
+                "hyp_page_toks": toks_b,
+                "bekern_decode_ok": True,
+                "has_loop": False,
+                "fsa_beat_score": 2.55,
+                "mean_logprob": -0.18,
+            },
+        ]
+
+        # Verify pairwise MBR downweights failed bekern parses (0.25 vs 1.0)
+        mbr_votes = ev.compute_mbr_vote_scores(cands)
+        self.assertGreater(mbr_votes[1], mbr_votes[0])
+        self.assertAlmostEqual(mbr_votes[1], mbr_votes[2], places=6)
+
+        # fsa_logprob_mbr rejects the 1152 hallucination and picks 1280
+        win_flm, _, scores_flm = ev.select_tta_view(cands, rerank="fsa_logprob_mbr")
+        self.assertEqual(win_flm["scale"], 1280)
+        expected_1280 = 0.5 * 2.60 + 1.5 * (-0.10) + 1.0 * mbr_votes[1]
+        self.assertAlmostEqual(scores_flm[1], expected_1280, places=6)
+
+        # fsa_logprob = fsa_beat_score + 2.0 * mean_logprob also picks 1280 (2.40 vs 2.05)
+        win_fl, _, scores_fl = ev.select_tta_view(cands, rerank="fsa_logprob")
+        self.assertEqual(win_fl["scale"], 1280)
+        self.assertAlmostEqual(scores_fl[1], 2.60 + 2.0 * (-0.10), places=6)
+
+        # mbr picks consensus view (1280 beats 1408 on mean_logprob tiebreak when MBR tied)
+        win_mbr, _, _ = ev.select_tta_view(cands, rerank="mbr")
+        self.assertEqual(win_mbr["scale"], 1280)
+
+        # 2. Failed bekern_decode_ok view gets weight 0.25 in MBR computation
+        c_ok1 = {"scale": 1280, "hyp_page_toks": toks_a, "bekern_decode_ok": True, "has_loop": False, "fsa_beat_score": 2.0, "mean_logprob": -0.2}
+        c_ok2 = {"scale": 1408, "hyp_page_toks": toks_a, "bekern_decode_ok": True, "has_loop": False, "fsa_beat_score": 2.0, "mean_logprob": -0.2}
+        c_bad = {"scale": 1536, "hyp_page_toks": toks_outlier, "bekern_decode_ok": False, "has_loop": False, "fsa_beat_score": -1.0, "mean_logprob": -0.2}
+        w_mbr = ev.compute_mbr_vote_scores([c_ok1, c_ok2, c_bad])
+        sim_ao = ev.compute_token_lcs_f1(toks_a, toks_outlier)
+        expected_ok1_mbr = (1.0 * 1.0 + 0.25 * sim_ao) / 1.25
+        self.assertAlmostEqual(w_mbr[0], expected_ok1_mbr, places=6)
+
+        # 3. Tie-breaking on exact equal fsa_logprob_mbr score:
+        # 3a. bekern_decode_ok True beats False
+        t_bad = {"scale": 1024, "bekern_decode_ok": False, "has_loop": False, "fsa_beat_score": 2.0, "mean_logprob": -0.2, "mbr_vote": 0.5}
+        t_ok = {"scale": 1280, "bekern_decode_ok": True, "has_loop": False, "fsa_beat_score": 2.0, "mean_logprob": -0.2, "mbr_vote": 0.5}
+        self.assertEqual(ev.select_tta_view([t_bad, t_ok], rerank="fsa_logprob_mbr")[0]["scale"], 1280)
+
+        # 3b. non-looping beats looping on equal rerank score
+        t_loop = {"scale": 1024, "bekern_decode_ok": True, "has_loop": True, "fsa_beat_score": 2.0, "mean_logprob": -0.2, "mbr_vote": 0.5}
+        t_clean = {"scale": 1408, "bekern_decode_ok": True, "has_loop": False, "fsa_beat_score": 2.0, "mean_logprob": -0.2, "mbr_vote": 0.5}
+        self.assertEqual(ev.select_tta_view([t_loop, t_clean], rerank="fsa_logprob_mbr")[0]["scale"], 1408)
+
+        # 3c. higher mean_logprob breaks exact rerank score tie
+        # 0.5*2.0 + 1.5*(-0.2) + 1.0*0.8 = 1.50 vs 0.5*2.3 + 1.5*(-0.1) + 1.0*0.5 = 1.50
+        t_lp_lo = {"scale": 1280, "bekern_decode_ok": True, "has_loop": False, "fsa_beat_score": 2.0, "mean_logprob": -0.2, "mbr_vote": 0.8}
+        t_lp_hi = {"scale": 1408, "bekern_decode_ok": True, "has_loop": False, "fsa_beat_score": 2.3, "mean_logprob": -0.1, "mbr_vote": 0.5}
+        self.assertEqual(ev.select_tta_view([t_lp_lo, t_lp_hi], rerank="fsa_logprob_mbr")[0]["scale"], 1408)
+
+        # 3d. full exact tie broken deterministically by earlier scale order
+        t_e1 = {"scale": 1280, "bekern_decode_ok": True, "has_loop": False, "fsa_beat_score": 2.0, "mean_logprob": -0.2, "mbr_vote": 0.8}
+        t_e2 = {"scale": 1536, "bekern_decode_ok": True, "has_loop": False, "fsa_beat_score": 2.0, "mean_logprob": -0.2, "mbr_vote": 0.8}
+        self.assertEqual(ev.select_tta_view([t_e1, t_e2], rerank="fsa_logprob_mbr")[0]["scale"], 1280)
+
+        # 4. Unknown rerank mode raises ValueError
+        with self.assertRaises(ValueError):
+            ev.select_tta_view([t_e1], rerank="unknown_mode")
 
     def test_oemer_dewarp_flat_autoskip_and_curved_straighten(self) -> None:
         # 1. Flat synthetic staff image -> must auto-skip and return bit-identical image
