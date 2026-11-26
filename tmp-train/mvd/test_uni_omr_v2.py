@@ -24,6 +24,7 @@ from uni_omr_v2 import (  # noqa: E402
     GroupedQueryAttention,
     InkTokenRouterV2,
     PAD_ID,
+    RMSNorm,
     SYS_ID,
     StrokeHogHead,
     VOCAB_SIZE,
@@ -652,6 +653,82 @@ def test_iter12_compute_memory_optimizations() -> None:
     assert sd_keys_after == fresh_keys
 
 
+def test_iter12_kernel_speedups() -> None:
+    """Verify fused RMSNorm parity + ONNX guard, 2-cumsum router border scan parity, batched MTP-4, grad_ckpt, and state_dict keys."""
+    torch.manual_seed(1213)
+
+    # 1. Fused F.rms_norm vs manual opset-17 fallback parity (< 1e-5) + ONNX export guard
+    rn = RMSNorm(128, eps=1e-6)
+    with torch.no_grad():
+        rn.weight.copy_(torch.randn(128))
+    x = torch.randn(2, 16, 128)
+    y_fused = rn(x)
+    y_ref = x * torch.rsqrt(x.pow(2).mean(dim=-1, keepdim=True) + rn.eps) * rn.weight
+    assert float((y_fused - y_ref).abs().max().item()) < 1e-5
+    orig_onnx_fn = torch.onnx.is_in_onnx_export
+    try:
+        torch.onnx.is_in_onnx_export = lambda: True  # type: ignore[assignment]
+        y_onnx = rn(x)
+        assert float((y_onnx - y_ref).abs().max().item()) == 0.0
+    finally:
+        torch.onnx.is_in_onnx_export = orig_onnx_fn  # type: ignore[assignment]
+
+    # 2. InkTokenRouterV2._compute_ink_and_paper_gate 2-cumsum/0-flip exact parity vs 4-edge flip scan
+    img = torch.full((2, 3, 96, 80), 0.9, dtype=torch.float32)
+    img[:, :, :12, :] = 0.05   # dark top desk border
+    img[:, :, -10:, :] = 0.10  # dark bottom desk border
+    img[:, :, :, :8] = 0.08    # dark left border
+    img[:, :, :, -6:] = 0.12   # dark right border
+    img[:, :, 40:52, 30:48] = 0.15  # dark interior music ink/shadow (must NOT be masked)
+    ink_fast, gate_fast, eff_fast = InkTokenRouterV2._compute_ink_and_paper_gate(img, 12, 10)
+    # Reference 4-edge flip scan
+    luma_ref = 0.299 * img[:, 0:1] + 0.587 * img[:, 1:2] + 0.114 * img[:, 2:3]
+    bi = (luma_ref >= 0.45).to(torch.int32)
+    top_d = bi.cumsum(dim=2) == 0
+    bot_d = bi.flip(dims=(2,)).cumsum(dim=2).flip(dims=(2,)) == 0
+    left_d = bi.cumsum(dim=3) == 0
+    right_d = bi.flip(dims=(3,)).cumsum(dim=3).flip(dims=(3,)) == 0
+    border_ref = ((top_d | bot_d | left_d | right_d) & (luma_ref < 0.30)).to(luma_ref.dtype)
+    bd_ref = torch.nn.functional.max_pool2d(
+        torch.nn.functional.max_pool2d(border_ref, (1, 33), 1, (0, 16)), (33, 1), 1, (16, 0)
+    )
+    paper_ref = (1.0 - bd_ref).clamp(0.0, 1.0)
+    paper_grid_ref = torch.nn.functional.adaptive_avg_pool2d(paper_ref, (12, 10))
+    eff_ref = paper_grid_ref > 0.5
+    assert bool((eff_fast == eff_ref).all())
+    assert float((gate_fast - torch.where(eff_ref, torch.ones_like(paper_grid_ref), torch.full_like(paper_grid_ref, 0.05))).abs().max().item()) == 0.0
+    assert torch.isfinite(ink_fast).all()
+
+    # 3. Batched MTP-4 + lm_head parity vs sequential loop (with and without QAT)
+    cfg = _tiny_cfg(mtp_k=4, dropout=0.0, grad_checkpoint=True)
+    m = UniOMRv2Net(cfg).eval()
+    h = torch.randn(2, 12, cfg.d_model)
+    with torch.no_grad():
+        seq_logits = m.lm_head(h)
+        seq_mtp = [m.lm_head(hd(h)) for hd in m.mtp_heads]
+        all_h = torch.stack([h, *(hd(h) for hd in m.mtp_heads)], dim=0)
+        all_l = m.lm_head(all_h)
+        assert float((all_l[0] - seq_logits).abs().max().item()) < 1e-5
+        for idx, ml in enumerate(all_l[1:].unbind(0)):
+            assert float((ml - seq_mtp[idx]).abs().max().item()) < 1e-5
+
+    # 4. Non-reentrant grad_checkpoint=True forward + backward
+    m.train()
+    m.zero_grad(set_to_none=True)
+    seq = torch.randint(0, VOCAB_SIZE - 4, (2, 13))
+    seq[:, 0] = BOS_ID
+    seq[:, -1] = EOS_ID
+    out = m(torch.rand(2, 3, 96, 96), seq[:, :-1])
+    loss = m.compute_loss(out, seq[:, 1:])["loss"]
+    loss.backward()
+    assert m.encoder.axial_layers[0].row_attn.qkv_proj.weight.grad is not None
+    assert m.dec_layers[0].self_attn.q_proj.weight.grad is not None
+
+    # 5. Exact preset state_dict key counts (zero schema drift)
+    assert len(UniOMRv2Net(UniOMRv2Config.small_45m()).state_dict()) == 349
+    assert len(UniOMRv2Net(UniOMRv2Config.edge85m()).state_dict()) == 383
+
+
 def main() -> None:
     summaries = _check_presets_param_counts_and_byte_budgets()
     test_aspect_normalized_rope2d_resolution_invariance()
@@ -661,6 +738,7 @@ def main() -> None:
     test_iter11_optimizations()
     test_frontier_2025_2026_upgrades()
     test_iter12_compute_memory_optimizations()
+    test_iter12_kernel_speedups()
 
     print("=== UniOMR v2 CPU Unit Tests PASSED ===")
     for name, s in summaries.items():

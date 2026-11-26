@@ -28,6 +28,7 @@ from uni_omr import (  # noqa: E402
     VOCAB_SIZE,
     UniOMRConfig,
     UniOMRNet,
+    eval_dataset,
 )
 from uni_omr_v2 import QATInt4ControllerV2, UniOMRv2Net  # noqa: E402
 from train_uni_v2 import (  # noqa: E402
@@ -36,11 +37,15 @@ from train_uni_v2 import (  # noqa: E402
     build_arg_parser,
     build_optimizer_v2,
     build_v2_config,
+    compute_generalized_jsd_loss,
     compute_sparse_topk_jsd_loss,
     ensure_v2_best_checkpoints,
+    eval_dataset_v2,
     extract_topk_from_logits,
     forward_and_loss_v2,
+    generate_mtp_speculative_v2,
     kd_alpha_for_step,
+    load_v1_teacher,
     load_v2_checkpoint,
     partition_muon_adamw_params,
     run_train_v2,
@@ -410,6 +415,162 @@ class TestTrainUniV2(unittest.TestCase):
             ensure_v2_best_checkpoints(out_dir, student, student.cfg, step=1234)
             reloaded = torch.load(str(out_dir / "uni_omr_v2_ema_best.pt"), map_location="cpu", weights_only=True)
             self.assertEqual(reloaded["step"], 999, "Existing uni_omr_v2_ema_best.pt must not be overwritten")
+
+    def test_7_generalized_jsd_parity_and_grad(self) -> None:
+        """Analytic _GeneralizedJSDAutograd matches reference forward & backward < 1e-5 across betas & dtypes."""
+        import math
+        import torch.nn.functional as F
+
+        def _ref_jsd(s_log: torch.Tensor, t_log: torch.Tensor, tgt: torch.Tensor, beta: float, temp: float) -> torch.Tensor:
+            tau = float(max(1e-4, temp))
+            b = float(max(0.0, min(1.0, beta)))
+            log_ps = F.log_softmax(s_log.float() / tau, dim=-1)
+            log_pt = F.log_softmax(t_log.detach().float() / tau, dim=-1)
+            ps = log_ps.exp()
+            pt = log_pt.exp()
+            if b <= 1e-6:
+                per_tok = (ps * (log_ps - log_pt)).sum(dim=-1)
+            elif b >= 1.0 - 1e-6:
+                per_tok = (pt * (log_pt - log_ps)).sum(dim=-1)
+            else:
+                log_m = torch.logaddexp(math.log(b) + log_pt, math.log(1.0 - b) + log_ps)
+                per_tok = b * (pt * (log_pt - log_m)).sum(dim=-1) + (1.0 - b) * (ps * (log_ps - log_m)).sum(dim=-1)
+            valid = (tgt != PAD_ID).float()
+            return ((per_tok * valid).sum() / valid.sum().clamp(min=1.0) * (tau * tau)).to(s_log.dtype)
+
+        g = torch.Generator().manual_seed(77)
+        s_base = torch.randn((2, 12, VOCAB_SIZE), generator=g, dtype=torch.float32)
+        t_base = torch.randn((2, 12, VOCAB_SIZE), generator=g, dtype=torch.float32)
+        targets = torch.randint(0, PAD_ID, (2, 12), generator=g, dtype=torch.long)
+        targets[:, -3:] = PAD_ID
+
+        for beta in (0.0, 0.25, 0.5, 0.75, 1.0):
+            for temp in (1.0, 2.0):
+                s_ref = s_base.clone().requires_grad_(True)
+                s_opt = s_base.clone().requires_grad_(True)
+                # Also verify inference_mode teacher tensor works directly without .clone()
+                with torch.inference_mode():
+                    t_inf = t_base.clone()
+                l_ref = _ref_jsd(s_ref, t_base, targets, beta=beta, temp=temp)
+                l_opt = compute_generalized_jsd_loss(s_opt, t_inf, targets, beta=beta, temp=temp)
+                self.assertLess(
+                    abs(float(l_ref.item()) - float(l_opt.item())),
+                    1e-5,
+                    f"Forward JSD mismatch at beta={beta}, temp={temp}: {l_ref.item()} vs {l_opt.item()}",
+                )
+                l_ref.backward()
+                l_opt.backward()
+                assert s_ref.grad is not None and s_opt.grad is not None
+                max_gdiff = float((s_ref.grad - s_opt.grad).abs().max().item())
+                self.assertLess(
+                    max_gdiff,
+                    1e-5,
+                    f"Backward JSD grad mismatch at beta={beta}, temp={temp}: max_diff={max_gdiff}",
+                )
+
+        # Edge case: all targets == PAD_ID -> zero loss & zero grad
+        all_pad = torch.full((2, 12), PAD_ID, dtype=torch.long)
+        s_pad = s_base.clone().requires_grad_(True)
+        l_pad = compute_generalized_jsd_loss(s_pad, t_base, all_pad, beta=0.5, temp=2.0)
+        self.assertEqual(float(l_pad.item()), 0.0)
+        l_pad.backward()
+        assert s_pad.grad is not None
+        self.assertEqual(float(s_pad.grad.abs().max().item()), 0.0)
+
+        # BF16 logits safety
+        s_bf16 = s_base.to(torch.bfloat16).requires_grad_(True)
+        t_bf16 = t_base.to(torch.bfloat16)
+        l_bf16 = compute_generalized_jsd_loss(s_bf16, t_bf16, targets, beta=0.5, temp=2.0)
+        self.assertEqual(l_bf16.dtype, torch.bfloat16)
+        self.assertTrue(torch.isfinite(l_bf16).item())
+        l_bf16.backward()
+        assert s_bf16.grad is not None
+        self.assertEqual(s_bf16.grad.dtype, torch.bfloat16)
+        self.assertTrue(torch.isfinite(s_bf16.grad).all().item())
+
+    def test_8_mtp_speculative_decode_exact_parity_and_eval_v2(self) -> None:
+        """generate_mtp_speculative_v2 and eval_dataset_v2 are bit-identical to model.generate()."""
+        torch.manual_seed(101)
+        student = _make_tiny_v2(grad_checkpoint=False)
+        student.eval()
+
+        # Verify bit-identical tokens for B=1 and B=3 (including different max_len values).
+        for bs, max_len in ((1, 20), (3, 19), (2, 1)):
+            images, _ = _make_dummy_batch(batch_size=bs, h=64, w=96, seq_len=16)
+            seq_ref, info_ref = student.generate(images, max_len=max_len, return_info=True)
+            seq_mtp, info_mtp = generate_mtp_speculative_v2(student, images, max_len=max_len, return_info=True)
+            self.assertTrue(
+                torch.equal(seq_ref, seq_mtp),
+                f"MTP speculative mismatch for B={bs}, max_len={max_len}:\nref={seq_ref}\nmtp={seq_mtp}",
+            )
+            self.assertEqual(info_ref["n_out"], info_mtp["n_out"])
+
+        # Verify mid-batch EOS_ID termination produces exact same length & PAD masking as generate().
+        with torch.no_grad():
+            # Bias lm_head toward EOS_ID so at least one sequence terminates early.
+            orig_lm = student.lm_head.weight.clone()
+            student.lm_head.weight[EOS_ID].add_(5.0)
+            images_eos, _ = _make_dummy_batch(batch_size=3, h=64, w=96, seq_len=16)
+            seq_ref_eos = student.generate(images_eos, max_len=16, return_info=False)
+            seq_mtp_eos = generate_mtp_speculative_v2(student, images_eos, max_len=16, return_info=False)
+            student.lm_head.weight.copy_(orig_lm)
+        self.assertTrue(
+            torch.equal(seq_ref_eos, seq_mtp_eos),
+            f"MTP speculative EOS mismatch:\nref={seq_ref_eos}\nmtp={seq_mtp_eos}",
+        )
+
+        # Verify eval_dataset_v2 matches eval_dataset metrics identically.
+        images, seqs = _make_dummy_batch(batch_size=4, h=64, w=96, seq_len=14)
+        samples = [
+            {
+                "image": (images[i] * 255.0).to(torch.uint8),
+                "seq": seqs[i],
+                "sample_id": f"val_{i}",
+                "kind": "strip",
+            }
+            for i in range(4)
+        ]
+        m_ref = eval_dataset(student, samples, device=torch.device("cpu"), max_len=16, batch_size=2, use_bf16=False)  # type: ignore[arg-type]
+        m_v2 = eval_dataset_v2(student, samples, device=torch.device("cpu"), max_len=16, batch_size=2, use_bf16=False)
+        for key in ("n_samples", "ser", "mean_sample_ser", "token_f1", "sys_count_exact", "total_edits", "total_ref_tokens", "total_pred_tokens"):
+            self.assertEqual(m_ref[key], m_v2[key], f"eval_dataset_v2 mismatch on {key}: {m_ref[key]} vs {m_v2[key]}")
+
+    def test_9_teacher_bf16_cast_and_cpu_fp32_safety(self) -> None:
+        """load_v1_teacher stays FP32 on CPU even with use_bf16=True; forward_and_loss_v2 supports BF16 teacher."""
+        torch.manual_seed(131)
+        teacher = _make_tiny_v1_teacher()
+        student = _make_tiny_v2(grad_checkpoint=False)
+        student.train()
+        images, seq = _make_dummy_batch(batch_size=2, h=64, w=96, seq_len=14)
+
+        from dataclasses import asdict
+        with tempfile.TemporaryDirectory() as td:
+            ckpt_p = Path(td) / "teacher_v1.pt"
+            torch.save({"config": asdict(teacher.cfg), "model": teacher.state_dict()}, str(ckpt_p))
+            loaded_cpu = load_v1_teacher(ckpt_p, device=torch.device("cpu"), use_bf16=True)
+            self.assertEqual(
+                next(loaded_cpu.parameters()).dtype,
+                torch.float32,
+                "CPU teacher must remain float32 even when use_bf16=True",
+            )
+
+        # Simulate CUDA BF16 teacher weights and verify forward_and_loss_v2 + backward work cleanly.
+        teacher_bf16 = teacher.to(dtype=torch.bfloat16)
+        losses, _ = forward_and_loss_v2(
+            student,
+            images,
+            seq,
+            teacher_v1=teacher_bf16,
+            kd_alpha=0.35,
+            kd_beta=0.5,
+            kd_temp=2.0,
+            use_bf16=False,
+            device=torch.device("cpu"),
+        )
+        self.assertTrue(torch.isfinite(losses["kd_loss"]).item())
+        self.assertGreater(float(losses["kd_loss"].item()), 0.0)
+        losses["loss"].backward()
+        self.assertIsNotNone(student.lm_head.weight.grad)
 
 
 if __name__ == "__main__":

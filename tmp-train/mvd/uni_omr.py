@@ -1964,6 +1964,43 @@ def _find_perspective_coeffs(
     return [float(c) for c in coeffs]
 
 
+def _fast_resize_rgb(img: Image.Image, size: Tuple[int, int]) -> Image.Image:
+    """Fast RGB resize using OpenCV (INTER_AREA downscale / INTER_LINEAR upscale) when available."""
+    tw, th = int(size[0]), int(size[1])
+    if img.size == (tw, th):
+        return img if img.mode == "RGB" else img.convert("RGB")
+    if _cv2 is not None:
+        if img.mode == "RGB":
+            arr = np.asarray(img, dtype=np.uint8)
+        elif img.mode == "RGBA":
+            arr = _cv2.cvtColor(np.asarray(img, dtype=np.uint8), _cv2.COLOR_RGBA2RGB)
+        else:
+            arr = np.asarray(img.convert("RGB"), dtype=np.uint8)
+        h, w = arr.shape[:2]
+        interp = _cv2.INTER_AREA if (tw < w or th < h) else _cv2.INTER_LINEAR
+        resized = _cv2.resize(arr, (tw, th), interpolation=interp)
+        return Image.fromarray(resized, mode="RGB")
+    rgb = img if img.mode == "RGB" else img.convert("RGB")
+    return rgb.resize((tw, th), Image.Resampling.BILINEAR)
+
+
+def _fast_jpeg_roundtrip(img: Image.Image, quality: int) -> Image.Image:
+    """Fast JPEG compression round-trip using OpenCV when available, else PIL."""
+    q = int(quality)
+    if _cv2 is not None:
+        rgb_arr = np.asarray(img if img.mode == "RGB" else img.convert("RGB"), dtype=np.uint8)
+        bgr = _cv2.cvtColor(rgb_arr, _cv2.COLOR_RGB2BGR)
+        ok, enc = _cv2.imencode(".jpg", bgr, [int(_cv2.IMWRITE_JPEG_QUALITY), q])
+        if ok:
+            dec = _cv2.imdecode(enc, _cv2.IMREAD_COLOR)
+            if dec is not None:
+                return Image.fromarray(_cv2.cvtColor(dec, _cv2.COLOR_BGR2RGB), mode="RGB")
+    buf = io.BytesIO()
+    img.save(buf, format="JPEG", quality=q)
+    buf.seek(0)
+    return Image.open(buf).convert("RGB")
+
+
 def apply_clean_scale_jitter(img: Image.Image, rng: Optional[random.Random] = None) -> Image.Image:
     """Mild clean-page scale jitter (0.90-1.00x) with white paper padding.
 
@@ -1980,14 +2017,21 @@ def apply_clean_scale_jitter(img: Image.Image, rng: Optional[random.Random] = No
     new_h = max(16, int(round(orig_h * scale)))
     if new_w >= orig_w and new_h >= orig_h:
         return out
-    resized = out.resize((new_w, new_h), Image.Resampling.BILINEAR)
     bg_v = r.randint(246, 255)
     paper_fill = (bg_v, max(242, bg_v - r.randint(0, 3)), max(238, bg_v - r.randint(0, 6)))
-    canvas = Image.new("RGB", (orig_w, orig_h), paper_fill)
     dx = r.randint(0, max(0, orig_w - new_w))
     dy = r.randint(0, max(0, orig_h - new_h))
-    canvas.paste(resized, (dx, dy))
-    return canvas
+    if _cv2 is not None:
+        arr = np.asarray(out, dtype=np.uint8)
+        resized = _cv2.resize(arr, (new_w, new_h), interpolation=_cv2.INTER_AREA)
+        canvas = np.empty((orig_h, orig_w, 3), dtype=np.uint8)
+        canvas[:, :] = paper_fill
+        canvas[dy : dy + new_h, dx : dx + new_w] = resized
+        return Image.fromarray(canvas, mode="RGB")
+    resized_pil = out.resize((new_w, new_h), Image.Resampling.BILINEAR)
+    canvas_pil = Image.new("RGB", (orig_w, orig_h), paper_fill)
+    canvas_pil.paste(resized_pil, (dx, dy))
+    return canvas_pil
 
 
 def _add_archival_empty_staves(arr: np.ndarray, r: Any) -> None:
@@ -2373,7 +2417,7 @@ def _apply_archival_border_and_colorbar(
                 if sx1 > sx0:
                     draw.rectangle([sx0, y0, sx1, min(ch - 1, y0 + bar_h)], fill=col)
 
-    return canvas.resize((orig_w, orig_h), Image.Resampling.BILINEAR)
+    return _fast_resize_rgb(canvas, (orig_w, orig_h))
 
 
 def _apply_composer_scratchouts(
@@ -2795,9 +2839,17 @@ def apply_online_augment(
     if r.random() < 0.25 and orig_w >= 32 and orig_h >= 32:
         pad_t = max(2, int(round(orig_h * r.uniform(0.02, 0.08))))
         pad_b = max(2, int(round(orig_h * r.uniform(0.02, 0.08))))
-        canvas = Image.new("RGB", (orig_w, orig_h + pad_t + pad_b), _sample_paper_fill())
-        canvas.paste(out, (0, pad_t))
-        out = canvas.resize((orig_w, orig_h), Image.Resampling.BILINEAR)
+        p_fill = _sample_paper_fill()
+        if _cv2 is not None:
+            arr_p = np.asarray(out, dtype=np.uint8)
+            padded = _cv2.copyMakeBorder(
+                arr_p, pad_t, pad_b, 0, 0, _cv2.BORDER_CONSTANT, value=p_fill
+            )
+            out = Image.fromarray(_cv2.resize(padded, (orig_w, orig_h), interpolation=_cv2.INTER_AREA), mode="RGB")
+        else:
+            canvas = Image.new("RGB", (orig_w, orig_h + pad_t + pad_b), p_fill)
+            canvas.paste(out, (0, pad_t))
+            out = canvas.resize((orig_w, orig_h), Image.Resampling.BILINEAR)
 
     if do_archival:
         # Historical Manuscript / Archival Mode:
@@ -2808,7 +2860,11 @@ def apply_online_augment(
         #   5) Optional low-res round-trip downscale + defocus blur + contrast compression
         if r.random() < 0.10 and orig_w >= 128 and orig_h >= 256:
             out = _apply_system1_left_indent(out, r)
-        luma = np.asarray(out.convert("L"), dtype=np.float32) * (1.0 / 255.0)
+        if _cv2 is not None:
+            luma = _cv2.cvtColor(np.asarray(out, dtype=np.uint8), _cv2.COLOR_RGB2GRAY).astype(np.float32)
+            luma *= (1.0 / 255.0)
+        else:
+            luma = np.asarray(out.convert("L"), dtype=np.float32) * (1.0 / 255.0)
         if r.random() < 0.25:
             _add_archival_empty_staves(luma, r)
 
@@ -2850,16 +2906,20 @@ def apply_online_augment(
             0.0,
             255.0,
         ).astype(np.uint8)
-        mottle = (
-            np.asarray(
+        mottle_scale = np.float32(r.uniform(0.04, 0.11) / 128.0)
+        if _cv2 is not None:
+            mottle = _cv2.resize(mottle_small, (w, h), interpolation=_cv2.INTER_LINEAR).astype(np.float32)
+        else:
+            mottle = np.asarray(
                 Image.fromarray(mottle_small, mode="L").resize((w, h), Image.Resampling.BILINEAR),
                 dtype=np.float32,
             )
-            - 128.0
-        ) * (r.uniform(0.04, 0.11) / 128.0)
+        mottle -= 128.0
+        mottle *= mottle_scale
 
         # Gentle uneven illumination / edge darkening folded into a single scalar map
-        illum_map = mottle + 1.0
+        illum_map = mottle
+        illum_map += 1.0
         if r.random() < 0.60:
             gx = r.uniform(-0.16, 0.16)
             gy = r.uniform(-0.16, 0.16)
@@ -2874,10 +2934,14 @@ def apply_online_augment(
             sigma = r.uniform(2.0, 7.5) / 255.0
             illum_map += np_rng.standard_normal((h, w), dtype=np.float32) * sigma
 
-        # Single RGB materialization: ink_rgb * (1 - L) + paper_rgb * L, modulated by illum_map
-        arr = ((paper_rgb - ink_rgb) * luma[..., None] + ink_rgb) * illum_map[..., None]
-        np.clip(arr, 0.0, 1.0, out=arr)
-        out = Image.fromarray((arr * 255.0).astype(np.uint8), mode="RGB")
+        # Single RGB materialization in [0, 255]: ((paper - ink) * luma + ink) * illum_map * 255
+        luma *= illum_map
+        diff_255 = (paper_rgb - ink_rgb) * np.float32(255.0)
+        ink_255 = ink_rgb * np.float32(255.0)
+        arr = luma[..., None] * diff_255
+        arr += illum_map[..., None] * ink_255
+        np.clip(arr, 0.0, 255.0, out=arr)
+        out = Image.fromarray(arr.astype(np.uint8), mode="RGB")
 
         # Composer/copyist scratch-outs on archival pages (p=0.22 HW, p=0.06 printed)
         if r.random() < (0.22 if is_hw else 0.06):
@@ -2919,10 +2983,7 @@ def apply_online_augment(
         elif r.random() < 0.25:
             out = _fast_gaussian_blur(out, r.uniform(0.3, 0.8))
         if r.random() < 0.40:
-            buf = io.BytesIO()
-            out.save(buf, format="JPEG", quality=r.randint(45, 88))
-            buf.seek(0)
-            out = Image.open(buf).convert("RGB")
+            out = _fast_jpeg_roundtrip(out, r.randint(45, 88))
         return out
 
     # 0. Pre-warp paper-surface manual corrections, HW layout/sticky-note, & performer markup
@@ -2945,21 +3006,41 @@ def apply_online_augment(
         pad_b = max(1, int(round(orig_h * r.uniform(0.02, 0.10))))
         cw = orig_w + pad_l + pad_r
         ch = orig_h + pad_t + pad_b
-        canvas = Image.new("RGB", (cw, ch), dark_fill)
-        if r.random() < 0.50:
-            # Fast subtle desk gradient/noise on low-res grid upsampled to canvas
-            np_rng = np.random.default_rng(r.randint(0, 2**31 - 1))
-            gw, gh = 32, 32
-            base_arr = np.array(dark_fill, dtype=np.float32).reshape(1, 1, 3)
-            gx = r.uniform(-10.0, 10.0)
-            gy = r.uniform(-10.0, 10.0)
-            xs = np.linspace(-0.5, 0.5, gw, dtype=np.float32).reshape(1, gw, 1)
-            ys = np.linspace(-0.5, 0.5, gh, dtype=np.float32).reshape(gh, 1, 1)
-            noise = np_rng.uniform(-4.0, 4.0, size=(gh, gw, 3)).astype(np.float32)
-            desk_small = np.clip(base_arr + gx * xs + gy * ys + noise, 0.0, 70.0).astype(np.uint8)
-            canvas = Image.fromarray(desk_small, mode="RGB").resize((cw, ch), Image.Resampling.BILINEAR)
-        canvas.paste(out, (pad_l, pad_t))
-        out = canvas.resize((orig_w, orig_h), Image.Resampling.BILINEAR)
+        if _cv2 is not None:
+            arr_in = np.asarray(out, dtype=np.uint8)
+            if r.random() < 0.50:
+                np_rng = np.random.default_rng(r.randint(0, 2**31 - 1))
+                gw, gh = 32, 32
+                base_arr = np.array(dark_fill, dtype=np.float32).reshape(1, 1, 3)
+                gx = r.uniform(-10.0, 10.0)
+                gy = r.uniform(-10.0, 10.0)
+                xs = np.linspace(-0.5, 0.5, gw, dtype=np.float32).reshape(1, gw, 1)
+                ys = np.linspace(-0.5, 0.5, gh, dtype=np.float32).reshape(gh, 1, 1)
+                noise = np_rng.uniform(-4.0, 4.0, size=(gh, gw, 3)).astype(np.float32)
+                desk_small = np.clip(base_arr + gx * xs + gy * ys + noise, 0.0, 70.0).astype(np.uint8)
+                canvas_arr = _cv2.resize(desk_small, (cw, ch), interpolation=_cv2.INTER_LINEAR)
+                canvas_arr[pad_t : pad_t + orig_h, pad_l : pad_l + orig_w] = arr_in
+            else:
+                canvas_arr = _cv2.copyMakeBorder(
+                    arr_in, pad_t, pad_b, pad_l, pad_r, _cv2.BORDER_CONSTANT, value=dark_fill
+                )
+            out = Image.fromarray(_cv2.resize(canvas_arr, (orig_w, orig_h), interpolation=_cv2.INTER_AREA), mode="RGB")
+        else:
+            canvas = Image.new("RGB", (cw, ch), dark_fill)
+            if r.random() < 0.50:
+                # Fast subtle desk gradient/noise on low-res grid upsampled to canvas
+                np_rng = np.random.default_rng(r.randint(0, 2**31 - 1))
+                gw, gh = 32, 32
+                base_arr = np.array(dark_fill, dtype=np.float32).reshape(1, 1, 3)
+                gx = r.uniform(-10.0, 10.0)
+                gy = r.uniform(-10.0, 10.0)
+                xs = np.linspace(-0.5, 0.5, gw, dtype=np.float32).reshape(1, gw, 1)
+                ys = np.linspace(-0.5, 0.5, gh, dtype=np.float32).reshape(gh, 1, 1)
+                noise = np_rng.uniform(-4.0, 4.0, size=(gh, gw, 3)).astype(np.float32)
+                desk_small = np.clip(base_arr + gx * xs + gy * ys + noise, 0.0, 70.0).astype(np.uint8)
+                canvas = Image.fromarray(desk_small, mode="RGB").resize((cw, ch), Image.Resampling.BILINEAR)
+            canvas.paste(out, (pad_l, pad_t))
+            out = canvas.resize((orig_w, orig_h), Image.Resampling.BILINEAR)
 
     # 2. Perspective quad warp (p=0.40): gentle 1-4% inward corner jitter
     if r.random() < 0.40 and orig_w >= 32 and orig_h >= 32:
@@ -2988,24 +3069,29 @@ def apply_online_augment(
     # so uneven illumination never turns clean pages solid black.
     do_1bit = r.random() < 0.15
     if do_1bit:
-        luma_u8 = np.asarray(out.convert("L"), dtype=np.float32) * (1.0 / 255.0)
         if _cv2 is not None:
+            luma_u8 = _cv2.cvtColor(np.asarray(out, dtype=np.uint8), _cv2.COLOR_RGB2GRAY)
             local_bg = _cv2.blur(luma_u8, (31, 31))
-        else:
-            local_bg = np.asarray(
-                out.convert("L").filter(ImageFilter.BoxBlur(15)), dtype=np.float32
-            ) * (1.0 / 255.0)
+            delta_u8 = int(round(r.uniform(0.10, 0.22) * 255.0))
+            bw = np.where(luma_u8.astype(np.int16) >= (local_bg.astype(np.int16) - delta_u8), np.uint8(255), np.uint8(0))
+            return Image.fromarray(_cv2.cvtColor(bw, _cv2.COLOR_GRAY2RGB), mode="RGB")
+        luma_f = np.asarray(out.convert("L"), dtype=np.float32) * (1.0 / 255.0)
+        local_bg_f = np.asarray(
+            out.convert("L").filter(ImageFilter.BoxBlur(15)), dtype=np.float32
+        ) * (1.0 / 255.0)
         delta = r.uniform(0.10, 0.22)
-        bw = np.where(luma_u8 >= (local_bg - delta), np.uint8(255), np.uint8(0))
+        bw = np.where(luma_f >= (local_bg_f - delta), np.uint8(255), np.uint8(0))
         return Image.fromarray(np.repeat(bw[..., None], 3, axis=2), mode="RGB")
 
-    # 5. Photometric pass (fused numpy for speed): uneven shadows/vignette/parchment + brightness/contrast
+    # 5. Photometric pass (fused in-place numpy in [0, 255]): uneven shadows/vignette/parchment + brightness/contrast
     illum_roll = r.random()
     do_bright = r.random() < 0.70
     do_contrast = r.random() < 0.70
     if illum_roll < 0.70 or do_bright or do_contrast:
-        arr = np.asarray(out, dtype=np.float32) * (1.0 / 255.0)
+        arr = np.array(out, dtype=np.float32)
         h, w = arr.shape[:2]
+        illum: Optional[np.ndarray] = None
+        tint: Optional[np.ndarray] = None
         if illum_roll < 0.35:
             # Stronger uneven shadows / vignette / warm cream-tan parchment cast (illum down to 0.40)
             tint = np.array(
@@ -3019,7 +3105,6 @@ def apply_online_augment(
             ys = np.linspace(-0.5, 0.5, h, dtype=np.float32).reshape(h, 1, 1)
             r2 = (xs * xs + ys * ys) * 2.0
             illum = np.clip(1.0 + gx * xs + gy * ys - vig * r2, 0.40, 1.15)
-            arr *= tint * illum
         elif illum_roll < 0.70:
             tint = np.array(
                 [r.uniform(0.95, 1.02), r.uniform(0.93, 1.00), r.uniform(0.87, 0.99)],
@@ -3030,16 +3115,22 @@ def apply_online_augment(
             xs = np.linspace(-0.5, 0.5, w, dtype=np.float32).reshape(1, w, 1)
             ys = np.linspace(-0.5, 0.5, h, dtype=np.float32).reshape(h, 1, 1)
             illum = np.clip(1.0 + gx * xs + gy * ys, 0.75, 1.15)
-            arr *= tint * illum
 
-        if do_bright:
-            arr *= r.uniform(0.80, 1.15)
+        bright_fac = r.uniform(0.80, 1.15) if do_bright else 1.0
+        c_fac = r.uniform(0.75, 1.25) if do_contrast else 1.0
+        gain = np.float32(bright_fac * c_fac)
+        if tint is not None:
+            tint *= gain
+            arr *= tint
+        elif gain != 1.0:
+            arr *= gain
+        if illum is not None:
+            arr *= illum
         if do_contrast:
-            c_fac = r.uniform(0.75, 1.25)
-            arr = (arr - 0.5) * c_fac + 0.5
+            arr += np.float32(127.5 * (1.0 - c_fac))
 
-        np.clip(arr, 0.0, 1.0, out=arr)
-        out = Image.fromarray((arr * 255.0).astype(np.uint8), mode="RGB")
+        np.clip(arr, 0.0, 255.0, out=arr)
+        out = Image.fromarray(arr.astype(np.uint8), mode="RGB")
 
     # 6. Mild Gaussian blur (or HW low-res round-trip + defocus + contrast compression, max(W,H) >= 1280)
     if is_hw and r.random() < (0.25 if orig_w > orig_h else 0.15) and max(orig_w, orig_h) >= 1280:
@@ -3049,19 +3140,17 @@ def apply_online_augment(
 
     # 7. JPEG compression artifacts
     if r.random() < 0.35:
-        buf = io.BytesIO()
-        out.save(buf, format="JPEG", quality=r.randint(35, 85))
-        buf.seek(0)
-        out = Image.open(buf).convert("RGB")
+        out = _fast_jpeg_roundtrip(out, r.randint(35, 85))
 
-    # 8. Additive Gaussian sensor noise (fast luma-dominant float32 noise)
+    # 8. Additive Gaussian sensor noise (fast in-place luma-dominant float32 noise)
     if r.random() < 0.45:
-        arr = np.asarray(out, dtype=np.float32)
+        arr = np.array(out, dtype=np.float32)
         sigma = r.uniform(2.5, 9.0)
         np_rng = np.random.default_rng(r.randint(0, 2**31 - 1))
-        noise = np_rng.standard_normal((arr.shape[0], arr.shape[1], 1), dtype=np.float32) * sigma
-        arr = np.clip(arr + noise, 0.0, 255.0).astype(np.uint8)
-        out = Image.fromarray(arr, mode="RGB")
+        noise = np_rng.standard_normal((arr.shape[0], arr.shape[1], 1), dtype=np.float32) * np.float32(sigma)
+        arr += noise
+        np.clip(arr, 0.0, 255.0, out=arr)
+        out = Image.fromarray(arr.astype(np.uint8), mode="RGB")
 
     return out
 
@@ -3072,8 +3161,8 @@ def _resize_strip_pil(img: Image.Image, strip_height: int = 192, max_strip_width
     scale = target_h / max(1, orig_h)
     target_w = _round_mult16(orig_w * scale, min_val=16, max_val=max_strip_width)
     if (orig_w, orig_h) != (target_w, target_h):
-        return img.resize((target_w, target_h), Image.Resampling.BILINEAR)
-    return img
+        return _fast_resize_rgb(img, (target_w, target_h))
+    return img if img.mode == "RGB" else img.convert("RGB")
 
 
 def _resize_fullpage_pil(img: Image.Image, fullpage_max_dim: int = 768) -> Image.Image:
@@ -3083,20 +3172,80 @@ def _resize_fullpage_pil(img: Image.Image, fullpage_max_dim: int = 768) -> Image
     target_w = _round_mult16(orig_w * scale, min_val=16, max_val=fullpage_max_dim)
     target_h = _round_mult16(orig_h * scale, min_val=16, max_val=fullpage_max_dim)
     if (orig_w, orig_h) != (target_w, target_h):
-        return img.resize((target_w, target_h), Image.Resampling.LANCZOS)
-    return img
+        return _fast_resize_rgb(img, (target_w, target_h))
+    return img if img.mode == "RGB" else img.convert("RGB")
+
+
+def _load_and_resize_rgb_array(
+    img_path: Path,
+    target_w: int,
+    target_h: int,
+    raw: Image.Image,
+) -> np.ndarray:
+    """Fast JPEG draft + RGB decode + OpenCV INTER_AREA/INTER_LINEAR resize to uint8 (H, W, 3)."""
+    if raw.format == "JPEG":
+        raw.draft("RGB", (target_w, target_h))
+    if _cv2 is not None:
+        if raw.mode == "RGB":
+            arr = np.asarray(raw, dtype=np.uint8)
+        elif raw.mode == "RGBA":
+            arr = _cv2.cvtColor(np.asarray(raw, dtype=np.uint8), _cv2.COLOR_RGBA2RGB)
+        else:
+            arr = np.asarray(raw.convert("RGB"), dtype=np.uint8)
+        h, w = arr.shape[:2]
+        if (w, h) != (target_w, target_h):
+            interp = _cv2.INTER_AREA if (target_w < w or target_h < h) else _cv2.INTER_LINEAR
+            arr = _cv2.resize(arr, (target_w, target_h), interpolation=interp)
+        elif not arr.flags.writeable:
+            arr = arr.copy()
+        return arr
+    rgb = raw if raw.mode == "RGB" else raw.convert("RGB")
+    if rgb.size != (target_w, target_h):
+        rgb = rgb.resize((target_w, target_h), Image.Resampling.BILINEAR)
+    return np.array(rgb, dtype=np.uint8, copy=True)
+
+
+def _load_and_resize_fullpage_array(img_path: Path, fullpage_max_dim: int = 768) -> np.ndarray:
+    with Image.open(img_path) as raw:
+        orig_w, orig_h = raw.size
+        max_side = max(orig_w, orig_h, 1)
+        scale = min(1.0, float(fullpage_max_dim) / float(max_side))
+        target_w = _round_mult16(orig_w * scale, min_val=16, max_val=fullpage_max_dim)
+        target_h = _round_mult16(orig_h * scale, min_val=16, max_val=fullpage_max_dim)
+        return _load_and_resize_rgb_array(img_path, target_w, target_h, raw)
+
+
+def _load_and_resize_strip_array(
+    img_path: Path, strip_height: int = 192, max_strip_width: int = 1024
+) -> np.ndarray:
+    with Image.open(img_path) as raw:
+        orig_w, orig_h = raw.size
+        target_h = _round_mult16(strip_height, min_val=16)
+        scale = target_h / max(1, orig_h)
+        target_w = _round_mult16(orig_w * scale, min_val=16, max_val=max_strip_width)
+        return _load_and_resize_rgb_array(img_path, target_w, target_h, raw)
+
+
+def _hwc_u8_to_chw_tensor(arr: np.ndarray, return_uint8: bool) -> torch.Tensor:
+    t = torch.from_numpy(np.ascontiguousarray(arr)).permute(2, 0, 1)
+    if return_uint8:
+        return t
+    return t.to(torch.float32).mul_(1.0 / 255.0)
 
 
 def _pil_to_chw_tensor(img: Image.Image) -> torch.Tensor:
     rgb = img if img.mode == "RGB" else img.convert("RGB")
-    arr = np.asarray(rgb, dtype=np.float32) * (1.0 / 255.0)
-    return torch.from_numpy(np.ascontiguousarray(arr)).permute(2, 0, 1)
+    arr = np.array(rgb, dtype=np.uint8, copy=True)
+    return torch.from_numpy(arr).permute(2, 0, 1).to(torch.float32).mul_(1.0 / 255.0)
 
 
 def _pil_to_chw_uint8(img: Image.Image) -> torch.Tensor:
     rgb = img if img.mode == "RGB" else img.convert("RGB")
     arr = np.array(rgb, dtype=np.uint8, copy=True)
     return torch.from_numpy(arr).permute(2, 0, 1)
+
+
+_SEQ_CACHE_DTYPE = np.int16 if VOCAB_SIZE <= 32767 else np.int32
 
 
 def _images_to_device_float(
@@ -3148,29 +3297,36 @@ class UniStripDataset(Dataset):
         self.kind = str(kind)
         self.return_uint8 = bool(return_uint8)
         self.is_hw = bool(is_hw) if is_hw is not None else (self.kind == "hw_strip")
+        self._seq_cache: Dict[int, np.ndarray] = {}
 
     def __len__(self) -> int:
         return len(self.pairs)
 
     def __getitem__(self, idx: int) -> Dict[str, Any]:
-        img_path, bekern_path = self.pairs[idx]
-        with Image.open(img_path) as raw:
-            rgb = raw if raw.mode == "RGB" else raw.convert("RGB")
-            img = _resize_strip_pil(rgb, self.strip_height, self.max_strip_width)
-            if img is raw:
-                raw.load()
-                img = raw.copy()
+        sample_idx = int(idx)
+        img_path, bekern_path = self.pairs[sample_idx]
+        arr = _load_and_resize_strip_array(img_path, self.strip_height, self.max_strip_width)
         if self.augment and self.aug_prob > 0.0:
             if (not _is_pre_degraded_path(img_path)) and random.random() < self.aug_prob:
-                img = apply_online_augment(img, is_hw=self.is_hw, is_strip=True)
+                img = apply_online_augment(Image.fromarray(arr, mode="RGB"), is_hw=self.is_hw, is_strip=True)
+                img_t = _pil_to_chw_uint8(img) if self.return_uint8 else _pil_to_chw_tensor(img)
             elif random.random() < 0.25:
-                img = apply_clean_scale_jitter(img)
-        toks = data.load_bekern(bekern_path)
-        ids = _cap_token_ids([BOS_ID] + data.encode(toks) + [EOS_ID], self.max_seq_len)
-        img_t = _pil_to_chw_uint8(img) if self.return_uint8 else _pil_to_chw_tensor(img)
+                img = apply_clean_scale_jitter(Image.fromarray(arr, mode="RGB"))
+                img_t = _pil_to_chw_uint8(img) if self.return_uint8 else _pil_to_chw_tensor(img)
+            else:
+                img_t = _hwc_u8_to_chw_tensor(arr, self.return_uint8)
+        else:
+            img_t = _hwc_u8_to_chw_tensor(arr, self.return_uint8)
+
+        cached_seq = self._seq_cache.get(sample_idx)
+        if cached_seq is None:
+            toks = data.load_bekern(bekern_path)
+            ids = _cap_token_ids([BOS_ID] + data.encode(toks) + [EOS_ID], self.max_seq_len)
+            cached_seq = np.asarray(ids, dtype=_SEQ_CACHE_DTYPE)
+            self._seq_cache[sample_idx] = cached_seq
         return {
             "image": img_t,
-            "seq": torch.tensor(ids, dtype=torch.long),
+            "seq": torch.from_numpy(cached_seq).to(torch.long),
             "sample_id": img_path.stem,
             "kind": self.kind,
         }
@@ -3220,6 +3376,7 @@ class UniFullPageDataset(Dataset):
         self.return_uint8 = bool(return_uint8)
         self.domains = [str(d).strip().lower() for d in domains] if domains is not None else None
         self._batch_target_dim: Optional[int] = None
+        self._seq_cache: Dict[int, np.ndarray] = {}
 
     def set_target_dim(self, dim: Optional[int]) -> None:
         """Set a shared per-batch target max_dim (pass None to clear)."""
@@ -3250,29 +3407,32 @@ class UniFullPageDataset(Dataset):
             domain = ""
         is_hw = domain in ("hw", "real_hw")
 
-        with Image.open(img_path) as raw:
-            rgb = raw if raw.mode == "RGB" else raw.convert("RGB")
-            img = _resize_fullpage_pil(rgb, target_dim)
-            if img is raw:
-                raw.load()
-                img = raw.copy()
+        arr = _load_and_resize_fullpage_array(img_path, target_dim)
         if self.augment and self.aug_prob > 0.0:
             if (not _is_pre_degraded_path(img_path)) and random.random() < self.aug_prob:
-                img = apply_online_augment(img, is_hw=is_hw, is_strip=False)
+                img = apply_online_augment(Image.fromarray(arr, mode="RGB"), is_hw=is_hw, is_strip=False)
+                img_t = _pil_to_chw_uint8(img) if self.return_uint8 else _pil_to_chw_tensor(img)
             elif random.random() < 0.25:
-                img = apply_clean_scale_jitter(img)
+                img = apply_clean_scale_jitter(Image.fromarray(arr, mode="RGB"))
+                img_t = _pil_to_chw_uint8(img) if self.return_uint8 else _pil_to_chw_tensor(img)
+            else:
+                img_t = _hwc_u8_to_chw_tensor(arr, self.return_uint8)
+        else:
+            img_t = _hwc_u8_to_chw_tensor(arr, self.return_uint8)
 
-        stitched: List[str] = []
-        for s_idx, b_path in enumerate(bekern_paths):
-            if s_idx > 0:
-                stitched.append(SYS_TOKEN)
-            stitched.extend(data.load_bekern(b_path))
-
-        ids = _cap_token_ids(encode_uni(stitched, add_bos_eos=True), self.max_seq_len)
-        img_t = _pil_to_chw_uint8(img) if self.return_uint8 else _pil_to_chw_tensor(img)
+        cached_seq = self._seq_cache.get(sample_idx)
+        if cached_seq is None:
+            stitched: List[str] = []
+            for s_idx, b_path in enumerate(bekern_paths):
+                if s_idx > 0:
+                    stitched.append(SYS_TOKEN)
+                stitched.extend(data.load_bekern(b_path))
+            ids = _cap_token_ids(encode_uni(stitched, add_bos_eos=True), self.max_seq_len)
+            cached_seq = np.asarray(ids, dtype=_SEQ_CACHE_DTYPE)
+            self._seq_cache[sample_idx] = cached_seq
         return {
             "image": img_t,
-            "seq": torch.tensor(ids, dtype=torch.long),
+            "seq": torch.from_numpy(cached_seq).to(torch.long),
             "sample_id": img_path.stem,
             "kind": "fullpage",
             "domain": domain,

@@ -79,9 +79,9 @@ from uni_omr import (  # noqa: E402
     VOCAB_SIZE,
     InkTokenRouter,
     MixStyle2d,
-    MTPHead,
+    MTPHead as _BaseMTPHead,
     QATInt4Controller,
-    RMSNorm,
+    RMSNorm as _BaseRMSNorm,
     RoPE1D,
     SwiGLU,
     _CUDA_SDPA_BACKENDS,
@@ -136,6 +136,32 @@ __all__ = [
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+_HAS_F_RMS_NORM: bool = hasattr(F, "rms_norm")
+
+
+class RMSNorm(_BaseRMSNorm):
+    """ONNX-safe fused RMSNorm using native PyTorch ``F.rms_norm`` (zero state_dict change)."""
+
+    def __init__(self, dim: int, eps: float = 1e-6) -> None:
+        super().__init__(dim, eps=eps)
+        self._normalized_shape: Tuple[int, ...] = (int(dim),)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if _HAS_F_RMS_NORM and not torch.onnx.is_in_onnx_export():
+            return F.rms_norm(x, self._normalized_shape, self.weight, self.eps)
+        norm = torch.rsqrt(x.pow(2).mean(dim=-1, keepdim=True) + self.eps)
+        return x * norm * self.weight
+
+
+class MTPHead(_BaseMTPHead):
+    """ONNX-safe MTP projection head using v2 fused ``RMSNorm`` (zero state_dict change)."""
+
+    def __init__(self, d_model: int) -> None:
+        nn.Module.__init__(self)
+        self.norm = RMSNorm(d_model)
+        self.proj = nn.Linear(d_model, d_model, bias=False)
+
 
 def _group_count(channels: int, max_groups: int = 16) -> int:
     g = min(max_groups, channels)
@@ -524,9 +550,10 @@ class AspectNormalizedRoPE1D(nn.Module):
         pos = pos_norm * self.coord_scale
         inv_f = self.inv_freq if self.inv_freq.device == device else self.inv_freq.to(device)
         freqs = torch.outer(pos, inv_f)  # (L, D/2)
-        emb = torch.cat([freqs, freqs], dim=-1)             # (L, D)
-        cos = emb.cos().to(dtype)[None, None, :, :]
-        sin = emb.sin().to(dtype)[None, None, :, :]
+        cos_h = freqs.cos().to(dtype)
+        sin_h = freqs.sin().to(dtype)
+        cos = torch.cat([cos_h, cos_h], dim=-1)[None, None, :, :]
+        sin = torch.cat([sin_h, sin_h], dim=-1)[None, None, :, :]
         if not use_jitter:
             _lru_put(self._cos_sin_cache, (seq_len, device, dtype), (cos, sin), self._max_cache_size)
         return cos, sin
@@ -584,19 +611,21 @@ class AspectNormalizedRoPE2D(nn.Module):
             fx = (x_norm * self.coord_scale).unsqueeze(-1) * inv_f
             fy_2d = fy[:, None, :].expand(h_p, w_p, -1)
             fx_2d = fx[None, :, :].expand(h_p, w_p, -1)
-            emb_half = torch.stack([fy_2d, fx_2d], dim=-1).flatten(-2)
-            emb = torch.cat([emb_half, emb_half], dim=-1).reshape(h_p * w_p, -1)
-            cos_grid = emb.cos().to(dtype)
-            sin_grid = emb.sin().to(dtype)
+            emb_half = torch.stack([fy_2d, fx_2d], dim=-1).flatten(-2).reshape(h_p * w_p, -1)
+            cos_h = emb_half.cos().to(dtype)
+            sin_h = emb_half.sin().to(dtype)
+            cos_grid = torch.cat([cos_h, cos_h], dim=-1)
+            sin_grid = torch.cat([sin_h, sin_h], dim=-1)
 
             cy = torch.tensor([(h_p - 1) * 0.5], device=device, dtype=torch.float32) / float(max(1, h_p - 1))
             cx = torch.tensor([(w_p - 1) * 0.5], device=device, dtype=torch.float32) / float(max(1, w_p - 1))
             fyc = (cy * self.coord_scale).unsqueeze(-1) * inv_f
             fxc = (cx * self.coord_scale).unsqueeze(-1) * inv_f
             emb_c_half = torch.stack([fyc, fxc], dim=-1).flatten(-2)
-            emb_c = torch.cat([emb_c_half, emb_c_half], dim=-1)
-            cos_center = emb_c.cos().to(dtype)
-            sin_center = emb_c.sin().to(dtype)
+            cos_ch = emb_c_half.cos().to(dtype)
+            sin_ch = emb_c_half.sin().to(dtype)
+            cos_center = torch.cat([cos_ch, cos_ch], dim=-1)
+            sin_center = torch.cat([sin_ch, sin_ch], dim=-1)
 
             val = (cos_grid, sin_grid, cos_center, sin_center)
             _lru_put(self._grid_cache, key, val, self._max_cache_size)
@@ -661,9 +690,10 @@ class AspectNormalizedRoPE2D(nn.Module):
         fx = (x_norm * self.coord_scale).unsqueeze(-1) * inv_f
         # Interleaved [y0, x0, y1, x1, ...] across rotary frequencies
         emb_half = torch.stack([fy, fx], dim=-1).flatten(-2)
-        emb = torch.cat([emb_half, emb_half], dim=-1)
-        cos = emb.cos().to(dtype).unsqueeze(1)
-        sin = emb.sin().to(dtype).unsqueeze(1)
+        cos_h = emb_half.cos().to(dtype)
+        sin_h = emb_half.sin().to(dtype)
+        cos = torch.cat([cos_h, cos_h], dim=-1).unsqueeze(1)
+        sin = torch.cat([sin_h, sin_h], dim=-1).unsqueeze(1)
         return cos, sin
 
 
@@ -800,6 +830,7 @@ class InkTokenRouterV2(nn.Module):
         self.bg_key_proj = nn.Linear(d_model, d_model, bias=False)
         self.bg_val_proj = nn.Linear(d_model, d_model, bias=False)
         self.bg_out_norm = RMSNorm(d_model)
+        self._inv_sqrt_d: float = 1.0 / math.sqrt(d_model)
         self._grid_cache: "OrderedDict[Tuple[int, int, torch.device], Tuple[torch.Tensor, torch.Tensor]]" = OrderedDict()
         self._grid_cache_max: int = 64
 
@@ -819,21 +850,23 @@ class InkTokenRouterV2(nn.Module):
         are NEVER masked out.
         """
         if images.shape[1] == 3:
-            luma = (
-                0.299 * images[:, 0:1].float()
-                + 0.587 * images[:, 1:2].float()
-                + 0.114 * images[:, 2:3].float()
-            )
+            luma = images[:, 0:1].to(torch.float32) * 0.299
+            luma.add_(images[:, 1:2], alpha=0.587).add_(images[:, 2:3], alpha=0.114)
         else:
-            luma = images.float().mean(dim=1, keepdim=True)
+            luma = images.to(torch.float32).mean(dim=1, keepdim=True)
 
-        # Edge-connected dark-border mask: 4-edge inward scan stopping at first bright pixel (luma >= 0.45)
+        # Edge-connected dark-border mask: 2 cumsums (0 flips) — bit-identical to 4-edge scan.
+        # Since (luma < 0.30) implies bright_i == 0, cs_y == cs_y[:, :, -1:, :] iff no bright pixel at y..H-1.
         bright_i = (luma >= 0.45).to(torch.int32)
-        top_dark = bright_i.cumsum(dim=2) == 0
-        bot_dark = bright_i.flip(dims=(2,)).cumsum(dim=2).flip(dims=(2,)) == 0
-        left_dark = bright_i.cumsum(dim=3) == 0
-        right_dark = bright_i.flip(dims=(3,)).cumsum(dim=3).flip(dims=(3,)) == 0
-        border_px = ((top_dark | bot_dark | left_dark | right_dark) & (luma < 0.30)).to(luma.dtype)
+        cs_y = bright_i.cumsum(dim=2)
+        cs_x = bright_i.cumsum(dim=3)
+        edge_dark = (
+            (cs_y == 0)
+            | (cs_y == cs_y[:, :, -1:, :])
+            | (cs_x == 0)
+            | (cs_x == cs_x[:, :, :, -1:])
+        )
+        border_px = (edge_dark & (luma < 0.30)).to(luma.dtype)
 
         # Dilate ONLY the outer border mask by 16px in pixel space (separable 1x33 + 33x1)
         border_dilated_px = F.max_pool2d(
@@ -842,7 +875,7 @@ class InkTokenRouterV2(nn.Module):
             stride=1,
             padding=(16, 0),
         )
-        paper_px = (1.0 - border_dilated_px).clamp(0.0, 1.0)
+        paper_px = (1.0 - border_dilated_px).clamp_(0.0, 1.0)
 
         local_bg = F.avg_pool2d(
             F.avg_pool2d(luma, kernel_size=(1, 31), stride=1, padding=(0, 15), count_include_pad=False),
@@ -851,20 +884,16 @@ class InkTokenRouterV2(nn.Module):
             padding=(15, 0),
             count_include_pad=False,
         )
-        local_ink = ((local_bg - luma) / local_bg.clamp(min=0.15)).clamp(0.0, 1.0) * paper_px
+        local_ink = local_bg.sub(luma).div_(local_bg.clamp(min=0.15)).clamp_(0.0, 1.0).mul_(paper_px)
         ink_max = F.adaptive_max_pool2d(local_ink, (h_p, w_p))
         ink_avg = F.adaptive_avg_pool2d(local_ink, (h_p, w_p))
-        local_ink_grid = 0.5 * ink_max + 0.5 * ink_avg
+        local_ink_grid = ink_max.mul_(0.5).add_(ink_avg, alpha=0.5)
 
         paper_grid_f = F.adaptive_avg_pool2d(paper_px, (h_p, w_p))
         effective_paper = (paper_grid_f > 0.5).detach()
 
-        local_ink_grid = local_ink_grid * effective_paper.to(local_ink_grid.dtype)
-        paper_gate = torch.where(
-            effective_paper,
-            torch.ones_like(paper_grid_f),
-            torch.full_like(paper_grid_f, 0.05),
-        ).detach()
+        local_ink_grid = local_ink_grid.mul_(effective_paper.to(local_ink_grid.dtype))
+        paper_gate = torch.where(effective_paper, 1.0, 0.05).to(paper_grid_f.dtype).detach()
         return local_ink_grid, paper_gate, effective_paper
 
     def forward(
@@ -978,8 +1007,7 @@ class InkTokenRouterV2(nn.Module):
         idx_feat = kept_idx.unsqueeze(-1).expand(-1, -1, D)
         kept_tokens = torch.gather(tokens_flat, 1, idx_feat) * kept_gate
 
-        idx_coords = kept_idx.unsqueeze(-1).expand(-1, -1, 2)
-        kept_coords = torch.gather(grid_coords, 1, idx_coords)
+        kept_coords = base_coords[0][kept_idx]
 
         kept_mask = torch.zeros(B, N, device=feat_2d.device, dtype=torch.bool)
         kept_mask.scatter_(1, kept_idx, True)
@@ -1002,8 +1030,10 @@ class InkTokenRouterV2(nn.Module):
         else:
             ink_recall = 1.0
 
-        bg_q_proj = F.linear(self.bg_queries, self.bg_key_proj.weight.t()).to(tokens_flat.dtype).expand(B, -1, -1)
-        bg_logits = torch.bmm(bg_q_proj, tokens_flat.transpose(1, 2)) / math.sqrt(D)
+        bg_q_proj = (
+            F.linear(self.bg_queries, self.bg_key_proj.weight.t()).to(tokens_flat.dtype) * self._inv_sqrt_d
+        ).expand(B, -1, -1)
+        bg_logits = torch.bmm(bg_q_proj, tokens_flat.transpose(1, 2))
         bg_logits = bg_logits - score_flat.unsqueeze(1)
         bg_logits = bg_logits.masked_fill(kept_mask.unsqueeze(1), -1e4)
         bg_attn = F.softmax(bg_logits, dim=-1)
@@ -1214,8 +1244,7 @@ class HybridAxialMergerEncoder(nn.Module):
         for layer in self.axial_layers:
             if use_ckpt:
                 x = _grad_ckpt(
-                    lambda _x, _rc, _rs, _cc, _cs, _l=layer: _l(_x, _rc, _rs, _cc, _cs),
-                    x, row_cos, row_sin, col_cos, col_sin,
+                    layer, x, row_cos, row_sin, col_cos, col_sin,
                     use_reentrant=False,
                 )
             else:
@@ -1279,8 +1308,7 @@ class HybridAxialMergerEncoder(nn.Module):
         for i, layer in enumerate(self.global_layers):
             if use_ckpt and (mem.shape[0] * mem.shape[1] > 12000):
                 mem = _grad_ckpt(
-                    lambda _m, _c, _s, _l=layer: _l(_m, rope_cos=_c, rope_sin=_s),
-                    mem, cos2d, sin2d,
+                    layer, mem, cos2d, sin2d,
                     use_reentrant=False,
                 )
             else:
@@ -1393,38 +1421,33 @@ def compute_stroke_hog_target(
     Zero CUDA-CPU syncs; outputs L2-normalized ``(B, n_bins, H_t, W_t)`` float32 targets.
     """
     device = img.device
-    with torch.amp.autocast(device_type=device.type, enabled=False):
+    with torch.no_grad(), torch.amp.autocast(device_type=device.type, enabled=False):
         if img.shape[1] == 3:
-            luma_f = (
-                0.299 * img[:, 0:1].float()
-                + 0.587 * img[:, 1:2].float()
-                + 0.114 * img[:, 2:3].float()
-            )
+            luma_f = img[:, 0:1].to(torch.float32) * 0.299
+            luma_f.add_(img[:, 1:2], alpha=0.587).add_(img[:, 2:3], alpha=0.114)
         else:
-            luma_f = img.float().mean(dim=1, keepdim=True)
+            luma_f = img.to(torch.float32).mean(dim=1, keepdim=True)
 
         kxy = _get_sobel_kxy(device)
         gxy = F.conv2d(luma_f, kxy, padding=1)
         gx = gxy[:, 0:1]
         gy = gxy[:, 1:2]
-        mag = torch.sqrt(gx * gx + gy * gy + 1e-8)
-        angle = torch.remainder(torch.atan2(gy, gx), math.pi)
-
-        bin_f = angle * (float(n_bins) / math.pi)
+        mag = gx.mul(gx).addcmul_(gy, gy).add_(1e-8).sqrt_()
+        bin_f = torch.atan2(gy, gx).remainder_(math.pi).mul_(float(n_bins) / math.pi)
         bin_floor = torch.floor(bin_f)
         bin_lo = bin_floor.to(torch.long) % n_bins
         bin_hi = (bin_lo + 1) % n_bins
-        w_hi = bin_f - bin_floor
+        w_hi = bin_f.sub_(bin_floor)
         w_lo = 1.0 - w_hi
 
         B, _, H, W = luma_f.shape
         hog_full = luma_f.new_zeros((B, n_bins, H, W), dtype=torch.float32)
-        hog_full.scatter_add_(1, bin_lo, (mag * w_lo).float())
-        hog_full.scatter_add_(1, bin_hi, (mag * w_hi).float())
+        hog_full.scatter_add_(1, bin_lo, mag * w_lo)
+        hog_full.scatter_add_(1, bin_hi, mag.mul_(w_hi))
 
         hog_pooled = F.adaptive_avg_pool2d(hog_full, (int(target_hw[0]), int(target_hw[1])))
-        norm = torch.sqrt((hog_pooled * hog_pooled).sum(dim=1, keepdim=True) + 1e-4)
-        return hog_pooled / norm
+        norm = hog_pooled.pow(2).sum(dim=1, keepdim=True).add_(1e-4).sqrt_()
+        return hog_pooled.div_(norm)
 
 
 def compute_stroke_hog_loss(
@@ -1742,9 +1765,10 @@ class _CachedRoPE1D(RoPE1D):
             alloc_len = max(512, 1 << (seq_len - 1).bit_length()) if seq_len > 0 else 512
             pos = torch.arange(alloc_len, device=device, dtype=torch.float32)
             freqs = torch.outer(pos, self.inv_freq.to(device))  # (L, D/2)
-            emb = torch.cat([freqs, freqs], dim=-1)  # (L, D)
-            cos = emb.cos().to(dtype)[None, None, :, :]
-            sin = emb.sin().to(dtype)[None, None, :, :]
+            cos_h = freqs.cos().to(dtype)
+            sin_h = freqs.sin().to(dtype)
+            cos = torch.cat([cos_h, cos_h], dim=-1)[None, None, :, :]
+            sin = torch.cat([sin_h, sin_h], dim=-1)[None, None, :, :]
             self._cache[key] = (alloc_len, cos, sin)
             return cos[:, :, :seq_len, :], sin[:, :, :seq_len, :]
         _, cos, sin = entry
@@ -1951,20 +1975,22 @@ class UniOMRv2Net(nn.Module):
                 new_past_kvs.append(layer_kv)
             elif use_dec_ckpt:
                 x = _grad_ckpt(
-                    lambda _x, _m, _c, _s, _l=layer: _l(_x, memory=_m, rope_cos=_c, rope_sin=_s),
-                    x, layer_mem, cos1d, sin1d,
+                    layer, x, layer_mem, cos1d, sin1d,
                     use_reentrant=False,
                 )
             else:
                 x = layer(x, memory=layer_mem, rope_cos=cos1d, rope_sin=sin1d)
         h = self.dec_norm(x)
 
-        logits = self.lm_head(h)
         want_mtp = self.training if return_mtp is None else bool(return_mtp)
-        mtp_logits: List[torch.Tensor] = []
         if want_mtp and len(self.mtp_heads) > 0:
-            for head in self.mtp_heads:
-                mtp_logits.append(self.lm_head(head(h)))
+            all_h = torch.stack([h, *(head(h) for head in self.mtp_heads)], dim=0)
+            all_logits = self.lm_head(all_h)
+            logits = all_logits[0]
+            mtp_logits: List[torch.Tensor] = list(all_logits[1:].unbind(0))
+        else:
+            logits = self.lm_head(h)
+            mtp_logits = []
 
         want_aux = self.training if return_aux is None else bool(return_aux)
         sys_y_pred: Optional[torch.Tensor] = None
