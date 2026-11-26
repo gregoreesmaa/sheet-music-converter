@@ -119,7 +119,7 @@ def _extract_pushed_kernel_ref(push_output: str) -> Optional[str]:
     return None
 
 
-def _acquire_file_lock(lock_path: Path, timeout_s: float = 30.0) -> int:
+def _acquire_file_lock(lock_path: Path, timeout_s: float = 180.0) -> int:
     lock_path.parent.mkdir(parents=True, exist_ok=True)
     deadline = time.monotonic() + timeout_s
     while True:

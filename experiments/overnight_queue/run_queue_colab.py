@@ -57,7 +57,7 @@ def _log_console(msg: str) -> None:
 
 
 def _session_name_for(exp_id: str) -> str:
-    m = re.search(r"(ov-\d+[a-z]*)", exp_id)
+    m = re.search(r"(ov-\d+[a-z]*|i13-\d+|exp\d+[a-z]*)", exp_id)
     if m:
         return m.group(1)
     slug = re.sub(r"[^a-z0-9-]+", "-", exp_id.lower()).strip("-")
@@ -358,14 +358,25 @@ def main() -> int:
         shutil.copyfile(RUN_SCRIPT, exec_script)
 
         print(f"[bootstrap:{{EXP_ID}}] Launching {{exec_script}} (mvd={{mvd_root}})", flush=True)
-        proc = subprocess.run(
+        # Stream child stdout/stderr through this kernel's captured stdout.
+        # (subprocess.run with inherited fds loses all output inside IPython/
+        # `colab exec`, which hid every traceback of fast-failing jobs.)
+        proc = subprocess.Popen(
             [sys.executable, "-u", str(exec_script)],
             cwd=str(repo_root),
             env=env,
-            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1,
+            errors="replace",
         )
-        print(f"[bootstrap:{{EXP_ID}}] Finished rc={{proc.returncode}}", flush=True)
-        return int(proc.returncode)
+        assert proc.stdout is not None
+        for _line in proc.stdout:
+            print(_line, end="", flush=True)
+        _rc = proc.wait()
+        print(f"[bootstrap:{{EXP_ID}}] Finished rc={{_rc}}", flush=True)
+        return int(_rc)
     finally:
         if HF_TOK.exists():
             try:
@@ -397,11 +408,24 @@ def _run_subprocess_logged(
         bufsize=1,
     )
     assert proc.stdout is not None
+    inner_rc: Optional[int] = None
     for line in proc.stdout:
         log_handle.write(line)
         log_handle.flush()
+        # `colab exec` returns 0 even when the in-VM job crashed (SystemExit is
+        # swallowed by IPython), so trust the bootstrap's own marker instead.
+        m = re.search(r"\[bootstrap:[^\]]*\] Finished rc=(-?\d+)", line)
+        if m:
+            inner_rc = int(m.group(1))
     rc = proc.wait()
     log_handle.write(f"[{_utc_now()}] [{label}] exit_code={rc}\n")
+    if label == "colab-exec" and int(rc) == 0:
+        if inner_rc is None:
+            log_handle.write(f"[{_utc_now()}] [{label}] NO bootstrap 'Finished rc=' marker -> treating as FAILED (rc=97)\n")
+            rc = 97
+        elif inner_rc != 0:
+            log_handle.write(f"[{_utc_now()}] [{label}] inner job rc={inner_rc} -> FAILED\n")
+            rc = inner_rc
     log_handle.flush()
     return int(rc)
 
@@ -640,10 +664,11 @@ def _print_schedule(selected: Sequence[Dict[str, Any]], gpu: str, max_parallel: 
         for e in by_wave[wave]:
             sess = _session_name_for(e["id"])
             script_ok = (REPO_ROOT / e["script"]).is_file()
+            _cu = float(e.get("est_cu") or round(int(e["est_minutes"]) * 0.0777, 2))
             w_min += int(e["est_minutes"])
-            w_cu += float(e["est_cu"])
+            w_cu += _cu
             print(
-                f"W{wave:<4} {e.get('priority', 0):<4} {sess:<8} {e['est_minutes']:>4} {e['est_cu']:>6.2f} "
+                f"W{wave:<4} {e.get('priority', 0):<4} {sess:<8} {e['est_minutes']:>4} {_cu:>6.2f} "
                 f"{e.get('status', 'QUEUED'):<10} {e['id']:<56} {'YES' if script_ok else 'MISSING'}"
             )
         total_min += w_min

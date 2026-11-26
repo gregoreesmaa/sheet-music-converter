@@ -1,0 +1,97 @@
+{
+  "batch_id": "batch_09",
+  "wave": 9,
+  "status": "PROPOSED",
+  "created_at": "2026-11-26T07:40:00Z",
+  "baseline_commit": "9303e51",
+  "theme": "Iter 13 Model Surgeon 1 — uni_omr_v2.py Architecture & Positional Parameter Audit",
+  "platform": "colab_l4",
+  "gpu": "L4",
+  "hf_repo": "gregoreesmaa/sheet-music-converter-omr",
+  "experiments": [
+    {
+      "id": "2026-11-26T07-40-i13-25-axial-global-layer-split",
+      "short_id": "i13-25",
+      "title": "Hybrid Encoder n_axial_layers vs n_global_layers Iso-Depth Split Sweep",
+      "wave": 9,
+      "priority": 1,
+      "provider": "colab_l4",
+      "gpu": "L4",
+      "colab_session": "i13-25-ax-gl",
+      "est_minutes": 34,
+      "est_cu": 2.8,
+      "script": "experiments/2026-11-26T07-40-i13-25-axial-global-layer-split/run_colab.py",
+      "readme": "experiments/2026-11-26T07-40-i13-25-axial-global-layer-split/README.md",
+      "plan": "experiments/2026-11-26T07-40-i13-25-axial-global-layer-split/PLAN.md",
+      "hf_eval_target": "evals/2026-11-26T07-40-i13-25-axial-global-layer-split.json",
+      "hf_run_target": "runs/2026-11-26T07-40-i13-25-axial-global-layer-split.json",
+      "status": "QUEUED",
+      "depends_on": [],
+      "datasets": [
+        "datasets/iter10_5_proxy_2k.tar"
+      ],
+      "sweep": [
+        {"arm": "ax1_gl5", "n_axial_layers": 1, "n_global_layers": 5},
+        {"arm": "ax2_gl4", "n_axial_layers": 2, "n_global_layers": 4, "is_control": true},
+        {"arm": "ax3_gl3", "n_axial_layers": 3, "n_global_layers": 3},
+        {"arm": "ax4_gl2", "n_axial_layers": 4, "n_global_layers": 2}
+      ]
+    },
+    {
+      "id": "2026-11-26T07-40-i13-26-gqa-kv-heads-sweep",
+      "short_id": "i13-26",
+      "title": "Decoder GQA n_kv_heads Visual Cross-Attention Bottleneck Sweep (1, 2, 4, 8)",
+      "wave": 9,
+      "priority": 2,
+      "provider": "colab_l4",
+      "gpu": "L4",
+      "colab_session": "i13-26-gqa-kv",
+      "est_minutes": 32,
+      "est_cu": 2.6,
+      "script": "experiments/2026-11-26T07-40-i13-26-gqa-kv-heads-sweep/run_colab.py",
+      "readme": "experiments/2026-11-26T07-40-i13-26-gqa-kv-heads-sweep/README.md",
+      "plan": "experiments/2026-11-26T07-40-i13-26-gqa-kv-heads-sweep/PLAN.md",
+      "hf_eval_target": "evals/2026-11-26T07-40-i13-26-gqa-kv-heads-sweep.json",
+      "hf_run_target": "runs/2026-11-26T07-40-i13-26-gqa-kv-heads-sweep.json",
+      "status": "QUEUED",
+      "depends_on": [],
+      "datasets": [
+        "datasets/iter10_5_proxy_2k.tar"
+      ],
+      "sweep": [
+        {"arm": "kv1_mqa", "n_kv_heads": 1},
+        {"arm": "kv2_gqa4x", "n_kv_heads": 2, "is_control": true},
+        {"arm": "kv4_gqa2x", "n_kv_heads": 4},
+        {"arm": "kv8_mha", "n_kv_heads": 8}
+      ]
+    },
+    {
+      "id": "2026-11-26T07-40-i13-27-rope-coord-scale-sweep",
+      "short_id": "i13-27",
+      "title": "Aspect-Normalized 1D/2D-RoPE rope_coord_scale Aliasing Sweep (32, 64, 128, 256)",
+      "wave": 9,
+      "priority": 3,
+      "provider": "colab_l4",
+      "gpu": "L4",
+      "colab_session": "i13-27-rope-scale",
+      "est_minutes": 32,
+      "est_cu": 2.6,
+      "script": "experiments/2026-11-26T07-40-i13-27-rope-coord-scale-sweep/run_colab.py",
+      "readme": "experiments/2026-11-26T07-40-i13-27-rope-coord-scale-sweep/README.md",
+      "plan": "experiments/2026-11-26T07-40-i13-27-rope-coord-scale-sweep/PLAN.md",
+      "hf_eval_target": "evals/2026-11-26T07-40-i13-27-rope-coord-scale-sweep.json",
+      "hf_run_target": "runs/2026-11-26T07-40-i13-27-rope-coord-scale-sweep.json",
+      "status": "QUEUED",
+      "depends_on": [],
+      "datasets": [
+        "datasets/iter10_5_proxy_2k.tar"
+      ],
+      "sweep": [
+        {"arm": "scale_32", "rope_coord_scale": 32.0},
+        {"arm": "scale_64", "rope_coord_scale": 64.0},
+        {"arm": "scale_128", "rope_coord_scale": 128.0, "is_control": true},
+        {"arm": "scale_256", "rope_coord_scale": 256.0}
+      ]
+    }
+  ]
+}

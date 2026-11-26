@@ -1,0 +1,41 @@
+[
+  {
+    "id": "2026-11-26T07-40-i13-16-mathpix-conf-gated-redecode",
+    "wave": 9,
+    "priority": 16,
+    "provider": "colab_l4",
+    "gpu": "L4",
+    "est_minutes": 26,
+    "est_cu": 2.2,
+    "script": "experiments/2026-11-26T07-40-i13-16-mathpix-conf-gated-redecode/run_colab.py",
+    "hf_eval_target": "evals/2026-11-26T07-40-i13-16-mathpix-conf-gated-redecode.json",
+    "status": "QUEUED",
+    "depends_on": []
+  },
+  {
+    "id": "2026-11-26T07-40-i13-17-paddleocr-vrfm-band-router",
+    "wave": 9,
+    "priority": 17,
+    "provider": "colab_l4",
+    "gpu": "L4",
+    "est_minutes": 22,
+    "est_cu": 1.8,
+    "script": "experiments/2026-11-26T07-40-i13-17-paddleocr-vrfm-band-router/run_colab.py",
+    "hf_eval_target": "evals/2026-11-26T07-40-i13-17-paddleocr-vrfm-band-router.json",
+    "status": "QUEUED",
+    "depends_on": []
+  },
+  {
+    "id": "2026-11-26T07-40-i13-18-trocr-pylaia-vcd-ilms",
+    "wave": 9,
+    "priority": 18,
+    "provider": "colab_l4",
+    "gpu": "L4",
+    "est_minutes": 28,
+    "est_cu": 2.3,
+    "script": "experiments/2026-11-26T07-40-i13-18-trocr-pylaia-vcd-ilms/run_colab.py",
+    "hf_eval_target": "evals/2026-11-26T07-40-i13-18-trocr-pylaia-vcd-ilms.json",
+    "status": "QUEUED",
+    "depends_on": []
+  }
+]

@@ -1,0 +1,41 @@
+[
+  {
+    "id": "2026-11-26T07-40-i13-07-dapo-drgrpo-rlvr-rism",
+    "wave": 9,
+    "priority": 107,
+    "provider": "colab_l4",
+    "gpu": "L4",
+    "est_minutes": 38,
+    "est_cu": 3.1,
+    "script": "experiments/2026-11-26T07-40-i13-07-dapo-drgrpo-rlvr-rism/run_colab.py",
+    "hf_eval_target": "evals/2026-11-26T07-40-i13-07-dapo-drgrpo-rlvr-rism.json",
+    "status": "QUEUED",
+    "depends_on": []
+  },
+  {
+    "id": "2026-11-26T07-40-i13-08-eagle3-fsa-spec-decode",
+    "wave": 9,
+    "priority": 108,
+    "provider": "colab_l4",
+    "gpu": "L4",
+    "est_minutes": 26,
+    "est_cu": 2.1,
+    "script": "experiments/2026-11-26T07-40-i13-08-eagle3-fsa-spec-decode/run_colab.py",
+    "hf_eval_target": "evals/2026-11-26T07-40-i13-08-eagle3-fsa-spec-decode.json",
+    "status": "QUEUED",
+    "depends_on": []
+  },
+  {
+    "id": "2026-11-26T07-40-i13-09-paretoq-awq-edge-qat",
+    "wave": 9,
+    "priority": 109,
+    "provider": "colab_l4",
+    "gpu": "L4",
+    "est_minutes": 30,
+    "est_cu": 2.4,
+    "script": "experiments/2026-11-26T07-40-i13-09-paretoq-awq-edge-qat/run_colab.py",
+    "hf_eval_target": "evals/2026-11-26T07-40-i13-09-paretoq-awq-edge-qat.json",
+    "status": "QUEUED",
+    "depends_on": []
+  }
+]

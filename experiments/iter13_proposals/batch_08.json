@@ -1,0 +1,41 @@
+[
+  {
+    "id": "2026-11-26T07-40-i13-22-selfplay-error-inject-repair",
+    "wave": 9,
+    "priority": 52,
+    "provider": "colab_l4",
+    "gpu": "L4",
+    "est_minutes": 30,
+    "est_cu": 2.2,
+    "script": "experiments/2026-11-26T07-40-i13-22-selfplay-error-inject-repair/run_colab.py",
+    "hf_eval_target": "evals/2026-11-26T07-40-i13-22-selfplay-error-inject-repair.json",
+    "status": "QUEUED",
+    "depends_on": []
+  },
+  {
+    "id": "2026-11-26T07-40-i13-23-per-measure-process-grpo-curriculum",
+    "wave": 9,
+    "priority": 53,
+    "provider": "colab_l4",
+    "gpu": "L4",
+    "est_minutes": 34,
+    "est_cu": 2.5,
+    "script": "experiments/2026-11-26T07-40-i13-23-per-measure-process-grpo-curriculum/run_colab.py",
+    "hf_eval_target": "evals/2026-11-26T07-40-i13-23-per-measure-process-grpo-curriculum.json",
+    "status": "QUEUED",
+    "depends_on": []
+  },
+  {
+    "id": "2026-11-26T07-40-i13-24-multiteacher-disagreement-kd",
+    "wave": 9,
+    "priority": 54,
+    "provider": "colab_l4",
+    "gpu": "L4",
+    "est_minutes": 36,
+    "est_cu": 2.8,
+    "script": "experiments/2026-11-26T07-40-i13-24-multiteacher-disagreement-kd/run_colab.py",
+    "hf_eval_target": "evals/2026-11-26T07-40-i13-24-multiteacher-disagreement-kd.json",
+    "status": "QUEUED",
+    "depends_on": []
+  }
+]

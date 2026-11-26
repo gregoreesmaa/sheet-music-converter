@@ -1,0 +1,41 @@
+[
+  {
+    "id": "2026-11-26T07-40-i13-13-cross-system-header-consensus",
+    "wave": 9,
+    "priority": 13,
+    "provider": "colab_l4",
+    "gpu": "L4",
+    "est_minutes": 25,
+    "est_cu": 2.1,
+    "script": "experiments/2026-11-26T07-40-i13-13-cross-system-header-consensus/run_colab.py",
+    "hf_eval_target": "evals/2026-11-26T07-40-i13-13-cross-system-header-consensus.json",
+    "status": "QUEUED",
+    "depends_on": []
+  },
+  {
+    "id": "2026-11-26T07-40-i13-14-photo-illum-flatten-autocrop",
+    "wave": 9,
+    "priority": 14,
+    "provider": "colab_l4",
+    "gpu": "L4",
+    "est_minutes": 22,
+    "est_cu": 1.9,
+    "script": "experiments/2026-11-26T07-40-i13-14-photo-illum-flatten-autocrop/run_colab.py",
+    "hf_eval_target": "evals/2026-11-26T07-40-i13-14-photo-illum-flatten-autocrop.json",
+    "status": "QUEUED",
+    "depends_on": []
+  },
+  {
+    "id": "2026-11-26T07-40-i13-15-confidence-selective-hires-redecode",
+    "wave": 9,
+    "priority": 15,
+    "provider": "colab_l4",
+    "gpu": "L4",
+    "est_minutes": 28,
+    "est_cu": 2.3,
+    "script": "experiments/2026-11-26T07-40-i13-15-confidence-selective-hires-redecode/run_colab.py",
+    "hf_eval_target": "evals/2026-11-26T07-40-i13-15-confidence-selective-hires-redecode.json",
+    "status": "QUEUED",
+    "depends_on": []
+  }
+]

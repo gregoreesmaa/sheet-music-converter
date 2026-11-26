@@ -1,0 +1,41 @@
+[
+  {
+    "id": "2026-11-26T07-40-i13-28-decoupled-wd-norm-nodecay",
+    "wave": 9,
+    "priority": 28,
+    "provider": "colab_l4",
+    "gpu": "L4",
+    "est_minutes": 30,
+    "est_cu": 2.4,
+    "script": "experiments/2026-11-26T07-40-i13-28-decoupled-wd-norm-nodecay/run_colab.py",
+    "hf_eval_target": "evals/2026-11-26T07-40-i13-28-decoupled-wd-norm-nodecay.json",
+    "status": "QUEUED",
+    "depends_on": []
+  },
+  {
+    "id": "2026-11-26T07-40-i13-29-grad-clip-threshold-sweep",
+    "wave": 9,
+    "priority": 29,
+    "provider": "colab_l4",
+    "gpu": "L4",
+    "est_minutes": 28,
+    "est_cu": 2.3,
+    "script": "experiments/2026-11-26T07-40-i13-29-grad-clip-threshold-sweep/run_colab.py",
+    "hf_eval_target": "evals/2026-11-26T07-40-i13-29-grad-clip-threshold-sweep.json",
+    "status": "QUEUED",
+    "depends_on": []
+  },
+  {
+    "id": "2026-11-26T07-40-i13-30-tok-dropout-exposure-bias-sweep",
+    "wave": 9,
+    "priority": 30,
+    "provider": "colab_l4",
+    "gpu": "L4",
+    "est_minutes": 30,
+    "est_cu": 2.4,
+    "script": "experiments/2026-11-26T07-40-i13-30-tok-dropout-exposure-bias-sweep/run_colab.py",
+    "hf_eval_target": "evals/2026-11-26T07-40-i13-30-tok-dropout-exposure-bias-sweep.json",
+    "status": "QUEUED",
+    "depends_on": []
+  }
+]

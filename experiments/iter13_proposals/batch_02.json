@@ -1,0 +1,41 @@
+[
+  {
+    "id": "2026-11-26T07-40-i13-04-lejepa-sigreg-vs-vicreg-rism-ssl",
+    "wave": 9,
+    "priority": 4,
+    "provider": "colab_l4",
+    "gpu": "L4",
+    "est_minutes": 42,
+    "est_cu": 3.4,
+    "script": "experiments/2026-11-26T07-40-i13-04-lejepa-sigreg-vs-vicreg-rism-ssl/run_colab.py",
+    "hf_eval_target": "evals/2026-11-26T07-40-i13-04-lejepa-sigreg-vs-vicreg-rism-ssl.json",
+    "status": "QUEUED",
+    "depends_on": []
+  },
+  {
+    "id": "2026-11-26T07-40-i13-05-fda-adain-rism-sim2real-transfer",
+    "wave": 9,
+    "priority": 5,
+    "provider": "colab_l4",
+    "gpu": "L4",
+    "est_minutes": 34,
+    "est_cu": 2.8,
+    "script": "experiments/2026-11-26T07-40-i13-05-fda-adain-rism-sim2real-transfer/run_colab.py",
+    "hf_eval_target": "evals/2026-11-26T07-40-i13-05-fda-adain-rism-sim2real-transfer.json",
+    "status": "QUEUED",
+    "depends_on": []
+  },
+  {
+    "id": "2026-11-26T07-40-i13-06-memo-sar-rhythm-gated-ttt",
+    "wave": 9,
+    "priority": 6,
+    "provider": "colab_l4",
+    "gpu": "L4",
+    "est_minutes": 26,
+    "est_cu": 2.2,
+    "script": "experiments/2026-11-26T07-40-i13-06-memo-sar-rhythm-gated-ttt/run_colab.py",
+    "hf_eval_target": "evals/2026-11-26T07-40-i13-06-memo-sar-rhythm-gated-ttt.json",
+    "status": "QUEUED",
+    "depends_on": []
+  }
+]

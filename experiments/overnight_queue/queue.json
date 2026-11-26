@@ -47,11 +47,14 @@
     "est_cu": 1.6,
     "script": "experiments/2026-11-26T01-38-ov-34-measure-beam-header-guard-sweep/run_colab.py",
     "hf_eval_target": "evals/2026-11-26T01-38-ov-34-measure-beam-header-guard-sweep.json",
-    "status": "RUNNING",
+    "status": "COMPLETED",
     "depends_on": [],
     "session": "ov-34",
     "started_at": "2026-11-26T00:41:23Z",
-    "log_path": "D:\\tmp\\overnight-queue-logs\\2026-11-26T01-38-ov-34-measure-beam-header-guard-sweep.log"
+    "log_path": "D:\\tmp\\overnight-queue-logs\\2026-11-26T01-38-ov-34-measure-beam-header-guard-sweep.log",
+    "completed_at": "2026-11-26T03:06:38Z",
+    "elapsed_sec": 8714.45,
+    "returncode": 0
   },
   {
     "id": "2026-11-26T01-38-ov-13-muon-lr-sweep",
@@ -63,11 +66,14 @@
     "est_cu": 1.5,
     "script": "experiments/2026-11-26T01-38-ov-13-muon-lr-sweep/run_colab.py",
     "hf_eval_target": "evals/2026-11-26T01-38-ov-13-muon-lr-sweep.json",
-    "status": "RUNNING",
+    "status": "COMPLETED",
     "depends_on": [],
     "session": "ov-13",
     "started_at": "2026-11-26T00:46:23Z",
-    "log_path": "D:\\tmp\\overnight-queue-logs\\2026-11-26T01-38-ov-13-muon-lr-sweep.log"
+    "log_path": "D:\\tmp\\overnight-queue-logs\\2026-11-26T01-38-ov-13-muon-lr-sweep.log",
+    "completed_at": "2026-11-26T02:49:24Z",
+    "elapsed_sec": 7381.19,
+    "returncode": 0
   },
   {
     "id": "2026-11-26T01-38-ov-15-ema-decay-soup-sweep",
@@ -79,8 +85,14 @@
     "est_cu": 1.6,
     "script": "experiments/2026-11-26T01-38-ov-15-ema-decay-soup-sweep/run_colab.py",
     "hf_eval_target": "evals/2026-11-26T01-38-ov-15-ema-decay-soup-sweep.json",
-    "status": "QUEUED",
-    "depends_on": []
+    "status": "COMPLETED",
+    "depends_on": [],
+    "session": "ov-15",
+    "started_at": "2026-11-26T02:49:25Z",
+    "log_path": "D:\\tmp\\overnight-queue-logs\\2026-11-26T01-38-ov-15-ema-decay-soup-sweep.log",
+    "completed_at": "2026-11-26T05:10:26Z",
+    "elapsed_sec": 8461.39,
+    "returncode": 0
   },
   {
     "id": "2026-11-26T01-38-ov-14-wsd-cooldown-shape",
@@ -92,8 +104,14 @@
     "est_cu": 1.8,
     "script": "experiments/2026-11-26T01-38-ov-14-wsd-cooldown-shape/run_colab.py",
     "hf_eval_target": "evals/2026-11-26T01-38-ov-14-wsd-cooldown-shape.json",
-    "status": "QUEUED",
-    "depends_on": []
+    "status": "COMPLETED",
+    "depends_on": [],
+    "session": "ov-14",
+    "started_at": "2026-11-26T03:06:38Z",
+    "log_path": "D:\\tmp\\overnight-queue-logs\\2026-11-26T01-38-ov-14-wsd-cooldown-shape.log",
+    "completed_at": "2026-11-26T05:58:57Z",
+    "elapsed_sec": 10338.78,
+    "returncode": 0
   },
   {
     "id": "2026-11-26T01-38-ov-16-resolution-multiscale-sweep",
@@ -106,7 +124,8 @@
     "script": "experiments/2026-11-26T01-38-ov-16-resolution-multiscale-sweep/run_colab.py",
     "hf_eval_target": "evals/2026-11-26T01-38-ov-16-resolution-multiscale-sweep.json",
     "status": "QUEUED",
-    "depends_on": []
+    "depends_on": [],
+    "note": "reset: false COMPLETED (inner rc=1 hidden by colab exec)"
   },
   {
     "id": "2026-11-26T01-38-ov-17-irope-registers-jitter-sweep",
@@ -119,25 +138,22 @@
     "script": "experiments/2026-11-26T01-38-ov-17-irope-registers-jitter-sweep/run_colab.py",
     "hf_eval_target": "evals/2026-11-26T01-38-ov-17-irope-registers-jitter-sweep.json",
     "status": "QUEUED",
-    "depends_on": []
+    "depends_on": [],
+    "note": "reset: false COMPLETED (inner rc=1 hidden by colab exec)"
   },
   {
     "id": "2026-11-26T01-38-ov-21-paper-gate-border-threshold",
     "wave": 5,
     "priority": 9,
-    "provider": "kaggle",
-    "gpu": "2xT4",
+    "provider": "colab_l4",
+    "gpu": "L4",
     "est_minutes": 20,
     "est_cu": 1.7,
     "script": "experiments/2026-11-26T01-38-ov-21-paper-gate-border-threshold/run_colab.py",
     "hf_eval_target": "evals/2026-11-26T01-38-ov-21-paper-gate-border-threshold.json",
-    "status": "FAILED",
+    "status": "QUEUED",
     "depends_on": [],
-    "kernel_id": "gregoreesmaa/omr-ov-21",
-    "completed_at": "2026-11-26T01:54:57Z",
-    "elapsed_sec": 5756.67,
-    "returncode": 1,
-    "failure_reason": "kaggle_state=ERROR hf_eval_exists=False"
+    "note": "reset: false COMPLETED (inner rc=1 hidden by colab exec)"
   },
   {
     "id": "2026-11-26T01-38-ov-19-router-saliency-keep-sweep",
@@ -150,7 +166,8 @@
     "script": "experiments/2026-11-26T01-38-ov-19-router-saliency-keep-sweep/run_colab.py",
     "hf_eval_target": "evals/2026-11-26T01-38-ov-19-router-saliency-keep-sweep.json",
     "status": "QUEUED",
-    "depends_on": []
+    "depends_on": [],
+    "note": "reset: false COMPLETED (inner rc=1 hidden by colab exec)"
   },
   {
     "id": "2026-11-26T01-38-ov-20-vir-vico-weight-schedule",
@@ -163,7 +180,8 @@
     "script": "experiments/2026-11-26T01-38-ov-20-vir-vico-weight-schedule/run_colab.py",
     "hf_eval_target": "evals/2026-11-26T01-38-ov-20-vir-vico-weight-schedule.json",
     "status": "QUEUED",
-    "depends_on": []
+    "depends_on": [],
+    "note": "reset: false COMPLETED (inner rc=1 hidden by colab exec)"
   },
   {
     "id": "2026-11-26T01-38-ov-22-fullpage-frac-sweep",
@@ -175,8 +193,11 @@
     "est_cu": 2.8,
     "script": "experiments/2026-11-26T01-38-ov-22-fullpage-frac-sweep/run_colab.py",
     "hf_eval_target": "evals/2026-11-26T01-38-ov-22-fullpage-frac-sweep.json",
-    "status": "QUEUED",
-    "depends_on": []
+    "status": "RUNNING",
+    "depends_on": [],
+    "session": "ov-22",
+    "started_at": "2026-11-26T05:24:16Z",
+    "log_path": "D:\\tmp\\overnight-queue-logs\\2026-11-26T01-38-ov-22-fullpage-frac-sweep.log"
   },
   {
     "id": "2026-11-26T01-38-ov-24-mixstyle-domain-invariance",
@@ -188,8 +209,11 @@
     "est_cu": 2.9,
     "script": "experiments/2026-11-26T01-38-ov-24-mixstyle-domain-invariance/run_colab.py",
     "hf_eval_target": "evals/2026-11-26T01-38-ov-24-mixstyle-domain-invariance.json",
-    "status": "QUEUED",
-    "depends_on": []
+    "status": "RUNNING",
+    "depends_on": [],
+    "session": "ov-24",
+    "started_at": "2026-11-26T05:58:57Z",
+    "log_path": "D:\\tmp\\overnight-queue-logs\\2026-11-26T01-38-ov-24-mixstyle-domain-invariance.log"
   },
   {
     "id": "2026-11-26T01-38-ov-18-sobel-hog-weight-sweep",
@@ -305,26 +329,27 @@
     "est_cu": 2.4,
     "script": "experiments/2026-11-26T01-38-ov-38-scribe-ttt-lr-steps-sweep/run_colab.py",
     "hf_eval_target": "evals/2026-11-26T01-38-ov-38-scribe-ttt-lr-steps-sweep.json",
-    "status": "QUEUED",
+    "status": "COMPLETED",
     "depends_on": [
       "2026-11-26T00-55-trial-scribe-ttt-suite31-hw"
-    ]
+    ],
+    "completed_at": "2026-11-26T06:27:41Z",
+    "skipped_existing_hf": true
   },
   {
     "id": "2026-11-26T01-38-ov-37-rlvr-kl-group-sweep",
     "wave": 7,
     "priority": 23,
-    "provider": "kaggle",
-    "gpu": "2xT4",
+    "provider": "colab_l4",
+    "gpu": "L4",
     "est_minutes": 35,
     "est_cu": 2.8,
     "script": "experiments/2026-11-26T01-38-ov-37-rlvr-kl-group-sweep/run_colab.py",
     "hf_eval_target": "evals/2026-11-26T01-38-ov-37-rlvr-kl-group-sweep.json",
     "status": "COMPLETED",
     "depends_on": [],
-    "completed_at": "2026-11-26T01:31:52Z",
-    "elapsed_sec": 4709.81,
-    "returncode": 0
+    "completed_at": "2026-11-26T06:27:41Z",
+    "skipped_existing_hf": true
   },
   {
     "id": "2026-11-26T01-38-ov-39-rism-pseudolabel-threshold-sweep",
@@ -338,13 +363,8 @@
     "hf_eval_target": "evals/2026-11-26T01-38-ov-39-rism-pseudolabel-threshold-sweep.json",
     "status": "COMPLETED",
     "depends_on": [],
-    "completed_at": "2026-11-26T01:53:05Z",
-    "started_at": "2026-11-26T00:13:20Z",
-    "elapsed_sec": 5984.98,
-    "returncode": 0,
-    "verdict": "PROMOTE",
-    "best_arm_id": "lp-0.35_beat0.70",
-    "best_hw_avg_delta": 0.023553
+    "completed_at": "2026-11-26T06:27:41Z",
+    "skipped_existing_hf": true
   },
   {
     "id": "2026-11-26T01-38-ov-31-vjepa21-mask-ratio-sweep",
@@ -429,63 +449,703 @@
     "depends_on": []
   },
   {
-    "id": "2026-11-26T02-48-academic-gevt-vbkern-4k-converged",
+    "id": "2026-11-26T07-40-i13-01-visual-causal-flow-encoder",
     "wave": 9,
     "priority": 31,
     "provider": "colab_l4",
     "gpu": "L4",
-    "est_minutes": 100,
-    "est_cu": 8.0,
+    "est_minutes": 32,
+    "est_cu": 2.6,
+    "script": "experiments/2026-11-26T07-40-i13-01-visual-causal-flow-encoder/run_colab.py",
+    "hf_eval_target": "evals/2026-11-26T07-40-i13-01-visual-causal-flow-encoder.json",
+    "status": "QUEUED",
+    "depends_on": []
+  },
+  {
+    "id": "2026-11-26T07-40-i13-02-anisotropic-patch-merger",
+    "wave": 9,
+    "priority": 32,
+    "provider": "colab_l4",
+    "gpu": "L4",
+    "est_minutes": 32,
+    "est_cu": 2.6,
+    "script": "experiments/2026-11-26T07-40-i13-02-anisotropic-patch-merger/run_colab.py",
+    "hf_eval_target": "evals/2026-11-26T07-40-i13-02-anisotropic-patch-merger.json",
+    "status": "QUEUED",
+    "depends_on": []
+  },
+  {
+    "id": "2026-11-26T07-40-i13-03-window2d-highres-encoder",
+    "wave": 9,
+    "priority": 33,
+    "provider": "colab_l4",
+    "gpu": "L4",
+    "est_minutes": 32,
+    "est_cu": 2.6,
+    "script": "experiments/2026-11-26T07-40-i13-03-window2d-highres-encoder/run_colab.py",
+    "hf_eval_target": "evals/2026-11-26T07-40-i13-03-window2d-highres-encoder.json",
+    "status": "QUEUED",
+    "depends_on": []
+  },
+  {
+    "id": "2026-11-26T07-40-i13-04-lejepa-sigreg-vs-vicreg-rism-ssl",
+    "wave": 9,
+    "priority": 4,
+    "provider": "colab_l4",
+    "gpu": "L4",
+    "est_minutes": 42,
+    "est_cu": 3.4,
+    "script": "experiments/2026-11-26T07-40-i13-04-lejepa-sigreg-vs-vicreg-rism-ssl/run_colab.py",
+    "hf_eval_target": "evals/2026-11-26T07-40-i13-04-lejepa-sigreg-vs-vicreg-rism-ssl.json",
+    "status": "QUEUED",
+    "depends_on": []
+  },
+  {
+    "id": "2026-11-26T07-40-i13-05-fda-adain-rism-sim2real-transfer",
+    "wave": 9,
+    "priority": 5,
+    "provider": "colab_l4",
+    "gpu": "L4",
+    "est_minutes": 34,
+    "est_cu": 2.8,
+    "script": "experiments/2026-11-26T07-40-i13-05-fda-adain-rism-sim2real-transfer/run_colab.py",
+    "hf_eval_target": "evals/2026-11-26T07-40-i13-05-fda-adain-rism-sim2real-transfer.json",
+    "status": "QUEUED",
+    "depends_on": []
+  },
+  {
+    "id": "2026-11-26T07-40-i13-06-memo-sar-rhythm-gated-ttt",
+    "wave": 9,
+    "priority": 6,
+    "provider": "colab_l4",
+    "gpu": "L4",
+    "est_minutes": 26,
+    "est_cu": 2.2,
+    "script": "experiments/2026-11-26T07-40-i13-06-memo-sar-rhythm-gated-ttt/run_colab.py",
+    "hf_eval_target": "evals/2026-11-26T07-40-i13-06-memo-sar-rhythm-gated-ttt.json",
+    "status": "QUEUED",
+    "depends_on": []
+  },
+  {
+    "id": "2026-11-26T07-40-i13-07-dapo-drgrpo-rlvr-rism",
+    "wave": 9,
+    "priority": 107,
+    "provider": "colab_l4",
+    "gpu": "L4",
+    "est_minutes": 38,
+    "est_cu": 3.1,
+    "script": "experiments/2026-11-26T07-40-i13-07-dapo-drgrpo-rlvr-rism/run_colab.py",
+    "hf_eval_target": "evals/2026-11-26T07-40-i13-07-dapo-drgrpo-rlvr-rism.json",
+    "status": "QUEUED",
+    "depends_on": []
+  },
+  {
+    "id": "2026-11-26T07-40-i13-08-eagle3-fsa-spec-decode",
+    "wave": 9,
+    "priority": 108,
+    "provider": "colab_l4",
+    "gpu": "L4",
+    "est_minutes": 26,
+    "est_cu": 2.1,
+    "script": "experiments/2026-11-26T07-40-i13-08-eagle3-fsa-spec-decode/run_colab.py",
+    "hf_eval_target": "evals/2026-11-26T07-40-i13-08-eagle3-fsa-spec-decode.json",
+    "status": "QUEUED",
+    "depends_on": []
+  },
+  {
+    "id": "2026-11-26T07-40-i13-09-paretoq-awq-edge-qat",
+    "wave": 9,
+    "priority": 109,
+    "provider": "colab_l4",
+    "gpu": "L4",
+    "est_minutes": 30,
+    "est_cu": 2.4,
+    "script": "experiments/2026-11-26T07-40-i13-09-paretoq-awq-edge-qat/run_colab.py",
+    "hf_eval_target": "evals/2026-11-26T07-40-i13-09-paretoq-awq-edge-qat.json",
+    "status": "QUEUED",
+    "depends_on": []
+  },
+  {
+    "id": "2026-11-26T07-40-i13-10-oemer-staff-dewarp-unitsize",
+    "wave": 9,
+    "priority": 10,
+    "provider": "colab_l4",
+    "gpu": "L4",
+    "est_minutes": 28,
+    "est_cu": 2.2,
+    "script": "experiments/2026-11-26T07-40-i13-10-oemer-staff-dewarp-unitsize/run_colab.py",
+    "hf_eval_target": "evals/2026-11-26T07-40-i13-10-oemer-staff-dewarp-unitsize.json",
+    "status": "QUEUED",
+    "depends_on": []
+  },
+  {
+    "id": "2026-11-26T07-40-i13-11-audiveris-humdrum-postproc",
+    "wave": 9,
+    "priority": 11,
+    "provider": "colab_l4",
+    "gpu": "L4",
+    "est_minutes": 12,
+    "est_cu": 1.0,
+    "script": "experiments/2026-11-26T07-40-i13-11-audiveris-humdrum-postproc/run_colab.py",
+    "hf_eval_target": "evals/2026-11-26T07-40-i13-11-audiveris-humdrum-postproc.json",
+    "status": "QUEUED",
+    "depends_on": []
+  },
+  {
+    "id": "2026-11-26T07-40-i13-12-smt-unfolding-text-reject-v2",
+    "wave": 9,
+    "priority": 12,
+    "provider": "colab_l4",
+    "gpu": "L4",
+    "est_minutes": 36,
+    "est_cu": 2.9,
+    "script": "experiments/2026-11-26T07-40-i13-12-smt-unfolding-text-reject-v2/run_colab.py",
+    "hf_eval_target": "evals/2026-11-26T07-40-i13-12-smt-unfolding-text-reject-v2.json",
+    "status": "QUEUED",
+    "depends_on": []
+  },
+  {
+    "id": "2026-11-26T07-40-i13-13-cross-system-header-consensus",
+    "wave": 9,
+    "priority": 13,
+    "provider": "colab_l4",
+    "gpu": "L4",
+    "est_minutes": 25,
+    "est_cu": 2.1,
+    "script": "experiments/2026-11-26T07-40-i13-13-cross-system-header-consensus/run_colab.py",
+    "hf_eval_target": "evals/2026-11-26T07-40-i13-13-cross-system-header-consensus.json",
+    "status": "QUEUED",
+    "depends_on": []
+  },
+  {
+    "id": "2026-11-26T07-40-i13-14-photo-illum-flatten-autocrop",
+    "wave": 9,
+    "priority": 14,
+    "provider": "colab_l4",
+    "gpu": "L4",
+    "est_minutes": 22,
+    "est_cu": 1.9,
+    "script": "experiments/2026-11-26T07-40-i13-14-photo-illum-flatten-autocrop/run_colab.py",
+    "hf_eval_target": "evals/2026-11-26T07-40-i13-14-photo-illum-flatten-autocrop.json",
+    "status": "QUEUED",
+    "depends_on": []
+  },
+  {
+    "id": "2026-11-26T07-40-i13-15-confidence-selective-hires-redecode",
+    "wave": 9,
+    "priority": 15,
+    "provider": "colab_l4",
+    "gpu": "L4",
+    "est_minutes": 28,
+    "est_cu": 2.3,
+    "script": "experiments/2026-11-26T07-40-i13-15-confidence-selective-hires-redecode/run_colab.py",
+    "hf_eval_target": "evals/2026-11-26T07-40-i13-15-confidence-selective-hires-redecode.json",
+    "status": "QUEUED",
+    "depends_on": []
+  },
+  {
+    "id": "2026-11-26T07-40-i13-16-mathpix-conf-gated-redecode",
+    "wave": 9,
+    "priority": 16,
+    "provider": "colab_l4",
+    "gpu": "L4",
+    "est_minutes": 26,
+    "est_cu": 2.2,
+    "script": "experiments/2026-11-26T07-40-i13-16-mathpix-conf-gated-redecode/run_colab.py",
+    "hf_eval_target": "evals/2026-11-26T07-40-i13-16-mathpix-conf-gated-redecode.json",
+    "status": "QUEUED",
+    "depends_on": []
+  },
+  {
+    "id": "2026-11-26T07-40-i13-17-paddleocr-vrfm-band-router",
+    "wave": 9,
+    "priority": 17,
+    "provider": "colab_l4",
+    "gpu": "L4",
+    "est_minutes": 22,
+    "est_cu": 1.8,
+    "script": "experiments/2026-11-26T07-40-i13-17-paddleocr-vrfm-band-router/run_colab.py",
+    "hf_eval_target": "evals/2026-11-26T07-40-i13-17-paddleocr-vrfm-band-router.json",
+    "status": "QUEUED",
+    "depends_on": []
+  },
+  {
+    "id": "2026-11-26T07-40-i13-18-trocr-pylaia-vcd-ilms",
+    "wave": 9,
+    "priority": 18,
+    "provider": "colab_l4",
+    "gpu": "L4",
+    "est_minutes": 28,
+    "est_cu": 2.3,
+    "script": "experiments/2026-11-26T07-40-i13-18-trocr-pylaia-vcd-ilms/run_colab.py",
+    "hf_eval_target": "evals/2026-11-26T07-40-i13-18-trocr-pylaia-vcd-ilms.json",
+    "status": "QUEUED",
+    "depends_on": []
+  },
+  {
+    "id": "2026-11-26T07-40-i13-19-coarse2fine-zoom-omr",
+    "exp_code": "i13-19",
+    "title": "Coarse-to-Fine 2-Pass System-Plan -> Native-Res Zoomed-System Foveated Decoder",
+    "wave": 9,
+    "priority": 19,
+    "provider": "colab_l4",
+    "gpu": "L4",
+    "est_minutes": 42,
+    "est_cu": 3.5,
+    "dir": "experiments/2026-11-26T07-40-i13-19-coarse2fine-zoom-omr",
+    "script": "experiments/2026-11-26T07-40-i13-19-coarse2fine-zoom-omr/run_colab.py",
+    "hf_eval_target": "evals/2026-11-26T07-40-i13-19-coarse2fine-zoom-omr.json",
+    "hf_run_path": "runs/2026-11-26T07-40-i13-19-coarse2fine-zoom-omr.json",
+    "datasets": [
+      "datasets/iter10_5_proxy_2k.tar",
+      "datasets/suite31_hw_eval.tar"
+    ],
+    "status": "QUEUED",
+    "depends_on": [],
+    "primary_metric": "suite31_hw hw_clean Strict Note F1 / Token F1 delta + Pass-1 system band recall",
+    "promote_gate": "hw_clean Note F1 >= +0.030 (or Token F1 >= +0.040) AND band_recall >= 0.92 AND printed_clean >= -0.010",
+    "kill_gate": "hw_clean delta < +0.010 OR latency > 2.5x without >= +0.020 HW gain"
+  },
+  {
+    "id": "2026-11-26T07-40-i13-20-masked-diffusion-measure-denoiser",
+    "exp_code": "i13-20",
+    "title": "Bidirectional Masked-Diffusion Measure Denoiser (MDM-MeasureRefiner)",
+    "wave": 9,
+    "priority": 20,
+    "provider": "colab_l4",
+    "gpu": "L4",
+    "est_minutes": 40,
+    "est_cu": 3.4,
+    "dir": "experiments/2026-11-26T07-40-i13-20-masked-diffusion-measure-denoiser",
+    "script": "experiments/2026-11-26T07-40-i13-20-masked-diffusion-measure-denoiser/run_colab.py",
+    "hf_eval_target": "evals/2026-11-26T07-40-i13-20-masked-diffusion-measure-denoiser.json",
+    "hf_run_path": "runs/2026-11-26T07-40-i13-20-masked-diffusion-measure-denoiser.json",
+    "datasets": [
+      "datasets/iter10_5_proxy_2k.tar",
+      "datasets/suite31_hw_eval.tar"
+    ],
+    "status": "QUEUED",
+    "depends_on": [],
+    "primary_metric": "suite31_hw hw_clean Strict Note F1 / Token F1 delta (K=4 vs K=0) + DecOK + oracle 30% mask-fill F1",
+    "promote_gate": "K=4 hw_clean Note F1 >= +0.025 (or Pitch/Token F1 >= +0.030) AND DecOK >= 98% printed / >= 90% HW AND latency overhead < 25%",
+    "kill_gate": "DecOK < 90% OR hw_clean delta < +0.005"
+  },
+  {
+    "id": "2026-11-26T07-40-i13-21-dual-stream-learned-ink-encoder",
+    "exp_code": "i13-21",
+    "title": "Dual-Stream Raw-RGB + Differentiable Learned-Binarized-Ink Encoder (DualInkStream) + RISM SSL",
+    "wave": 9,
+    "priority": 21,
+    "provider": "colab_l4",
+    "gpu": "L4",
+    "est_minutes": 42,
+    "est_cu": 3.5,
+    "dir": "experiments/2026-11-26T07-40-i13-21-dual-stream-learned-ink-encoder",
+    "script": "experiments/2026-11-26T07-40-i13-21-dual-stream-learned-ink-encoder/run_colab.py",
+    "hf_eval_target": "evals/2026-11-26T07-40-i13-21-dual-stream-learned-ink-encoder.json",
+    "hf_run_path": "runs/2026-11-26T07-40-i13-21-dual-stream-learned-ink-encoder.json",
+    "datasets": [
+      "datasets/iter10_5_proxy_2k.tar",
+      "datasets/rism_hw_5707.tar",
+      "datasets/suite31_hw_eval.tar"
+    ],
+    "status": "QUEUED",
+    "depends_on": [],
+    "primary_metric": "suite31_hw hw_clean & hw_photo Strict Note F1 delta + archival bleed-through CE degradation reduction + learned gate magnitude",
+    "promote_gate": "mean |tanh(g)| >= 0.05 AND hw_clean or hw_photo Note F1 >= +0.020 AND bleed-through CE reduction >= 20% AND printed_clean >= -0.005",
+    "kill_gate": "mean |tanh(g)| < 0.02 OR hw_clean delta < 0.0"
+  },
+  {
+    "id": "2026-11-26T07-40-i13-22-selfplay-error-inject-repair",
+    "wave": 9,
+    "priority": 52,
+    "provider": "colab_l4",
+    "gpu": "L4",
+    "est_minutes": 30,
+    "est_cu": 2.2,
+    "script": "experiments/2026-11-26T07-40-i13-22-selfplay-error-inject-repair/run_colab.py",
+    "hf_eval_target": "evals/2026-11-26T07-40-i13-22-selfplay-error-inject-repair.json",
+    "status": "QUEUED",
+    "depends_on": []
+  },
+  {
+    "id": "2026-11-26T07-40-i13-23-per-measure-process-grpo-curriculum",
+    "wave": 9,
+    "priority": 53,
+    "provider": "colab_l4",
+    "gpu": "L4",
+    "est_minutes": 34,
+    "est_cu": 2.5,
+    "script": "experiments/2026-11-26T07-40-i13-23-per-measure-process-grpo-curriculum/run_colab.py",
+    "hf_eval_target": "evals/2026-11-26T07-40-i13-23-per-measure-process-grpo-curriculum.json",
+    "status": "QUEUED",
+    "depends_on": []
+  },
+  {
+    "id": "2026-11-26T07-40-i13-24-multiteacher-disagreement-kd",
+    "wave": 9,
+    "priority": 54,
+    "provider": "colab_l4",
+    "gpu": "L4",
+    "est_minutes": 36,
+    "est_cu": 2.8,
+    "script": "experiments/2026-11-26T07-40-i13-24-multiteacher-disagreement-kd/run_colab.py",
+    "hf_eval_target": "evals/2026-11-26T07-40-i13-24-multiteacher-disagreement-kd.json",
+    "status": "QUEUED",
+    "depends_on": []
+  },
+  {
+    "id": "2026-11-26T07-40-i13-25-axial-global-layer-split",
+    "short_id": "i13-25",
+    "title": "Hybrid Encoder n_axial_layers vs n_global_layers Iso-Depth Split Sweep",
+    "wave": 9,
+    "priority": 1,
+    "provider": "colab_l4",
+    "gpu": "L4",
+    "colab_session": "i13-25-ax-gl",
+    "est_minutes": 34,
+    "est_cu": 2.8,
+    "script": "experiments/2026-11-26T07-40-i13-25-axial-global-layer-split/run_colab.py",
+    "readme": "experiments/2026-11-26T07-40-i13-25-axial-global-layer-split/README.md",
+    "plan": "experiments/2026-11-26T07-40-i13-25-axial-global-layer-split/PLAN.md",
+    "hf_eval_target": "evals/2026-11-26T07-40-i13-25-axial-global-layer-split.json",
+    "hf_run_target": "runs/2026-11-26T07-40-i13-25-axial-global-layer-split.json",
+    "status": "RUNNING",
+    "depends_on": [],
+    "datasets": [
+      "datasets/iter10_5_proxy_2k.tar"
+    ],
+    "sweep": [
+      {
+        "arm": "ax1_gl5",
+        "n_axial_layers": 1,
+        "n_global_layers": 5
+      },
+      {
+        "arm": "ax2_gl4",
+        "n_axial_layers": 2,
+        "n_global_layers": 4,
+        "is_control": true
+      },
+      {
+        "arm": "ax3_gl3",
+        "n_axial_layers": 3,
+        "n_global_layers": 3
+      },
+      {
+        "arm": "ax4_gl2",
+        "n_axial_layers": 4,
+        "n_global_layers": 2
+      }
+    ],
+    "session": "i13-25",
+    "started_at": "2026-11-26T06:32:06Z",
+    "log_path": "D:\\tmp\\overnight-queue-logs\\2026-11-26T07-40-i13-25-axial-global-layer-split.log"
+  },
+  {
+    "id": "2026-11-26T07-40-i13-26-gqa-kv-heads-sweep",
+    "short_id": "i13-26",
+    "title": "Decoder GQA n_kv_heads Visual Cross-Attention Bottleneck Sweep (1, 2, 4, 8)",
+    "wave": 9,
+    "priority": 2,
+    "provider": "colab_l4",
+    "gpu": "L4",
+    "colab_session": "i13-26-gqa-kv",
+    "est_minutes": 32,
+    "est_cu": 2.6,
+    "script": "experiments/2026-11-26T07-40-i13-26-gqa-kv-heads-sweep/run_colab.py",
+    "readme": "experiments/2026-11-26T07-40-i13-26-gqa-kv-heads-sweep/README.md",
+    "plan": "experiments/2026-11-26T07-40-i13-26-gqa-kv-heads-sweep/PLAN.md",
+    "hf_eval_target": "evals/2026-11-26T07-40-i13-26-gqa-kv-heads-sweep.json",
+    "hf_run_target": "runs/2026-11-26T07-40-i13-26-gqa-kv-heads-sweep.json",
+    "status": "RUNNING",
+    "depends_on": [],
+    "datasets": [
+      "datasets/iter10_5_proxy_2k.tar"
+    ],
+    "sweep": [
+      {
+        "arm": "kv1_mqa",
+        "n_kv_heads": 1
+      },
+      {
+        "arm": "kv2_gqa4x",
+        "n_kv_heads": 2,
+        "is_control": true
+      },
+      {
+        "arm": "kv4_gqa2x",
+        "n_kv_heads": 4
+      },
+      {
+        "arm": "kv8_mha",
+        "n_kv_heads": 8
+      }
+    ],
+    "session": "i13-26",
+    "started_at": "2026-11-26T06:32:06Z",
+    "log_path": "D:\\tmp\\overnight-queue-logs\\2026-11-26T07-40-i13-26-gqa-kv-heads-sweep.log"
+  },
+  {
+    "id": "2026-11-26T07-40-i13-27-rope-coord-scale-sweep",
+    "short_id": "i13-27",
+    "title": "Aspect-Normalized 1D/2D-RoPE rope_coord_scale Aliasing Sweep (32, 64, 128, 256)",
+    "wave": 9,
+    "priority": 3,
+    "provider": "colab_l4",
+    "gpu": "L4",
+    "colab_session": "i13-27-rope-scale",
+    "est_minutes": 32,
+    "est_cu": 2.6,
+    "script": "experiments/2026-11-26T07-40-i13-27-rope-coord-scale-sweep/run_colab.py",
+    "readme": "experiments/2026-11-26T07-40-i13-27-rope-coord-scale-sweep/README.md",
+    "plan": "experiments/2026-11-26T07-40-i13-27-rope-coord-scale-sweep/PLAN.md",
+    "hf_eval_target": "evals/2026-11-26T07-40-i13-27-rope-coord-scale-sweep.json",
+    "hf_run_target": "runs/2026-11-26T07-40-i13-27-rope-coord-scale-sweep.json",
+    "status": "QUEUED",
+    "depends_on": [],
+    "datasets": [
+      "datasets/iter10_5_proxy_2k.tar"
+    ],
+    "sweep": [
+      {
+        "arm": "scale_32",
+        "rope_coord_scale": 32.0
+      },
+      {
+        "arm": "scale_64",
+        "rope_coord_scale": 64.0
+      },
+      {
+        "arm": "scale_128",
+        "rope_coord_scale": 128.0,
+        "is_control": true
+      },
+      {
+        "arm": "scale_256",
+        "rope_coord_scale": 256.0
+      }
+    ]
+  },
+  {
+    "id": "2026-11-26T07-40-i13-28-decoupled-wd-norm-nodecay",
+    "wave": 9,
+    "priority": 28,
+    "provider": "colab_l4",
+    "gpu": "L4",
+    "est_minutes": 30,
+    "est_cu": 2.4,
+    "script": "experiments/2026-11-26T07-40-i13-28-decoupled-wd-norm-nodecay/run_colab.py",
+    "hf_eval_target": "evals/2026-11-26T07-40-i13-28-decoupled-wd-norm-nodecay.json",
+    "status": "QUEUED",
+    "depends_on": []
+  },
+  {
+    "id": "2026-11-26T07-40-i13-29-grad-clip-threshold-sweep",
+    "wave": 9,
+    "priority": 29,
+    "provider": "colab_l4",
+    "gpu": "L4",
+    "est_minutes": 28,
+    "est_cu": 2.3,
+    "script": "experiments/2026-11-26T07-40-i13-29-grad-clip-threshold-sweep/run_colab.py",
+    "hf_eval_target": "evals/2026-11-26T07-40-i13-29-grad-clip-threshold-sweep.json",
+    "status": "QUEUED",
+    "depends_on": []
+  },
+  {
+    "id": "2026-11-26T07-40-i13-30-tok-dropout-exposure-bias-sweep",
+    "wave": 9,
+    "priority": 30,
+    "provider": "colab_l4",
+    "gpu": "L4",
+    "est_minutes": 30,
+    "est_cu": 2.4,
+    "script": "experiments/2026-11-26T07-40-i13-30-tok-dropout-exposure-bias-sweep/run_colab.py",
+    "hf_eval_target": "evals/2026-11-26T07-40-i13-30-tok-dropout-exposure-bias-sweep.json",
+    "status": "QUEUED",
+    "depends_on": []
+  },
+  {
+    "id": "2026-11-26T02-18-ablation-vir-router-bucket-parity",
+    "wave": 9,
+    "priority": 40,
+    "provider": "colab_l4",
+    "gpu": "L4",
+    "est_minutes": 30,
+    "script": "experiments/2026-11-26T02-18-ablation-vir-router-bucket-parity/run_colab.py",
+    "hf_eval_target": "evals/2026-11-26T02-18-ablation-vir-router-bucket-parity.json",
+    "status": "QUEUED",
+    "depends_on": [
+      "2026-11-26T00-54-ablation-vir-vico-router"
+    ],
+    "restored": "queue clobber 2026-11-26"
+  },
+  {
+    "id": "2026-11-26T02-20-academic-dual-verifier-v2-fixed-render",
+    "wave": 9,
+    "priority": 40,
+    "provider": "colab_l4",
+    "gpu": "L4",
+    "est_minutes": 30,
+    "script": "experiments/2026-11-26T02-20-academic-dual-verifier-v2-fixed-render/run_colab.py",
+    "hf_eval_target": "evals/2026-11-26T02-20-academic-dual-verifier-v2-fixed-render.json",
+    "status": "QUEUED",
+    "depends_on": [
+      "2026-11-26T01-30-academic-dual-verifier-rlvr-ttc"
+    ],
+    "restored": "queue clobber 2026-11-26"
+  },
+  {
+    "id": "2026-11-26T02-20-vjepa21-vicreg-anticollapse-rism-v2",
+    "wave": 9,
+    "priority": 40,
+    "provider": "colab_l4",
+    "gpu": "L4",
+    "est_minutes": 30,
+    "script": "experiments/2026-11-26T02-20-vjepa21-vicreg-anticollapse-rism-v2/run_colab.py",
+    "hf_eval_target": "evals/2026-11-26T02-20-vjepa21-vicreg-anticollapse-rism-v2.json",
+    "status": "QUEUED",
+    "depends_on": [
+      "2026-11-26T00-54-vjepa21-gram-rism-v2"
+    ],
+    "restored": "queue clobber 2026-11-26"
+  },
+  {
+    "id": "2026-11-26T02-45-ov-35b-lower-res-tight-maxlen-sweep",
+    "wave": 9,
+    "priority": 40,
+    "provider": "colab_l4",
+    "gpu": "L4",
+    "est_minutes": 30,
+    "script": "experiments/2026-11-26T02-45-ov-35b-lower-res-tight-maxlen-sweep/run_colab.py",
+    "hf_eval_target": "evals/2026-11-26T02-45-ov-35b-lower-res-tight-maxlen-sweep.json",
+    "status": "COMPLETED",
+    "depends_on": [
+      "2026-11-26T01-38-ov-35-maxlen-resolution-inference-sweep"
+    ],
+    "restored": "queue clobber 2026-11-26"
+  },
+  {
+    "id": "2026-11-26T02-48-academic-gevt-vbkern-4k-converged",
+    "wave": 9,
+    "priority": 40,
+    "provider": "colab_l4",
+    "gpu": "L4",
+    "est_minutes": 30,
     "script": "experiments/2026-11-26T02-48-academic-gevt-vbkern-4k-converged/run_colab.py",
     "hf_eval_target": "evals/2026-11-26T02-48-academic-gevt-vbkern-4k-converged.json",
     "status": "QUEUED",
     "depends_on": [
       "2026-11-26T01-30-academic-gevt-vbkern-mr"
-    ]
+    ],
+    "restored": "queue clobber 2026-11-26"
   },
   {
     "id": "2026-11-26T03-08-ov-36b-multiscale-logprob-fsa-tta",
-    "wave": 4,
-    "priority": 2,
+    "wave": 9,
+    "priority": 40,
     "provider": "colab_l4",
     "gpu": "L4",
-    "est_minutes": 12,
-    "est_cu": 1.0,
+    "est_minutes": 30,
     "script": "experiments/2026-11-26T03-08-ov-36b-multiscale-logprob-fsa-tta/run_colab.py",
     "hf_eval_target": "evals/2026-11-26T03-08-ov-36b-multiscale-logprob-fsa-tta.json",
     "status": "QUEUED",
     "depends_on": [
       "2026-11-26T01-38-ov-36-hw-multiview-tta-voting"
-    ]
+    ],
+    "restored": "queue clobber 2026-11-26"
   },
   {
     "id": "2026-11-26T03-31-exp4b-decoupled-muon-lr-sweep",
-    "wave": 4,
-    "priority": 5,
+    "wave": 9,
+    "priority": 40,
     "provider": "colab_l4",
     "gpu": "L4",
-    "est_minutes": 45,
-    "est_cu": 3.0,
+    "est_minutes": 30,
     "script": "experiments/2026-11-26T03-31-exp4b-decoupled-muon-lr-sweep/run_colab.py",
     "hf_eval_target": "evals/2026-11-26T03-31-exp4b-decoupled-muon-lr-sweep.json",
     "status": "QUEUED",
     "depends_on": [
-      "2026-11-26T00-54-ablation-muon-vs-adamw"
-    ]
+      "2026-11-26T00-54-ablation-muon-vs-adamw",
+      "2026-11-26T01-38-ov-13-muon-lr-sweep"
+    ],
+    "restored": "queue clobber 2026-11-26"
   },
   {
     "id": "2026-11-26T04-02-ov-37b-rlvr-scale200-len512-eval3840",
-    "wave": 7,
-    "priority": 23,
+    "wave": 9,
+    "priority": 40,
     "provider": "colab_l4",
     "gpu": "L4",
-    "est_minutes": 40,
-    "est_cu": 3.2,
+    "est_minutes": 30,
     "script": "experiments/2026-11-26T04-02-ov-37b-rlvr-scale200-len512-eval3840/run_colab.py",
     "hf_eval_target": "evals/2026-11-26T04-02-ov-37b-rlvr-scale200-len512-eval3840.json",
-    "status": "QUEUED",
+    "status": "COMPLETED",
     "depends_on": [
       "2026-11-26T01-38-ov-37-rlvr-kl-group-sweep"
-    ]
+    ],
+    "restored": "queue clobber 2026-11-26"
+  },
+  {
+    "id": "2026-11-26T04-18-academic-gauge-rope-converged-v2",
+    "wave": 9,
+    "priority": 40,
+    "provider": "colab_l4",
+    "gpu": "L4",
+    "est_minutes": 30,
+    "script": "experiments/2026-11-26T04-18-academic-gauge-rope-converged-v2/run_colab.py",
+    "hf_eval_target": "evals/2026-11-26T04-18-academic-gauge-rope-converged-v2.json",
+    "status": "QUEUED",
+    "depends_on": [
+      "2026-11-26T01-30-academic-gauge-rope",
+      "2026-11-26T07-15-iter12-v2-strip-warmup-24k"
+    ],
+    "restored": "queue clobber 2026-11-26"
+  },
+  {
+    "id": "2026-11-26T05-33-ov-15b-ema-warmup-late-cooldown-soup",
+    "wave": 9,
+    "priority": 40,
+    "provider": "colab_l4",
+    "gpu": "L4",
+    "est_minutes": 30,
+    "script": "experiments/2026-11-26T05-33-ov-15b-ema-warmup-late-cooldown-soup/run_colab.py",
+    "hf_eval_target": "evals/2026-11-26T05-33-ov-15b-ema-warmup-late-cooldown-soup.json",
+    "status": "QUEUED",
+    "depends_on": [
+      "2026-11-26T01-38-ov-15-ema-decay-soup-sweep"
+    ],
+    "restored": "queue clobber 2026-11-26"
+  },
+  {
+    "id": "2026-11-26T05-35-ov-34b-budgeted-logprob-measure-beam",
+    "wave": 9,
+    "priority": 40,
+    "provider": "colab_l4",
+    "gpu": "L4",
+    "est_minutes": 30,
+    "script": "experiments/2026-11-26T05-35-ov-34b-budgeted-logprob-measure-beam/run_colab.py",
+    "hf_eval_target": "evals/2026-11-26T05-35-ov-34b-budgeted-logprob-measure-beam.json",
+    "status": "COMPLETED",
+    "depends_on": [
+      "2026-11-26T01-38-ov-34-measure-beam-header-guard-sweep"
+    ],
+    "restored": "queue clobber 2026-11-26"
+  },
+  {
+    "id": "2026-11-26T06-25-ov-38b-scribe-ttt-budget-cons-3840",
+    "wave": 9,
+    "priority": 40,
+    "provider": "colab_l4",
+    "gpu": "L4",
+    "est_minutes": 30,
+    "script": "experiments/2026-11-26T06-25-ov-38b-scribe-ttt-budget-cons-3840/run_colab.py",
+    "hf_eval_target": "evals/2026-11-26T06-25-ov-38b-scribe-ttt-budget-cons-3840.json",
+    "status": "QUEUED",
+    "depends_on": [
+      "2026-11-26T01-38-ov-38-scribe-ttt-lr-steps-sweep"
+    ],
+    "restored": "queue clobber 2026-11-26"
   }
 ]

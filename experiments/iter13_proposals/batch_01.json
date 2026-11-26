@@ -1,0 +1,41 @@
+[
+  {
+    "id": "2026-11-26T07-40-i13-01-visual-causal-flow-encoder",
+    "wave": 9,
+    "priority": 31,
+    "provider": "colab_l4",
+    "gpu": "L4",
+    "est_minutes": 32,
+    "est_cu": 2.6,
+    "script": "experiments/2026-11-26T07-40-i13-01-visual-causal-flow-encoder/run_colab.py",
+    "hf_eval_target": "evals/2026-11-26T07-40-i13-01-visual-causal-flow-encoder.json",
+    "status": "QUEUED",
+    "depends_on": []
+  },
+  {
+    "id": "2026-11-26T07-40-i13-02-anisotropic-patch-merger",
+    "wave": 9,
+    "priority": 32,
+    "provider": "colab_l4",
+    "gpu": "L4",
+    "est_minutes": 32,
+    "est_cu": 2.6,
+    "script": "experiments/2026-11-26T07-40-i13-02-anisotropic-patch-merger/run_colab.py",
+    "hf_eval_target": "evals/2026-11-26T07-40-i13-02-anisotropic-patch-merger.json",
+    "status": "QUEUED",
+    "depends_on": []
+  },
+  {
+    "id": "2026-11-26T07-40-i13-03-window2d-highres-encoder",
+    "wave": 9,
+    "priority": 33,
+    "provider": "colab_l4",
+    "gpu": "L4",
+    "est_minutes": 32,
+    "est_cu": 2.6,
+    "script": "experiments/2026-11-26T07-40-i13-03-window2d-highres-encoder/run_colab.py",
+    "hf_eval_target": "evals/2026-11-26T07-40-i13-03-window2d-highres-encoder.json",
+    "status": "QUEUED",
+    "depends_on": []
+  }
+]

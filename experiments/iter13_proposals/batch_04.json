@@ -1,0 +1,41 @@
+[
+  {
+    "id": "2026-11-26T07-40-i13-10-oemer-staff-dewarp-unitsize",
+    "wave": 9,
+    "priority": 10,
+    "provider": "colab_l4",
+    "gpu": "L4",
+    "est_minutes": 28,
+    "est_cu": 2.2,
+    "script": "experiments/2026-11-26T07-40-i13-10-oemer-staff-dewarp-unitsize/run_colab.py",
+    "hf_eval_target": "evals/2026-11-26T07-40-i13-10-oemer-staff-dewarp-unitsize.json",
+    "status": "QUEUED",
+    "depends_on": []
+  },
+  {
+    "id": "2026-11-26T07-40-i13-11-audiveris-humdrum-postproc",
+    "wave": 9,
+    "priority": 11,
+    "provider": "colab_l4",
+    "gpu": "L4",
+    "est_minutes": 12,
+    "est_cu": 1.0,
+    "script": "experiments/2026-11-26T07-40-i13-11-audiveris-humdrum-postproc/run_colab.py",
+    "hf_eval_target": "evals/2026-11-26T07-40-i13-11-audiveris-humdrum-postproc.json",
+    "status": "QUEUED",
+    "depends_on": []
+  },
+  {
+    "id": "2026-11-26T07-40-i13-12-smt-unfolding-text-reject-v2",
+    "wave": 9,
+    "priority": 12,
+    "provider": "colab_l4",
+    "gpu": "L4",
+    "est_minutes": 36,
+    "est_cu": 2.9,
+    "script": "experiments/2026-11-26T07-40-i13-12-smt-unfolding-text-reject-v2/run_colab.py",
+    "hf_eval_target": "evals/2026-11-26T07-40-i13-12-smt-unfolding-text-reject-v2.json",
+    "status": "QUEUED",
+    "depends_on": []
+  }
+]
