@@ -204,6 +204,23 @@
     "hf_eval_target": "evals/2026-11-27T14-50-i15-44-xf-verifier-kv-rewind-mbr.json"
   },
   {
+    "id": "2026-11-27T22-15-i15-44b-xf-verifier-kv-rewind-mbr-fixed",
+    "wave": 0,
+    "priority": 10,
+    "status": "QUEUED",
+    "target_gpu": "A100",
+    "gpu_pref": "A100",
+    "depends_on": [
+      "2026-11-27T14-50-i15-44-xf-verifier-kv-rewind-mbr"
+    ],
+    "script": "experiments/2026-11-27T22-15-i15-44b-xf-verifier-kv-rewind-mbr-fixed/run_colab.py",
+    "script_path": "experiments/2026-11-27T22-15-i15-44b-xf-verifier-kv-rewind-mbr-fixed/run_colab.py",
+    "title": "Cross-field PRE-ITER-15: Fixed KV-cache rewind + MBR successor (MusicXML scorer, ban premature EOS, violation-only)",
+    "notes": "Clean ITERATE successor to i15-44: fixes MusicXML Note F1/wFPP scorer, bans premature EOS, violation-only rewind trigger, K=2 low latency",
+    "est_minutes": 10,
+    "hf_eval_target": "evals/2026-11-27T22-15-i15-44b-xf-verifier-kv-rewind-mbr-fixed.json"
+  },
+  {
     "id": "2026-11-27T14-50-i15-45-xf-qvla-mixedbit-quant",
     "wave": 0,
     "priority": 14,
