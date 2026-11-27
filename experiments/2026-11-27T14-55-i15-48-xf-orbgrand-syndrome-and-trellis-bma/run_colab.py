@@ -28,7 +28,9 @@ import random
 import subprocess
 import sys
 import tarfile
+import tempfile
 import time
+import xml.etree.ElementTree as ET
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
@@ -47,7 +49,11 @@ HF_RUN_PATH = f"runs/{EXP_ID}.json"
 HF_CKPT_PREFIX = f"checkpoints/{EXP_ID}"
 
 HF_TOKEN_FILE = Path("/tmp/.hf_token")
-WORK_ROOT = Path("/vol/i15_48") if Path("/vol").is_dir() else Path("/content/i15_48")
+WORK_ROOT = (
+    Path("/vol/i15_48")
+    if Path("/vol").is_dir()
+    else (Path("D:/tmp/i15_48") if sys.platform == "win32" and Path("D:/tmp").is_dir() else Path("/content/i15_48"))
+)
 
 SEED = 42
 MAX_DIM = 1408
@@ -648,43 +654,166 @@ def _resolve_checkpoint(hf_token: str) -> Tuple[Path, str]:
     raise FileNotFoundError(f"None of HF checkpoint candidates found: {HF_CKPT_CANDIDATES}")
 
 
+def _extract_musicxml_toks_py(xml_path: Path) -> List[str]:
+    """Pure-Python MusicXML fallback extracting canonical bekern-like tokens for LCS F1."""
+    toks: List[str] = []
+    root = ET.parse(str(xml_path)).getroot()
+
+    def _strip(tag: str) -> str:
+        return tag.split("}", 1)[-1] if "}" in tag else tag
+
+    for part in root:
+        if _strip(part.tag) != "part":
+            continue
+        for meas in part:
+            if _strip(meas.tag) != "measure":
+                continue
+            for child in meas:
+                ctag = _strip(child.tag)
+                if ctag == "attributes":
+                    attr_clefs: List[str] = []
+                    attr_keys: List[str] = []
+                    attr_times: List[str] = []
+                    for attr in child:
+                        atag = _strip(attr.tag)
+                        if atag == "clef":
+                            sign = line = ""
+                            for cc in attr:
+                                cct = _strip(cc.tag)
+                                txt = (cc.text or "").strip()
+                                if cct == "sign":
+                                    sign = txt.upper()
+                                elif cct == "line":
+                                    line = txt
+                            if sign and line:
+                                attr_clefs.append(f"clef-{sign}-{line}")
+                        elif atag == "key":
+                            for kc in attr:
+                                if _strip(kc.tag) == "fifths":
+                                    txt = (kc.text or "").strip()
+                                    if txt:
+                                        try:
+                                            attr_keys.append(f"key{int(txt):+d}")
+                                        except ValueError:
+                                            pass
+                        elif atag == "time":
+                            beats = btype = ""
+                            for tc in attr:
+                                tct = _strip(tc.tag)
+                                txt = (tc.text or "").strip()
+                                if tct == "beats":
+                                    beats = txt
+                                elif tct == "beat-type":
+                                    btype = txt
+                            if beats and btype:
+                                attr_times.append(f"time-{beats}-{btype}")
+                    toks.extend(attr_clefs + attr_keys + attr_times)
+                elif ctag == "note":
+                    is_rest = is_grace = False
+                    step = octave = alter = dur = ""
+                    n_dots = 0
+                    for nc in child:
+                        ntag = _strip(nc.tag)
+                        if ntag == "rest":
+                            is_rest = True
+                        elif ntag == "grace":
+                            is_grace = True
+                        elif ntag == "pitch":
+                            for pc in nc:
+                                ptag = _strip(pc.tag)
+                                txt = (pc.text or "").strip()
+                                if ptag == "step":
+                                    step = txt.upper()
+                                elif ptag == "octave":
+                                    octave = txt
+                                elif ptag == "alter":
+                                    try:
+                                        av = int(round(float(txt)))
+                                        if av != 0:
+                                            alter = f"a{av}"
+                                    except ValueError:
+                                        pass
+                        elif ntag == "type":
+                            dur = (nc.text or "").strip().lower()
+                        elif ntag == "dot":
+                            n_dots += 1
+                    if is_rest:
+                        if dur:
+                            toks.extend(["rest", dur] + ["dot"] * n_dots)
+                    elif (not is_grace) and step and octave and dur:
+                        toks.extend([dur, step, octave])
+                        if alter:
+                            toks.append(alter)
+                        toks.extend(["dot"] * n_dots)
+            toks.append("bar")
+    return toks
+
+
+def _load_gt_tokens(gt_path: Optional[Path], slug: str, workdir: Path) -> List[str]:
+    """Load ground-truth tokens from a `.musicxml` (via Rust ASER or pure-Python fallback) or text file."""
+    if gt_path is None or not gt_path.is_file():
+        return []
+    if gt_path.suffix.lower() in (".musicxml", ".xml"):
+        try:
+            import eval_sys_gate as esg
+            if esg.ASER.is_file():
+                ref_toks, _ = esg.suite31_page_refs(gt_path, f"i1548-{slug}", workdir)
+                if ref_toks:
+                    return list(ref_toks)
+        except Exception:
+            pass
+        return _extract_musicxml_toks_py(gt_path)
+    return gt_path.read_text(encoding="utf-8", errors="ignore").strip().split()
+
+
 def _ensure_suite31_subset(hf_token: str) -> List[Dict[str, Any]]:
     from huggingface_hub import hf_hub_download
     import eval_uni_suite31
 
-    ds_dir = WORK_ROOT / "datasets" / "suite31_hw"
-    manifest_candidates = list(ds_dir.rglob("suite31_hw_manifest.json")) if ds_dir.is_dir() else []
-    if not manifest_candidates:
-        ds_dir.mkdir(parents=True, exist_ok=True)
-        dl_dir = WORK_ROOT / "hf_dl"
-        dl_dir.mkdir(parents=True, exist_ok=True)
-        tar_path = hf_hub_download(
-            repo_id=HF_REPO_ID,
-            filename=HF_SUITE31_TAR,
-            repo_type="dataset",
-            token=hf_token,
-            local_dir=str(dl_dir),
-        )
-        with tarfile.open(tar_path, "r:*") as tf:
-            tf.extractall(path=ds_dir)
-        manifest_candidates = list(ds_dir.rglob("suite31_hw_manifest.json"))
-    if not manifest_candidates:
-        raise FileNotFoundError(f"suite31_hw_manifest.json not found in {ds_dir}")
+    manifest_path: Optional[Path] = None
+    local_manifest = Path(__file__).resolve().parents[2] / "data-gen" / "score-corpus" / "suite31" / "suite31_hw_manifest.json"
+    if local_manifest.is_file():
+        _, local_pieces = eval_uni_suite31.resolve_manifest_pieces(local_manifest)
+        if local_pieces and local_pieces[0]["photo"].is_file():
+            manifest_path = local_manifest
 
-    _, pieces = eval_uni_suite31.resolve_manifest_pieces(manifest_candidates[0])
-    printed = [p for p in pieces if str(p.get("domain", "printed")).lower() != "handwritten"]
-    hw = [p for p in pieces if str(p.get("domain", "printed")).lower() == "handwritten"]
+    if manifest_path is None:
+        ds_dir = WORK_ROOT / "datasets" / "suite31_hw"
+        manifest_candidates = sorted(ds_dir.rglob("suite31_hw_manifest.json")) if ds_dir.is_dir() else []
+        if not manifest_candidates:
+            ds_dir.mkdir(parents=True, exist_ok=True)
+            dl_dir = WORK_ROOT / "hf_dl"
+            dl_dir.mkdir(parents=True, exist_ok=True)
+            tar_path = hf_hub_download(
+                repo_id=HF_REPO_ID,
+                filename=HF_SUITE31_TAR,
+                repo_type="dataset",
+                token=hf_token,
+                local_dir=str(dl_dir),
+            )
+            with tarfile.open(tar_path, "r:*") as tf:
+                tf.extractall(path=ds_dir)
+            manifest_candidates = sorted(ds_dir.rglob("suite31_hw_manifest.json"))
+        if not manifest_candidates:
+            raise FileNotFoundError(f"suite31_hw_manifest.json not found in {ds_dir}")
+        manifest_path = manifest_candidates[0]
+
+    _, pieces = eval_uni_suite31.resolve_manifest_pieces(manifest_path)
+    printed = [p for p in pieces if not bool(p.get("handwritten", False))]
+    hw = [p for p in pieces if bool(p.get("handwritten", False))]
 
     # Deterministic hard 12-page subset: 6 printed photo + 6 handwritten photo (fallback clean)
     selected: List[Dict[str, Any]] = []
     for p in printed[:N_HARD_PRINTED]:
+        pid = str(p.get("slug") or p.get("id"))
         img_p = p.get("photo") or p.get("clean")
-        gt_p = p.get("gt_bekern") or p.get("bekern")
-        selected.append({"id": p["id"], "domain": "printed", "image": Path(img_p), "gt_bekern": Path(gt_p) if gt_p else None})
+        gt_p = p.get("gt") or p.get("gt_bekern") or p.get("bekern")
+        selected.append({"id": pid, "domain": "printed", "image": Path(img_p), "gt_bekern": Path(gt_p) if gt_p else None})
     for p in hw[:N_HARD_HW]:
+        pid = str(p.get("slug") or p.get("id"))
         img_p = p.get("photo") or p.get("clean")
-        gt_p = p.get("gt_bekern") or p.get("bekern")
-        selected.append({"id": p["id"], "domain": "hw", "image": Path(img_p), "gt_bekern": Path(gt_p) if gt_p else None})
+        gt_p = p.get("gt") or p.get("gt_bekern") or p.get("bekern")
+        selected.append({"id": pid, "domain": "hw", "image": Path(img_p), "gt_bekern": Path(gt_p) if gt_p else None})
     return selected
 
 
@@ -735,15 +864,17 @@ def _decode_fsa_with_top_cands(
 
     with torch.no_grad(), torch.amp.autocast(device.type, dtype=torch.bfloat16, enabled=use_bf16):
         mem, _, _ = model.encode_image(inp, return_aux=False)
+        past_kvs = model.precompute_cross_kv(mem) if hasattr(model, "precompute_cross_kv") else None
         cur_ids = torch.full((1, 1), bos_id, dtype=torch.long, device=device)
-        past_kvs = None
         for _ in range(max_len):
             logits, _, past_kvs = model.decode_tokens(
                 cur_ids,
                 memory=mem if past_kvs is None else None,
                 return_mtp=False,
+                return_aux=False,
                 past_kvs=past_kvs,
                 use_cache=True,
+                apply_tok_dropout=False,
             )
             step_logits = logits[0, -1, :].float()
             allowed = eval_uni_suite31._allowed_ids_for_state(state, vocab_size)
@@ -885,14 +1016,15 @@ def main() -> int:
         print(f"[{EXP_ID}] Loaded ckpt={ckpt_source} | pages={len(pages)}", flush=True)
 
         model, _, ckpt_meta = eval_uni_suite31.load_uni_checkpoint(ckpt_path, device)
+        if hasattr(model, "cfg") and hasattr(model.cfg, "max_mem_tokens"):
+            model.cfg.max_mem_tokens = max(int(model.cfg.max_mem_tokens), 4096)
 
         # Shared Arm-0 cache so Arm 1 & Arm 2 avoid redundant base decoding
         base_cache: Dict[str, Dict[str, Any]] = {}
+        gt_workdir = WORK_ROOT / "gt_refs"
+        gt_workdir.mkdir(parents=True, exist_ok=True)
         for p in pages:
-            gt_toks: List[str] = []
-            if p["gt_bekern"] is not None and p["gt_bekern"].is_file():
-                gt_toks = p["gt_bekern"].read_text(encoding="utf-8", errors="ignore").strip().split()
-            p["gt_toks"] = gt_toks
+            p["gt_toks"] = _load_gt_tokens(p["gt_bekern"], p["id"], gt_workdir)
 
         def _summarize_arm(arm_name: str, per_page: List[Dict[str, Any]]) -> Dict[str, Any]:
             pr_f1 = [r["token_f1"] for r in per_page if r["domain"] == "printed"]
