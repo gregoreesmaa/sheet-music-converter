@@ -2160,7 +2160,11 @@ class UniOMRv2Net(nn.Module):
         )
         B = images.shape[0]
         device = images.device
-        cur_ids = torch.full((B, 1), BOS_ID, dtype=torch.long, device=device)
+        v = int(self.cfg.vocab_size)
+        pad_id = PAD_ID if v == VOCAB_SIZE else (v - 4)
+        bos_id = BOS_ID if v == VOCAB_SIZE else (v - 3)
+        eos_id = EOS_ID if v == VOCAB_SIZE else (v - 2)
+        cur_ids = torch.full((B, 1), bos_id, dtype=torch.long, device=device)
         past_kvs: Optional[List[Any]] = self.precompute_cross_kv(mem)
         finished = torch.zeros(B, dtype=torch.bool, device=device)
         out_tokens: List[torch.Tensor] = [cur_ids]
@@ -2175,9 +2179,9 @@ class UniOMRv2Net(nn.Module):
                 use_cache=True,
             )
             next_tok = logits[:, -1, :].argmax(dim=-1)
-            next_tok = torch.where(finished, torch.full_like(next_tok, PAD_ID), next_tok)
+            next_tok = torch.where(finished, torch.full_like(next_tok, pad_id), next_tok)
             out_tokens.append(next_tok.unsqueeze(1))
-            finished = finished | (next_tok == EOS_ID)
+            finished = finished | (next_tok == eos_id)
             if bool(finished.all()):
                 break
             cur_ids = next_tok.unsqueeze(1)
