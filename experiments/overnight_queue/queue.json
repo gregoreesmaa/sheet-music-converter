@@ -1,5 +1,77 @@
 [
   {
+    "id": "2026-11-27T10-30-eval-northstar-clarity-omr-v2",
+    "wave": 0,
+    "priority": 1,
+    "status": "QUEUED",
+    "gpu_pref": "H100",
+    "script": "experiments/2026-11-27T10-30-eval-northstar-clarity-omr-v2/run_colab.py",
+    "notes": "#2 contender Clarity-OMR rerun on omr-northstar db12da9 + 125 raw MusicXML HF archive"
+  },
+  {
+    "id": "2026-11-27T10-30-i15-40-pro200m-d768-capacity-proxy",
+    "wave": 0,
+    "priority": 2,
+    "status": "QUEUED",
+    "gpu_pref": "H100",
+    "script": "experiments/2026-11-27T10-30-i15-40-pro200m-d768-capacity-proxy/run_colab.py",
+    "notes": "Weight-incompatible PRE-ITER-15: pro200m (d=768, 192M, 119.2 MB INT4) vs edge85m"
+  },
+  {
+    "id": "2026-11-27T10-30-i15-31-hrnet-music-dualres-s4",
+    "wave": 0,
+    "priority": 3,
+    "status": "QUEUED",
+    "gpu_pref": "H100",
+    "script": "experiments/2026-11-27T10-30-i15-31-hrnet-music-dualres-s4/run_colab.py",
+    "notes": "Weight-incompatible PRE-ITER-15: HRNet-Music parallel /4||/8 stage4 (-1.94 MB INT4)"
+  },
+  {
+    "id": "2026-11-27T10-30-i15-38-coordkey-ca-fourier-cross-attn",
+    "wave": 0,
+    "priority": 4,
+    "status": "QUEUED",
+    "gpu_pref": "H100",
+    "script": "experiments/2026-11-27T10-30-i15-38-coordkey-ca-fourier-cross-attn/run_colab.py",
+    "notes": "Weight-incompatible PRE-ITER-15: Decoupled 2D Fourier CoordKey cross-attn (+0.44 MB INT4)"
+  },
+  {
+    "id": "2026-11-27T10-30-i15-37-modegate-dualhead-text-and-chained-mtp",
+    "wave": 0,
+    "priority": 5,
+    "status": "QUEUED",
+    "gpu_pref": "H100",
+    "script": "experiments/2026-11-27T10-30-i15-37-modegate-dualhead-text-and-chained-mtp/run_colab.py",
+    "notes": "Weight-incompatible PRE-ITER-15: ModeGate music/text dual-head + DeepSeek-V3 Chained MTP-4"
+  },
+  {
+    "id": "2026-11-27T10-30-i15-11-sheared-strip-conv-and-aniso-pitch-rope2d",
+    "wave": 0,
+    "priority": 6,
+    "status": "QUEUED",
+    "gpu_pref": "H100",
+    "script": "experiments/2026-11-27T10-30-i15-11-sheared-strip-conv-and-aniso-pitch-rope2d/run_colab.py",
+    "notes": "Weight-incompatible PRE-ITER-15: 3-angle sheared strips + pitch-biased aniso 2D-RoPE"
+  },
+  {
+    "id": "2026-11-27T10-30-i15-36-yoco-cla-resformer-12l-decoder",
+    "wave": 0,
+    "priority": 7,
+    "status": "QUEUED",
+    "gpu_pref": "H100",
+    "script": "experiments/2026-11-27T10-30-i15-36-yoco-cla-resformer-12l-decoder/run_colab.py",
+    "notes": "Weight-incompatible PRE-ITER-15: YOCO-3Bank Cross-KV + CLA-2:1 + ResFormer 12L (-40% KV)"
+  },
+  {
+    "id": "2026-11-27T10-30-i15-39-sysslot-mem-hierarchical-encoder",
+    "wave": 0,
+    "priority": 8,
+    "status": "QUEUED",
+    "gpu_pref": "H100",
+    "script": "experiments/2026-11-27T10-30-i15-39-sysslot-mem-hierarchical-encoder/run_colab.py",
+    "notes": "Weight-incompatible PRE-ITER-15: S=16 competitive System Slot-Attention memory"
+  },
+  {
     "id": "2026-11-26T01-38-ov-36-hw-multiview-tta-voting",
     "wave": 4,
     "priority": 1,
@@ -1636,27 +1708,25 @@
     "id": "2026-11-26T21-50-eval-northstar-praig-smt-fp-polish",
     "short_id": "ns-praig-polish",
     "title": "OMR-NorthStar 125p Competitor Eval: PRAIG SMT++ Polish Scores (PRAIG/smt-fp-polish-scores)",
-    "wave": 10,
-    "priority": 2,
+    "wave": 14,
+    "priority": 99,
     "provider": "colab_l4",
     "gpu": "L4",
     "est_minutes": 20,
     "est_cu": 1.6,
     "script": "experiments/2026-11-26T21-50-eval-northstar-praig-smt-fp-polish/run_colab.py",
     "hf_eval_target": "evals/2026-11-26T21-50-eval-northstar-praig-smt-fp-polish.json",
-    "status": "RUNNING",
+    "status": "FAILED",
     "depends_on": [],
     "note": "Broadest ungated full-page PRAIG checkpoint beyond smt-fp-grandstaff (MIT, ungated).",
     "log_path": "D:\\tmp\\overnight-queue-logs\\2026-11-26T21-50-eval-northstar-praig-smt-fp-polish.log",
     "retry_note": "Fixed Colab transformers 5.x crash (SMTConfig._experts_implementation_internal) by pinning transformers>=4.45.0,<5.0.0 when major>=5.",
-    "started_at": "2026-11-27T03:35:51Z",
     "modal_app_id": "",
     "modal_call_id": "",
-    "completed_at": "2026-11-26T21:31:47Z",
-    "elapsed_sec": 15.11,
-    "returncode": -1,
-    "failure_reason": "modal run --detach failed for 2026-11-26T21-50-eval-northstar-praig-smt-fp-polish (rc=1, app_id=None, call_id=None)",
-    "session": "2026-11-26t21-50-eval-no"
+    "elapsed_sec": 12326.09,
+    "started_at": "2026-11-27T03:35:51Z",
+    "completed_at": "2026-11-27T07:01:17Z",
+    "returncode": 1
   },
   {
     "id": "2026-11-26T21-50-eval-northstar-score-reader",
@@ -1776,16 +1846,16 @@
     "est_cu": 2.8,
     "script": "experiments/2026-11-26T22-18-i14-02-harmony-tempo-grammar-and-lyric-roi/run_colab.py",
     "hf_eval_target": "evals/2026-11-26T22-18-i14-02-harmony-tempo-grammar-and-lyric-roi.json",
-    "status": "RUNNING",
+    "status": "COMPLETED",
     "depends_on": [],
     "note": "Wave 11 text-layer proxy (Safe B): tests +48 compositional harmony/tempo/rehearsal/anchor tokens + ~0.65M-param LyricRoICTCHead on iter10_5_proxy_2k.",
     "started_at": "2026-11-27T06:32:47Z",
     "log_path": "D:\\tmp\\overnight-queue-logs\\2026-11-26T22-18-i14-02-harmony-tempo-grammar-and-lyric-roi.log",
     "modal_app_id": "",
     "modal_call_id": "",
-    "completed_at": "2026-11-26T21:32:11Z",
-    "elapsed_sec": 28.84,
-    "returncode": -1,
+    "completed_at": "2026-11-27T07:20:55Z",
+    "elapsed_sec": 2888.33,
+    "returncode": 0,
     "failure_reason": "modal run --detach failed for 2026-11-26T22-18-i14-02-harmony-tempo-grammar-and-lyric-roi (rc=1, app_id=None, call_id=None)",
     "session": "2026-11-26t22-18-i14-02-"
   },
@@ -2143,13 +2213,16 @@
     "plan": "experiments/2026-11-27T00-01-i14-16-bekern-monotonic-sys-y-anchors/PLAN.md",
     "hf_eval_target": "evals/2026-11-27T00-01-i14-16-bekern-monotonic-sys-y-anchors.json",
     "hf_run_target": "runs/2026-11-27T00-01-i14-16-bekern-monotonic-sys-y-anchors.json",
-    "status": "QUEUED",
+    "status": "RUNNING",
     "depends_on": [],
     "datasets": [
       "datasets/iter10_5_proxy_2k.tar",
       "datasets/suite31_hw_eval.tar"
     ],
-    "note": "Wave 12 Bekern Theorist 3 (Safe): 600 steps/arm A/B proxy comparing ungrounded <sys> vs append-only <sys> <y-bin-00..63> + monotonic decode mask (y[k] > y[k-1]) on suite31_hw Note F1, sys-count MAE, copy-loop rate."
+    "note": "Wave 12 Bekern Theorist 3 (Safe): 600 steps/arm A/B proxy comparing ungrounded <sys> vs append-only <sys> <y-bin-00..63> + monotonic decode mask (y[k] > y[k-1]) on suite31_hw Note F1, sys-count MAE, copy-loop rate.",
+    "session": "2026-11-27t00-01-i14-16-",
+    "started_at": "2026-11-27T07:12:58Z",
+    "log_path": "D:\\tmp\\overnight-queue-logs\\2026-11-27T00-01-i14-16-bekern-monotonic-sys-y-anchors.log"
   },
   {
     "id": "2026-11-27T00-01-i14-17-bekern-dur-dot-first-and-mbpe",
@@ -2375,7 +2448,7 @@
     "wave": 13,
     "priority": 2,
     "provider": "colab_l4",
-    "gpu": "H100",
+    "gpu": "L4",
     "est_minutes": 60,
     "est_cu": 4.5,
     "script": "experiments/2026-11-27T07-52-i15-08-bekern3-expressive-oracle-and-compress/run_colab.py",
@@ -2383,7 +2456,7 @@
     "plan": "experiments/2026-11-27T07-52-i15-08-bekern3-expressive-oracle-and-compress/PLAN.md",
     "hf_eval_target": "evals/2026-11-27T07-52-i15-08-bekern3-expressive-oracle-and-compress.json",
     "hf_run_target": "runs/2026-11-27T07-52-i15-08-bekern3-expressive-oracle-and-compress.json",
-    "status": "QUEUED",
+    "status": "RUNNING",
     "depends_on": [],
     "datasets": [
       "datasets/iter10_5_proxy_2k.tar",
@@ -2391,7 +2464,7 @@
     ],
     "note": "Wave 13 bekern3 Architect 3: Part A 125-page OMR-NorthStar Oracle Closure (NS>=98.0, S_expr>=0.980) + Part B 3-arm 600-step MTP-4 bake-off (arm0_bekern_v2a vs arm1_profile_a_comp -20.2% vs arm2_profile_a_plus_core_pitch -41.1%, gate >=1.45x MTP-4 speedup & >=-0.2pp Note F1).",
     "session": "2026-11-27t07-52-i15-08-",
-    "started_at": "2026-11-27T06:08:04Z",
+    "started_at": "2026-11-27T07:20:56Z",
     "log_path": "D:\\tmp\\overnight-queue-logs\\2026-11-27T07-52-i15-08-bekern3-expressive-oracle-and-compress.log"
   },
   {
@@ -2432,12 +2505,18 @@
     "plan": "experiments/2026-11-27T08-47-eval-iter14-mid-suite31-and-northstar/PLAN.md",
     "hf_eval_target": "evals/2026-11-27T08-47-eval-iter14-mid-suite31-and-northstar.json",
     "hf_run_target": "runs/2026-11-27T08-47-eval-iter14-mid-suite31-and-northstar.json",
-    "status": "QUEUED",
+    "status": "COMPLETED",
     "depends_on": [],
     "datasets": [
       "datasets/suite31_hw_eval.tar",
       "datasets/northstar_eval_pack_125p.tar.gz"
     ],
-    "note": "TOP priority Wave 13 dual eval of Iter 14 v2a mid EMA snapshot (step 6874, 265-vocab bekern+v2, checkpoints/iter14-v2a-mid/uni_omr_v2_ema_latest.pt): Pass 1 full 90p suite31_hw (1408px, max_len=3072, max_mem=4096, FSA+MTP-4, BF16) + Pass 2 full 125p OMR-NorthStar (1408px, neg-control-gate, FSA+MTP-4, latest omr-northstar 1beaec4 + mscz-rs b8cb626 bekern+v2 exporter)."
+    "note": "TOP priority Wave 13 dual eval of Iter 14 v2a mid EMA snapshot (step 6874, 265-vocab bekern+v2, checkpoints/iter14-v2a-mid/uni_omr_v2_ema_latest.pt): Pass 1 full 90p suite31_hw (1408px, max_len=3072, max_mem=4096, FSA+MTP-4, BF16) + Pass 2 full 125p OMR-NorthStar (1408px, neg-control-gate, FSA+MTP-4, latest omr-northstar 1beaec4 + mscz-rs b8cb626 bekern+v2 exporter).",
+    "session": "2026-11-27t08-47-eval-it",
+    "started_at": "2026-11-27T07:01:18Z",
+    "log_path": "D:\\tmp\\overnight-queue-logs\\2026-11-27T08-47-eval-iter14-mid-suite31-and-northstar.log",
+    "completed_at": "2026-11-27T07:12:58Z",
+    "elapsed_sec": 700.0,
+    "returncode": 0
   }
 ]
