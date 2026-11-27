@@ -2416,5 +2416,28 @@
       "datasets/suite31_hw_eval.tar"
     ],
     "note": "Wave 13 Data-Mix & Repetition-Cap Sweep: 3-arm 800-step warm-start ablation on frozen UniOMRv2 EMA (arm0_v3_50_50 vs arm1_hw_heavy_30_70 vs arm2_rep_cap_10x_hard_upsample with <=10x real_hw_archival cap spilling to rism_pseudo+synth_hw + 2x hard-layout upsample), RAW+EMA eval on all 90 suite31_hw pages. Promote gate: >= +2.0 pp HW Note F1 with <= 0.5 pp Printed drop."
+  },
+  {
+    "id": "2026-11-27T08-47-eval-iter14-mid-suite31-and-northstar",
+    "short_id": "eval-iter14-mid",
+    "title": "Iter 14 v2a Mid-Checkpoint (step 6874 EMA, 265-vocab bekern+v2) Dual Eval: suite31_hw (90p) + OMR-NorthStar (125p)",
+    "wave": 13,
+    "priority": 0,
+    "provider": "colab_l4",
+    "gpu": "L4",
+    "est_minutes": 15,
+    "est_cu": 1.2,
+    "script": "experiments/2026-11-27T08-47-eval-iter14-mid-suite31-and-northstar/run_colab.py",
+    "readme": "experiments/2026-11-27T08-47-eval-iter14-mid-suite31-and-northstar/README.md",
+    "plan": "experiments/2026-11-27T08-47-eval-iter14-mid-suite31-and-northstar/PLAN.md",
+    "hf_eval_target": "evals/2026-11-27T08-47-eval-iter14-mid-suite31-and-northstar.json",
+    "hf_run_target": "runs/2026-11-27T08-47-eval-iter14-mid-suite31-and-northstar.json",
+    "status": "QUEUED",
+    "depends_on": [],
+    "datasets": [
+      "datasets/suite31_hw_eval.tar",
+      "datasets/northstar_eval_pack_125p.tar.gz"
+    ],
+    "note": "TOP priority Wave 13 dual eval of Iter 14 v2a mid EMA snapshot (step 6874, 265-vocab bekern+v2, checkpoints/iter14-v2a-mid/uni_omr_v2_ema_latest.pt): Pass 1 full 90p suite31_hw (1408px, max_len=3072, max_mem=4096, FSA+MTP-4, BF16) + Pass 2 full 125p OMR-NorthStar (1408px, neg-control-gate, FSA+MTP-4, latest omr-northstar 1beaec4 + mscz-rs b8cb626 bekern+v2 exporter)."
   }
 ]
