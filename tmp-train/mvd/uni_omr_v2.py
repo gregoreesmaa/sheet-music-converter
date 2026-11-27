@@ -272,6 +272,11 @@ class UniOMRv2Config:
     axial_ffn_mult: float = 2.0
     dropout: float = 0.1
     vocab_size: int = VOCAB_SIZE
+    pad_id: Optional[int] = None
+    bos_id: Optional[int] = None
+    eos_id: Optional[int] = None
+    sys_id: Optional[int] = None
+    music_vocab_end: Optional[int] = None
 
     # Backbone channels & blocks (stages 1..4: /2, /4, /8, /8)
     backbone_channels: Tuple[int, int, int, int] = (64, 128, 240, 448)
@@ -328,6 +333,62 @@ class UniOMRv2Config:
         self.rope_jitter = float(max(0.0, self.rope_jitter))
         self.mixstyle_prob = float(max(0.0, min(1.0, self.mixstyle_prob)))
         self.vrfm_band_alpha = float(max(0.0, self.vrfm_band_alpha))
+        for _name in ("pad_id", "bos_id", "eos_id", "sys_id"):
+            _val = getattr(self, _name)
+            if _val is not None:
+                _ival = int(_val)
+                if not (0 <= _ival < self.vocab_size):
+                    raise ValueError(f"{_name} ({_ival}) must be in [0, vocab_size={self.vocab_size})")
+                setattr(self, _name, _ival)
+        if self.music_vocab_end is not None:
+            _mve = int(self.music_vocab_end)
+            if not (1 <= _mve <= self.vocab_size):
+                raise ValueError(
+                    f"music_vocab_end ({_mve}) must be in [1, vocab_size={self.vocab_size}]"
+                )
+            self.music_vocab_end = _mve
+
+    def resolved_pad_id(self) -> int:
+        """Return explicit ``pad_id`` if set, else legacy fallback (``PAD_ID`` or ``vocab_size - 4``)."""
+        if self.pad_id is not None:
+            return int(self.pad_id)
+        v = int(self.vocab_size)
+        return PAD_ID if v == VOCAB_SIZE else (v - 4)
+
+    def resolved_bos_id(self) -> int:
+        """Return explicit ``bos_id`` if set, else legacy fallback (``BOS_ID`` or ``vocab_size - 3``)."""
+        if self.bos_id is not None:
+            return int(self.bos_id)
+        v = int(self.vocab_size)
+        return BOS_ID if v == VOCAB_SIZE else (v - 3)
+
+    def resolved_eos_id(self) -> int:
+        """Return explicit ``eos_id`` if set, else legacy fallback (``EOS_ID`` or ``vocab_size - 2``)."""
+        if self.eos_id is not None:
+            return int(self.eos_id)
+        v = int(self.vocab_size)
+        return EOS_ID if v == VOCAB_SIZE else (v - 2)
+
+    def resolved_sys_id(self) -> int:
+        """Return explicit ``sys_id`` if set, else legacy fallback (``SYS_ID`` or ``vocab_size - 1``)."""
+        if self.sys_id is not None:
+            return int(self.sys_id)
+        v = int(self.vocab_size)
+        return SYS_ID if v == VOCAB_SIZE else (v - 1)
+
+    def resolved_music_vocab_end(self) -> int:
+        """Return exclusive upper bound for random music tokens in ``tok_dropout``."""
+        if self.music_vocab_end is not None:
+            return int(self.music_vocab_end)
+        if self.pad_id is not None and int(self.pad_id) > 0:
+            return int(self.pad_id)
+        v = int(self.vocab_size)
+        if v == VOCAB_SIZE:
+            return len(data.VOCAB)
+        pad_id = self.resolved_pad_id()
+        if 0 < pad_id <= v:
+            return pad_id
+        return max(1, v)
 
     @classmethod
     def small_45m(cls, **overrides: Any) -> "UniOMRv2Config":
@@ -1918,7 +1979,8 @@ class UniOMRv2Net(nn.Module):
         )
 
         # 4. GQA Causal Decoder (Llama 4 iRoPE) + DeepStack Multi-Level Visual Injection + MTP-4
-        pad_idx = PAD_ID if PAD_ID < c.vocab_size else (c.vocab_size - 4 if c.vocab_size >= 4 else None)
+        _resolved_pad = c.resolved_pad_id()
+        pad_idx = _resolved_pad if (0 <= _resolved_pad < c.vocab_size) else None
         self.tok_emb = nn.Embedding(c.vocab_size, c.d_model, padding_idx=pad_idx)
         self.rope1d = _CachedRoPE1D(head_dim=head_dim, base=c.rope_base)
         self.deepstack_fusions = nn.ModuleList([
@@ -2033,13 +2095,22 @@ class UniOMRv2Net(nn.Module):
         _, T = tgt_ids.shape
         inp_ids = tgt_ids
         if self.training and apply_tok_dropout and self.cfg.tok_dropout > 0.0 and not use_cache:
+            pad_id = self.cfg.resolved_pad_id()
+            bos_id = self.cfg.resolved_bos_id()
+            eos_id = self.cfg.resolved_eos_id()
+            sys_id = self.cfg.resolved_sys_id()
+            music_end = self.cfg.resolved_music_vocab_end()
+            rand_toks = torch.randint(0, music_end, inp_ids.shape, device=inp_ids.device, dtype=inp_ids.dtype)
             drop_mask = (
                 (torch.rand_like(inp_ids, dtype=torch.float32) < self.cfg.tok_dropout)
-                & (inp_ids != PAD_ID)
-                & (inp_ids != BOS_ID)
-                & (inp_ids != EOS_ID)
+                & (inp_ids != pad_id)
+                & (inp_ids != bos_id)
+                & (inp_ids != eos_id)
+                & (rand_toks != pad_id)
+                & (rand_toks != bos_id)
+                & (rand_toks != eos_id)
+                & (rand_toks != sys_id)
             )
-            rand_toks = torch.randint(0, len(data.VOCAB), inp_ids.shape, device=inp_ids.device, dtype=inp_ids.dtype)
             inp_ids = torch.where(drop_mask, rand_toks, inp_ids)
 
         x = self.tok_emb(inp_ids)
@@ -2160,10 +2231,9 @@ class UniOMRv2Net(nn.Module):
         )
         B = images.shape[0]
         device = images.device
-        v = int(self.cfg.vocab_size)
-        pad_id = PAD_ID if v == VOCAB_SIZE else (v - 4)
-        bos_id = BOS_ID if v == VOCAB_SIZE else (v - 3)
-        eos_id = EOS_ID if v == VOCAB_SIZE else (v - 2)
+        pad_id = self.cfg.resolved_pad_id()
+        bos_id = self.cfg.resolved_bos_id()
+        eos_id = self.cfg.resolved_eos_id()
         cur_ids = torch.full((B, 1), bos_id, dtype=torch.long, device=device)
         past_kvs: Optional[List[Any]] = self.precompute_cross_kv(mem)
         finished = torch.zeros(B, dtype=torch.bool, device=device)
@@ -2242,11 +2312,12 @@ class UniOMRv2Net(nn.Module):
             if ce_token_weights is not None
             else None
         )
+        pad_id = self.cfg.resolved_pad_id()
         ce_loss = F.cross_entropy(
             logits.reshape(-1, V),
             targets.reshape(-1),
             weight=ce_w,
-            ignore_index=PAD_ID,
+            ignore_index=pad_id,
             label_smoothing=ls,
         )
 
@@ -2258,7 +2329,7 @@ class UniOMRv2Net(nn.Module):
             mtp_stacked = torch.stack(mtp_logits, dim=0)  # (M, B, T, V)
             shifted_tgts = torch.full(
                 (n_mtp, targets.shape[0], T),
-                PAD_ID,
+                pad_id,
                 device=targets.device,
                 dtype=targets.dtype,
             )
@@ -2267,11 +2338,11 @@ class UniOMRv2Net(nn.Module):
                 if T > shift:
                     shifted_tgts[idx, :, :-shift] = targets[:, shift:]
             shifted_flat = shifted_tgts.reshape(-1)
-            mtp_valid = (shifted_flat != PAD_ID).to(torch.float32)
+            mtp_valid = (shifted_flat != pad_id).to(torch.float32)
             mtp_per_tok = F.cross_entropy(
                 mtp_stacked.reshape(-1, V),
                 shifted_flat,
-                ignore_index=PAD_ID,
+                ignore_index=pad_id,
                 label_smoothing=ls,
                 reduction="none",
             )

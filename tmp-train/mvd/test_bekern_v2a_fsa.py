@@ -528,6 +528,316 @@ class TestBekernV2AFSA(unittest.TestCase):
                     st.step(tok)
             self.assertFalse(st.broken)
 
+    # ------------------------------------------------------------------
+    # 9. bekern-full Hardening: Exact Rational Tuplets, Multi-Digit tup-open,
+    #    Depth-2 Nesting, and bar_tok_capped Forced tup-close
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _build_bekern_full_vocab() -> dict[str, int]:
+        extra = [
+            "9", "/",
+            "<txt>", "</txt>", "<lyr>", "<harm>", "<dir>", "<tempo>",
+            "txt-a", "txt-b", "txt-allegro",
+            "slur-1-start", "slur-1-stop", "slur-2-start", "slur-2-stop",
+            "slur-3-start", "slur-3-stop", "slur-4-start", "slur-4-stop",
+            "hairpin-1-cresc-start", "hairpin-1-dim-start", "hairpin-1-stop",
+            "hairpin-2-cresc-start", "hairpin-2-stop",
+            "hairpin-3-dim-start", "hairpin-3-stop",
+            "trem2-start", "trem2-stop",
+        ]
+        vm = dict(data.TOKEN_TO_ID)
+        for tok in extra:
+            if tok not in vm:
+                vm[tok] = len(vm)
+        return vm
+
+    def test_bekern_full_exact_rational_multidigit_and_depth2_tuplets(self) -> None:
+        """Exact rational tuplet math (13:8 and nested 5:4 in 3:2), multi-digit tup-open, and depth-2 cap."""
+        vm = self._build_bekern_full_vocab()
+
+        # 9a. 13:8 multi-digit tup-open in 4/4 under strict=True (zero float drift)
+        st = grammar.PrefixState(strict=True, vocab_map=vm, max_tuplet_depth=2)
+        for tok in ("clef-G-2", "key+0", "time-4-4", "voice-1", "tup-open", "1", "3", "/", "8"):
+            allow, _ = st.allowed()
+            self.assertIn(vm[tok], allow, f"13:8 token {tok!r} blocked")
+            st.step(tok)
+        self.assertEqual(st._open_scale_rat(), (8, 13))
+        for _ in range(13):
+            for tok in ("eighth", "C", "4"):
+                allow, _ = st.allowed()
+                self.assertIn(vm[tok], allow)
+                st.step(tok)
+        # Bar is now exactly full: (4, 1); 14th eighth must be blocked, tup-close + bar allowed
+        allow_full, eos_full = st.allowed()
+        self.assertFalse(eos_full)
+        self.assertNotIn(vm["eighth"], allow_full)
+        self.assertIn(vm["tup-close"], allow_full)
+        st.step("tup-close")
+        self.assertEqual(st.vcurs_rat[0], (4, 1))
+        allow_bar, eos_bar = st.allowed()
+        self.assertTrue(eos_bar)
+        self.assertIn(vm["bar"], allow_bar)
+        st.step("bar")
+
+        # 9b. Nested 5:4 inside 3:2 (depth=2) -> exact scale (8, 15); 15 eighths = exact 4 beats
+        st2 = grammar.PrefixState(strict=True, vocab_map=vm, max_tuplet_depth=2)
+        for tok in ("clef-G-2", "key+0", "time-4-4", "voice-1",
+                    "tup-open", "3", "/", "2",
+                    "tup-open", "5", "/", "4"):
+            allow, _ = st2.allowed()
+            self.assertIn(vm[tok], allow, f"nested tuplet token {tok!r} blocked")
+            st2.step(tok)
+        self.assertEqual(st2._open_scale_rat(), (8, 15))
+        # Depth 3 must be blocked
+        allow_d2, _ = st2.allowed()
+        self.assertNotIn(vm["tup-open"], allow_d2)
+        with self.assertRaises(ValueError):
+            st2.step("tup-open")
+        for _ in range(15):
+            for tok in ("eighth", "D", "4"):
+                allow, _ = st2.allowed()
+                self.assertIn(vm[tok], allow)
+                st2.step(tok)
+        st2.step("tup-close")
+        self.assertEqual(st2.depth[0], 1)
+        self.assertEqual(st2._open_scale_rat(), (2, 3))
+        st2.step("tup-close")
+        self.assertEqual(st2.depth[0], 0)
+        self.assertEqual(st2._open_scale_rat(), (1, 1))
+        self.assertEqual(st2.vcurs_rat[0], (4, 1))
+
+        # 9c. Identity tuplet (a == n) banned and cap <= 32 enforced
+        st_id = grammar.PrefixState(strict=False, vocab_map=vm, max_tuplet_depth=2)
+        for tok in ("clef-G-2", "key+0", "time-4-4", "tup-open", "5", "/"):
+            st_id.step(tok)
+        allow_n5, _ = st_id.allowed()
+        self.assertNotIn(vm["5"], allow_n5)
+        with self.assertRaises(ValueError):
+            st_id.step("5")
+
+        st_id3 = grammar.PrefixState(strict=False, vocab_map=vm, max_tuplet_depth=2)
+        for tok in ("clef-G-2", "key+0", "time-4-4", "tup-open", "3", "/", "3"):
+            st_id3.step(tok)
+        allow_n3, _ = st_id3.allowed()
+        # 3:3 cannot close immediately; only 30/31/32 (digits 0, 1, 2) are legal
+        self.assertNotIn(vm["eighth"], allow_n3)
+        self.assertEqual(allow_n3, {vm["0"], vm["1"], vm["2"]})
+        with self.assertRaises(ValueError):
+            st_id3.step("eighth")
+
+        st_cap = grammar.PrefixState(strict=False, vocab_map=vm, max_tuplet_depth=2)
+        for tok in ("clef-G-2", "key+0", "time-4-4", "tup-open", "3"):
+            st_cap.step(tok)
+        allow_a3, _ = st_cap.allowed()
+        self.assertNotIn(vm["3"], allow_a3)  # 33 > 32
+        self.assertIn(vm["2"], allow_a3)     # 32 <= 32
+        with self.assertRaises(ValueError):
+            st_cap.step("3")
+
+        # 9d. bar_tok_capped forces tup-close across depth-2 before allowing bar
+        st_bc = grammar.PrefixState(strict=False, vocab_map=vm, max_tuplet_depth=2)
+        for tok in ("clef-G-2", "key+0", "time-4-4", "tup-open", "3", "/", "2",
+                    "tup-open", "5", "/", "4", "eighth", "C", "4"):
+            st_bc.step(tok)
+        st_bc.tokens_since_bar = grammar.MAX_TOKENS_PER_BAR
+        allow_bc1, eos_bc1 = st_bc.allowed()
+        self.assertFalse(eos_bc1)
+        self.assertEqual(allow_bc1, {vm["tup-close"], vm["tuplet-stop"]})
+        st_bc.step("tup-close")
+        allow_bc2, eos_bc2 = st_bc.allowed()
+        self.assertFalse(eos_bc2)
+        self.assertEqual(allow_bc2, {vm["tup-close"], vm["tuplet-stop"]})
+        st_bc.step("tup-close")
+        allow_bc3, eos_bc3 = st_bc.allowed()
+        self.assertTrue(eos_bc3)
+        self.assertIn(vm["bar"], allow_bc3)
+
+    # ------------------------------------------------------------------
+    # 10. bekern-full Hardening: Open-Text Span Anti-Loop Guard
+    # ------------------------------------------------------------------
+
+    def test_bekern_full_text_span_anti_loop_guard(self) -> None:
+        """Open text spans cap at MAX_TXT_TOKENS=24 (forcing </txt>) and MAX_TEXT_SPANS_PER_BAR=4."""
+        vm = self._build_bekern_full_vocab()
+        st = grammar.PrefixState(strict=False, vocab_map=vm)
+        for tok in ("clef-G-2", "key+0", "time-4-4", "quarter", "C", "4"):
+            st.step(tok)
+
+        # Open a <lyr> text span and fill to MAX_TXT_TOKENS (24)
+        allow_open, _ = st.allowed()
+        self.assertIn(vm["<lyr>"], allow_open)
+        st.step("<lyr>")
+        self.assertTrue(st.in_text_span)
+        self.assertEqual(st.txt_toks, 0)
+        self.assertEqual(st.bar_txt_spans, 1)
+        self.assertFalse(st.can_emit_sys())
+        self.assertFalse(st.can_emit_eos())
+
+        for i in range(grammar.MAX_TXT_TOKENS):
+            allow_t, eos_t = st.allowed()
+            self.assertFalse(eos_t)
+            self.assertIn(vm["txt-a"], allow_t)
+            self.assertIn(vm["</txt>"], allow_t)
+            self.assertNotIn(vm["bar"], allow_t)
+            st.step("txt-a")
+            self.assertEqual(st.txt_toks, i + 1)
+
+        # At MAX_TXT_TOKENS, ONLY </txt> is allowed
+        allow_cap, eos_cap = st.allowed()
+        self.assertFalse(eos_cap)
+        self.assertEqual(allow_cap, {vm["</txt>"]})
+        with self.assertRaises(ValueError):
+            st.step("txt-a")
+        st.step("</txt>")
+        self.assertFalse(st.in_text_span)
+        self.assertEqual(st.txt_toks, 0)
+        self.assertTrue(st.can_emit_eos())
+
+        # Emit 3 more text spans in the same bar (total = MAX_TEXT_SPANS_PER_BAR = 4)
+        for tag in ("<harm>", "<dir>", "<tempo>"):
+            allow_tag, _ = st.allowed()
+            self.assertIn(vm[tag], allow_tag)
+            st.step(tag)
+            st.step("txt-allegro")
+            st.step("</txt>")
+        self.assertEqual(st.bar_txt_spans, grammar.MAX_TEXT_SPANS_PER_BAR)
+
+        # 5th text span in the same bar must be blocked
+        allow_5th, _ = st.allowed()
+        for tag in grammar.TEXT_TAG_OPENS:
+            self.assertNotIn(vm[tag], allow_5th)
+        with self.assertRaises(ValueError):
+            st.step("<txt>")
+
+        # Barline resets bar_txt_spans
+        st.step("bar")
+        self.assertEqual(st.bar_txt_spans, 0)
+        allow_next_bar, _ = st.allowed()
+        self.assertIn(vm["<txt>"], allow_next_bar)
+
+    # ------------------------------------------------------------------
+    # 11. bekern-full Hardening: Per-Staff u16 Spanner Bitmask & Onset Guard
+    # ------------------------------------------------------------------
+
+    def test_bekern_full_per_staff_spanner_bitmask_and_page_crossing(self) -> None:
+        """Per-staff u16 spanner bitmask blocks duplicate/same-onset starts, never blocks <sys>/<eos>."""
+        vm = self._build_bekern_full_vocab()
+        st = grammar.PrefixState(strict=False, vocab_map=vm)
+        for tok in ("clef-G-2", "key+0", "time-4-4", "quarter", "C", "4"):
+            st.step(tok)
+
+        # Start slur-1 and slur-2 on staff 0
+        st.step("slur-1-start")
+        allow_s1, _ = st.allowed()
+        self.assertNotIn(vm["slur-1-start"], allow_s1)  # already active
+        self.assertIn(vm["slur-2-start"], allow_s1)
+        st.step("slur-2-start")
+        # Alternating slur-1-start / slur-2-start spam is blocked
+        allow_s12, _ = st.allowed()
+        self.assertNotIn(vm["slur-1-start"], allow_s12)
+        self.assertNotIn(vm["slur-2-start"], allow_s12)
+        with self.assertRaises(ValueError):
+            st.step("slur-1-start")
+
+        # Same-onset stop + re-start of slur-1 is ALSO blocked by onset_spanner_starts
+        st.step("slur-1-stop")
+        allow_same_onset, _ = st.allowed()
+        self.assertNotIn(vm["slur-1-start"], allow_same_onset)
+        with self.assertRaises(ValueError):
+            st.step("slur-1-start")
+
+        # Next note onset resets onset_spanner_starts; slur-1 can start again, slur-2 still active
+        for tok in ("quarter", "D", "4"):
+            st.step(tok)
+        allow_next, _ = st.allowed()
+        self.assertIn(vm["slur-1-start"], allow_next)
+        self.assertNotIn(vm["slur-2-start"], allow_next)
+        st.step("slur-1-start")
+        st.step("trem2-start")
+
+        # Staff 1 after <staff> has independent bitmask (slur-1-start is legal on staff 1)
+        st.step("<staff>")
+        for tok in ("quarter", "C", "3"):
+            st.step(tok)
+        allow_staff1, _ = st.allowed()
+        self.assertIn(vm["slur-1-start"], allow_staff1)
+        self.assertIn(vm["trem2-start"], allow_staff1)
+        st.step("hairpin-1-cresc-start")
+        allow_hp, _ = st.allowed()
+        self.assertNotIn(vm["hairpin-1-cresc-start"], allow_hp)
+        self.assertNotIn(vm["hairpin-1-dim-start"], allow_hp)
+
+        # Page-crossing / system-crossing active spanners NEVER block <sys> or <eos>
+        self.assertTrue(st.staff_spanners[0] != 0)
+        self.assertTrue(st.staff_spanners[1] != 0)
+        self.assertTrue(st.can_emit_sys())
+        self.assertTrue(st.can_emit_eos())
+
+        # Stopping a spanner started on a previous page (bit=0) is always allowed
+        st_fresh = grammar.PrefixState(strict=False, vocab_map=vm)
+        for tok in ("clef-G-2", "key+0", "time-4-4", "quarter", "C", "4", "slur-1-stop", "hairpin-1-stop"):
+            allow_f, _ = st_fresh.allowed()
+            self.assertIn(vm[tok], allow_f)
+            st_fresh.step(tok)
+
+    # ------------------------------------------------------------------
+    # 12. bekern-full Hardening: Polymeter tsig_by_staff under strict=True
+    # ------------------------------------------------------------------
+
+    def test_bekern_full_polymeter_tsig_by_staff_strict(self) -> None:
+        """Simultaneous 4/4 (staff 0) and 3/4 (staff 1) across <staff> splits stay exact under strict=True."""
+        st = grammar.PrefixState(strict=True)
+        # Polymeter header: Staff 0 = 4/4, Staff 1 = 3/4
+        for tok in ("clef-G-2", "key+0", "time-4-4", "clef-F-4", "key+0", "time-3-4"):
+            allow, _ = st.allowed()
+            self.assertIn(_T[tok], allow)
+            st.step(tok)
+        self.assertEqual(st.tsig_by_staff, {0: 4.0, 1: 3.0})
+
+        # Copy preserves polymeter state
+        st_copy = st.copy()
+        self.assertEqual(st_copy.tsig_by_staff, {0: 4.0, 1: 3.0})
+
+        # Measure 1, Staff 0 (4/4): 4 quarters MUST be allowed (not falsely masked at 3/4)
+        for pitch in ("C", "D", "E", "F"):
+            for tok in ("quarter", pitch, "4"):
+                allow, _ = st.allowed()
+                self.assertIn(_T[tok], allow, f"4/4 staff 0 note {pitch} blocked")
+                st.step(tok)
+        # 5th quarter on staff 0 must be blocked
+        allow_s0_full, _ = st.allowed()
+        self.assertNotIn(_T["quarter"], allow_s0_full)
+
+        # Measure 1, Staff 1 (3/4): 3 quarters allowed, 4th blocked
+        st.step("<staff>")
+        for pitch in ("C", "D", "E"):
+            for tok in ("quarter", pitch, "3"):
+                allow, _ = st.allowed()
+                self.assertIn(_T[tok], allow, f"3/4 staff 1 note {pitch} blocked")
+                st.step(tok)
+        allow_s1_full, _ = st.allowed()
+        self.assertNotIn(_T["quarter"], allow_s1_full)
+        with self.assertRaises(ValueError):
+            st.step("quarter")
+
+        # Measure 2: barline resets staves_in_bar -> Staff 0 is 4/4 again
+        st.step("bar")
+        for tok in ("whole", "G", "4"):
+            allow, _ = st.allowed()
+            self.assertIn(_T[tok], allow)
+            st.step(tok)
+        st.step("<staff>")
+        # Staff 1 is 3/4 -> whole note (4 beats) blocked, dotted half (3 beats) allowed
+        allow_m2_s1, _ = st.allowed()
+        self.assertNotIn(_T["whole"], allow_m2_s1)
+        self.assertIn(_T["half"], allow_m2_s1)
+        for tok in ("half", "G", "2", "dot", "bar-light-heavy"):
+            allow, _ = st.allowed()
+            self.assertIn(_T[tok], allow)
+            st.step(tok)
+        self.assertTrue(st.can_emit_eos())
+
 
 if __name__ == "__main__":
     unittest.main()

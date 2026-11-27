@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import difflib
 import hashlib
+import math
 import sys
 from pathlib import Path
 
@@ -89,12 +90,118 @@ TAB_STRINGS = frozenset('str-%d' % s for s in range(1, 7))
 TAB_FRETS = frozenset('fret-%d' % f for f in range(0, 25))
 
 # Written duration values in quarter beats (mirror decode.rs
-# written_dur) plus the bar-closure epsilon for T2.3 strict duration
-# books (fp slack for tuplet/dot sums like 3 x (1/2 x 2/3)).
+# written_dur) plus exact reduced integer rationals (num, den) for
+# drift-free nested/high-order tuplet arithmetic (e.g. 13:8, 5:4 in 3:2).
 _WRITTEN = {'breve': 8.0, 'whole': 4.0, 'half': 2.0, 'quarter': 1.0,
             'eighth': 0.5, '16th': 0.25, '32nd': 0.125, '64th': 0.0625,
             '128th': 0.03125}
+_WRITTEN_RAT = {
+    'breve': (8, 1), 'whole': (4, 1), 'half': (2, 1), 'quarter': (1, 1),
+    'eighth': (1, 2), '16th': (1, 4), '32nd': (1, 8), '64th': (1, 16),
+    '128th': (1, 32),
+}
 _BAR_EPS = 1e-6
+MAX_TUPLET_VAL = 32
+MAX_TXT_TOKENS = 24
+MAX_TEXT_SPANS_PER_BAR = 4
+TXT_OPEN = '<txt>'
+TXT_CLOSE = '</txt>'
+TEXT_TAG_OPENS = frozenset(['<txt>', '<lyr>', '<harm>', '<dir>', '<tempo>'])
+_TEXT_FORBIDDEN = (
+    BAR_LIKES
+    | frozenset([STAFF_SEP, '<sys>', '<pad>', '<bos>', '<eos>', TXT_CLOSE])
+    | TEXT_TAG_OPENS
+)
+
+# Per-staff u16 active-spanner bit layout for bekern-full numbered spanners
+# (slur-1..4, hairpin-1..3, trem2). Legacy unnumbered slur-start/slur-stop
+# and hairpin-* stay untouched for 100% v2a backward compatibility.
+SPANNER_START_BIT = {
+    'slur-1-start': 1 << 0,
+    'slur-2-start': 1 << 1,
+    'slur-3-start': 1 << 2,
+    'slur-4-start': 1 << 3,
+    'hairpin-1-start': 1 << 4,
+    'hairpin-1-cresc-start': 1 << 4,
+    'hairpin-1-dim-start': 1 << 4,
+    'hairpin-2-start': 1 << 5,
+    'hairpin-2-cresc-start': 1 << 5,
+    'hairpin-2-dim-start': 1 << 5,
+    'hairpin-3-start': 1 << 6,
+    'hairpin-3-cresc-start': 1 << 6,
+    'hairpin-3-dim-start': 1 << 6,
+    'trem2-start': 1 << 7,
+}
+SPANNER_STOP_BIT = {
+    'slur-1-stop': 1 << 0,
+    'slur-2-stop': 1 << 1,
+    'slur-3-stop': 1 << 2,
+    'slur-4-stop': 1 << 3,
+    'hairpin-1-stop': 1 << 4,
+    'hairpin-2-stop': 1 << 5,
+    'hairpin-3-stop': 1 << 6,
+    'trem2-stop': 1 << 7,
+}
+SPANNER_MOD_TOKENS = frozenset(
+    t for t in (*SPANNER_START_BIT.keys(), *SPANNER_STOP_BIT.keys())
+    if t.startswith('slur-') or t.startswith('trem2-')
+)
+SPANNER_DIR_TOKENS = frozenset(
+    t for t in (*SPANNER_START_BIT.keys(), *SPANNER_STOP_BIT.keys())
+    if t.startswith('hairpin-')
+)
+
+
+def _rat_reduce(num, den):
+    """Return reduced exact rational (num, den) with den > 0 via math.gcd."""
+    if num == 0:
+        return (0, 1)
+    if den < 0:
+        num = -num
+        den = -den
+    g = math.gcd(abs(num), den)
+    return (num // g, den // g)
+
+
+def _rat_mul(a, b):
+    return _rat_reduce(a[0] * b[0], a[1] * b[1])
+
+
+def _rat_add(a, b):
+    return _rat_reduce(a[0] * b[1] + b[0] * a[1], a[1] * b[1])
+
+
+def _rat_cmp(a, b):
+    """Return <0, 0, or >0 comparing exact rationals a and b (den > 0)."""
+    return a[0] * b[1] - b[0] * a[1]
+
+
+def _dot_mult_rat(dots):
+    """Exact rational multiplier for `dots` augmentation dots: (2^(d+1)-1) / 2^d."""
+    return ((1 << (dots + 1)) - 1, 1 << dots)
+
+
+def _float_to_rat(x):
+    """Fallback conversion for floats into exact reduced rationals."""
+    if x is None:
+        return None
+    # Powers of 2 up to 1/32 cover all standard durations/meters cleanly.
+    den = 1024
+    num = int(round(x * den))
+    return _rat_reduce(num, den)
+
+
+def _beats_rat_of(time_tok):
+    """Exact rational quarter-beat measure duration for a ``time-B-T`` token."""
+    try:
+        _, b, t = time_tok.split('-')
+        bi = int(b)
+        ti = int(t)
+        if ti <= 0:
+            return None
+        return _rat_reduce(bi * 4, ti)
+    except (ValueError, ZeroDivisionError):
+        return None
 MAX_CHORDS_PER_ONSET = 8
 MAX_CONSECUTIVE_GRACE = 8
 MAX_CONSECUTIVE_BAR_REST = 24
@@ -183,9 +290,11 @@ class PrefixState:
                  'pending', 'strict', 'broken',
                  'run_tok', 'run_len', 'alter_seen', 'dot_seen',
                  'opened', 'recent',
-                 'tsig', 'pending_tsig', 'vcurs', 'vscales',
-                 'pend_spans',
-                 'ev_base', 'ev_dots', 'ev_chord', 'ev_grace',
+                 'tsig', 'tsig_rat', 'pending_tsig', 'pending_tsig_rat',
+                 'tsig_by_staff', 'tsig_rat_by_staff', 'pending_tsig_by_staff',
+                 'vcurs', 'vcurs_rat', 'vscales',
+                 'pend_spans', 'max_tuplet_depth',
+                 'ev_base', 'ev_base_rat', 'ev_dots', 'ev_chord', 'ev_grace',
                  'ev_mods', 'ev_alters',
                  'chords_on_onset', 'grace_run',
                  'consec_bar_rest_bars', 'bar_has_pitched', 'bar_has_bar_rest',
@@ -203,6 +312,8 @@ class PrefixState:
                  'last_was_time', 'header_clefs', 'header_keys', 'header_times',
                  'first_sys_staves', 'cur_hdr_tuple', 'completed_hdr_tuples',
                  'comp_num', 'comp_digits', 'comp_val',
+                 'in_text_span', 'txt_toks', 'bar_txt_spans',
+                 'staff_spanners', 'onset_spanner_starts',
                  'allow_percussion_tab', 'vocab_map')
 
     def __init__(
@@ -212,6 +323,7 @@ class PrefixState:
         vocab_map=None,
         max_bars_per_system=MAX_BARS_PER_SYSTEM,
         max_tokens_per_system=MAX_TOKENS_PER_SYSTEM,
+        max_tuplet_depth=1,
     ):
         self.mode = 'bound'
         self.header_open = True
@@ -231,18 +343,27 @@ class PrefixState:
         # uniform; strict=True caps at tsig, strict=False enforces a
         # generous safety ceiling max(8.0, 2.5 * tsig)): active
         # time signature in quarter beats (None until seen),
-        # per-voice running cursors, per-voice open tuplet ratio
-        # stacks, queued tuplet starts, and the pending event's
+        # per-staff polymeter time signatures, per-voice running cursors
+        # (both float and exact reduced integer rationals), per-voice open
+        # tuplet ratio stacks, queued tuplet starts, and the pending event's
         # written base quarters + dot count + chord flag.
         self.tsig = None
+        self.tsig_rat = None
         # Courtesy time-sig stashed mid-measure; applied at the next
         # barline (a courtesy change must not retune the running
         # books, but must take effect for the new measure).
         self.pending_tsig = None
+        self.pending_tsig_rat = None
+        self.tsig_by_staff = {}
+        self.tsig_rat_by_staff = {}
+        self.pending_tsig_by_staff = {}
         self.vcurs = [0.0]
+        self.vcurs_rat = [(0, 1)]
         self.vscales = [[]]
         self.pend_spans = []
+        self.max_tuplet_depth = max(1, int(max_tuplet_depth))
         self.ev_base = None
+        self.ev_base_rat = None
         self.ev_dots = 0
         self.ev_chord = False
         self.ev_grace = False
@@ -287,6 +408,13 @@ class PrefixState:
         self.comp_num = 0
         self.comp_digits = 0
         self.comp_val = 0
+        # bekern-full opt-in text-span anti-loop state
+        self.in_text_span = False
+        self.txt_toks = 0
+        self.bar_txt_spans = 0
+        # bekern-full per-staff u16 active-spanner bitmasks + per-onset start guard
+        self.staff_spanners = [0]
+        self.onset_spanner_starts = 0
         # Gate-D opt-in: percussion/tab grammar transitions (OFF by default).
         self.allow_percussion_tab = bool(allow_percussion_tab)
         if vocab_map is not None:
@@ -314,11 +442,19 @@ class PrefixState:
         c.opened = set(self.opened)
         c.recent = list(self.recent)
         c.tsig = self.tsig
+        c.tsig_rat = self.tsig_rat
         c.pending_tsig = self.pending_tsig
+        c.pending_tsig_rat = self.pending_tsig_rat
+        c.tsig_by_staff = dict(self.tsig_by_staff)
+        c.tsig_rat_by_staff = dict(self.tsig_rat_by_staff)
+        c.pending_tsig_by_staff = dict(self.pending_tsig_by_staff)
         c.vcurs = list(self.vcurs)
+        c.vcurs_rat = list(self.vcurs_rat)
         c.vscales = [list(s) for s in self.vscales]
         c.pend_spans = list(self.pend_spans)
+        c.max_tuplet_depth = self.max_tuplet_depth
         c.ev_base = self.ev_base
+        c.ev_base_rat = self.ev_base_rat
         c.ev_dots = self.ev_dots
         c.ev_chord = self.ev_chord
         c.ev_grace = self.ev_grace
@@ -362,6 +498,11 @@ class PrefixState:
         c.comp_num = self.comp_num
         c.comp_digits = self.comp_digits
         c.comp_val = self.comp_val
+        c.in_text_span = self.in_text_span
+        c.txt_toks = self.txt_toks
+        c.bar_txt_spans = self.bar_txt_spans
+        c.staff_spanners = list(self.staff_spanners)
+        c.onset_spanner_starts = self.onset_spanner_starts
         c.allow_percussion_tab = self.allow_percussion_tab
         c.vocab_map = self.vocab_map
         return c
@@ -518,11 +659,15 @@ class PrefixState:
             self.mv_bar_consec = 0
 
     def can_emit_sys(self):
-        """Return True iff the current system has >=1 musical event, no open tuplet,
-        page is under MAX_SYSTEMS, and the current system does not duplicate a previously completed system."""
+        """Return True iff the current system has >=1 musical event, no open tuplet/text span,
+        page is under MAX_SYSTEMS, and the current system does not duplicate a previously completed system.
+
+        NOTE: Active spanners (`staff_spanners`) deliberately NEVER block `<sys>` so
+        system/page-crossing slurs, hairpins, and tremolos stay legal.
+        """
         if not self.sys_has_event or self.sys_count >= MAX_SYSTEMS - 1:
             return False
-        if self.has_open_tuplet():
+        if self.has_open_tuplet() or self.in_text_span:
             return False
         cur_canon = self._canonical_system_tokens()
         if not cur_canon:
@@ -547,10 +692,12 @@ class PrefixState:
         return False
 
     def can_emit_eos(self, cur_len=None, max_len=None):
-        """Return True iff <eos> is legal here (guards against empty trailing systems & unclosed tuplets)."""
+        """Return True iff <eos> is legal here (guards against empty trailing systems,
+        unclosed tuplets, and unclosed text spans; NEVER blocks on page-crossing spanners).
+        """
         if cur_len is not None and max_len is not None and cur_len >= max_len:
             return True
-        if self.has_open_tuplet():
+        if self.has_open_tuplet() or self.in_text_span:
             return False
         if (self.sys_count + 1) >= MAX_SYSTEMS:
             return True
@@ -559,7 +706,9 @@ class PrefixState:
         return bool(self.sys_has_event)
 
     def reset_system(self):
-        """Advance to a new system on ``<sys>`` while preserving cross-system cycle history."""
+        """Advance to a new system on ``<sys>`` while preserving cross-system cycle history
+        and cross-system spanner / polymeter state.
+        """
         if self.sys_has_event:
             cur_canon = self._canonical_system_tokens()
             if cur_canon:
@@ -598,9 +747,11 @@ class PrefixState:
         self.dot_seen = False
         self.opened = set()
         self.vcurs = [0.0]
+        self.vcurs_rat = [(0, 1)]
         self.vscales = [[]]
         self.pend_spans = []
         self.ev_base = None
+        self.ev_base_rat = None
         self.ev_dots = 0
         self.ev_chord = False
         self.ev_grace = False
@@ -616,6 +767,10 @@ class PrefixState:
         self.comp_num = 0
         self.comp_digits = 0
         self.comp_val = 0
+        self.in_text_span = False
+        self.txt_toks = 0
+        self.bar_txt_spans = 0
+        self.onset_spanner_starts = 0
         self.recent.append('<sys>')
         if len(self.recent) > RECENT_WINDOW_KEEP:
             del self.recent[:-RECENT_WINDOW_KEEP]
@@ -625,128 +780,211 @@ class PrefixState:
             self.seg_last.append(False)
             self.depth.append(0)
             self.vcurs.append(0.0)
+            self.vcurs_rat.append((0, 1))
             self.vscales.append([])
 
-    def _open_scale(self):
-        """Pending-event scale: open spans x queued starts (N/A each)."""
-        s = 1.0
-        for a, n in self.vscales[self.seg]:
-            s *= n / a
-        for a, n in self.pend_spans:
-            s *= n / a
-        return s
+    def _ensure_staff_spanner(self, staff_idx=None):
+        idx = self.staves_in_bar if staff_idx is None else staff_idx
+        while len(self.staff_spanners) <= idx:
+            self.staff_spanners.append(0)
+        return idx
 
-    def _drained_scale(self):
-        """Scale after queuing pending starts into this segment."""
+    def _spanner_ok(self, tok):
+        """Return True iff spanner start/stop token is legal on current staff & onset."""
+        bit = SPANNER_START_BIT.get(tok)
+        if bit is not None:
+            idx = self._ensure_staff_spanner()
+            if (self.staff_spanners[idx] & bit) or (self.onset_spanner_starts & bit):
+                return False
+            return True
+        # Spanner stops are always legal (supports page-crossing spanners started on prev page).
+        return True
+
+    def _apply_spanner(self, tok):
+        """Update per-staff u16 active-spanner bitmask and per-onset duplicate guard."""
+        bit = SPANNER_START_BIT.get(tok)
+        if bit is not None:
+            idx = self._ensure_staff_spanner()
+            if (self.staff_spanners[idx] & bit) or (self.onset_spanner_starts & bit):
+                raise ValueError('duplicate or already-active spanner start %r' % tok)
+            self.staff_spanners[idx] = (self.staff_spanners[idx] | bit) & 0xFFFF
+            self.onset_spanner_starts = (self.onset_spanner_starts | bit) & 0xFFFF
+            return
+        stop_bit = SPANNER_STOP_BIT.get(tok)
+        if stop_bit is not None:
+            idx = self._ensure_staff_spanner()
+            self.staff_spanners[idx] = (self.staff_spanners[idx] & ~stop_bit) & 0xFFFF
+
+    def _open_scale_rat(self):
+        """Exact reduced rational pending-event scale: open spans x queued starts (N/A each)."""
+        num, den = 1, 1
+        for a, n in self.vscales[self.seg]:
+            num *= n
+            den *= a
+            g = math.gcd(num, den)
+            num //= g
+            den //= g
+        for a, n in self.pend_spans:
+            num *= n
+            den *= a
+            g = math.gcd(num, den)
+            num //= g
+            den //= g
+        return (num, den)
+
+    def _open_scale(self):
+        """Float view of :meth:`_open_scale_rat` (preserved for backward-compatible callers)."""
+        num, den = self._open_scale_rat()
+        return num / den
+
+    def _drained_scale_rat(self):
+        """Exact reduced rational scale after draining pending starts into this segment."""
         self.vscales[self.seg].extend(self.pend_spans)
         del self.pend_spans[:]
-        s = 1.0
+        num, den = 1, 1
         for a, n in self.vscales[self.seg]:
-            s *= n / a
-        return s
+            num *= n
+            den *= a
+            g = math.gcd(num, den)
+            num //= g
+            den //= g
+        return (num, den)
+
+    def _drained_scale(self):
+        """Float view of :meth:`_drained_scale_rat`."""
+        num, den = self._drained_scale_rat()
+        return num / den
+
+    def _pending_value_rat(self):
+        """Exact rational projected quarters of the still-open event ((0, 1) if none)."""
+        if self.ev_base_rat is None or self.ev_chord or self.ev_grace:
+            return (0, 1)
+        return _rat_mul(
+            _rat_mul(self.ev_base_rat, _dot_mult_rat(self.ev_dots)),
+            self._open_scale_rat(),
+        )
 
     def _pending_value(self):
-        """Projected quarters of the still-open event (0 if none)."""
-        if self.ev_base is None or self.ev_chord or self.ev_grace:
-            return 0.0
-        return (self.ev_base * (2.0 - 2.0 ** (-self.ev_dots))
-                * self._open_scale())
+        """Float view of :meth:`_pending_value_rat`."""
+        num, den = self._pending_value_rat()
+        return num / den
 
-    def _beat_limit(self):
-        """Active per-voice beat ceiling (strict=tsig, lax=max(8.0, 2.5*tsig))."""
-        if self.tsig is None:
+    def _active_tsig_rat(self):
+        """Active exact rational time signature for the current staff (polymeter-aware)."""
+        r = self.tsig_rat_by_staff.get(self.staves_in_bar)
+        if r is not None:
+            return r
+        if self.tsig_rat is not None:
+            return self.tsig_rat
+        if self.tsig is not None:
+            return _float_to_rat(self.tsig)
+        return None
+
+    def _active_tsig(self):
+        """Float view of :meth:`_active_tsig_rat`."""
+        r = self._active_tsig_rat()
+        return None if r is None else (r[0] / r[1])
+
+    def _beat_limit_rat(self):
+        """Active exact rational per-voice beat ceiling (strict=tsig, lax=max(8, 5/2*tsig))."""
+        ts = self._active_tsig_rat()
+        if ts is None:
             return None
         if self.strict:
-            return self.tsig
-        return max(LAX_BAR_MIN_BEATS, LAX_BAR_MULT * self.tsig)
+            return ts
+        scaled = _rat_mul((5, 2), ts)
+        return scaled if _rat_cmp(scaled, (8, 1)) >= 0 else (8, 1)
+
+    def _beat_limit(self):
+        """Float view of :meth:`_beat_limit_rat`."""
+        r = self._beat_limit_rat()
+        return None if r is None else (r[0] / r[1])
 
     def _dot_overshoots(self):
-        """True if the open event already exceeds the active beat ceiling."""
-        limit = self._beat_limit()
-        return (limit is not None
-                and not self.ev_chord and not self.ev_grace
-                and self.ev_base is not None
-                and self.vcurs[self.seg] + self._pending_value()
-                > limit + _BAR_EPS)
+        """True if the open event already exceeds the active beat ceiling (exact rational)."""
+        limit = self._beat_limit_rat()
+        if limit is None or self.ev_chord or self.ev_grace or self.ev_base_rat is None:
+            return False
+        total = _rat_add(self.vcurs_rat[self.seg], self._pending_value_rat())
+        return _rat_cmp(total, limit) > 0
 
     def _dot_ok(self):
-        """True if one more dot keeps the open event within the beat ceiling.
-
-        Pure read (no state mutation) mirroring the projection
-        :meth:`step` checks via :meth:`_dot_overshoots` after
-        incrementing ``ev_dots``: chord tones add no duration and an
-        absent time signature disables gating, so both stay legal.
-        """
+        """True if one more dot keeps the open event within the beat ceiling (exact rational)."""
         if self.ev_dots >= MAX_DOTS_PER_EVENT:
             return False
-        limit = self._beat_limit()
+        limit = self._beat_limit_rat()
         if limit is None:
             return True
-        if self.ev_chord or self.ev_grace or self.ev_base is None:
+        if self.ev_chord or self.ev_grace or self.ev_base_rat is None:
             return True
-        val = (self.ev_base * (2.0 - 2.0 ** (-(self.ev_dots + 1)))
-               * self._open_scale())
-        return self.vcurs[self.seg] + val <= limit + _BAR_EPS
+        val = _rat_mul(
+            _rat_mul(self.ev_base_rat, _dot_mult_rat(self.ev_dots + 1)),
+            self._open_scale_rat(),
+        )
+        total = _rat_add(self.vcurs_rat[self.seg], val)
+        return _rat_cmp(total, limit) <= 0
 
     def _blocks_duration(self, base):
-        """True if undotted ``base`` quarters would overshoot the beat ceiling."""
-        limit = self._beat_limit()
+        """True if undotted ``base`` (exact rational tuple or float) would overshoot the beat ceiling."""
+        limit = self._beat_limit_rat()
         if limit is None:
             return False
-        if self.strict and round(base * self._open_scale() * 480.0) <= 0:
+        base_rat = base if isinstance(base, tuple) else _float_to_rat(base)
+        scale_rat = self._open_scale_rat()
+        ev_rat = _rat_mul(base_rat, scale_rat)
+        if self.strict and round((ev_rat[0] * 480.0) / ev_rat[1]) <= 0:
             return True
-        return (self.vcurs[self.seg] + self._pending_value()
-                + base * self._open_scale() > limit + _BAR_EPS)
+        used = _rat_add(self.vcurs_rat[self.seg], self._pending_value_rat())
+        total = _rat_add(used, ev_rat)
+        return _rat_cmp(total, limit) > 0
 
     def _bar_is_full(self):
-        """True if no further timed event can fit in the current voice/bar.
-
-        ``vcurs`` lags by one event (it only closes on the next
-        boundary token), so fullness must add the open event's
-        projected value -- otherwise a full bar of notes still offers
-        REST and traps the decoder in rest-mode with every duration
-        overshooting (all logits -inf). ``_BAR_EPS`` absorbs tuplet/dot
-        float dust.
-        """
-        limit = self._beat_limit()
+        """True if no further timed event can fit in the current voice/bar (exact rational)."""
+        limit = self._beat_limit_rat()
         if limit is None:
             return False
+        used = _rat_add(self.vcurs_rat[self.seg], self._pending_value_rat())
         if self.strict:
-            return (self.vcurs[self.seg] + self._pending_value()
-                    >= limit - _BAR_EPS)
+            return _rat_cmp(used, limit) >= 0
         # In lax mode, full only once even the shortest duration (128th)
         # would exceed the generous safety ceiling.
-        return (self.vcurs[self.seg] + self._pending_value()
-                + _WRITTEN['128th'] * self._open_scale() > limit + _BAR_EPS)
+        min_ev = _rat_mul(_WRITTEN_RAT['128th'], self._open_scale_rat())
+        return _rat_cmp(_rat_add(used, min_ev), limit) > 0
 
     def _short_pickup_time_ok(self, prev_tok=None, recent_before=None):
-        """Allow time-1-32 / time-1-16 in header, after a bar* token (allowing clef*/key* between), or when already in a short pickup bar."""
+        """Allow time-1-32 / time-1-16 in header, after a bar*/<staff> token (allowing clef*/key* between), or when already in a short pickup bar."""
         if self.header_open:
             return True
-        if self.tsig is not None and self.tsig <= 0.25 + _BAR_EPS:
+        ts = self._active_tsig_rat()
+        if ts is not None and _rat_cmp(ts, (1, 4)) <= 0:
+            return True
+        if self.tsig_rat is not None and _rat_cmp(self.tsig_rat, (1, 4)) <= 0:
             return True
         if recent_before is not None:
             for tok in reversed(recent_before):
                 if tok in CLEFS or tok in KEYS:
                     continue
-                return tok in BAR_LIKES or tok in BAR_LEFT
+                return tok in BAR_LIKES or tok in BAR_LEFT or tok == STAFF_SEP
             return True
-        return prev_tok is not None and (prev_tok in BAR_LIKES or prev_tok in BAR_LEFT)
+        return prev_tok is not None and (
+            prev_tok in BAR_LIKES or prev_tok in BAR_LEFT or prev_tok == STAFF_SEP
+        )
 
     def _header_attr_ok(self):
         """Allow key*/time-* at system start, bar start, or full-bar end (courtesy change).
 
         In lax mode (strict=False), also permits legitimate mid-bar key*/time-* changes.
         In strict mode, forbids stray mid-bar key*/time-* emitted after a note/rest inside
-        an incomplete bar (0 < cur_used < tsig - eps), while preserving opening headers,
+        an incomplete bar (0 < cur_used < tsig), while preserving opening headers,
         post-barline changes, and full-bar courtesy changes.
         """
         if not self.strict or self.header_open:
             return True
-        cur_used = self.vcurs[self.seg] + self._pending_value()
-        if cur_used <= _BAR_EPS:
+        cur_used = _rat_add(self.vcurs_rat[self.seg], self._pending_value_rat())
+        if cur_used[0] <= 0:
             return True
-        if self.tsig is not None and cur_used >= self.tsig - _BAR_EPS:
+        ts = self._active_tsig_rat()
+        if ts is not None and _rat_cmp(cur_used, ts) >= 0:
             return True
         return False
 
@@ -754,12 +992,26 @@ class PrefixState:
         self.depth[self.seg] += self.pending
         self.pending = 0
 
-    def _apply_tsig(self, beats):
-        if all(v == 0.0 for v in self.vcurs):
+    def _apply_tsig(self, beats, beats_rat=None):
+        if beats_rat is None and beats is not None:
+            beats_rat = _float_to_rat(beats)
+        if beats is None and beats_rat is not None:
+            beats = beats_rat[0] / beats_rat[1]
+        staff_idx = max(0, self.header_times - 1) if self.header_open else self.staves_in_bar
+        if all(v[0] == 0 for v in self.vcurs_rat):
             self.tsig = beats
+            self.tsig_rat = beats_rat
             self.pending_tsig = None
+            self.pending_tsig_rat = None
+            if beats is not None and beats_rat is not None:
+                self.tsig_by_staff[staff_idx] = beats
+                self.tsig_rat_by_staff[staff_idx] = beats_rat
+                self.pending_tsig_by_staff.pop(staff_idx, None)
         else:
             self.pending_tsig = beats
+            self.pending_tsig_rat = beats_rat
+            if beats is not None and beats_rat is not None:
+                self.pending_tsig_by_staff[staff_idx] = (beats, beats_rat)
 
     def _bound(self, t):
         if t == TIME_KW:
@@ -828,7 +1080,7 @@ class PrefixState:
                 self.header_times += 1
             else:
                 self.midbar_times += 1
-            self._apply_tsig(_beats_of(t))
+            self._apply_tsig(_beats_of(t), _beats_rat_of(t))
             self.last_was_time = True
             return 'bound'
         self.last_was_time = False
@@ -861,19 +1113,30 @@ class PrefixState:
             self.bar_has_bar_rest = False
             self.seg_has_bar_rest = False
             self.staves_in_bar = 0
+            self.bar_txt_spans = 0
+            self.onset_spanner_starts = 0
             self._reset_event_guards()
             # A stashed courtesy time-sig takes effect for the new
             # measure whose barline just arrived.
+            if self.pending_tsig_by_staff:
+                for _s_idx, (_pb, _pbr) in self.pending_tsig_by_staff.items():
+                    self.tsig_by_staff[_s_idx] = _pb
+                    self.tsig_rat_by_staff[_s_idx] = _pbr
+                self.pending_tsig_by_staff.clear()
             if self.pending_tsig is not None:
                 self.tsig = self.pending_tsig
+                self.tsig_rat = self.pending_tsig_rat
                 self.pending_tsig = None
+                self.pending_tsig_rat = None
             self.seg_last = [False]
             self.seg = 0
             self.depth = [0]
             self.opened = set()
             self.vcurs = [0.0]
+            self.vcurs_rat = [(0, 1)]
             self.vscales = [[]]
             self.ev_base = None
+            self.ev_base_rat = None
             self.ev_dots = 0
             self.ev_chord = False
             self.ev_grace = False
@@ -888,15 +1151,19 @@ class PrefixState:
             if self.staves_in_bar >= MAX_STAVES_PER_BAR:
                 raise ValueError('staves per bar cap exceeded (%d)' % MAX_STAVES_PER_BAR)
             self.staves_in_bar += 1
+            self._ensure_staff_spanner()
             self.seg_has_bar_rest = False
+            self.onset_spanner_starts = 0
             self._reset_event_guards()
             self.seg_last = [False]
             self.seg = 0
             self.depth = [0]
             self.opened = set()
             self.vcurs = [0.0]
+            self.vcurs_rat = [(0, 1)]
             self.vscales = [[]]
             self.ev_base = None
+            self.ev_base_rat = None
             self.ev_dots = 0
             self.ev_chord = False
             self.ev_grace = False
@@ -925,10 +1192,11 @@ class PrefixState:
             self.chords_on_onset = 0
             self.grace_run = 0
             self.seg_has_bar_rest = False
+            self.onset_spanner_starts = 0
             self.voice_switch_run += 1
             return 'bound'
         if t in TUPLET_STARTS:
-            if (self.depth[self.seg] + self.pending >= 1) or (
+            if (self.depth[self.seg] + self.pending >= self.max_tuplet_depth) or (
                     self.strict and self._bar_is_full()):
                 raise ValueError('tuplet-start blocked (chained/full bar): %r' % t)
             self.pending += 1
@@ -936,13 +1204,15 @@ class PrefixState:
             self.pend_spans.append((int(a), int(n)))
             return 'bound'
         if t == TUP_OPEN:
-            if (self.depth[self.seg] + self.pending >= 1) or (
+            if (self.depth[self.seg] + self.pending >= self.max_tuplet_depth) or (
                     self.strict and self._bar_is_full()):
                 raise ValueError('tup-open blocked (chained/full bar): %r' % t)
             self.comp_num = 0
+            self.comp_digits = 0
+            self.comp_val = 0
             return 'tup-open-a'
         if t == TUPLET_KW:
-            if (self.depth[self.seg] + self.pending >= 1) or (
+            if (self.depth[self.seg] + self.pending >= self.max_tuplet_depth) or (
                     self.strict and self._bar_is_full()):
                 raise ValueError('tuplet-start blocked (chained/full bar): %r' % t)
             self.comp_num = 0
@@ -953,14 +1223,16 @@ class PrefixState:
             self.sys_has_event = True
             self._reset_event_guards()
             self._drain()
-            self._drained_scale()
+            self._drained_scale_rat()
             self.ev_base = None
+            self.ev_base_rat = None
             self.ev_dots = 0
             self.ev_mods = 0
             self.ev_alters = 0
             self.seg_last[self.seg] = False
             self.chords_on_onset = 0
             self.grace_run = 0
+            self.onset_spanner_starts = 0
             self.comp_num = 0
             self.comp_digits = 0
             self.comp_val = 0
@@ -979,16 +1251,27 @@ class PrefixState:
             self.chords_on_onset = 0
             self._reset_event_guards()
             return 'grace'
-        if t in DIR_TOKENS or (
+        if t in TEXT_TAG_OPENS:
+            if TXT_CLOSE not in self.vocab_map:
+                raise ValueError('text span %r without </txt> in vocab' % t)
+            if self.bar_txt_spans >= MAX_TEXT_SPANS_PER_BAR:
+                raise ValueError('text spans per bar cap exceeded (%d)' % MAX_TEXT_SPANS_PER_BAR)
+            self.in_text_span = True
+            self.txt_toks = 0
+            self.bar_txt_spans += 1
+            return 'text'
+        if t in DIR_TOKENS or t in SPANNER_DIR_TOKENS or (
                 self.allow_percussion_tab and t in SLASH_MARKS):
             # Measure dynamics, hairpin wedges, ottava spans, volta brackets
             # and opening repeats: measure/staff scope with anti-loop caps.
-            if t in DIR_TOKENS:
+            if t in DIR_TOKENS or t in SPANNER_DIR_TOKENS:
                 # step() appends t to recent before dispatch; compare against
                 # recent[-2] and last_dir_tok to block consecutive identical spam.
                 prev_tok = self.recent[-2] if len(self.recent) >= 2 else None
                 if self.dir_run >= MAX_CONSEC_DIR_TOKENS or self.last_dir_tok == t or prev_tok == t:
                     raise ValueError('consecutive or capped direction token %r' % t)
+                if t in SPANNER_DIR_TOKENS:
+                    self._apply_spanner(t)
                 self.dir_run += 1
                 self.last_dir_tok = t
             return 'bound'
@@ -1009,7 +1292,7 @@ class PrefixState:
             self._reset_event_guards()
             self._drain()
             if t in DURATIONS:
-                if self._blocks_duration(_WRITTEN[t]):
+                if self._blocks_duration(_WRITTEN_RAT[t]):
                     raise ValueError(
                         'duration overshoots bar: %.4f + %.4f > %.4f'
                         % (self.vcurs[self.seg],
@@ -1017,23 +1300,27 @@ class PrefixState:
                 self.alter_seen = False
                 self.dot_seen = False
                 self.ev_base = _WRITTEN[t]
+                self.ev_base_rat = _WRITTEN_RAT[t]
                 self.ev_dots = 0
                 self.ev_grace = False
                 self.ev_mods = 0
                 self.ev_alters = 0
                 self.chords_on_onset = 0
                 self.grace_run = 0
+                self.onset_spanner_starts = 0
                 self.bar_has_pitched = True
                 self.consec_bar_rest_bars = 0
                 self.seg_has_bar_rest = False
                 return 'dur'
             if t == REST:
                 self.ev_base = None
+                self.ev_base_rat = None
                 self.ev_dots = 0
                 self.ev_mods = 0
                 self.ev_alters = 0
                 self.chords_on_onset = 0
                 self.grace_run = 0
+                self.onset_spanner_starts = 0
                 self.seg_has_bar_rest = False
                 return 'rest'
             if self.seg_has_bar_rest:
@@ -1042,19 +1329,22 @@ class PrefixState:
                 raise ValueError(
                     'consecutive bar-rest cap exceeded (%d)' % MAX_CONSECUTIVE_BAR_REST
                 )
-            if self.strict and (self._bar_is_full() or self.vcurs[self.seg] > _BAR_EPS):
+            if self.strict and (self._bar_is_full() or self.vcurs_rat[self.seg][0] > 0):
                 raise ValueError('bar-rest blocked in non-empty/full bar')
-            self._drained_scale()
-            if self.tsig is not None:
-                self.vcurs[self.seg] = max(self.vcurs[self.seg],
-                                           self.tsig)
+            self._drained_scale_rat()
+            ts_rat = self._active_tsig_rat()
+            if ts_rat is not None and _rat_cmp(ts_rat, self.vcurs_rat[self.seg]) > 0:
+                self.vcurs_rat[self.seg] = ts_rat
+                self.vcurs[self.seg] = ts_rat[0] / ts_rat[1]
             self.ev_base = None
+            self.ev_base_rat = None
             self.ev_dots = 0
             self.ev_mods = 0
             self.ev_alters = 0
             self.seg_last[self.seg] = False
             self.chords_on_onset = 0
             self.grace_run = 0
+            self.onset_spanner_starts = 0
             self.bar_has_bar_rest = True
             self.seg_has_bar_rest = True
             return 'bound'
@@ -1088,6 +1378,7 @@ class PrefixState:
             self.alter_seen = False
             self.dot_seen = False
             self.ev_base = _WRITTEN[t]
+            self.ev_base_rat = _WRITTEN_RAT[t]
             self.ev_dots = 0
             self.ev_mods = 0
             self.ev_alters = 0
@@ -1103,6 +1394,7 @@ class PrefixState:
             self.alter_seen = False
             self.dot_seen = False
             self.ev_base = _WRITTEN[t]
+            self.ev_base_rat = _WRITTEN_RAT[t]
             self.ev_dots = 0
             self.ev_mods = 0
             self.ev_alters = 0
@@ -1112,7 +1404,7 @@ class PrefixState:
             if t not in DURATIONS:
                 raise ValueError('unpitched without duration %r' % t)
             self._drain()
-            if not self.ev_grace and self._blocks_duration(_WRITTEN[t]):
+            if not self.ev_grace and self._blocks_duration(_WRITTEN_RAT[t]):
                 raise ValueError(
                     'duration overshoots bar: %.4f + %.4f > %.4f'
                     % (self.vcurs[self.seg],
@@ -1120,6 +1412,7 @@ class PrefixState:
             self.alter_seen = False
             self.dot_seen = False
             self.ev_base = _WRITTEN[t]
+            self.ev_base_rat = _WRITTEN_RAT[t]
             self.ev_dots = 0
             self.ev_mods = 0
             self.ev_alters = 0
@@ -1154,15 +1447,17 @@ class PrefixState:
                         raise ValueError(
                             'dot overshoots bar: %.4f > %.4f'
                             % (self.vcurs[self.seg]
-                               + self._pending_value(), self.tsig))
+                               + self._pending_value(), self._active_tsig()))
                 return
-            if t in MODS or (self.allow_percussion_tab and (
+            if t in MODS or t in SPANNER_MOD_TOKENS or (self.allow_percussion_tab and (
                     t in NOTEHEADS or t in TAB_STRINGS or t in TAB_FRETS)):
                 # Slur/articulation/ornament/cue/xstaff/fermata marks (plus
-                # opt-in Gate-D notehead/tab string/fret marks): tail position,
-                # capped per event to prevent unbounded modifier loops.
+                # bekern-full numbered spanners & opt-in Gate-D notehead/tab marks):
+                # tail position, capped per event to prevent unbounded modifier loops.
                 if self.ev_mods >= MAX_MODS_PER_EVENT:
                     raise ValueError('modifier cap exceeded (%d)' % MAX_MODS_PER_EVENT)
+                if t in SPANNER_MOD_TOKENS:
+                    self._apply_spanner(t)
                 self.ev_mods += 1
                 return
             if t == TIE_START:
@@ -1179,9 +1474,11 @@ class PrefixState:
                 self._close_event(True)
                 self.mode = 'bound'
                 return
-            if t in MODS:
+            if t in MODS or t in SPANNER_MOD_TOKENS:
                 if self.ev_mods >= MAX_MODS_PER_EVENT:
                     raise ValueError('modifier cap exceeded (%d)' % MAX_MODS_PER_EVENT)
+                if t in SPANNER_MOD_TOKENS:
+                    self._apply_spanner(t)
                 self.ev_mods += 1
                 return
             self._close_event(True)
@@ -1189,12 +1486,13 @@ class PrefixState:
         elif self.mode == 'rest':
             if t not in DURATIONS:
                 raise ValueError('bad rest duration %r' % t)
-            if self._blocks_duration(_WRITTEN[t]):
+            if self._blocks_duration(_WRITTEN_RAT[t]):
                 raise ValueError(
                     'duration overshoots bar: %.4f + %.4f > %.4f'
                     % (self.vcurs[self.seg],
                        _WRITTEN[t] * self._open_scale(), self._beat_limit()))
             self.ev_base = _WRITTEN[t]
+            self.ev_base_rat = _WRITTEN_RAT[t]
             self.ev_dots = 0
             self.ev_mods = 0
             self.ev_alters = 0
@@ -1208,28 +1506,110 @@ class PrefixState:
                     raise ValueError(
                         'dot overshoots bar: %.4f > %.4f'
                         % (self.vcurs[self.seg]
-                           + self._pending_value(), self.tsig))
+                           + self._pending_value(), self._active_tsig()))
                 return
-            if t in MODS:
+            if t in MODS or t in SPANNER_MOD_TOKENS:
                 # Fermatas / cue / xstaff / articulations over rests ride the rest tail.
                 if self.ev_mods >= MAX_MODS_PER_EVENT:
                     raise ValueError('modifier cap exceeded (%d)' % MAX_MODS_PER_EVENT)
+                if t in SPANNER_MOD_TOKENS:
+                    self._apply_spanner(t)
                 self.ev_mods += 1
                 return
             self._close_event(False)
             self.mode = self._bound(t)
+        elif self.mode == 'text':
+            if t == TXT_CLOSE:
+                self.in_text_span = False
+                self.txt_toks = 0
+                self.mode = 'bound'
+                return
+            if self.txt_toks >= MAX_TXT_TOKENS:
+                raise ValueError('text span token cap exceeded (%d)' % MAX_TXT_TOKENS)
+            if t in _TEXT_FORBIDDEN:
+                raise ValueError('forbidden token %r inside text span' % t)
+            self.txt_toks += 1
+            return
         elif self.mode == 'tup-open-a':
-            if t not in TUP_OPEN_DIGITS:
-                raise ValueError('bad tup-open actual digit %r' % t)
-            self.comp_num = int(t)
-            self.mode = 'tup-open-n'
+            if SLASH in self.vocab_map:
+                if t == SLASH:
+                    if self.comp_digits == 0 or self.comp_val <= 0 or self.comp_val > MAX_TUPLET_VAL:
+                        raise ValueError('tup-open slash without valid actual count')
+                    self.comp_num = self.comp_val
+                    self.comp_digits = 0
+                    self.comp_val = 0
+                    self.mode = 'tup-open-n'
+                elif t in DIGITS:
+                    if self.comp_digits == 0 and t == '0':
+                        raise ValueError('leading zero in tup-open actual')
+                    if self.comp_digits >= 2:
+                        raise ValueError('tup-open actual too many digits')
+                    new_val = self.comp_val * 10 + int(t)
+                    if new_val > MAX_TUPLET_VAL:
+                        raise ValueError('tup-open actual %d exceeds cap %d' % (new_val, MAX_TUPLET_VAL))
+                    self.comp_val = new_val
+                    self.comp_digits += 1
+                else:
+                    raise ValueError('bad tup-open actual token %r' % t)
+            else:
+                valid_digs = NONZERO_DIGITS if '9' in self.vocab_map else TUP_OPEN_DIGITS
+                if t not in valid_digs:
+                    raise ValueError('bad tup-open actual digit %r' % t)
+                self.comp_num = int(t)
+                self.mode = 'tup-open-n'
         elif self.mode == 'tup-open-n':
-            if t not in TUP_OPEN_DIGITS:
-                raise ValueError('bad tup-open normal digit %r' % t)
-            self.pending += 1
-            self.pend_spans.append((self.comp_num, int(t)))
-            self.comp_num = 0
-            self.mode = 'bound'
+            if SLASH in self.vocab_map:
+                if t in DIGITS:
+                    if self.comp_digits == 0 and t == '0':
+                        raise ValueError('leading zero in tup-open normal')
+                    if self.comp_digits >= 2:
+                        raise ValueError('tup-open normal too many digits')
+                    new_val = self.comp_val * 10 + int(t)
+                    if new_val > MAX_TUPLET_VAL:
+                        raise ValueError('tup-open normal %d exceeds cap %d' % (new_val, MAX_TUPLET_VAL))
+                    if self.comp_digits == 1:
+                        if new_val == self.comp_num:
+                            raise ValueError('identity tuplet %d:%d forbidden' % (self.comp_num, new_val))
+                        self.pending += 1
+                        self.pend_spans.append((self.comp_num, new_val))
+                        self.comp_num = 0
+                        self.comp_digits = 0
+                        self.comp_val = 0
+                        self.mode = 'bound'
+                    elif new_val * 10 > MAX_TUPLET_VAL:
+                        if new_val == self.comp_num:
+                            raise ValueError('identity tuplet %d:%d forbidden' % (self.comp_num, new_val))
+                        self.pending += 1
+                        self.pend_spans.append((self.comp_num, new_val))
+                        self.comp_num = 0
+                        self.comp_digits = 0
+                        self.comp_val = 0
+                        self.mode = 'bound'
+                    else:
+                        self.comp_val = new_val
+                        self.comp_digits = 1
+                else:
+                    if self.comp_digits == 0:
+                        raise ValueError('tup-open normal missing before %r' % t)
+                    if self.comp_val == self.comp_num:
+                        raise ValueError('identity tuplet %d:%d forbidden' % (self.comp_num, self.comp_val))
+                    self.pending += 1
+                    self.pend_spans.append((self.comp_num, self.comp_val))
+                    self.comp_num = 0
+                    self.comp_digits = 0
+                    self.comp_val = 0
+                    self.mode = self._bound(t)
+            else:
+                valid_digs = NONZERO_DIGITS if '9' in self.vocab_map else TUP_OPEN_DIGITS
+                if t not in valid_digs:
+                    raise ValueError('bad tup-open normal digit %r' % t)
+                norm_val = int(t)
+                if (self.max_tuplet_depth > 1 or '9' in self.vocab_map) and norm_val == self.comp_num:
+                    raise ValueError('identity tuplet %d:%d forbidden' % (self.comp_num, norm_val))
+                self.pending += 1
+                self.pend_spans.append((self.comp_num, norm_val))
+                self.comp_num = 0
+                self.mode = 'bound'
         elif self.mode == 'time-num':
             if t == SLASH:
                 if self.comp_digits == 0 or self.comp_val <= 0:
@@ -1255,7 +1635,10 @@ class PrefixState:
                     self.comp_val = int(t)
                     self.comp_digits = 1
                     if self.comp_val in (2, 4, 8):
-                        self._apply_tsig(self.comp_num * 4.0 / self.comp_val)
+                        self._apply_tsig(
+                            self.comp_num * 4.0 / self.comp_val,
+                            _rat_reduce(self.comp_num * 4, self.comp_val),
+                        )
                         self.comp_num = 0
                         self.comp_digits = 0
                         self.comp_val = 0
@@ -1265,7 +1648,10 @@ class PrefixState:
                     den = self.comp_val * 10 + int(t)
                     if den not in (16, 32, 64):
                         raise ValueError('bad time denominator %d' % den)
-                    self._apply_tsig(self.comp_num * 4.0 / den)
+                    self._apply_tsig(
+                        self.comp_num * 4.0 / den,
+                        _rat_reduce(self.comp_num * 4, den),
+                    )
                     self.comp_num = 0
                     self.comp_digits = 0
                     self.comp_val = 0
@@ -1275,7 +1661,10 @@ class PrefixState:
                     raise ValueError('time denominator too many digits')
             else:
                 if self.comp_digits == 1 and self.comp_val == 1:
-                    self._apply_tsig(self.comp_num * 4.0)
+                    self._apply_tsig(
+                        self.comp_num * 4.0,
+                        _rat_reduce(self.comp_num * 4, 1),
+                    )
                     self.comp_num = 0
                     self.comp_digits = 0
                     self.comp_val = 0
@@ -1346,23 +1735,27 @@ class PrefixState:
 
     def _close_event(self, placed):
         self.seg_last[self.seg] = placed
-        if self.ev_base is not None:
+        if self.ev_base_rat is not None:
             # Queued tuplet starts open on this event's segment
             # (mirrors decode.rs: spans drain into every event,
             # chord tones included); chord tones add no duration.
-            scale = self._drained_scale()
+            scale_rat = self._drained_scale_rat()
             if not self.ev_chord and not self.ev_grace:
-                val = (self.ev_base * (2.0 - 2.0 ** (-self.ev_dots))
-                       * scale)
-                limit = self._beat_limit()
-                if (limit is not None
-                        and self.vcurs[self.seg] + val
-                        > limit + _BAR_EPS):
+                val_rat = _rat_mul(
+                    _rat_mul(self.ev_base_rat, _dot_mult_rat(self.ev_dots)),
+                    scale_rat,
+                )
+                limit_rat = self._beat_limit_rat()
+                new_cur = _rat_add(self.vcurs_rat[self.seg], val_rat)
+                if limit_rat is not None and _rat_cmp(new_cur, limit_rat) > 0:
                     raise ValueError(
                         'duration overshoots bar: %.4f + %.4f > %.4f'
-                        % (self.vcurs[self.seg], val, limit))
-                self.vcurs[self.seg] += val
+                        % (self.vcurs[self.seg], val_rat[0] / val_rat[1],
+                           limit_rat[0] / limit_rat[1]))
+                self.vcurs_rat[self.seg] = new_cur
+                self.vcurs[self.seg] = new_cur[0] / new_cur[1]
         self.ev_base = None
+        self.ev_base_rat = None
         self.ev_dots = 0
         self.ev_chord = False
         self.ev_grace = False
@@ -1494,7 +1887,7 @@ class PrefixState:
                         allow.add(vm[TUP_CLOSE])
                 elif self.pending > 0:
                     for t in DURATIONS:
-                        if t in vm and not self._blocks_duration(_WRITTEN[t]):
+                        if t in vm and not self._blocks_duration(_WRITTEN_RAT[t]):
                             allow.add(vm[t])
                 return
             if bar_tok_capped:
@@ -1505,7 +1898,7 @@ class PrefixState:
                         allow.add(vm[TUP_CLOSE])
                 elif self.pending > 0:
                     for t in DURATIONS:
-                        if t in vm and not self._blocks_duration(_WRITTEN[t]):
+                        if t in vm and not self._blocks_duration(_WRITTEN_RAT[t]):
                             allow.add(vm[t])
                 else:
                     allow.add(vm[BAR])
@@ -1535,7 +1928,7 @@ class PrefixState:
                                 and _vn not in self.opened:
                             continue
                     allow.add(vm[_vt])
-            if not (self.depth[self.seg] + self.pending >= 1
+            if not (self.depth[self.seg] + self.pending >= self.max_tuplet_depth
                     or (self.strict and self._bar_is_full())):
                 allow.update(vm[t] for t in TUPLET_STARTS if t in vm)
                 if TUP_OPEN in vm:
@@ -1543,7 +1936,7 @@ class PrefixState:
                 if TUPLET_KW in vm:
                     allow.add(vm[TUPLET_KW])
             for t in DURATIONS:
-                if t in vm and not self._blocks_duration(_WRITTEN[t]):
+                if t in vm and not self._blocks_duration(_WRITTEN_RAT[t]):
                     allow.add(vm[t])
             # T2.4b: a full bar must not offer REST -- entering
             # rest-mode with every duration overshooting traps the
@@ -1553,7 +1946,7 @@ class PrefixState:
             # Iter-7/8 anti-loop: forbid BAR_REST when consecutive pure-rest
             # bars hit MAX_CONSECUTIVE_BAR_REST (both modes), when this voice
             # segment already emitted a bar-rest, or when strict bar is full / non-empty.
-            cur_used = self.vcurs[self.seg] + self._pending_value()
+            cur_used_rat = _rat_add(self.vcurs_rat[self.seg], self._pending_value_rat())
             bar_rest_capped = (
                 self.seg_has_bar_rest
                 or (
@@ -1562,7 +1955,7 @@ class PrefixState:
                 )
             )
             if not bar_rest_capped and not (
-                self.strict and (self._bar_is_full() or cur_used > _BAR_EPS)
+                self.strict and (self._bar_is_full() or cur_used_rat[0] > 0)
             ):
                 allow.add(vm[BAR_REST])
                 if MULTIREST_KW in vm:
@@ -1593,6 +1986,13 @@ class PrefixState:
             for t in DIR_TOKENS:
                 if t in vm and self._dir_token_ok(t):
                     allow.add(vm[t])
+            for t in SPANNER_DIR_TOKENS:
+                if t in vm and self._dir_token_ok(t) and self._spanner_ok(t):
+                    allow.add(vm[t])
+            if TXT_CLOSE in vm and self.bar_txt_spans < MAX_TEXT_SPANS_PER_BAR:
+                for t in TEXT_TAG_OPENS:
+                    if t in vm:
+                        allow.add(vm[t])
             if self.allow_percussion_tab:
                 if self._header_clef_ok():
                     allow.update(vm[t] for t in TAB_CLEFS if t in vm)
@@ -1603,6 +2003,14 @@ class PrefixState:
         if self.mode == 'bound':
             add_boundary()
             return allow, eos_ok
+        if self.mode == 'text':
+            if TXT_CLOSE in vm:
+                allow.add(vm[TXT_CLOSE])
+            if self.txt_toks < MAX_TXT_TOKENS and not (bar_tok_capped or sys_capped):
+                for tok, tid in vm.items():
+                    if tok not in _TEXT_FORBIDDEN:
+                        allow.add(tid)
+            return allow, False
         if self.mode == 'grace':
             # Display-only duration follows a grace marker (never
             # strict-gated: grace steals no time).
@@ -1612,7 +2020,7 @@ class PrefixState:
             return allow, False
         if self.mode == 'unpitched':
             for t in DURATIONS:
-                if t in vm and (self.ev_grace or not self._blocks_duration(_WRITTEN[t])):
+                if t in vm and (self.ev_grace or not self._blocks_duration(_WRITTEN_RAT[t])):
                     allow.add(vm[t])
             return allow, False
         if self.mode == 'chord':
@@ -1637,6 +2045,9 @@ class PrefixState:
                 allow.add(vm[TIE_STOP])
                 if self.ev_mods < MAX_MODS_PER_EVENT:
                     allow.update(vm[t] for t in MODS if t in vm)
+                    for t in SPANNER_MOD_TOKENS:
+                        if t in vm and self._spanner_ok(t):
+                            allow.add(vm[t])
                     if self.allow_percussion_tab:
                         allow.update(vm[t] for t in NOTEHEADS | TAB_STRINGS | TAB_FRETS
                                      if t in vm)
@@ -1647,6 +2058,9 @@ class PrefixState:
                 allow.add(vm[TIE_STOP])
                 if self.ev_mods < MAX_MODS_PER_EVENT:
                     allow.update(vm[t] for t in MODS if t in vm)
+                    for t in SPANNER_MOD_TOKENS:
+                        if t in vm and self._spanner_ok(t):
+                            allow.add(vm[t])
             add_boundary(placed=True)
             return allow, eos_ok
         if self.mode == 'rest':
@@ -1657,7 +2071,7 @@ class PrefixState:
                 # never reports full.
                 return allow, False
             for t in DURATIONS:
-                if t in vm and not self._blocks_duration(_WRITTEN[t]):
+                if t in vm and not self._blocks_duration(_WRITTEN_RAT[t]):
                     allow.add(vm[t])
             return allow, False
         if self.mode == 'rest-tail':
@@ -1666,11 +2080,59 @@ class PrefixState:
                     allow.add(vm[DOT])
                 if self.ev_mods < MAX_MODS_PER_EVENT:
                     allow.update(vm[t] for t in MODS if t in vm)
+                    for t in SPANNER_MOD_TOKENS:
+                        if t in vm and self._spanner_ok(t):
+                            allow.add(vm[t])
             add_boundary()
             return allow, eos_ok
-        if self.mode in ('tup-open-a', 'tup-open-n'):
-            allow.update(vm[t] for t in TUP_OPEN_DIGITS if t in vm)
+        if self.mode == 'tup-open-a':
+            if SLASH in vm:
+                if self.comp_digits == 0:
+                    allow.update(vm[t] for t in NONZERO_DIGITS if t in vm)
+                elif self.comp_digits == 1:
+                    allow.add(vm[SLASH])
+                    for d in DIGITS:
+                        if d in vm and (self.comp_val * 10 + int(d)) <= MAX_TUPLET_VAL:
+                            allow.add(vm[d])
+                else:
+                    allow.add(vm[SLASH])
+            else:
+                valid_digs = NONZERO_DIGITS if '9' in vm else TUP_OPEN_DIGITS
+                allow.update(vm[t] for t in valid_digs if t in vm)
             return allow, False
+        if self.mode == 'tup-open-n':
+            if SLASH in vm:
+                if self.comp_digits == 0:
+                    for d in NONZERO_DIGITS:
+                        if d not in vm:
+                            continue
+                        di = int(d)
+                        if di != self.comp_num or di * 10 <= MAX_TUPLET_VAL:
+                            allow.add(vm[d])
+                    return allow, False
+                # comp_digits == 1 (1 <= comp_val <= 3, since >= 4 commits immediately)
+                for d in DIGITS:
+                    if d not in vm:
+                        continue
+                    nv = self.comp_val * 10 + int(d)
+                    if nv <= MAX_TUPLET_VAL and nv != self.comp_num:
+                        allow.add(vm[d])
+                if self.comp_val != self.comp_num:
+                    self.pending += 1
+                    self.pend_spans.append((self.comp_num, self.comp_val))
+                    try:
+                        add_boundary()
+                    finally:
+                        self.pending -= 1
+                        self.pend_spans.pop()
+                return allow, False
+            else:
+                valid_digs = NONZERO_DIGITS if '9' in vm else TUP_OPEN_DIGITS
+                ban_eq = (self.max_tuplet_depth > 1 or '9' in vm)
+                for d in valid_digs:
+                    if d in vm and (not ban_eq or int(d) != self.comp_num):
+                        allow.add(vm[d])
+                return allow, False
         if self.mode == 'time-num':
             if self.comp_digits == 0:
                 allow.update(vm[t] for t in NONZERO_DIGITS if t in vm)
