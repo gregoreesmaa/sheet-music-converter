@@ -506,6 +506,28 @@ class TestBekernV2AFSA(unittest.TestCase):
             self.assertIn("<score-partwise", xml_text)
             self.assertIn("</score-partwise>", xml_text)
 
+    # ------------------------------------------------------------------
+    # 8. Orchestral >8-staff opening header support (MAX_HEADER_STAVES_DEFAULT=24)
+    # ------------------------------------------------------------------
+
+    def test_orchestral_header_up_to_24_staves_allowed_on_system_1(self) -> None:
+        """System 1 opening headers with >8 staves (up to 24) must not be blocked."""
+        self.assertEqual(grammar.MAX_HEADER_STAVES_DEFAULT, 24)
+        self.assertEqual(grammar.MAX_HEADER_STAVES_DEFAULT, grammar.MAX_STAVES_PER_BAR)
+        for strict in (False, True):
+            st = grammar.PrefixState(strict=strict)
+            for s in range(16):
+                clef = "clef-G-2" if s < 12 else "clef-F-4"
+                for tok in (clef, "key+0", "time-4-4"):
+                    allow, _ = st.allowed()
+                    self.assertIn(
+                        _T[tok],
+                        allow,
+                        f"strict={strict} staff={s + 1} header token {tok!r} blocked",
+                    )
+                    st.step(tok)
+            self.assertFalse(st.broken)
+
 
 if __name__ == "__main__":
     unittest.main()
