@@ -248,6 +248,7 @@ class ViRTwoTierRouter(nn.Module):
         router_hidden: int = 64,
         merge_temp: float = 0.25,
         spatial_gamma: float = 2.0,
+        adaptive_ink_target: bool = True,
     ) -> None:
         super().__init__()
         if not (0.0 < keep_ratio <= 1.0):
@@ -273,6 +274,7 @@ class ViRTwoTierRouter(nn.Module):
         self.n_bg_summary = int(k_coarse)  # Drop-in alias for HybridAxialMergerEncoder telemetry
         self.merge_temp = float(max(1e-3, merge_temp))
         self.spatial_gamma = float(max(0.0, spatial_gamma))
+        self.adaptive_ink_target = bool(adaptive_ink_target)
 
         hidden = max(32, int(router_hidden))
         self.saliency_net = nn.Sequential(
@@ -381,7 +383,17 @@ class ViRTwoTierRouter(nn.Module):
                 images, H_m, W_m
             )
             score = score * paper_gate
-            ink_target = ((local_ink_grid > 0.04).to(torch.float32) * effective_paper_f)
+            if getattr(self, "adaptive_ink_target", False):
+                flat_ink = local_ink_grid.flatten(1)
+                paper_flat = effective_paper_f.flatten(1)
+                paper_cnt = paper_flat.sum(dim=-1, keepdim=True).clamp(min=1.0)
+                mean_ink = (flat_ink * paper_flat).sum(dim=-1, keepdim=True) / paper_cnt
+                var_ink = ((flat_ink - mean_ink) * (flat_ink - mean_ink) * paper_flat).sum(dim=-1, keepdim=True) / paper_cnt
+                std_ink = torch.sqrt(var_ink.clamp(min=0.0))
+                ink_thr = (mean_ink + 0.5 * std_ink).clamp(min=0.08, max=0.20).view(B, 1, 1, 1)
+                ink_target = ((local_ink_grid > ink_thr).to(torch.float32) * effective_paper_f)
+            else:
+                ink_target = ((local_ink_grid > 0.04).to(torch.float32) * effective_paper_f)
             if self.use_ink_prior and saliency_map is None:
                 flat_f = local_ink_grid.flatten(1)
                 mean_f = flat_f.mean(dim=-1, keepdim=True)

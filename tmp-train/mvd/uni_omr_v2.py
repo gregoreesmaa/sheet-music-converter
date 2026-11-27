@@ -288,6 +288,7 @@ class UniOMRv2Config:
     max_mem_tokens: int = 10240
     n_bg_summary: int = 4
     use_ink_prior: bool = True
+    adaptive_ink_target: bool = True
     router_hidden: int = 64
     vrfm_band_alpha: float = 0.30
 
@@ -821,6 +822,7 @@ class InkTokenRouterV2(nn.Module):
         max_mem_tokens: int = 10240,
         router_hidden: int = 64,
         vrfm_band_alpha: float = 0.30,
+        adaptive_ink_target: bool = True,
     ) -> None:
         super().__init__()
         if not (0.0 < keep_ratio <= 1.0):
@@ -835,6 +837,7 @@ class InkTokenRouterV2(nn.Module):
         self.use_ink_prior = bool(use_ink_prior)
         self.max_mem_tokens = int(max_mem_tokens)
         self.vrfm_band_alpha = float(max(0.0, vrfm_band_alpha))
+        self.adaptive_ink_target = bool(adaptive_ink_target)
 
         hidden = max(32, int(router_hidden))
         self.saliency_net = nn.Sequential(
@@ -949,7 +952,22 @@ class InkTokenRouterV2(nn.Module):
             local_ink_grid = local_ink_grid.to(saliency_logits.dtype)
             paper_gate = paper_gate.to(saliency_logits.dtype)
             saliency_prob = saliency_prob * paper_gate
-            ink_target = ((local_ink_grid > 0.04) & paper_mask_grid).to(saliency_logits.dtype)
+            if getattr(self, "adaptive_ink_target", False):
+                flat_ink = local_ink_grid.flatten(1).float()
+                paper_f = paper_mask_grid.flatten(1).float()
+                paper_cnt = paper_f.sum(dim=-1, keepdim=True).clamp(min=1.0)
+                mean_ink = (flat_ink * paper_f).sum(dim=-1, keepdim=True) / paper_cnt
+                var_ink = (((flat_ink - mean_ink) ** 2) * paper_f).sum(dim=-1, keepdim=True) / paper_cnt
+                std_ink = torch.sqrt(var_ink.clamp(min=0.0))
+                ink_thr = (
+                    (mean_ink + 0.5 * std_ink)
+                    .clamp(min=0.08, max=0.20)
+                    .view(B, 1, 1, 1)
+                    .to(local_ink_grid.dtype)
+                )
+                ink_target = ((local_ink_grid > ink_thr) & paper_mask_grid).to(saliency_logits.dtype)
+            else:
+                ink_target = ((local_ink_grid > 0.04) & paper_mask_grid).to(saliency_logits.dtype)
             if self.use_ink_prior:
                 flat_f = local_ink_grid.flatten(1).float()
                 denom = (
@@ -1150,6 +1168,7 @@ class HybridAxialMergerEncoder(nn.Module):
             max_mem_tokens=cfg.max_mem_tokens,
             router_hidden=cfg.router_hidden,
             vrfm_band_alpha=cfg.vrfm_band_alpha,
+            adaptive_ink_target=bool(getattr(cfg, "adaptive_ink_target", False)),
         )
 
         self.rope2d = AspectNormalizedRoPE2D(
@@ -2018,6 +2037,7 @@ class UniOMRv2Net(nn.Module):
                 (torch.rand_like(inp_ids, dtype=torch.float32) < self.cfg.tok_dropout)
                 & (inp_ids != PAD_ID)
                 & (inp_ids != BOS_ID)
+                & (inp_ids != EOS_ID)
             )
             rand_toks = torch.randint(0, len(data.VOCAB), inp_ids.shape, device=inp_ids.device, dtype=inp_ids.dtype)
             inp_ids = torch.where(drop_mask, rand_toks, inp_ids)
@@ -2242,15 +2262,18 @@ class UniOMRv2Net(nn.Module):
                 shift = idx + 1
                 if T > shift:
                     shifted_tgts[idx, :, :-shift] = targets[:, shift:]
-            mtp_loss = torch.nan_to_num(
-                F.cross_entropy(
-                    mtp_stacked.reshape(-1, V),
-                    shifted_tgts.reshape(-1),
-                    ignore_index=PAD_ID,
-                    label_smoothing=ls,
-                ),
-                nan=0.0,
+            shifted_flat = shifted_tgts.reshape(-1)
+            mtp_valid = (shifted_flat != PAD_ID).to(torch.float32)
+            mtp_per_tok = F.cross_entropy(
+                mtp_stacked.reshape(-1, V),
+                shifted_flat,
+                ignore_index=PAD_ID,
+                label_smoothing=ls,
+                reduction="none",
             )
+            mtp_loss = (
+                (mtp_per_tok.float() * mtp_valid).sum() / mtp_valid.sum().clamp(min=1.0)
+            ).to(logits.dtype)
         else:
             mtp_loss = logits.new_zeros(())
 

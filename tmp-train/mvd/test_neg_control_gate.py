@@ -100,7 +100,7 @@ class TestNegControlGate(unittest.TestCase):
 
     def test_rotated_real_staff_and_notes_accepted(self) -> None:
         base = _make_real_staff_and_notes(width=1200, height=1650)
-        for angle in (-3.0, 3.0):
+        for angle in (-8.0, -6.0, -3.0, 3.0, 6.0, 8.0):
             with self.subTest(angle=angle):
                 rot = base.rotate(
                     angle,

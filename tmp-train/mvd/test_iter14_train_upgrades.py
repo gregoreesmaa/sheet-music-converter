@@ -31,14 +31,17 @@ from uni_omr import (  # noqa: E402
     BOS_ID,
     EOS_ID,
     PAD_ID,
+    SYS_ID,
     VOCAB_SIZE,
+    GPUEmaShadow,
     UniFullPageDataset,
     UniOMRConfig,
     UniOMRNet,
     UniStripDataset,
     make_sample_id,
 )
-from uni_omr_v2 import UniOMRv2Config, UniOMRv2Net  # noqa: E402
+from uni_omr_v2 import InkTokenRouterV2, UniOMRv2Config, UniOMRv2Net  # noqa: E402
+from vir_router_v2 import ViRTwoTierRouter  # noqa: E402
 
 
 def _write_dummy_page(img_path: Path, bekern_path: Path) -> None:
@@ -311,6 +314,237 @@ class TestIter14TrainUpgrades(unittest.TestCase):
         self.assertEqual(res["steps"], 1)
         self.assertEqual(captured["n_axial"], 1)
         self.assertEqual(captured["n_global"], 5)
+
+    # ------------------------------------------------------------------
+    # 4. Adaptive Router ink_target (InkTokenRouterV2 & ViRTwoTierRouter)
+    # ------------------------------------------------------------------
+    def test_adaptive_ink_target_suppresses_aged_paper_background(self) -> None:
+        torch.manual_seed(7)
+        B, D, H_img, W_img = 1, 32, 128, 128
+        H_p, W_p = H_img // 16, W_img // 16
+
+        # Simulate aged/foxed archival paper: mottled background with local_ink ~ 0.06-0.08
+        # plus crisp dark ink strokes in a small region (local_ink ~ 0.65).
+        bg = torch.full((B, 3, H_img, W_img), 0.78, dtype=torch.float32)
+        # Checkerboard-like fine foxing speckle with contrast ~0.07 (above legacy 0.04, below adaptive thr)
+        yy = torch.arange(H_img).view(1, 1, H_img, 1)
+        xx = torch.arange(W_img).view(1, 1, 1, W_img)
+        speckle = (((yy + xx) % 2) == 0).float() * 0.09
+        aged_img = (bg - speckle).clamp(0.0, 1.0)
+        # Add genuine dark ink block (2 patches)
+        aged_img[:, :, 48:64, 48:80] = 0.08
+
+        feat = torch.randn(B, D, H_p, W_p)
+
+        # InkTokenRouterV2: legacy (0.04) vs adaptive (clamp(mean+0.5*std, 0.08, 0.20))
+        r_legacy = InkTokenRouterV2(d_model=D, adaptive_ink_target=False).eval()
+        r_adapt = InkTokenRouterV2(d_model=D, adaptive_ink_target=True).eval()
+        with torch.no_grad():
+            _, _, info_leg = r_legacy(feat, images=aged_img)
+            _, _, info_adp = r_adapt(feat, images=aged_img)
+        frac_leg = float(info_leg["ink_target"].mean().item())
+        frac_adp = float(info_adp["ink_target"].mean().item())
+        self.assertGreater(frac_leg, 0.50, f"Expected legacy 0.04 to over-fire on aged paper, got {frac_leg:.3f}")
+        self.assertLess(frac_adp, 0.25, f"Expected adaptive threshold to suppress aged paper bg, got {frac_adp:.3f}")
+        self.assertGreater(frac_adp, 0.0, "Adaptive threshold must still retain genuine dark ink strokes")
+
+        # ViRTwoTierRouter: same adaptive behavior in pure float32
+        v_legacy = ViRTwoTierRouter(d_model=D, k_coarse=4, adaptive_ink_target=False).eval()
+        v_adapt = ViRTwoTierRouter(d_model=D, k_coarse=4, adaptive_ink_target=True).eval()
+        with torch.no_grad():
+            _, _, vinfo_leg = v_legacy(feat, images=aged_img)
+            _, _, vinfo_adp = v_adapt(feat, images=aged_img)
+        vfrac_leg = float(vinfo_leg["ink_target"].mean().item())
+        vfrac_adp = float(vinfo_adp["ink_target"].mean().item())
+        self.assertGreater(vfrac_leg, 0.50)
+        self.assertLess(vfrac_adp, 0.25)
+        self.assertGreater(vfrac_adp, 0.0)
+
+        # CLI flag wiring (--adaptive-ink-target / --no-adaptive-ink-target)
+        parser = tv2.build_arg_parser()
+        self.assertTrue(parser.parse_args([]).adaptive_ink_target)
+        self.assertFalse(parser.parse_args(["--no-adaptive-ink-target"]).adaptive_ink_target)
+
+    # ------------------------------------------------------------------
+    # 5. Decoder --tok-dropout & --sys-count-loss-weight wiring
+    # ------------------------------------------------------------------
+    def test_tok_dropout_and_sys_count_aux_wiring(self) -> None:
+        parser = tv2.build_arg_parser()
+        args = parser.parse_args(["--tok-dropout", "0.12", "--sys-count-loss-weight", "0.35"])
+        self.assertAlmostEqual(args.tok_dropout, 0.12)
+        self.assertAlmostEqual(args.sys_count_loss_weight, 0.35)
+
+        torch.manual_seed(19)
+        cfg = tv2.uni_omr_v2_tiny(tok_dropout=0.50)
+        model = UniOMRv2Net(cfg).train()
+        seen_inp: list = []
+        orig_emb = model.tok_emb.forward
+
+        def _spy_emb(ids):
+            seen_inp.append(ids.clone())
+            return orig_emb(ids)
+
+        seq = torch.full((2, 40), 10, dtype=torch.long)
+        seq[:, 0] = BOS_ID
+        seq[:, -2] = EOS_ID
+        seq[:, -1] = PAD_ID
+        mem = torch.randn(2, 16, cfg.d_model)
+        with mock.patch.object(model.tok_emb, "forward", side_effect=_spy_emb):
+            model.decode_tokens(seq, mem, return_mtp=False, return_aux=False)
+        inp_used = seen_inp[0]
+        # Special tokens BOS / EOS / PAD must never be corrupted
+        self.assertTrue(bool((inp_used[:, 0] == BOS_ID).all()))
+        self.assertTrue(bool((inp_used[:, -2] == EOS_ID).all()))
+        self.assertTrue(bool((inp_used[:, -1] == PAD_ID).all()))
+        # Middle music tokens must have some corruption under tok_dropout=0.50
+        n_changed = int((inp_used[:, 1:-2] != 10).sum().item())
+        self.assertGreater(n_changed, 5)
+
+    # ------------------------------------------------------------------
+    # 6. STRATIFIED_FULLPAGE_WEIGHTS_V3 & graceful renormalization
+    # ------------------------------------------------------------------
+    def test_stratified_fullpage_weights_v3_and_renormalization(self) -> None:
+        # v2 stays untouched for backward compat
+        self.assertAlmostEqual(sum(tv2.STRATIFIED_FULLPAGE_WEIGHTS_V2.values()), 1.0, places=6)
+        self.assertNotIn("real_hw_pseudo", tv2.STRATIFIED_FULLPAGE_WEIGHTS_V2)
+        self.assertNotIn("neg_control", tv2.STRATIFIED_FULLPAGE_WEIGHTS_V2)
+
+        # v3 exact weights
+        w3 = tv2.STRATIFIED_FULLPAGE_WEIGHTS_V3
+        self.assertAlmostEqual(sum(w3.values()), 1.0, places=6)
+        self.assertAlmostEqual(
+            w3["legacy_printed"] + w3["multi_renderer_printed"] + w3["rare_printed"], 0.50, places=6
+        )
+        self.assertAlmostEqual(w3["synth_hw"], 0.195, places=6)
+        self.assertAlmostEqual(w3["real_hw_archival"], 0.120, places=6)
+        self.assertAlmostEqual(w3["real_hw_pseudo"], 0.120, places=6)
+        self.assertAlmostEqual(w3["real_hw_stitched"], 0.060, places=6)
+        self.assertAlmostEqual(w3["neg_control"], 0.005, places=6)
+
+        # Full 8-bucket corpus
+        pairs_all = [
+            (Path("legacy/p1.png"), [Path("p1.bekern")], "printed"),
+            (Path("verovio/p2.png"), [Path("p2.bekern")], "multi_renderer_printed"),
+            (Path("rare/p3.png"), [Path("p3.bekern")], "rare_printed"),
+            (Path("hw-sim-v05/p4.png"), [Path("p4.bekern")], "synth_hw"),
+            (Path("debussy/p5.png"), [Path("p5.bekern")], "real_hw"),
+            (Path("rism_pseudo/p6.png"), [Path("p6.bekern")], "real_hw_pseudo"),
+            (Path("real_hw_stitched/p7.png"), [Path("p7.bekern")], "real_hw"),
+            (Path("neg_control/p8.png"), [], "neg_control"),
+        ]
+        s_all = tv2.ArchivalStratifiedFullPageSampler(pairs_all, preset="v3")
+        self.assertEqual(s_all.bucket_counts()["real_hw_pseudo"], 1)
+        self.assertEqual(s_all.bucket_counts()["neg_control"], 1)
+        self.assertAlmostEqual(sum(s_all.active_weights.values()), 1.0, places=6)
+        self.assertAlmostEqual(s_all.active_weights["real_hw_pseudo"], 0.120, places=6)
+        self.assertAlmostEqual(s_all.active_weights["neg_control"], 0.005, places=6)
+
+        # Renormalization when 0 real_hw_pseudo and 0 neg_control rows are present
+        pairs_no_pseudo_neg = pairs_all[:5] + [pairs_all[6]]
+        s_renorm = tv2.ArchivalStratifiedFullPageSampler(pairs_no_pseudo_neg, preset="v3")
+        self.assertNotIn("real_hw_pseudo", s_renorm.active_weights)
+        self.assertNotIn("neg_control", s_renorm.active_weights)
+        self.assertAlmostEqual(sum(s_renorm.active_weights.values()), 1.0, places=6)
+        expected_denom = 1.0 - 0.120 - 0.005
+        self.assertAlmostEqual(
+            s_renorm.active_weights["real_hw_archival"], 0.120 / expected_denom, places=6
+        )
+        self.assertAlmostEqual(
+            s_renorm.active_weights["synth_hw"], 0.195 / expected_denom, places=6
+        )
+
+        # split_fullpage_train_val_with_hw must never put real_hw_pseudo or neg_control into hw_val
+        _, _, hw_va = tv2.split_fullpage_train_val_with_hw(pairs_all, val_count=1, val_real_hw_count=1, seed=42)
+        for entry in hw_va:
+            dom = str(entry[2])
+            self.assertNotIn(dom, ("real_hw_pseudo", "neg_control"))
+
+    # ------------------------------------------------------------------
+    # 7. neg_control empty-target (<bos> <eos>) loss/mask/grad safety
+    # ------------------------------------------------------------------
+    def test_neg_control_empty_target_forward_and_backward_safe(self) -> None:
+        torch.manual_seed(23)
+        model = UniOMRv2Net(tv2.uni_omr_v2_tiny(tok_dropout=0.12)).train()
+
+        # Case A: pure neg_control batch with minimal length [BOS, EOS] (T=2 -> tgt_out T=1)
+        imgs_a = torch.rand(2, 3, 128, 128)
+        seq_a = torch.tensor([[BOS_ID, EOS_ID], [BOS_ID, EOS_ID]], dtype=torch.long)
+        losses_a, _ = tv2.forward_and_loss_v2(
+            model, imgs_a, seq_a, domains=["neg_control", "neg_control"], cass_prob=0.25
+        )
+        for k in ("loss", "ce_loss", "mtp_loss", "sys_count_loss"):
+            self.assertTrue(bool(torch.isfinite(losses_a[k])), f"{k} not finite: {losses_a[k]}")
+        model.zero_grad(set_to_none=True)
+        losses_a["loss"].backward()
+        for name, p in model.named_parameters():
+            if p.grad is not None:
+                self.assertTrue(bool(torch.isfinite(p.grad).all()), f"NaN/Inf grad in {name}")
+
+        # Case B: pure neg_control batch padded to T=6 (all MTP shifted targets are PAD_ID!)
+        seq_b = torch.tensor(
+            [
+                [BOS_ID, EOS_ID, PAD_ID, PAD_ID, PAD_ID, PAD_ID],
+                [BOS_ID, EOS_ID, PAD_ID, PAD_ID, PAD_ID, PAD_ID],
+            ],
+            dtype=torch.long,
+        )
+        losses_b, _ = tv2.forward_and_loss_v2(
+            model, imgs_a, seq_b, domains=["neg_control", "neg_control"], cass_prob=0.25
+        )
+        self.assertTrue(bool(torch.isfinite(losses_b["loss"])))
+        self.assertAlmostEqual(float(losses_b["mtp_loss"].item()), 0.0, places=6)
+        model.zero_grad(set_to_none=True)
+        losses_b["loss"].backward()
+        for name, p in model.named_parameters():
+            if p.grad is not None:
+                self.assertTrue(bool(torch.isfinite(p.grad).all()), f"NaN/Inf grad in {name}")
+
+        # Case C: UniFullPageDataset with empty bekerns=[] produces exact [BOS_ID, EOS_ID]
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            img_p = Path(tmp_dir) / "neg_blank.png"
+            Image.new("RGB", (96, 64), (245, 240, 230)).save(img_p)
+            ds = UniFullPageDataset([(img_p, [], "neg_control")], fullpage_max_dim=128, max_seq_len=64, augment=False)
+            item = ds[0]
+            self.assertEqual(item["seq"].tolist(), [BOS_ID, EOS_ID])
+
+    # ------------------------------------------------------------------
+    # 8. Milestone EMA snapshots & pruning
+    # ------------------------------------------------------------------
+    def test_ema_milestone_snapshots_and_pruning(self) -> None:
+        torch.manual_seed(31)
+        cfg = tv2.uni_omr_v2_tiny()
+        model = UniOMRv2Net(cfg)
+        ema = GPUEmaShadow(model, decay=0.99, update_every=1)
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            out_dir = Path(tmp_dir)
+            for s in (4000, 8000, 12000, 16000):
+                p = tv2.atomic_save_v2_ema_milestone(
+                    out_dir, model, cfg, step=s, gpu_ema=ema, best_ema_ser=0.42, keep_last=3
+                )
+                self.assertIsNotNone(p)
+            remaining = sorted(x.name for x in out_dir.glob("uni_omr_v2_ema_step*.pt"))
+            self.assertEqual(
+                remaining,
+                [
+                    "uni_omr_v2_ema_step12000.pt",
+                    "uni_omr_v2_ema_step16000.pt",
+                    "uni_omr_v2_ema_step8000.pt",
+                ],
+            )
+            ck = torch.load(str(out_dir / "uni_omr_v2_ema_step16000.pt"), map_location="cpu", weights_only=True)
+            self.assertEqual(ck["step"], 16000)
+            self.assertIn("model", ck)
+
+        # CLI defaults
+        parser = tv2.build_arg_parser()
+        args_def = parser.parse_args([])
+        self.assertEqual(args_def.save_ema_milestones, 4000)
+        self.assertEqual(args_def.keep_ema_milestones, 0)
+        self.assertEqual(args_def.best_min_step, 0)
+        self.assertIsNone(args_def.stratified_preset)
+        args_v3 = parser.parse_args(["--stratified-preset", "v3", "--best-min-step", "6000"])
+        self.assertEqual(args_v3.stratified_preset, "v3")
+        self.assertEqual(args_v3.best_min_step, 6000)
 
 
 if __name__ == "__main__":

@@ -12,8 +12,9 @@ Empirically calibrated on the 125-page OMR-NorthStar local eval pack:
   - `h_frac`: fraction of pixels belonging to horizontal dark-ink runs of length
     >= max(16, int(0.04 * W)). Text-only program notes have ~0.00071; real
     music pages have staff lines >= 0.00248 (~3.5x above default h_thr=0.0015).
-    If the 0-degree pass falls below `h_thr`, [-3 deg, +3 deg] rotations are
-    checked and the max is taken so skewed archival scans never false-trigger.
+    If the 0-degree pass falls below `h_thr`, [-9, -6, -3, +3, +6, +9] deg
+    rotations are checked and the max is taken so skewed archival/HWM scans
+    never false-trigger (0 ms overhead on unskewed pages).
 """
 
 from __future__ import annotations
@@ -103,7 +104,7 @@ def is_non_music_page(
 
     if h_frac < h_thr:
         fill_val = int(round(max(0.0, min(255.0, p85))))
-        for angle in (-3.0, 3.0):
+        for angle in (-9.0, -6.0, -3.0, 3.0, 6.0, 9.0):
             rot_im = gray.rotate(
                 angle,
                 resample=Image.Resampling.BILINEAR,

@@ -161,8 +161,9 @@ class TestTrainUniV2(unittest.TestCase):
         with torch.no_grad():
             t_logits = teacher(images, tgt_in, return_aux=False, return_mtp=False)["logits"]
         vals_b, idx_b = extract_topk_from_logits(t_logits, k=K)
+        expected_idx_dtype = np.uint8 if VOCAB_SIZE <= 256 else np.int16
         self.assertEqual(vals_b.dtype, np.float16)
-        self.assertEqual(idx_b.dtype, np.uint8)
+        self.assertEqual(idx_b.dtype, expected_idx_dtype)
         self.assertEqual(vals_b.shape, (2, T, K))
         self.assertEqual(idx_b.shape, (2, T, K))
 
@@ -180,7 +181,7 @@ class TestTrainUniV2(unittest.TestCase):
                 # Exact roundtrip parity
                 rv0, ri0 = cache.get("sample_a")
                 self.assertEqual(rv0.dtype, np.float16)
-                self.assertEqual(ri0.dtype, np.uint8)
+                self.assertEqual(ri0.dtype, expected_idx_dtype)
                 self.assertTrue(np.array_equal(rv0, vals_b[0]))
                 self.assertTrue(np.array_equal(ri0, idx_b[0]))
 
@@ -639,10 +640,11 @@ class TestTrainUniV2(unittest.TestCase):
 
         # Sparse Top-K CE gating parity
         vals_k, idx_k = torch.topk(t_base, k=8, dim=-1)
+        idx_k_dtype = torch.uint8 if VOCAB_SIZE <= 256 else torch.int16
         l_sp, gf_sp = compute_sparse_topk_jsd_loss(
             s_base.clone().requires_grad_(True),
             vals_k.to(torch.float16),
-            idx_k.to(torch.uint8),
+            idx_k.to(idx_k_dtype),
             targets,
             beta=0.5,
             temp=2.0,

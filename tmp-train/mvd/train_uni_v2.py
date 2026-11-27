@@ -577,7 +577,8 @@ class TopKTeacherCache:
         B = len(sample_ids)
         T = int(seq_len)
         vals = np.zeros((B, T, self.k), dtype=np.float16)
-        idx = np.zeros((B, T, self.k), dtype=np.uint8)
+        idx_dtype = self._idx_mm.dtype if self._idx_mm.size > 0 else (np.uint8 if self.vocab_size <= 256 else np.int16)
+        idx = np.zeros((B, T, self.k), dtype=idx_dtype)
         mask = np.zeros((B, T), dtype=np.bool_)
         n_hits = 0
         for i, sid in enumerate(sample_ids):
@@ -592,7 +593,8 @@ class TopKTeacherCache:
                 mask[i, :copy_len] = True
                 n_hits += 1
         vals_t = torch.from_numpy(vals).to(device=device, non_blocking=(device.type == "cuda"))
-        idx_t = torch.from_numpy(idx).to(device=device, non_blocking=(device.type == "cuda"))
+        idx_np = idx if idx.dtype in (np.uint8, np.int16, np.int32, np.int64) else idx.astype(np.int32)
+        idx_t = torch.from_numpy(idx_np).to(device=device, non_blocking=(device.type == "cuda"))
         mask_t = torch.from_numpy(mask).to(device=device, non_blocking=(device.type == "cuda"))
         return vals_t, idx_t, mask_t, n_hits
 
@@ -618,20 +620,21 @@ class TopKTeacherCache:
         teacher_ckpt: str = "",
     ) -> "TopKTeacherCache":
         """Write ``(sample_id, vals_fp16 (L, K), idx_u8 (L, K))`` records to flat ``.npy`` files."""
-        if vocab_size > 256:
-            raise ValueError(f"uint8 TopKTeacherCache requires vocab_size <= 256, got {vocab_size}")
+        if vocab_size > 32767:
+            raise ValueError(f"TopKTeacherCache requires vocab_size <= 32767, got {vocab_size}")
+        idx_np_dtype = np.uint8 if int(vocab_size) <= 256 else np.int16
         out = Path(cache_dir)
         out.mkdir(parents=True, exist_ok=True)
 
         total_tokens = sum(int(v.shape[0]) for _, v, _ in records)
         all_vals = np.empty((total_tokens, int(k)), dtype=np.float16)
-        all_idx = np.empty((total_tokens, int(k)), dtype=np.uint8)
+        all_idx = np.empty((total_tokens, int(k)), dtype=idx_np_dtype)
         entries: Dict[str, List[int]] = {}
 
         offset = 0
         for sid, v_arr, i_arr in records:
             v_np = np.asarray(v_arr, dtype=np.float16)
-            i_np = np.asarray(i_arr, dtype=np.uint8)
+            i_np = np.asarray(i_arr, dtype=idx_np_dtype)
             if v_np.ndim != 2 or i_np.ndim != 2 or v_np.shape != i_np.shape or v_np.shape[1] != int(k):
                 raise ValueError(
                     f"Record {sid!r} shape mismatch: vals={v_np.shape}, idx={i_np.shape}, expected (*, {k})"
@@ -674,11 +677,12 @@ def extract_topk_from_logits(
     logits: torch.Tensor,
     k: int = 8,
 ) -> Tuple[np.ndarray, np.ndarray]:
-    """Extract Top-K ``(vals_fp16, idx_u8)`` arrays from ``(T, V)`` or ``(B, T, V)`` logits."""
+    """Extract Top-K ``(vals_fp16, idx_u8/i16)`` arrays from ``(T, V)`` or ``(B, T, V)`` logits."""
     vals, idx = torch.topk(logits.detach().float(), k=int(k), dim=-1, largest=True, sorted=True)
+    idx_dtype = torch.uint8 if int(logits.shape[-1]) <= 256 else torch.int16
     return (
         vals.to(torch.float16).cpu().numpy(),
-        idx.to(torch.uint8).cpu().numpy(),
+        idx.to(idx_dtype).cpu().numpy(),
     )
 
 
@@ -1187,6 +1191,55 @@ def atomic_save_v2_latest(
     return latest_path, ema_path
 
 
+def atomic_save_v2_ema_milestone(
+    out_dir: Path,
+    model: UniOMRv2Net,
+    cfg: UniOMRv2Config,
+    step: int,
+    gpu_ema: Optional[GPUEmaShadow],
+    best_ema_ser: float = float("inf"),
+    keep_last: int = 0,
+) -> Optional[Path]:
+    """Atomically save a periodic EMA milestone checkpoint ``uni_omr_v2_ema_step{N}.pt``.
+
+    When ``keep_last > 0``, prunes older ``uni_omr_v2_ema_step*.pt`` files beyond the
+    newest ``keep_last`` milestones (by step number). ``keep_last <= 0`` keeps all.
+    """
+    if gpu_ema is None:
+        return None
+    cfg_dict = asdict(cfg)
+    milestone_path = out_dir / f"uni_omr_v2_ema_step{int(step)}.pt"
+    atomic_save_checkpoint(
+        milestone_path,
+        {
+            "cfg": cfg_dict,
+            "config": cfg_dict,
+            "vocab": list(data.VOCAB),
+            "step": int(step),
+            "best_val_ser": float(best_ema_ser),
+            "ema_decay": float(gpu_ema.decay),
+            "model": gpu_ema.cpu_state_dict(model),
+        },
+    )
+    if int(keep_last) > 0:
+        existing: List[Tuple[int, Path]] = []
+        prefix = "uni_omr_v2_ema_step"
+        for p in out_dir.glob(f"{prefix}*.pt"):
+            stem = p.stem
+            if stem.startswith(prefix):
+                tail = stem[len(prefix):]
+                if tail.isdigit():
+                    existing.append((int(tail), p))
+        existing.sort(key=lambda pair: pair[0])
+        while len(existing) > int(keep_last):
+            _, old_p = existing.pop(0)
+            try:
+                old_p.unlink()
+            except OSError:
+                pass
+    return milestone_path
+
+
 def ensure_v2_best_checkpoints(
     out_dir: Path,
     model: UniOMRv2Net,
@@ -1263,6 +1316,7 @@ _HW_DOMAIN_VALUES: Tuple[str, ...] = (
     "real_hw",
     "synth_hw",
     "real_hw_archival",
+    "real_hw_pseudo",
     "real_hw_stitched",
     "hw_strip",
 )
@@ -1441,7 +1495,9 @@ def forward_and_loss_v2(
     tgt_out = seq[:, 1:]
 
     # Derive exact system count target from <sys> separator occurrences (0 syncs).
-    sys_count_target = (seq == SYS_ID).sum(dim=1).to(torch.float32) + 1.0
+    # Empty targets (<bos> <eos> only, e.g. neg_control) get sys_count_target = 0.0.
+    has_content = ((tgt_out != PAD_ID) & (tgt_out != EOS_ID)).any(dim=1).to(torch.float32)
+    sys_count_target = has_content * ((seq == SYS_ID).sum(dim=1).to(torch.float32) + 1.0)
 
     # Determine which aux heads actually have active targets & weights so dead heads are skipped.
     need_sys_y = (sys_y_target is not None) and (sys_y_loss_weight > 0.0)
@@ -1493,6 +1549,7 @@ def forward_and_loss_v2(
                         (torch.rand_like(tail_in, dtype=torch.float32) < cass_prob)
                         & (tail_in != PAD_ID)
                         & (tail_in != BOS_ID)
+                        & (tail_in != EOS_ID)
                         & (pred_ids[:, :-1] != EOS_ID)
                     )
                     dec_in = torch.cat(
@@ -1959,6 +2016,17 @@ STRATIFIED_FULLPAGE_WEIGHTS_V2: Dict[str, float] = {
     "real_hw_archival": 0.10,
 }
 
+STRATIFIED_FULLPAGE_WEIGHTS_V3: Dict[str, float] = {
+    "legacy_printed": 0.22,
+    "multi_renderer_printed": 0.22,
+    "rare_printed": 0.06,
+    "synth_hw": 0.195,
+    "real_hw_archival": 0.120,
+    "real_hw_pseudo": 0.120,
+    "real_hw_stitched": 0.060,
+    "neg_control": 0.005,
+}
+
 _STITCHED_HW_MARKERS: Tuple[str, ...] = (
     "1s2s",
     "stitched",
@@ -1967,13 +2035,45 @@ _STITCHED_HW_MARKERS: Tuple[str, ...] = (
     "composed",
 )
 
+_PSEUDO_HW_MARKERS: Tuple[str, ...] = (
+    "real_hw_pseudo",
+    "pseudo_hw",
+    "rism_pseudo",
+    "pseudolabel",
+    "pseudo-label",
+)
+
+_NEG_CONTROL_MARKERS: Tuple[str, ...] = (
+    "neg_control",
+    "neg-control",
+    "negative_control",
+)
+
+
+def _is_neg_control_row(img_path: Any, domain: str = "") -> bool:
+    dom = str(domain or "").strip().lower()
+    p_str = str(img_path).replace("\\", "/").lower()
+    return dom in _NEG_CONTROL_MARKERS or any(tok in p_str or tok in dom for tok in _NEG_CONTROL_MARKERS)
+
+
+def _is_pseudo_hw_row(img_path: Any, domain: str = "") -> bool:
+    dom = str(domain or "").strip().lower()
+    p_str = str(img_path).replace("\\", "/").lower()
+    return dom in _PSEUDO_HW_MARKERS or any(tok in p_str or tok in dom for tok in _PSEUDO_HW_MARKERS)
+
 
 def classify_fullpage_bucket_v2(
     img_path: Any,
     domain: str = "",
     split_archival_hw: bool = False,
+    support_v3_buckets: bool = False,
 ) -> str:
-    """Classify a full-page sample, optionally splitting ``real_hw`` into archival vs stitched."""
+    """Classify a full-page sample, optionally splitting archival/stitched/pseudo HW & neg_control."""
+    if support_v3_buckets:
+        if _is_neg_control_row(img_path, domain):
+            return "neg_control"
+        if _is_pseudo_hw_row(img_path, domain):
+            return "real_hw_pseudo"
     base = classify_fullpage_bucket(img_path, domain)
     if split_archival_hw and base == "real_hw":
         p_str = str(img_path).replace("\\", "/").lower()
@@ -1985,21 +2085,36 @@ def classify_fullpage_bucket_v2(
 
 
 class ArchivalStratifiedFullPageSampler(StratifiedFullPageSampler):
-    """6-bucket stratified full-page sampler splitting ``real_hw_archival`` vs ``real_hw_stitched``."""
+    """Stratified full-page sampler supporting v2 (6-bucket) and v3 (8-bucket w/ pseudo HW & neg_control)."""
 
     def __init__(
         self,
         pairs: Sequence[Tuple[Any, ...]],
         weights: Optional[Dict[str, float]] = None,
         epoch_size: Optional[int] = None,
+        preset: str = "v2",
     ) -> None:
         self.num_samples = len(pairs)
         self.epoch_size = int(epoch_size) if epoch_size is not None else self.num_samples
-        raw_weights = dict(STRATIFIED_FULLPAGE_WEIGHTS_V2 if weights is None else weights)
+        preset_norm = str(preset or "v2").strip().lower()
+        if weights is not None:
+            raw_weights = dict(weights)
+        elif preset_norm == "v3":
+            raw_weights = dict(STRATIFIED_FULLPAGE_WEIGHTS_V3)
+        else:
+            raw_weights = dict(STRATIFIED_FULLPAGE_WEIGHTS_V2)
+        support_v3 = (
+            preset_norm == "v3"
+            or "real_hw_pseudo" in raw_weights
+            or "neg_control" in raw_weights
+        )
+        self.preset = preset_norm
         self.buckets: Dict[str, List[int]] = {k: [] for k in raw_weights}
         for idx, entry in enumerate(pairs):
             dom = str(entry[2]) if len(entry) > 2 else ""
-            bname = classify_fullpage_bucket_v2(entry[0], dom, split_archival_hw=True)
+            bname = classify_fullpage_bucket_v2(
+                entry[0], dom, split_archival_hw=True, support_v3_buckets=support_v3
+            )
             self.buckets.setdefault(bname, []).append(idx)
         active = {
             k: raw_weights.get(k, 0.0)
@@ -2040,7 +2155,11 @@ def split_fullpage_train_val_with_hw(
     other_rows: List[Tuple[Any, ...]] = []
     for entry in fp_pairs:
         dom = str(entry[2]) if len(entry) > 2 else ""
-        if classify_fullpage_bucket(entry[0], dom) == "real_hw":
+        if (
+            (not _is_pseudo_hw_row(entry[0], dom))
+            and (not _is_neg_control_row(entry[0], dom))
+            and classify_fullpage_bucket(entry[0], dom) == "real_hw"
+        ):
             real_hw_rows.append(entry)
         else:
             other_rows.append(entry)
@@ -2113,7 +2232,7 @@ def _build_datasets_and_iters(
                     img_p = Path(rec["image"])
                     beks = [Path(b) for b in rec.get("bekerns", [])]
                     domain = str(rec.get("domain", "")).strip().lower()
-                    if img_p.is_file() and beks:
+                    if img_p.is_file() and (beks or _is_neg_control_row(img_p, domain)):
                         fp_pairs.append((img_p, beks, domain))
         max_sys_cap = int(getattr(args, "max_systems_per_page", 16))
         if fp_pairs and max_sys_cap > 0:
@@ -2310,13 +2429,18 @@ def _build_datasets_and_iters(
 
     if fp_tr or fp_va or fp_hw_va:
         if args.stratified_fullpage and len(fp_tr) > 0:
-            fp_strat_sampler: Optional[StratifiedFullPageSampler] = (
-                ArchivalStratifiedFullPageSampler(fp_tr)
-                if bool(getattr(args, "split_archival_hw", False))
-                else StratifiedFullPageSampler(fp_tr)
-            )
+            strat_preset = getattr(args, "stratified_preset", None)
+            if strat_preset is None:
+                strat_preset = "v2" if bool(getattr(args, "split_archival_hw", False)) else "v1"
+            strat_preset = str(strat_preset).strip().lower()
+            if strat_preset in ("v2", "v3"):
+                fp_strat_sampler: Optional[StratifiedFullPageSampler] = ArchivalStratifiedFullPageSampler(
+                    fp_tr, preset=strat_preset
+                )
+            else:
+                fp_strat_sampler = StratifiedFullPageSampler(fp_tr)
             print(
-                f"[UniOMRv2 data] fullpage_strata={fp_strat_sampler.bucket_counts()} "
+                f"[UniOMRv2 data] fullpage_strata ({strat_preset})={fp_strat_sampler.bucket_counts()} "
                 f"weights={ {k: round(v, 3) for k, v in fp_strat_sampler.active_weights.items()} }",
                 flush=True,
             )
@@ -2464,6 +2588,7 @@ def run_train_v2(args: argparse.Namespace) -> Dict[str, Any]:
         tok_dropout=float(args.tok_dropout),
         keep_ratio=float(args.keep_ratio),
         dynamic_routing=bool(args.dynamic_routing),
+        adaptive_ink_target=bool(getattr(args, "adaptive_ink_target", True)),
         mtp_k=int(args.mtp_k),
         use_sys_y_aux=bool(args.use_sys_y_aux and float(args.sys_y_loss_weight) > 0.0),
         use_sys_count_aux=bool(args.use_sys_count_aux and float(args.sys_count_loss_weight) > 0.0),
@@ -2769,6 +2894,8 @@ def run_train_v2(args: argparse.Namespace) -> Dict[str, Any]:
     def _run_eval_suite(step_label: Any) -> Dict[str, Any]:
         eval_rec: Dict[str, Any] = {"step": step_label}
         val_sers: List[float] = []
+        val_f1s: List[float] = []
+        strip_sers: List[float] = []
         with torch.inference_mode():
             for tag, val_ds, bs in (
                 ("strip_val", strip_val_ds, eval_batch_size),
@@ -2787,13 +2914,41 @@ def run_train_v2(args: argparse.Namespace) -> Dict[str, Any]:
                     use_bf16=use_bf16,
                 )
                 eval_rec[tag] = m
-                val_sers.append(float(m["ser"]))
+                ser_v = float(m["ser"])
+                f1_v = float(m["token_f1"])
+                val_sers.append(ser_v)
+                val_f1s.append(f1_v)
+                if tag in ("strip_val", "hw_strip_val"):
+                    strip_sers.append(ser_v)
                 print(
-                    f"  [eval {tag} @ {step_label}] SER={m['ser']:.4f} F1={m['token_f1']:.4f} "
+                    f"  [eval {tag} @ {step_label}] SER={ser_v:.4f} F1={f1_v:.4f} "
                     f"sys_exact={m['sys_count_exact']:.3f} comp={m['mean_compression_x']:.2f}x",
                     flush=True,
                 )
-        eval_rec["mean_val_ser"] = round(float(np.mean(val_sers)) if val_sers else float("inf"), 6)
+        mean_ser = round(float(np.mean(val_sers)) if val_sers else float("inf"), 6)
+        mean_f1 = round(float(np.mean(val_f1s)) if val_f1s else 0.0, 6)
+        fp_ser = float(eval_rec["fullpage_val"]["ser"]) if "fullpage_val" in eval_rec else None
+        fp_hw_ser = float(eval_rec["fullpage_hw_val"]["ser"]) if "fullpage_hw_val" in eval_rec else None
+        if fp_ser is not None and fp_hw_ser is not None:
+            if strip_sers:
+                comp_ser = 0.45 * fp_ser + 0.35 * fp_hw_ser + 0.20 * float(np.mean(strip_sers))
+            else:
+                comp_ser = 0.55 * fp_ser + 0.45 * fp_hw_ser
+            composite_ser = round(float(comp_ser), 6)
+        else:
+            composite_ser = mean_ser
+        eval_rec["mean_val_ser"] = mean_ser
+        eval_rec["mean_val_f1"] = mean_f1
+        eval_rec["composite_val_ser"] = composite_ser
+        eval_rec["fullpage_val_ser"] = round(fp_ser, 6) if fp_ser is not None else None
+        eval_rec["fullpage_hw_val_ser"] = round(fp_hw_ser, 6) if fp_hw_ser is not None else None
+        fp_s = f"{fp_ser:.4f}" if fp_ser is not None else "n/a"
+        fp_hw_s = f"{fp_hw_ser:.4f}" if fp_hw_ser is not None else "n/a"
+        print(
+            f"  [eval summary @ {step_label}] composite_ser={composite_ser:.4f} "
+            f"(mean_ser={mean_ser:.4f}, fp={fp_s}, fp_hw={fp_hw_s}, mean_f1={mean_f1:.4f})",
+            flush=True,
+        )
         return eval_rec
 
     history: List[Dict[str, Any]] = []
@@ -2801,6 +2956,9 @@ def run_train_v2(args: argparse.Namespace) -> Dict[str, Any]:
     best_val_ser = float("inf")
     best_ema_ser = float("inf")
     save_every_sec = max(0.0, float(args.save_every_minutes) * 60.0)
+    save_ema_milestones = max(0, int(getattr(args, "save_ema_milestones", 4000)))
+    keep_ema_milestones = max(0, int(getattr(args, "keep_ema_milestones", 0)))
+    best_min_step = max(0, int(getattr(args, "best_min_step", 0)))
     last_time_save = time.perf_counter()
     last_empty_cache_step = -25
     last_logged_hist_idx = 0
@@ -3012,6 +3170,26 @@ def run_train_v2(args: argparse.Namespace) -> Dict[str, Any]:
                 ema_note = f" + {ep.name}" if ep is not None else ""
                 print(f"  [autosave @ step {step}] saved {lp.name}{ema_note}", flush=True)
 
+            # Periodic milestone EMA snapshots (default every 4,000 steps)
+            if (
+                out_dir is not None
+                and (not args.dry_run)
+                and gpu_ema is not None
+                and save_ema_milestones > 0
+                and (step % save_ema_milestones == 0)
+            ):
+                mp = atomic_save_v2_ema_milestone(
+                    out_dir,
+                    model,
+                    cfg,
+                    step=step,
+                    gpu_ema=gpu_ema,
+                    best_ema_ser=best_ema_ser,
+                    keep_last=keep_ema_milestones,
+                )
+                if mp is not None:
+                    print(f"  [milestone @ step {step}] saved {mp.name}", flush=True)
+
             # Periodic validation
             should_eval = (
                 use_real_data
@@ -3028,38 +3206,55 @@ def run_train_v2(args: argparse.Namespace) -> Dict[str, Any]:
                 if device.type == "cuda":
                     torch.cuda.empty_cache()
                 eval_rec = _run_eval_suite(step)
-                mean_ser = float(eval_rec["mean_val_ser"])
-                if out_dir is not None and mean_ser < best_val_ser:
-                    best_val_ser = mean_ser
+                sel_ser = float(eval_rec["composite_val_ser"])
+                can_update_best = (step >= best_min_step) or (step == steps)
+                if out_dir is not None and can_update_best and sel_ser < best_val_ser:
+                    best_val_ser = sel_ser
                     atomic_save_checkpoint(
                         out_dir / "uni_omr_v2_best.pt",
                         {
                             "step": step,
                             "val_ser": best_val_ser,
+                            "mean_val_ser": float(eval_rec["mean_val_ser"]),
+                            "composite_val_ser": best_val_ser,
+                            "fullpage_val_ser": eval_rec.get("fullpage_val_ser"),
+                            "fullpage_hw_val_ser": eval_rec.get("fullpage_hw_val_ser"),
                             "cfg": asdict(cfg),
                             "config": asdict(cfg),
                             "vocab": list(data.VOCAB),
                             "model": {k: v.detach().cpu() for k, v in model.state_dict().items()},
                         },
                     )
+                    print(f"  [best @ step {step}] updated uni_omr_v2_best.pt (composite_ser={best_val_ser:.4f})", flush=True)
                 if gpu_ema is not None:
                     with gpu_ema.swap_into(model, qat_ctrl=qat_ctrl):
                         ema_eval = _run_eval_suite(f"{step} EMA")
                     eval_rec["ema_eval"] = ema_eval
-                    ema_ser = float(ema_eval["mean_val_ser"])
-                    if out_dir is not None and ema_ser < best_ema_ser:
+                    ema_ser = float(ema_eval["composite_val_ser"])
+                    if out_dir is not None and can_update_best and ema_ser < best_ema_ser:
                         best_ema_ser = ema_ser
                         atomic_save_checkpoint(
                             out_dir / "uni_omr_v2_ema_best.pt",
                             {
                                 "step": step,
                                 "val_ser": best_ema_ser,
+                                "mean_val_ser": float(ema_eval["mean_val_ser"]),
+                                "composite_val_ser": best_ema_ser,
+                                "fullpage_val_ser": ema_eval.get("fullpage_val_ser"),
+                                "fullpage_hw_val_ser": ema_eval.get("fullpage_hw_val_ser"),
                                 "ema_decay": gpu_ema_decay,
                                 "cfg": asdict(cfg),
                                 "config": asdict(cfg),
                                 "vocab": list(data.VOCAB),
                                 "model": gpu_ema.cpu_state_dict(model),
                             },
+                        )
+                        print(f"  [ema_best @ step {step}] updated uni_omr_v2_ema_best.pt (composite_ser={best_ema_ser:.4f})", flush=True)
+                    elif out_dir is not None and not can_update_best:
+                        print(
+                            f"  [ema_best @ step {step}] skipped update (step < best_min_step={best_min_step}, "
+                            f"composite_ser={ema_ser:.4f})",
+                            flush=True,
                         )
                 eval_history.append(eval_rec)
     finally:
@@ -3125,6 +3320,13 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--keep-ratio", type=float, default=0.40)
     p.add_argument("--dynamic-routing", action="store_true", default=True)
     p.add_argument("--no-dynamic-routing", dest="dynamic_routing", action="store_false")
+    p.add_argument(
+        "--adaptive-ink-target",
+        action="store_true",
+        default=True,
+        help="Use per-page adaptive router ink threshold clamp(mean+0.5*std, 0.08, 0.20) (default: True)",
+    )
+    p.add_argument("--no-adaptive-ink-target", dest="adaptive_ink_target", action="store_false")
     p.add_argument(
         "--max-mem-tokens",
         type=int,
@@ -3245,6 +3447,24 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--gpu-ema-decay", type=float, default=0.997)
     p.add_argument("--gpu-ema-every", type=int, default=5)
     p.add_argument("--save-every-minutes", type=float, default=5.0)
+    p.add_argument(
+        "--save-ema-milestones",
+        type=int,
+        default=4000,
+        help="Save periodic EMA milestone uni_omr_v2_ema_step{N}.pt every N steps (default: 4000; 0 disables)",
+    )
+    p.add_argument(
+        "--keep-ema-milestones",
+        type=int,
+        default=0,
+        help="Max periodic EMA milestone checkpoints to retain on disk (0 = keep all; >0 = keep last K)",
+    )
+    p.add_argument(
+        "--best-min-step",
+        type=int,
+        default=0,
+        help="Defer updating uni_omr_v2_best.pt / uni_omr_v2_ema_best.pt until step >= N (default: 0)",
+    )
 
     # Data & training loop
     p.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
@@ -3308,6 +3528,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Snap full-page batch (H, W) up to 6 canonical buckets (never crops; falls back to mult-64)",
     )
     p.add_argument("--stratified-fullpage", action="store_true", default=True)
+    p.add_argument(
+        "--stratified-preset",
+        choices=["v1", "v2", "v3"],
+        default=None,
+        help="Stratified full-page weight preset: v1 (5-bucket), v2 (6-bucket archival), v3 (8-bucket w/ real_hw_pseudo & neg_control)",
+    )
     p.add_argument(
         "--split-archival-hw",
         action="store_true",

@@ -167,7 +167,7 @@ def _allowed_ids_for_state(state: grammar.PrefixState, vocab_size: int) -> List[
             allow_ids.discard(cyc_id)
 
     after_bar = bool(state.recent) and (state.recent[-1] in grammar.BAR_LIKES)
-    can_end_sys = bool(eos_ok or after_bar)
+    can_end_sys = bool(eos_ok or after_bar) and (not state.has_open_tuplet())
     if can_end_sys:
         allow_ids.add(eos_id)
         if state.can_emit_sys():
@@ -562,6 +562,40 @@ def override_max_keep_ratio(
         yield
     finally:
         router.max_keep_ratio = orig
+
+
+@contextlib.contextmanager
+def override_max_mem_tokens(
+    model: Any,
+    max_mem_tokens: Optional[int],
+) -> Iterator[None]:
+    """Temporarily override router ``max_mem_tokens`` at eval time when supported.
+
+    Safely no-ops on older checkpoints (e.g. UniOMR v1) whose router does not
+    expose ``max_mem_tokens``, or when ``max_mem_tokens`` is ``None`` / ``<= 0``.
+    """
+    if max_mem_tokens is None:
+        yield
+        return
+    val = int(max_mem_tokens)
+    if val <= 0:
+        yield
+        return
+    router = _get_model_router(model)
+    if router is None or not hasattr(router, "max_mem_tokens"):
+        yield
+        return
+    n_bg = int(getattr(router, "n_bg_summary", 0))
+    if val <= n_bg:
+        raise ValueError(
+            f"max_mem_tokens ({val}) must exceed router.n_bg_summary ({n_bg})"
+        )
+    orig = int(router.max_mem_tokens)
+    router.max_mem_tokens = val
+    try:
+        yield
+    finally:
+        router.max_mem_tokens = orig
 
 
 # ---------------------------------------------------------------------------
@@ -1519,16 +1553,94 @@ def resolve_manifest_pieces(manifest_path: str | Path) -> Tuple[Path, List[Dict[
     return base_dir, resolved
 
 
-def stitch_uni_tokens(pred_toks: Sequence[str]) -> Tuple[List[str], int]:
-    """Split UniOMR full-page tokens on ``<sys>`` and stitch into page bekern.
+def _system_canonical_body(sys_toks: Sequence[str]) -> List[str]:
+    """Strip leading header tokens (clef/key/time) and cosmetic dyn/slur tokens."""
+    i = 0
+    n = len(sys_toks)
+    while i < n and (
+        sys_toks[i] in grammar.CLEFS
+        or sys_toks[i] in grammar.KEYS
+        or sys_toks[i] in grammar.TIMES
+    ):
+        i += 1
+    return [t for t in sys_toks[i:] if t not in grammar._COSMETIC_SYS_TOKENS]
 
-    Uses ``eval_sys_gate.stitch_page_toks`` so header deduplication and
-    canonical tail ordering match the 2-stage ``suite31_hw`` evaluator.
-    Returns ``(stitched_tokens, n_systems)``.
+
+def truncate_duplicate_trailing_systems(
+    pred_toks: Sequence[str],
+    sim_threshold: float = 0.90,
+) -> List[str]:
+    """Truncate verbatim/near-verbatim (>=sim_threshold) trailing ``<sys>`` repetitions.
+
+    Triggers only when the previous system ended on a barline (``grammar.BAR_LIKES``)
+    and the trailing system contains >=8 non-cosmetic body tokens with at least one
+    pitched step, matching the previous system (or an earlier system) at
+    ``SequenceMatcher.ratio() >= sim_threshold``. Fixes trailing-system hallucinations
+    on short pieces such as ``essen-ballad``, ``essen-altdeu``, and ``ryans-jig``.
     """
     chunks: List[List[str]] = []
     cur: List[str] = []
     for t in pred_toks:
+        if t == uni_omr.SYS_TOKEN:
+            if cur:
+                chunks.append(cur)
+                cur = []
+        else:
+            cur.append(t)
+    if cur:
+        chunks.append(cur)
+
+    if len(chunks) < 2:
+        return list(pred_toks)
+
+    while len(chunks) >= 2:
+        prev = chunks[-2]
+        last = chunks[-1]
+        if not prev or prev[-1] not in grammar.BAR_LIKES:
+            break
+        last_body = _system_canonical_body(last)
+        if len(last_body) < 8 or not any(t in grammar.STEPS for t in last_body):
+            break
+        is_dup = False
+        for earlier in reversed(chunks[:-1]):
+            prev_body = _system_canonical_body(earlier)
+            if len(prev_body) < 8:
+                continue
+            hi = max(len(last_body), len(prev_body))
+            lo = min(len(last_body), len(prev_body))
+            if (float(lo) / float(hi)) < float(sim_threshold):
+                continue
+            if (
+                difflib.SequenceMatcher(None, prev_body, last_body, autojunk=False).ratio()
+                >= float(sim_threshold)
+            ):
+                is_dup = True
+                break
+        if is_dup:
+            chunks.pop()
+        else:
+            break
+
+    out: List[str] = []
+    for idx, ch in enumerate(chunks):
+        if idx > 0:
+            out.append(uni_omr.SYS_TOKEN)
+        out.extend(ch)
+    return out
+
+
+def stitch_uni_tokens(pred_toks: Sequence[str]) -> Tuple[List[str], int]:
+    """Split UniOMR full-page tokens on ``<sys>`` and stitch into page bekern.
+
+    First strips any verbatim/near-verbatim (``>= 0.90``) trailing ``<sys>``
+    repetitions after a barline, then uses ``eval_sys_gate.stitch_page_toks``
+    so header deduplication and canonical tail ordering match the 2-stage
+    ``suite31_hw`` evaluator. Returns ``(stitched_tokens, n_systems)``.
+    """
+    cleaned_toks = truncate_duplicate_trailing_systems(pred_toks)
+    chunks: List[List[str]] = []
+    cur: List[str] = []
+    for t in cleaned_toks:
         if t == uni_omr.SYS_TOKEN:
             if cur:
                 chunks.append(cur)
@@ -1683,8 +1795,9 @@ def detect_token_loop(
     max_ngram: int = 24,
     min_repeats: int = 4,
     max_single_run: int = 8,
+    min_mv_bar_repeats: int = 3,
 ) -> bool:
-    """Detect degenerate consecutive token loops (repeated n-grams or stuck single tokens)."""
+    """Detect degenerate consecutive token loops (repeated n-grams, stuck tokens, or >=3 identical multi-voice bars)."""
     n = len(toks)
     if n < min_ngram * min_repeats:
         # Still check stuck single-token runs on short sequences.
@@ -1724,6 +1837,39 @@ def detect_token_loop(
                 if reps >= min_repeats:
                     return True
             i = j if reps > 1 else (i + 1)
+
+    # 3. >= min_mv_bar_repeats (default 3) consecutive verbatim identical normalized
+    #    multi-voice bars (catches long cross-bar quartet/piano loops > max_ngram).
+    if min_mv_bar_repeats >= 2:
+        prev_mv: Optional[Tuple[str, ...]] = None
+        mv_consec = 0
+        cur_bar: List[str] = []
+        for tok in tok_list:
+            if tok == uni_omr.SYS_TOKEN:
+                cur_bar = []
+                prev_mv = None
+                mv_consec = 0
+                continue
+            if tok in grammar.BAR_LIKES:
+                if cur_bar:
+                    canon = [t for t in cur_bar if t not in grammar._COSMETIC_BAR_TOKENS]
+                    voices = {t for t in canon if t in grammar.VOICES}
+                    has_pitch = any(t in grammar.STEPS for t in canon)
+                    if has_pitch and len(voices) >= 2:
+                        mv_key = tuple(grammar._canonicalize_single_measure(canon))
+                        if mv_key == prev_mv:
+                            mv_consec += 1
+                            if mv_consec >= min_mv_bar_repeats:
+                                return True
+                        else:
+                            prev_mv = mv_key
+                            mv_consec = 1
+                    else:
+                        prev_mv = None
+                        mv_consec = 0
+                cur_bar = []
+            else:
+                cur_bar.append(tok)
     return False
 
 
@@ -2114,6 +2260,12 @@ def evaluate_suite31(args: argparse.Namespace) -> Dict[str, Any]:
         float(ttt_conf_skip_thr_raw) if ttt_conf_skip_thr_raw is not None else None
     )
     max_keep_ratio_override = getattr(args, "max_keep_ratio_override", None)
+    max_mem_tokens_raw = getattr(args, "max_mem_tokens", 4096)
+    max_mem_tokens_override: Optional[int] = (
+        int(max_mem_tokens_raw)
+        if (max_mem_tokens_raw is not None and int(max_mem_tokens_raw) > 0)
+        else None
+    )
     tta_scales = parse_tta_scales(getattr(args, "tta_scales", None))
     tta_rerank = str(getattr(args, "tta_rerank", "fsa_logprob_mbr")).strip().lower()
     if tta_scales and tta_rerank not in TTA_RERANK_MODES:
@@ -2153,6 +2305,11 @@ def evaluate_suite31(args: argparse.Namespace) -> Dict[str, Any]:
         if max_keep_ratio_override is not None
         else ""
     )
+    mmt_str = (
+        f" | max_mem_tokens={max_mem_tokens_override}"
+        if max_mem_tokens_override is not None
+        else ""
+    )
     dim_str = (
         f"tta_scales={','.join(str(s) for s in tta_scales)}"
         if tta_scales
@@ -2161,7 +2318,7 @@ def evaluate_suite31(args: argparse.Namespace) -> Dict[str, Any]:
     print(
         f"[UniOMR suite31_hw] ckpt={args.ckpt} (arch={ckpt_meta['arch']}, step={ckpt_meta['step']}) | "
         f"device={device} | mode={mode_tag} | {dim_str} | "
-        f"max_len={args.max_len} | pieces={len(pieces)}{mkr_str}",
+        f"max_len={args.max_len} | pieces={len(pieces)}{mkr_str}{mmt_str}",
         flush=True,
     )
 
@@ -2195,7 +2352,9 @@ def evaluate_suite31(args: argparse.Namespace) -> Dict[str, Any]:
             conf_skip_thr=ttt_conf_skip_thr,
         )
 
-    with override_max_keep_ratio(model, max_keep_ratio_override):
+    with override_max_keep_ratio(model, max_keep_ratio_override), override_max_mem_tokens(
+        model, max_mem_tokens_override
+    ):
         for idx, piece in enumerate(pieces, start=1):
             slug = piece["slug"]
             is_hw = piece["handwritten"]
@@ -2531,6 +2690,7 @@ def evaluate_suite31(args: argparse.Namespace) -> Dict[str, Any]:
                 if max_keep_ratio_override is not None
                 else None
             ),
+            "max_mem_tokens": max_mem_tokens_override,
             "tta_scales": tta_scales if tta_scales else None,
             "tta_rerank": tta_rerank if tta_scales else None,
             "tta_selector": tta_rerank if tta_scales else None,
@@ -2691,6 +2851,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
         type=float,
         default=None,
         help="Temporarily override model.router.max_keep_ratio at eval time (e.g. 0.55 or 0.65)",
+    )
+    ap.add_argument(
+        "--max-mem-tokens",
+        type=int,
+        default=4096,
+        help="Temporarily override model.router.max_mem_tokens at eval time when supported (default: 4096; <=0 keeps checkpoint value)",
     )
     ap.add_argument(
         "--tta-scales",

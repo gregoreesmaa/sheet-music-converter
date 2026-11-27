@@ -12,6 +12,7 @@ Seam: if ``decode.rs`` event order changes, update ``_State`` together.
 
 from __future__ import annotations
 
+import difflib
 import hashlib
 import sys
 from pathlib import Path
@@ -92,6 +93,10 @@ RECENT_WINDOW_CAP = 640
 BAR_HASH_CONSEC_LIMIT = 5
 BAR_HASH_WINDOW_SIZE = 12
 BAR_HASH_WINDOW_LIMIT = 8
+MULTI_VOICE_BAR_HASH_CONSEC_LIMIT = 3
+MAX_HEADER_STAVES_DEFAULT = 8
+SINGLE_STAFF_HEADER_REPEAT_LIMIT = 2
+SYS_DUP_SIM_THRESHOLD = 0.90
 _COSMETIC_SYS_TOKENS = frozenset(DYNS) | frozenset(['slur-start', 'slur-stop'])
 _COSMETIC_BAR_TOKENS = (
     frozenset(DYNS) | frozenset(CLEFS) | frozenset(KEYS) | frozenset(TIMES)
@@ -166,7 +171,11 @@ class PrefixState:
                  'bars_in_system', 'tokens_in_system',
                  'max_bars_per_system', 'max_tokens_per_system',
                  'tokens_since_bar', 'cur_sys_tokens', 'completed_system_hashes',
+                 'completed_systems',
                  'cur_bar_tokens', 'sys_bar_hashes', 'bar_repeat_forbidden_tok',
+                 'last_mv_bar_canon', 'mv_bar_consec',
+                 'last_was_time', 'header_clefs', 'header_keys', 'header_times',
+                 'first_sys_staves', 'cur_hdr_tuple', 'completed_hdr_tuples',
                  'comp_num', 'comp_digits', 'comp_val',
                  'allow_percussion_tab', 'vocab_map')
 
@@ -225,9 +234,19 @@ class PrefixState:
         self.tokens_since_bar = 0
         self.cur_sys_tokens = []
         self.completed_system_hashes = {}
+        self.completed_systems = []
         self.cur_bar_tokens = []
         self.sys_bar_hashes = []
         self.bar_repeat_forbidden_tok = None
+        self.last_mv_bar_canon = None
+        self.mv_bar_consec = 0
+        self.last_was_time = False
+        self.header_clefs = 0
+        self.header_keys = 0
+        self.header_times = 0
+        self.first_sys_staves = 0
+        self.cur_hdr_tuple = None
+        self.completed_hdr_tuples = []
         # bekern v2 compositional sub-state counters (flat ints for cheap copy())
         self.comp_num = 0
         self.comp_digits = 0
@@ -281,9 +300,19 @@ class PrefixState:
         c.tokens_since_bar = self.tokens_since_bar
         c.cur_sys_tokens = list(self.cur_sys_tokens)
         c.completed_system_hashes = dict(self.completed_system_hashes)
+        c.completed_systems = [list(s) for s in self.completed_systems]
         c.cur_bar_tokens = list(self.cur_bar_tokens)
         c.sys_bar_hashes = list(self.sys_bar_hashes)
         c.bar_repeat_forbidden_tok = self.bar_repeat_forbidden_tok
+        c.last_mv_bar_canon = list(self.last_mv_bar_canon) if self.last_mv_bar_canon is not None else None
+        c.mv_bar_consec = self.mv_bar_consec
+        c.last_was_time = self.last_was_time
+        c.header_clefs = self.header_clefs
+        c.header_keys = self.header_keys
+        c.header_times = self.header_times
+        c.first_sys_staves = self.first_sys_staves
+        c.cur_hdr_tuple = list(self.cur_hdr_tuple) if self.cur_hdr_tuple is not None else None
+        c.completed_hdr_tuples = list(self.completed_hdr_tuples)
         c.comp_num = self.comp_num
         c.comp_digits = self.comp_digits
         c.comp_val = self.comp_val
@@ -295,11 +324,77 @@ class PrefixState:
     def _hash_tokens(toks):
         return hashlib.sha1(' '.join(toks).encode('utf-8')).hexdigest()[:16]
 
+    def _canonical_system_tokens(self):
+        return [t for t in self.cur_sys_tokens if t not in _COSMETIC_SYS_TOKENS]
+
     def _canonical_system_hash(self):
-        canon = [t for t in self.cur_sys_tokens if t not in _COSMETIC_SYS_TOKENS]
+        canon = self._canonical_system_tokens()
         if not canon:
             return None
         return self._hash_tokens(canon)
+
+    def _is_near_dup_system(self, cur_canon):
+        if len(cur_canon) < 8 or not any(t in STEPS for t in cur_canon):
+            return False
+        n_cur = len(cur_canon)
+        for prev_canon in self.completed_systems:
+            n_prev = len(prev_canon)
+            if n_prev < 8:
+                continue
+            hi = n_cur if n_cur >= n_prev else n_prev
+            lo = n_prev if n_cur >= n_prev else n_cur
+            if (float(lo) / float(hi)) < SYS_DUP_SIM_THRESHOLD:
+                continue
+            if difflib.SequenceMatcher(None, cur_canon, prev_canon, autojunk=False).ratio() >= SYS_DUP_SIM_THRESHOLD:
+                return True
+        return False
+
+    def has_open_tuplet(self):
+        """Return True iff any tuplet-start is queued (pending) or open (depth > 0)."""
+        return self.pending > 0 or any(d > 0 for d in self.depth)
+
+    def _header_staff_cap(self):
+        return max(self.first_sys_staves, MAX_HEADER_STAVES_DEFAULT)
+
+    def _single_staff_hdr_repeat_capped(self):
+        if not self.header_open or self.first_sys_staves != 1:
+            return False
+        tuples = list(self.completed_hdr_tuples)
+        if self.cur_hdr_tuple is not None:
+            tuples.append(tuple(self.cur_hdr_tuple))
+        if len(tuples) < SINGLE_STAFF_HEADER_REPEAT_LIMIT:
+            return False
+        tail = tuples[-SINGLE_STAFF_HEADER_REPEAT_LIMIT:]
+        return all(x == tail[0] for x in tail[1:])
+
+    def _header_clef_ok(self):
+        if not self.header_open:
+            return True
+        if self.header_clefs >= self._header_staff_cap():
+            return False
+        if self._single_staff_hdr_repeat_capped():
+            return False
+        return True
+
+    def _header_key_ok(self):
+        if not self.header_open:
+            return True
+        if self.header_keys >= self._header_staff_cap():
+            return False
+        if self._single_staff_hdr_repeat_capped():
+            return False
+        return True
+
+    def _header_time_ok(self):
+        if self.last_was_time:
+            return False
+        if not self.header_open:
+            return True
+        if self.header_times >= self._header_staff_cap():
+            return False
+        if self._single_staff_hdr_repeat_capped():
+            return False
+        return True
 
     @staticmethod
     def _is_pure_rest_bar(bar_toks):
@@ -309,11 +404,15 @@ class PrefixState:
         if not self.cur_bar_tokens or self._is_pure_rest_bar(self.cur_bar_tokens):
             self.sys_bar_hashes.append(None)
             self.bar_repeat_forbidden_tok = None
+            self.last_mv_bar_canon = None
+            self.mv_bar_consec = 0
             return
         canon = [t for t in self.cur_bar_tokens if t not in _COSMETIC_BAR_TOKENS]
         if not canon:
             self.sys_bar_hashes.append(None)
             self.bar_repeat_forbidden_tok = None
+            self.last_mv_bar_canon = None
+            self.mv_bar_consec = 0
             return
         bh = self._hash_tokens(canon)
         self.sys_bar_hashes.append(bh)
@@ -330,13 +429,31 @@ class PrefixState:
         else:
             self.bar_repeat_forbidden_tok = None
 
+        # Multi-voice bar consecutive repetition tracker (>=2 distinct voices, pitched).
+        distinct_voices = {t for t in canon if t in VOICES}
+        if len(distinct_voices) >= 2:
+            mv_canon = _canonicalize_single_measure(canon)
+            if mv_canon == self.last_mv_bar_canon:
+                self.mv_bar_consec += 1
+            else:
+                self.last_mv_bar_canon = mv_canon
+                self.mv_bar_consec = 1
+        else:
+            self.last_mv_bar_canon = None
+            self.mv_bar_consec = 0
+
     def can_emit_sys(self):
-        """Return True iff the current system has >=1 musical event, page is under MAX_SYSTEMS,
-        and the current system does not duplicate a previously completed system."""
+        """Return True iff the current system has >=1 musical event, no open tuplet,
+        page is under MAX_SYSTEMS, and the current system does not duplicate a previously completed system."""
         if not self.sys_has_event or self.sys_count >= MAX_SYSTEMS - 1:
             return False
-        cur_h = self._canonical_system_hash()
-        if cur_h is not None and self.completed_system_hashes.get(cur_h, 0) >= 1:
+        if self.has_open_tuplet():
+            return False
+        cur_canon = self._canonical_system_tokens()
+        if not cur_canon:
+            return False
+        cur_h = self._hash_tokens(cur_canon)
+        if self.completed_system_hashes.get(cur_h, 0) >= 1:
             return False
         return True
 
@@ -355,9 +472,11 @@ class PrefixState:
         return False
 
     def can_emit_eos(self, cur_len=None, max_len=None):
-        """Return True iff <eos> is legal here (guards against empty trailing systems)."""
+        """Return True iff <eos> is legal here (guards against empty trailing systems & unclosed tuplets)."""
         if cur_len is not None and max_len is not None and cur_len >= max_len:
             return True
+        if self.has_open_tuplet():
+            return False
         if (self.sys_count + 1) >= MAX_SYSTEMS:
             return True
         if self._sys_is_capped():
@@ -367,11 +486,13 @@ class PrefixState:
     def reset_system(self):
         """Advance to a new system on ``<sys>`` while preserving cross-system cycle history."""
         if self.sys_has_event:
-            cur_h = self._canonical_system_hash()
-            if cur_h is not None:
+            cur_canon = self._canonical_system_tokens()
+            if cur_canon:
+                cur_h = self._hash_tokens(cur_canon)
                 self.completed_system_hashes[cur_h] = (
                     self.completed_system_hashes.get(cur_h, 0) + 1
                 )
+                self.completed_systems.append(cur_canon)
         self.sys_count += 1
         self.sys_has_event = False
         self.bars_in_system = 0
@@ -381,6 +502,14 @@ class PrefixState:
         self.cur_bar_tokens = []
         self.sys_bar_hashes = []
         self.bar_repeat_forbidden_tok = None
+        self.last_mv_bar_canon = None
+        self.mv_bar_consec = 0
+        self.last_was_time = False
+        self.header_clefs = 0
+        self.header_keys = 0
+        self.header_times = 0
+        self.cur_hdr_tuple = None
+        self.completed_hdr_tuples = []
         self.mode = 'bound'
         self.header_open = True
         self.seg_last = [False]
@@ -554,6 +683,15 @@ class PrefixState:
         if t == TIME_KW:
             if not self._header_attr_ok():
                 raise ValueError('spurious mid-bar header %r' % t)
+            if not self._header_time_ok():
+                raise ValueError('consecutive or capped time header %r' % t)
+            if self.header_open:
+                if self.cur_hdr_tuple is None:
+                    self.cur_hdr_tuple = [None, None, t]
+                else:
+                    self.cur_hdr_tuple[2] = t
+                self.header_times += 1
+            self.last_was_time = False
             self.comp_num = 0
             self.comp_digits = 0
             self.comp_val = 0
@@ -562,20 +700,59 @@ class PrefixState:
                 self.allow_percussion_tab and t in TAB_CLEFS):
             # Mid-stream attribute changes (bekern+): clef/key/time
             # may appear at any measure start (or courtesy end of a full
-            # measure). Forbid stray key*/time-* inside an incomplete bar.
-            # A time token retunes the books at a true barline (all
-            # cursors idle); a courtesy change at full-bar end is stashed
-            # and applied at the next barline instead.
+            # measure). Forbid stray key*/time-* inside an incomplete bar,
+            # consecutive time-* tokens, and runaway repeated system headers.
             if (t in KEYS or t in TIMES) and not self._header_attr_ok():
                 raise ValueError('spurious mid-bar header %r' % t)
+            if t in CLEFS or (self.allow_percussion_tab and t in TAB_CLEFS):
+                if self.header_open:
+                    if not self._header_clef_ok():
+                        raise ValueError('header staff cap exceeded %r' % t)
+                    if self.cur_hdr_tuple is not None:
+                        self.completed_hdr_tuples.append(tuple(self.cur_hdr_tuple))
+                    self.cur_hdr_tuple = [t, None, None]
+                    self.header_clefs += 1
+                self.last_was_time = False
+                return 'bound'
+            if t in KEYS:
+                if self.header_open:
+                    if not self._header_key_ok():
+                        raise ValueError('header key cap exceeded %r' % t)
+                    if self.cur_hdr_tuple is None:
+                        self.cur_hdr_tuple = [None, t, None]
+                    else:
+                        self.cur_hdr_tuple[1] = t
+                    self.header_keys += 1
+                self.last_was_time = False
+                return 'bound'
+            # t in TIMES
+            if not self._header_time_ok():
+                raise ValueError('consecutive or capped time token %r' % t)
             if t in SHORT_PICKUP_TIMES:
                 if not self._short_pickup_time_ok(recent_before=self.recent[:-1]):
                     raise ValueError('spurious mid-bar pickup time %r' % t)
-            if t in TIMES:
-                self._apply_tsig(_beats_of(t))
+            if self.header_open:
+                if self.cur_hdr_tuple is None:
+                    self.cur_hdr_tuple = [None, None, t]
+                else:
+                    self.cur_hdr_tuple[2] = t
+                self.header_times += 1
+            self._apply_tsig(_beats_of(t))
+            self.last_was_time = True
             return 'bound'
-        self.header_open = False
+        self.last_was_time = False
+        if self.header_open:
+            if self.cur_hdr_tuple is not None:
+                self.completed_hdr_tuples.append(tuple(self.cur_hdr_tuple))
+                self.cur_hdr_tuple = None
+            if self.first_sys_staves == 0:
+                self.first_sys_staves = max(
+                    1, self.header_clefs, self.header_keys, self.header_times
+                )
+            self.header_open = False
         if t == BAR or t in BAR_RIGHT:
+            if self.has_open_tuplet():
+                raise ValueError('unclosed tuplet before bar marker %r' % t)
             # step() appends every token to recent before dispatch, so
             # the previous token is recent[-2] (recent[-1] is t itself).
             if self.strict and len(self.recent) >= 2 \
@@ -610,6 +787,8 @@ class PrefixState:
             self.grace_run = 0
             return 'bound'
         if t in VOICES:
+            if self.has_open_tuplet():
+                raise ValueError('unclosed tuplet before voice marker %r' % t)
             n = int(t.split('-')[1])
             if n == 0:
                 raise ValueError('bad voice token %r' % t)
@@ -889,6 +1068,7 @@ class PrefixState:
                         self.comp_num = 0
                         self.comp_digits = 0
                         self.comp_val = 0
+                        self.last_was_time = True
                         self.mode = 'bound'
                 elif self.comp_digits == 1:
                     den = self.comp_val * 10 + int(t)
@@ -898,6 +1078,7 @@ class PrefixState:
                     self.comp_num = 0
                     self.comp_digits = 0
                     self.comp_val = 0
+                    self.last_was_time = True
                     self.mode = 'bound'
                 else:
                     raise ValueError('time denominator too many digits')
@@ -907,6 +1088,7 @@ class PrefixState:
                     self.comp_num = 0
                     self.comp_digits = 0
                     self.comp_val = 0
+                    self.last_was_time = True
                     self.mode = self._bound(t)
                 else:
                     raise ValueError('incomplete time denominator before %r' % t)
@@ -1029,6 +1211,24 @@ class PrefixState:
             and all(tok in _COSMETIC_BAR_TOKENS for tok in self.cur_bar_tokens)
         ):
             return self.bar_repeat_forbidden_tok
+        # 0b. Multi-voice consecutive bar-hash repetition guard (>=3 identical normalized
+        # multi-voice bars): once the next bar matches >=6 non-cosmetic tokens verbatim
+        # (or len-1 for shorter bars), forbid the next matching token to force divergence
+        # without ever blocking a legitimately different bar starting with `voice-1`.
+        if (
+            self.mv_bar_consec >= MULTI_VOICE_BAR_HASH_CONSEC_LIMIT
+            and self.last_mv_bar_canon
+            and len(self.last_mv_bar_canon) >= 6
+        ):
+            cur_non_cos = [tok for tok in self.cur_bar_tokens if tok not in _COSMETIC_BAR_TOKENS]
+            m = len(cur_non_cos)
+            min_prefix = min(6, len(self.last_mv_bar_canon) - 1)
+            if (
+                m >= min_prefix
+                and m < len(self.last_mv_bar_canon)
+                and cur_non_cos == self.last_mv_bar_canon[:m]
+            ):
+                return self.last_mv_bar_canon[m]
         r = self.recent
         n = len(r)
         # 1. Conservative 8..16-token n-gram loop guard (bar: >3x, non-bar ostinato: >=8x)
@@ -1092,32 +1292,48 @@ class PrefixState:
         eos_ok = (len(self.recent) == 0) or self.can_emit_eos()
 
         def add_boundary(placed=None):
+            open_tup = self.has_open_tuplet()
             if sys_capped:
+                if self.depth[self.seg] > 0:
+                    allow.add(vm[TUPLET_STOP])
+                elif self.pending > 0:
+                    for t in DURATIONS:
+                        if t in vm and not self._blocks_duration(_WRITTEN[t]):
+                            allow.add(vm[t])
                 return
             if bar_tok_capped:
-                allow.add(vm[BAR])
-                allow.update(vm[t] for t in BAR_RIGHT if t in vm)
+                if self.depth[self.seg] > 0:
+                    allow.add(vm[TUPLET_STOP])
+                elif self.pending > 0:
+                    for t in DURATIONS:
+                        if t in vm and not self._blocks_duration(_WRITTEN[t]):
+                            allow.add(vm[t])
+                else:
+                    allow.add(vm[BAR])
+                    allow.update(vm[t] for t in BAR_RIGHT if t in vm)
                 return
             # Strict parity with step(): a BAR right after a BAR, and
             # a voice marker that step() would reject (non-sequential
             # open or consecutive duplicate), are masked here instead
             # of failing open after the fact. Non-strict keeps the
-            # legacy unconditional set.
-            if not (self.strict and self.recent
+            # legacy unconditional set. Both modes forbid bar* and voice-*
+            # while a tuplet is open.
+            if not open_tup and not (self.strict and self.recent
                     and self.recent[-1] in BAR_LIKES):
                 allow.add(vm[BAR])
                 allow.update(vm[t] for t in BAR_RIGHT if t in vm)
-            for _vt in VOICES:
-                if _vt not in vm:
-                    continue
-                if self.recent and self.recent[-1] == _vt:
-                    continue
-                if self.strict:
-                    _vn = int(_vt.split('-')[1])
-                    if _vn != 1 and (_vn - 1) not in self.opened \
-                            and _vn not in self.opened:
+            if not open_tup:
+                for _vt in VOICES:
+                    if _vt not in vm:
                         continue
-                allow.add(vm[_vt])
+                    if self.recent and self.recent[-1] == _vt:
+                        continue
+                    if self.strict:
+                        _vn = int(_vt.split('-')[1])
+                        if _vn != 1 and (_vn - 1) not in self.opened \
+                                and _vn not in self.opened:
+                            continue
+                    allow.add(vm[_vt])
             if not (self.strict and (self.depth[self.seg] + self.pending >= 1
                     or self._bar_is_full())):
                 allow.update(vm[t] for t in TUPLET_STARTS if t in vm)
@@ -1150,21 +1366,25 @@ class PrefixState:
             if (placed if placed is not None else self.seg_last[self.seg]) \
                     and self.chords_on_onset < MAX_CHORDS_PER_ONSET:
                 allow.add(vm[CHORD])
-            allow.update(vm[t] for t in CLEFS if t in vm)
+            if self._header_clef_ok():
+                allow.update(vm[t] for t in CLEFS if t in vm)
             hdr_ok = self._header_attr_ok()
             if hdr_ok:
-                allow.update(vm[t] for t in KEYS if t in vm)
-                short_ok = self._short_pickup_time_ok(recent_before=self.recent)
-                for t in TIMES:
-                    if t in vm and (short_ok or t not in SHORT_PICKUP_TIMES):
-                        allow.add(vm[t])
-                if TIME_KW in vm:
-                    allow.add(vm[TIME_KW])
+                if self._header_key_ok():
+                    allow.update(vm[t] for t in KEYS if t in vm)
+                if self._header_time_ok():
+                    short_ok = self._short_pickup_time_ok(recent_before=self.recent)
+                    for t in TIMES:
+                        if t in vm and (short_ok or t not in SHORT_PICKUP_TIMES):
+                            allow.add(vm[t])
+                    if TIME_KW in vm:
+                        allow.add(vm[TIME_KW])
             if self.grace_run < MAX_CONSECUTIVE_GRACE:
                 allow.add(vm[GRACE])
             allow.update(vm[t] for t in DYNS | HAIRS | BAR_LEFT if t in vm)
             if self.allow_percussion_tab:
-                allow.update(vm[t] for t in TAB_CLEFS if t in vm)
+                if self._header_clef_ok():
+                    allow.update(vm[t] for t in TAB_CLEFS if t in vm)
                 allow.update(vm[t] for t in SLASH_MARKS if t in vm)
                 if UNPITCHED in vm:
                     allow.add(vm[UNPITCHED])
