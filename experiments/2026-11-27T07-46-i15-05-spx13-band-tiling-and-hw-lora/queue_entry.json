@@ -1,0 +1,23 @@
+{
+  "id": "2026-11-27T07-46-i15-05-spx13-band-tiling-and-hw-lora",
+  "short_id": "i15-05",
+  "title": "Pivot Strategist 5 (Pivots 1 & 3A): Canonical s_px=13 Band Tiling (Zero-Train) + Rank-16 HW-Only LoRA (< 55 MB Edge)",
+  "wave": 13,
+  "priority": 5,
+  "provider": "colab_l4",
+  "gpu": "L4",
+  "est_minutes": 75,
+  "est_cu": 5.5,
+  "script": "experiments/2026-11-27T07-46-i15-05-spx13-band-tiling-and-hw-lora/run_colab.py",
+  "readme": "experiments/2026-11-27T07-46-i15-05-spx13-band-tiling-and-hw-lora/README.md",
+  "plan": "experiments/2026-11-27T07-46-i15-05-spx13-band-tiling-and-hw-lora/PLAN.md",
+  "hf_eval_target": "evals/2026-11-27T07-46-i15-05-spx13-band-tiling-and-hw-lora.json",
+  "hf_run_target": "runs/2026-11-27T07-46-i15-05-spx13-band-tiling-and-hw-lora.json",
+  "status": "QUEUED",
+  "depends_on": [],
+  "datasets": [
+    "datasets/suite31_hw_eval.tar",
+    "datasets/iter10_5_proxy_2k.tar"
+  ],
+  "note": "Wave 13 Pivot Strategist 5: Arm A tests zero-train dark-border crop + canonical s_px=13 px 1-2 system band tiling (n_bands=1 bit-identical passthrough when s_px>=10 px; gate hw_landscape >= +5.0 pp, 0.00 pp printed); Arm B freezes base and trains 1,500-step rank-16 HW-only LoRA (1.29 MB INT4 on edge85m, <55 MB total) strictly on HW s_px=13 bands (gate hw_clean/hw_photo >= +4.0 pp over Arm A, domain-gated 0.00 pp printed)."
+}

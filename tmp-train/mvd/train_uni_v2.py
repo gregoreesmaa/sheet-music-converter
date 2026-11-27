@@ -316,27 +316,87 @@ def load_v2_checkpoint(
     }
 
 
-def load_v1_teacher(
+def _is_v2_teacher_checkpoint(raw_cfg: Any, sd: Dict[str, torch.Tensor]) -> bool:
+    """Return True if a checkpoint payload belongs to ``UniOMRv2Net`` rather than legacy ``UniOMRNet``."""
+    if isinstance(raw_cfg, UniOMRv2Config):
+        return True
+    if isinstance(raw_cfg, dict):
+        v2_cfg_keys = (
+            "n_axial_layers",
+            "n_global_layers",
+            "n_kv_heads",
+            "backbone_channels",
+            "vrfm_band_alpha",
+        )
+        if any(k in raw_cfg for k in v2_cfg_keys):
+            return True
+    v2_sd_prefixes = (
+        "encoder.axial_layers.",
+        "encoder.global_layers.",
+        "encoder.patch_merger.",
+        "deepstack_fusions.",
+    )
+    return any(k.startswith(v2_sd_prefixes) for k in sd.keys())
+
+
+def load_teacher(
     teacher_ckpt: Path | str,
     device: torch.device,
     use_bf16: bool = False,
-) -> UniOMRNet:
-    """Load a frozen ``UniOMRNet`` (v1) teacher from checkpoint in eval mode.
+) -> nn.Module:
+    """Load a frozen ``UniOMRNet`` (v1) or ``UniOMRv2Net`` (v2) teacher from checkpoint in eval mode.
 
-    When ``use_bf16=True`` on CUDA, casts frozen weights to ``torch.bfloat16`` to cut
-    teacher weight memory bandwidth by 2x; always stays ``float32`` on CPU.
+    Auto-detects v1 vs v2 from checkpoint config / state_dict keys. When ``use_bf16=True``
+    on CUDA, casts frozen weights to ``torch.bfloat16`` to cut teacher weight memory
+    bandwidth by 2x; always stays ``float32`` on CPU.
     """
     ck = torch.load(str(teacher_ckpt), map_location="cpu", weights_only=True)
-    raw_cfg = ck.get("config") or ck.get("cfg") or {}
+    raw_cfg = ck.get("cfg") or ck.get("config") or {}
+    sd = _extract_state_dict(ck)
+    cast_bf16 = bool(use_bf16 and device.type == "cuda")
+
+    if _is_v2_teacher_checkpoint(raw_cfg, sd):
+        if isinstance(raw_cfg, UniOMRv2Config):
+            t_cfg_v2 = raw_cfg
+        else:
+            valid_fields = set(UniOMRv2Config.__dataclass_fields__.keys())
+            cfg_dict = {k: v for k, v in dict(raw_cfg).items() if k in valid_fields}
+            for tup_key in ("backbone_channels", "backbone_blocks"):
+                if tup_key in cfg_dict and isinstance(cfg_dict[tup_key], list):
+                    cfg_dict[tup_key] = tuple(int(x) for x in cfg_dict[tup_key])
+            if "vocab_size" not in cfg_dict and "tok_emb.weight" in sd and sd["tok_emb.weight"].ndim == 2:
+                cfg_dict["vocab_size"] = int(sd["tok_emb.weight"].shape[0])
+            t_cfg_v2 = UniOMRv2Config(**cfg_dict)
+        teacher_v2 = UniOMRv2Net(t_cfg_v2)
+        inc = teacher_v2.load_state_dict(sd, strict=False)
+        teacher_v2.strip_aux_heads(strip_mtp=True)
+        if cast_bf16:
+            teacher_v2.to(device=device, dtype=torch.bfloat16)
+        else:
+            teacher_v2.to(device=device)
+        teacher_v2.eval()
+        for p in teacher_v2.parameters():
+            p.requires_grad_(False)
+        print(
+            f"[UniOMRv2 teacher-v2] loaded frozen v2 teacher from {teacher_ckpt} "
+            f"(d_model={t_cfg_v2.d_model}, vocab={t_cfg_v2.vocab_size}, "
+            f"ax={t_cfg_v2.n_axial_layers}/gl={t_cfg_v2.n_global_layers}/dec={t_cfg_v2.n_dec_layers}, "
+            f"dtype={'bfloat16' if cast_bf16 else 'float32'}, "
+            f"missing={len(inc.missing_keys)}, unexpected={len(inc.unexpected_keys)})",
+            flush=True,
+        )
+        return teacher_v2
+
     if isinstance(raw_cfg, UniOMRConfig):
         t_cfg = raw_cfg
     else:
         valid_fields = set(UniOMRConfig.__dataclass_fields__.keys())
-        t_cfg = UniOMRConfig(**{k: v for k, v in dict(raw_cfg).items() if k in valid_fields})
+        cfg_dict = {k: v for k, v in dict(raw_cfg).items() if k in valid_fields}
+        if "vocab_size" not in cfg_dict and "tok_emb.weight" in sd and sd["tok_emb.weight"].ndim == 2:
+            cfg_dict["vocab_size"] = int(sd["tok_emb.weight"].shape[0])
+        t_cfg = UniOMRConfig(**cfg_dict)
     teacher = UniOMRNet(t_cfg)
-    sd = _extract_state_dict(ck)
     inc = teacher.load_state_dict(sd, strict=False)
-    cast_bf16 = bool(use_bf16 and device.type == "cuda")
     if cast_bf16:
         teacher.to(device=device, dtype=torch.bfloat16)
     else:
@@ -346,11 +406,21 @@ def load_v1_teacher(
         p.requires_grad_(False)
     print(
         f"[UniOMRv2 teacher-v1] loaded frozen v1 teacher from {teacher_ckpt} "
-        f"(d_model={t_cfg.d_model}, dtype={'bfloat16' if cast_bf16 else 'float32'}, "
+        f"(d_model={t_cfg.d_model}, vocab={t_cfg.vocab_size}, "
+        f"dtype={'bfloat16' if cast_bf16 else 'float32'}, "
         f"missing={len(inc.missing_keys)}, unexpected={len(inc.unexpected_keys)})",
         flush=True,
     )
     return teacher
+
+
+def load_v1_teacher(
+    teacher_ckpt: Path | str,
+    device: torch.device,
+    use_bf16: bool = False,
+) -> nn.Module:
+    """Backward-compatible wrapper around :func:`load_teacher` (supports both v1 and v2 teachers)."""
+    return load_teacher(teacher_ckpt, device=device, use_bf16=use_bf16)
 
 
 # ---------------------------------------------------------------------------
@@ -876,14 +946,23 @@ def precompute_teacher_cache(
 
             tgt_in = seq[:, :-1]
             with amp_ctx:
-                out = teacher(
-                    images,
-                    tgt_in,
-                    keep_ratio_override=keep_ratio_override,
-                    return_aux=False,
-                    return_mtp=False,
-                    compute_ink_recall=compute_ink_recall,
-                )
+                if isinstance(teacher, UniOMRv2Net):
+                    out = teacher(
+                        images,
+                        tgt_in,
+                        keep_ratio_override=keep_ratio_override,
+                        return_aux=False,
+                        return_mtp=False,
+                    )
+                else:
+                    out = teacher(
+                        images,
+                        tgt_in,
+                        keep_ratio_override=keep_ratio_override,
+                        return_aux=False,
+                        return_mtp=False,
+                        compute_ink_recall=compute_ink_recall,
+                    )
             vals_b, idx_b = extract_topk_from_logits(out["logits"], k=k)
             for i, sid in enumerate(sids):
                 eff_len = max(0, int(orig_lens[i]) - 1)
@@ -1805,14 +1884,23 @@ def forward_and_loss_v2(
                             )
                         else:
                             t_tgt_in = src_tgt_in
-                        t_out = teacher_v1(
-                            t_images,
-                            t_tgt_in,
-                            keep_ratio_override=0.45,
-                            return_aux=False,
-                            return_mtp=False,
-                            compute_ink_recall=False,
-                        )
+                        if isinstance(teacher_v1, UniOMRv2Net):
+                            t_out = teacher_v1(
+                                t_images,
+                                t_tgt_in,
+                                keep_ratio_override=0.45,
+                                return_aux=False,
+                                return_mtp=False,
+                            )
+                        else:
+                            t_out = teacher_v1(
+                                t_images,
+                                t_tgt_in,
+                                keep_ratio_override=0.45,
+                                return_aux=False,
+                                return_mtp=False,
+                                compute_ink_recall=False,
+                            )
                         t_logits_inf = t_out["logits"]
                         if t_vocab_smaller:
                             t_base = t_v - 4
@@ -2731,6 +2819,8 @@ def run_train_v2(args: argparse.Namespace) -> Dict[str, Any]:
         cfg_overrides["n_axial_layers"] = int(args.n_axial_layers)
     if getattr(args, "n_global_layers", None) is not None:
         cfg_overrides["n_global_layers"] = int(args.n_global_layers)
+    if getattr(args, "vrfm_band_alpha", None) is not None:
+        cfg_overrides["vrfm_band_alpha"] = float(args.vrfm_band_alpha)
     cfg = build_v2_config(args.preset, **cfg_overrides)
 
     use_bf16 = bool(args.bf16 and device.type == "cuda")
@@ -2839,17 +2929,26 @@ def run_train_v2(args: argparse.Namespace) -> Dict[str, Any]:
         else max(1, int(args.eval_batch_size))
     )
 
-    # QAT-INT4 controller (last frac of training)
+    # QAT-INT4 controller (explicit --qat-int4-start-frac > 0.0 or legacy --qat-int4 + --qat-int4-last-frac)
+    qat_start_frac = float(getattr(args, "qat_int4_start_frac", 0.0))
+    qat_enabled_req = bool(args.qat_int4) or (qat_start_frac > 0.0)
     qat_ctrl: Optional[QATInt4ControllerV2] = (
         QATInt4ControllerV2(model, block_size=int(args.qat_int4_block_size), enabled=False)
-        if args.qat_int4
+        if qat_enabled_req
         else None
     )
-    qat_start_step = (
-        steps + 1
-        if args.qat_int4_last_frac <= 0.0
-        else max(1, int(steps * (1.0 - float(args.qat_int4_last_frac))))
-    )
+    if qat_start_frac > 0.0:
+        qat_start_step = (
+            steps + 1
+            if qat_start_frac >= 1.0
+            else max(1, int(steps * qat_start_frac))
+        )
+    else:
+        qat_start_step = (
+            steps + 1
+            if args.qat_int4_last_frac <= 0.0
+            else max(1, int(steps * (1.0 - float(args.qat_int4_last_frac))))
+        )
 
     # Device-resident EMA shadow
     gpu_ema_decay = float(max(0.0, min(0.99999, args.gpu_ema_decay)))
@@ -3438,7 +3537,13 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description="UniOMR v2 — Iter-11 Training & Hybrid v1->v2 Distillation")
 
     # Model preset & warm-start
-    p.add_argument("--preset", choices=["small_45m", "edge85m", "tiny"], default="small_45m")
+    p.add_argument(
+        "--preset",
+        "--arch-preset",
+        dest="preset",
+        choices=["small_45m", "edge85m", "tiny"],
+        default="small_45m",
+    )
     p.add_argument("--init-from", type=str, default=None, help="Resume full UniOMRv2 checkpoint")
     p.add_argument("--init-encoder-from", type=str, default=None, help="Load I-JEPA v2 encoder weights (strict=False)")
     p.add_argument("--grad-checkpoint", action="store_true", help="Enable axial-only selective checkpointing")
@@ -3474,6 +3579,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
         type=int,
         default=None,
         help="Override preset encoder n_global_layers (default: None = preset default, e.g. 4; use 5 for ax1_gl5)",
+    )
+    p.add_argument(
+        "--vrfm-band-alpha",
+        type=float,
+        default=None,
+        help="Override router 3-row staff-band saliency smoothing alpha (default: None = config default 0.30)",
     )
     p.add_argument("--mtp-k", type=int, default=4)
     p.add_argument("--use-sys-y-aux", action="store_true", default=True)
@@ -3572,6 +3683,13 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Probability of running the CASS draft decoder pass on a microbatch (default 1.0)",
     )
     p.add_argument("--qat-int4", action="store_true")
+    p.add_argument(
+        "--qat-int4-start-frac",
+        type=float,
+        default=0.0,
+        help="Enable late-stage QATInt4ControllerV2 starting at this fraction of total steps "
+        "(default: 0.0 = off; e.g. 0.85 activates QAT in the final 15%% of steps)",
+    )
     p.add_argument("--qat-int4-last-frac", type=float, default=0.15)
     p.add_argument("--qat-int4-block-size", type=int, default=32)
     p.add_argument("--gpu-ema-decay", type=float, default=0.997)

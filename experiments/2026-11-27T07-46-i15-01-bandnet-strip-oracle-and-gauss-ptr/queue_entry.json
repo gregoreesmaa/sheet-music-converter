@@ -1,0 +1,22 @@
+{
+  "id": "2026-11-27T07-46-i15-01-bandnet-strip-oracle-and-gauss-ptr",
+  "short_id": "i15-01",
+  "title": "Pivot Strategist 1 (Wave 13): Zero-Retrain BandNet Strip Oracle & StaffSeg Gaussian Cross-Attention Pointer",
+  "wave": 13,
+  "priority": 1,
+  "provider": "colab_l4",
+  "gpu": "L4",
+  "est_minutes": 20,
+  "est_cu": 1.5,
+  "script": "experiments/2026-11-27T07-46-i15-01-bandnet-strip-oracle-and-gauss-ptr/run_colab.py",
+  "readme": "experiments/2026-11-27T07-46-i15-01-bandnet-strip-oracle-and-gauss-ptr/README.md",
+  "plan": "experiments/2026-11-27T07-46-i15-01-bandnet-strip-oracle-and-gauss-ptr/PLAN.md",
+  "hf_eval_target": "evals/2026-11-27T07-46-i15-01-bandnet-strip-oracle-and-gauss-ptr.json",
+  "hf_run_target": "runs/2026-11-27T07-46-i15-01-bandnet-strip-oracle-and-gauss-ptr.json",
+  "status": "QUEUED",
+  "depends_on": [],
+  "datasets": [
+    "datasets/suite31_hw_eval.tar"
+  ],
+  "note": "Wave 13 Pivot Strategist 1: 3 zero-retrain arms on frozen UniOMRv2 EMA over suite31_hw (14 HW + 10 printed safety = 48 pages): fullpage_baseline vs StaffSegHead Gaussian cross-attn pointer vs BandNet strip-crop oracle."
+}

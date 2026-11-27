@@ -1,0 +1,23 @@
+{
+  "id": "2026-11-27T07-52-i15-06-bekern3-visual-sp-chord-polyphony",
+  "short_id": "i15-06",
+  "title": "bekern3 Architect 1: Core Visual-Pitch (sp-14..sp+20 + 5 Printed acc-*), Duration-First Implicit Chords & Fused Dots, Descending-mean(sp) Polyphony (<v>/skip), and Rational d0..d9 / Tuplets & Meters",
+  "wave": 13,
+  "priority": 6,
+  "provider": "colab_l4",
+  "gpu": "L4",
+  "est_minutes": 65,
+  "est_cu": 4.8,
+  "script": "experiments/2026-11-27T07-52-i15-06-bekern3-visual-sp-chord-polyphony/run_colab.py",
+  "readme": "experiments/2026-11-27T07-52-i15-06-bekern3-visual-sp-chord-polyphony/README.md",
+  "plan": "experiments/2026-11-27T07-52-i15-06-bekern3-visual-sp-chord-polyphony/PLAN.md",
+  "hf_eval_target": "evals/2026-11-27T07-52-i15-06-bekern3-visual-sp-chord-polyphony.json",
+  "hf_run_target": "runs/2026-11-27T07-52-i15-06-bekern3-visual-sp-chord-polyphony.json",
+  "status": "QUEUED",
+  "depends_on": [],
+  "datasets": [
+    "datasets/iter10_5_proxy_2k.tar",
+    "datasets/suite31_hw_eval.tar"
+  ],
+  "note": "Wave 13 bekern3 Architect 1: 2-arm 1,200-step Colab L4 ablation on UniOMRv2Net(small_45m) comparing arm0_bekern_v2a vs arm1_bekern3_core (sp-14..sp+20 + 5 printed acc-*, duration-first implicit chords + fused dotted durations, descending-mean(sp) <v> + skip <DUR>, rational d0..d9 / tuplets & meters, exact Ratio<i64> resolver). Gates: suite31_hw MusicXML round-trip oracle >= 99.5%, token-length reduction >= 30%, and HWM Note F1 >= +3.0 pp OR printed >= -0.5 pp with >= +30% MTP-4 effective notes/sec throughput."
+}

@@ -1,0 +1,24 @@
+{
+  "id": "2026-11-27T07-46-i15-03-lyrics-textspotter-vs-deferred-bpe",
+  "short_id": "i15-03",
+  "title": "Pivot Strategist 3: Lyrics & Text Bake-Off (Parallel TextSpotterHead vs Deferred <sys_lyr> Syllable BPE)",
+  "wave": 13,
+  "priority": 3,
+  "provider": "colab_l4",
+  "gpu": "L4",
+  "est_minutes": 75,
+  "est_min": 75,
+  "est_cu": 5.5,
+  "script": "experiments/2026-11-27T07-46-i15-03-lyrics-textspotter-vs-deferred-bpe/run_colab.py",
+  "readme": "experiments/2026-11-27T07-46-i15-03-lyrics-textspotter-vs-deferred-bpe/README.md",
+  "plan": "experiments/2026-11-27T07-46-i15-03-lyrics-textspotter-vs-deferred-bpe/PLAN.md",
+  "hf_eval_target": "evals/2026-11-27T07-46-i15-03-lyrics-textspotter-vs-deferred-bpe.json",
+  "hf_run_target": "runs/2026-11-27T07-46-i15-03-lyrics-textspotter-vs-deferred-bpe.json",
+  "status": "QUEUED",
+  "depends_on": [],
+  "datasets": [
+    "datasets/iter10_5_proxy_2k.tar",
+    "datasets/suite31_hw_eval.tar"
+  ],
+  "note": "Wave 13 Pivot Strategist 3: 2-arm 1,500-step bake-off on edge85m (<55MB INT4) breaking the -13.5pp S_expr text=0.000 ceiling — arm_a_textspotter_head (~1.8M parallel 2L d=256 cross-attending to mem_post_merger + unfrozen router) vs arm_b_deferred_sys_lyr_bpe (end-of-system <sys_lyr> + 256-token syllable BPE). Promote gate: held-out text F1 >= 0.70, vocal S_note delta >= -0.5pp, packed INT4 < 55.0 MB."
+}

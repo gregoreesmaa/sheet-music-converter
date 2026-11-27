@@ -1,0 +1,23 @@
+{
+  "id": "2026-11-27T07-52-i15-08-bekern3-expressive-oracle-and-compress",
+  "short_id": "i15-08",
+  "title": "bekern3 Architect 3 (Wave 13): Expressive/Text 125-Page NorthStar Oracle Closure & Profile-A / Core-Pitch Compression + MTP-4 Speedup Bake-Off",
+  "wave": 13,
+  "priority": 2,
+  "provider": "colab_l4",
+  "gpu": "L4",
+  "est_minutes": 60,
+  "est_cu": 4.5,
+  "script": "experiments/2026-11-27T07-52-i15-08-bekern3-expressive-oracle-and-compress/run_colab.py",
+  "readme": "experiments/2026-11-27T07-52-i15-08-bekern3-expressive-oracle-and-compress/README.md",
+  "plan": "experiments/2026-11-27T07-52-i15-08-bekern3-expressive-oracle-and-compress/PLAN.md",
+  "hf_eval_target": "evals/2026-11-27T07-52-i15-08-bekern3-expressive-oracle-and-compress.json",
+  "hf_run_target": "runs/2026-11-27T07-52-i15-08-bekern3-expressive-oracle-and-compress.json",
+  "status": "QUEUED",
+  "depends_on": [],
+  "datasets": [
+    "datasets/iter10_5_proxy_2k.tar",
+    "datasets/suite31_hw_eval.tar"
+  ],
+  "note": "Wave 13 bekern3 Architect 3: Part A 125-page OMR-NorthStar Oracle Closure (NS>=98.0, S_expr>=0.980) + Part B 3-arm 600-step MTP-4 bake-off (arm0_bekern_v2a vs arm1_profile_a_comp -20.2% vs arm2_profile_a_plus_core_pitch -41.1%, gate >=1.45x MTP-4 speedup & >=-0.2pp Note F1)."
+}

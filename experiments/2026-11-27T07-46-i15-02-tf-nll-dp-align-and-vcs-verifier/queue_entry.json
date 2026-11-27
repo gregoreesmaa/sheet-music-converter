@@ -1,0 +1,22 @@
+{
+  "id": "2026-11-27T07-46-i15-02-tf-nll-dp-align-and-vcs-verifier",
+  "short_id": "i15-02",
+  "title": "Pivot Strategist 2 (Pivots 1 & 3): Visual Consistency Score (VCS) Verifier Correlation & AR-Free Teacher-Forced NLL + Cross-Attention Monotonicity DP Alignment Bench",
+  "wave": 13,
+  "priority": 2,
+  "provider": "colab_l4",
+  "gpu": "L4",
+  "est_minutes": 30,
+  "est_cu": 2.0,
+  "script": "experiments/2026-11-27T07-46-i15-02-tf-nll-dp-align-and-vcs-verifier/run_colab.py",
+  "readme": "experiments/2026-11-27T07-46-i15-02-tf-nll-dp-align-and-vcs-verifier/README.md",
+  "plan": "experiments/2026-11-27T07-46-i15-02-tf-nll-dp-align-and-vcs-verifier/PLAN.md",
+  "hf_eval_target": "evals/2026-11-27T07-46-i15-02-tf-nll-dp-align-and-vcs-verifier.json",
+  "hf_run_target": "runs/2026-11-27T07-46-i15-02-tf-nll-dp-align-and-vcs-verifier.json",
+  "status": "QUEUED",
+  "depends_on": [],
+  "datasets": [
+    "datasets/suite31_hw_eval.tar"
+  ],
+  "note": "Wave 13 Pivot Strategist 2 (100% permissive): Part A validates VCS (ink IoU + barline-X corr + 1280/1536 cross-scale agree + frozen encoder cosine) on 14 suite31_hw HW pieces (gate Pearson r >= 0.70 + ov-39 hallucination FP rejection); Part B benchmarks AR-free TF-NLL + Cross-Attention Monotonicity DP vs free-decoded alignment on multi-system HW spans (gate Top-1 >= 0.85 for 1,466 idle gold-XML archival pages)."
+}

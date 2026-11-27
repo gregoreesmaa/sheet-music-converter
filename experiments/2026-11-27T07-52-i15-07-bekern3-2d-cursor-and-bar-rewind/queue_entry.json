@@ -1,0 +1,23 @@
+{
+  "id": "2026-11-27T07-52-i15-07-bekern3-2d-cursor-and-bar-rewind",
+  "short_id": "i15-07",
+  "title": "bekern3 Architect 2: 2D Spatial Cursor (@y/@x + CE-Masked @y?/@x?), Macro-Topology (PPQ=40320) & Local Single-Bar KV-Rewind",
+  "wave": 13,
+  "priority": 7,
+  "provider": "colab_l4",
+  "gpu": "L4",
+  "est_minutes": 65,
+  "est_cu": 4.8,
+  "script": "experiments/2026-11-27T07-52-i15-07-bekern3-2d-cursor-and-bar-rewind/run_colab.py",
+  "readme": "experiments/2026-11-27T07-52-i15-07-bekern3-2d-cursor-and-bar-rewind/README.md",
+  "plan": "experiments/2026-11-27T07-52-i15-07-bekern3-2d-cursor-and-bar-rewind/PLAN.md",
+  "hf_eval_target": "evals/2026-11-27T07-52-i15-07-bekern3-2d-cursor-and-bar-rewind.json",
+  "hf_run_target": "runs/2026-11-27T07-52-i15-07-bekern3-2d-cursor-and-bar-rewind.json",
+  "status": "QUEUED",
+  "depends_on": [],
+  "datasets": [
+    "datasets/iter10_5_proxy_2k.tar",
+    "datasets/suite31_hw_eval.tar"
+  ],
+  "note": "Wave 13 bekern3 Architect 2: 2-arm 1,200-step Colab L4 ablation (arm0_bekern_v2a vs arm1_bekern3_spatial: quantized @y00..@y63 after <sys> + @x00..@x63 after BarClose with train-only CE-masked @y?/@x? for noisy HW, strict 2D monotonic FSA, <part> <s1..s12> + <pickup>/bar-split with exact PPQ=40320 ticks, plus eval-time local single-bar KV-cache rewind beam=4 on beat-mismatch). Gates: loop_truncation_count -> 0% without n-gram hacks, sys_count_exact >= +5pp, ryans-jig/mozart-k387 Note F1, aloha-oe S_play, latency overhead <= +12%."
+}
