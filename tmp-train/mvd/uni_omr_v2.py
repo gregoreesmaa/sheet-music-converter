@@ -954,14 +954,14 @@ class InkTokenRouterV2(nn.Module):
             saliency_prob = saliency_prob * paper_gate
             if getattr(self, "adaptive_ink_target", False):
                 flat_ink = local_ink_grid.flatten(1).float()
-                paper_f = paper_mask_grid.flatten(1).float()
-                paper_cnt = paper_f.sum(dim=-1, keepdim=True).clamp(min=1.0)
-                mean_ink = (flat_ink * paper_f).sum(dim=-1, keepdim=True) / paper_cnt
-                var_ink = (((flat_ink - mean_ink) ** 2) * paper_f).sum(dim=-1, keepdim=True) / paper_cnt
-                std_ink = torch.sqrt(var_ink.clamp(min=0.0))
+                if torch.onnx.is_in_onnx_export():
+                    k30 = max(1, min(N, int(round(0.30 * max(0, N - 1))) + 1))
+                    bg_p30 = torch.topk(flat_ink, k=k30, dim=1, largest=False, sorted=True).values[:, -1:]
+                else:
+                    bg_p30 = torch.quantile(flat_ink, 0.30, dim=1, keepdim=True)
                 ink_thr = (
-                    (mean_ink + 0.5 * std_ink)
-                    .clamp(min=0.08, max=0.20)
+                    (bg_p30 + 0.045)
+                    .clamp(min=0.045, max=0.10)
                     .view(B, 1, 1, 1)
                     .to(local_ink_grid.dtype)
                 )

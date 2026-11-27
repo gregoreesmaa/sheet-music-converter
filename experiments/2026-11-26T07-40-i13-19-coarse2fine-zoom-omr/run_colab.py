@@ -548,7 +548,7 @@ def _encode_bekerns_to_systems(bek_paths: Sequence[Path]) -> Tuple[List[List[int
     sys_seqs: List[List[int]] = []
     full_toks: List[str] = []
     for idx, bp in enumerate(bek_paths):
-        toks = data.read_bekern_tokens(bp)
+        toks = data.load_bekern(bp)
         if not toks:
             continue
         sys_seqs.append(uni_omr.encode_uni(toks))
@@ -677,16 +677,82 @@ def _eval_suite31(
     aser_bin: Optional[Path],
     eharness_bin: Optional[Path],
 ) -> Dict[str, Any]:
+    import xml.etree.ElementTree as ET
     import torch
     from PIL import Image
-    import data
     import eval_uni_suite31 as eus
+    import rlvr_grpo
     import uni_omr
+
+    def _extract_musicxml_notes_and_sys(xml_path: Path) -> Tuple[List[Tuple[str, int, str, str, str]], int]:
+        notes: List[Tuple[str, int, str, str, str]] = []
+        n_sys = 1
+        try:
+            root = ET.parse(str(xml_path)).getroot()
+        except Exception:
+            return notes, n_sys
+
+        def _strip(tag: str) -> str:
+            return tag.split("}", 1)[-1] if "}" in tag else tag
+
+        for elem in root.iter():
+            tag = _strip(elem.tag)
+            if tag == "print" and str(elem.attrib.get("new-system", "")).lower() == "yes":
+                n_sys += 1
+            elif tag == "note":
+                is_rest = is_grace = False
+                step = octave = alter = dur = ""
+                n_dots = 0
+                for child in elem:
+                    ctag = _strip(child.tag)
+                    if ctag == "rest":
+                        is_rest = True
+                    elif ctag == "grace":
+                        is_grace = True
+                    elif ctag == "pitch":
+                        for pc in child:
+                            ptag = _strip(pc.tag)
+                            text = (pc.text or "").strip()
+                            if ptag == "step":
+                                step = text.upper()
+                            elif ptag == "octave":
+                                octave = text
+                            elif ptag == "alter":
+                                try:
+                                    av = int(round(float(text)))
+                                    if av != 0:
+                                        alter = f"a{av}"
+                                except ValueError:
+                                    pass
+                    elif ctag == "type":
+                        dur = (child.text or "").strip().lower()
+                    elif ctag == "dot":
+                        n_dots += 1
+                if not is_rest and not is_grace and step and octave and dur:
+                    notes.append((dur, n_dots, step, octave, alter))
+        return notes, max(1, n_sys)
+
+    def _decode_from_mem(model_base: Any, mem: Any, max_len: int) -> List[int]:
+        _, bos_id, eos_id, _, _, _ = eus._vocab_spec(int(model_base.cfg.vocab_size))
+        cur_ids = torch.full((1, 1), bos_id, dtype=torch.long, device=device)
+        past_kvs = None
+        out_ids = [bos_id]
+        with torch.amp.autocast("cuda", dtype=torch.bfloat16, enabled=use_bf16):
+            for _ in range(max_len):
+                logits, _, past_kvs = model_base.decode_tokens(
+                    cur_ids, mem, past_kvs=past_kvs, use_cache=True
+                )
+                nxt = int(logits[:, -1, :].argmax(dim=-1).item())
+                out_ids.append(nxt)
+                if nxt == eos_id:
+                    break
+                cur_ids = torch.tensor([[nxt]], dtype=torch.long, device=device)
+        return out_ids
 
     wrapper_or_base.eval()
     base = wrapper_or_base.base if is_two_pass else wrapper_or_base
-    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-    base_dir = manifest_path.parent
+    _, _, eos_id, _, _, id_to_tok = eus._vocab_spec(int(base.cfg.vocab_size))
+    _, pieces = eus.resolve_manifest_pieces(manifest_path)
 
     buckets: Dict[str, List[Dict[str, float]]] = {
         "printed_clean": [],
@@ -698,21 +764,12 @@ def _eval_suite31(
     hw_band_recalls: List[float] = []
 
     with torch.no_grad():
-        for entry in manifest.get("pieces", []):
-            is_hw = bool(entry.get("is_handwritten", False)) or str(entry.get("domain", "")).lower().startswith("hw")
-            gt_beks = [base_dir / p for p in entry.get("bekerns", [])]
-            gt_toks: List[str] = []
-            for idx, bp in enumerate(gt_beks):
-                if bp.is_file():
-                    if idx > 0:
-                        gt_toks.append(uni_omr.SYS_TOKEN)
-                    gt_toks.extend(data.read_bekern_tokens(bp))
-            n_gt_sys = max(1, len(gt_beks))
+        for entry in pieces:
+            is_hw = bool(entry.get("handwritten", False))
+            ref_notes, n_gt_sys = _extract_musicxml_notes_and_sys(Path(entry["gt"]))
 
-            for mode_key, img_rel in (("clean", entry.get("clean_image")), ("photo", entry.get("photo_image"))):
-                if not img_rel:
-                    continue
-                img_p = base_dir / img_rel
+            for mode_key in ("clean", "photo"):
+                img_p = Path(entry[mode_key])
                 if not img_p.is_file():
                     continue
                 img = Image.open(img_p).convert("RGB")
@@ -726,15 +783,17 @@ def _eval_suite31(
                         gt_bands = _extract_gt_system_bands_from_image(img, n_gt_sys)
                         hw_band_recalls.append(_band_recall(pred_bands, gt_bands))
                     pred_toks: List[str] = []
+                    hit_eos = True
                     for b_idx, (y0, y1) in enumerate(pred_bands[:10]):
                         crop = _crop_zoom_band(img, y0, y1)
                         bt = _pil_to_tensor(crop, ZOOM_BAND_W, target_hw=(ZOOM_BAND_H, ZOOM_BAND_W)).unsqueeze(0).to(device)
                         with torch.amp.autocast("cuda", dtype=torch.bfloat16, enabled=use_bf16):
                             mem = wrapper_or_base.encode_zoom_with_ctx(bt, global_ctx)
-                        ids = eus.generate_constrained(
-                            base, mem, max_len=BAND_MAX_SEQ_LEN, use_grammar=True, device=device
-                        )
-                        toks_b = eus.decode_uni_compat(ids, vocab_size=base.cfg.vocab_size)
+                        ids = _decode_from_mem(base, mem, BAND_MAX_SEQ_LEN)
+                        toks_b = eus.decode_uni_compat(ids, vocab_size=base.cfg.vocab_size, skip_special=True)
+                        if eos_id not in ids[1:]:
+                            toks_b = eus.trim_truncated_tokens(toks_b)
+                            hit_eos = False
                         if b_idx > 0 and toks_b:
                             pred_toks.append(uni_omr.SYS_TOKEN)
                         pred_toks.extend(toks_b)
@@ -742,40 +801,21 @@ def _eval_suite31(
                     inp_t = _pil_to_tensor(img, FULLPAGE_MAX_DIM).unsqueeze(0).to(device)
                     with torch.amp.autocast("cuda", dtype=torch.bfloat16, enabled=use_bf16):
                         mem, _, _ = base.encode_image(inp_t, return_aux=False)
-                    ids = eus.generate_constrained(
-                        base, mem, max_len=SUITE31_MAX_LEN, use_grammar=True, device=device
-                    )
-                    pred_toks = eus.decode_uni_compat(ids, vocab_size=base.cfg.vocab_size)
+                    ids = _decode_from_mem(base, mem, SUITE31_MAX_LEN)
+                    hit_eos = eos_id in ids[1:]
+                    pred_toks = eus.decode_uni_compat(ids, vocab_size=base.cfg.vocab_size, skip_special=True)
+                    if not hit_eos:
+                        pred_toks = eus.trim_truncated_tokens(pred_toks)
 
                 latencies.append(time.perf_counter() - t0)
-                tok_f1 = _token_f1(pred_toks, gt_toks)
-                note_f1 = tok_f1  # fallback if Rust binaries unavailable
-                dec_ok = 1.0 if len(pred_toks) > 0 else 0.0
-                if aser_bin is not None and eharness_bin is not None and entry.get("gt_musicxml"):
-                    gt_xml = base_dir / entry["gt_musicxml"]
-                    if gt_xml.is_file():
-                        try:
-                            with tempfile.TemporaryDirectory() as td:
-                                bek_f = Path(td) / "pred.bekern"
-                                xml_f = Path(td) / "pred.musicxml"
-                                bek_f.write_text(" ".join(eus.trim_truncated_tokens(pred_toks)), encoding="utf-8")
-                                r1 = subprocess.run(
-                                    [str(aser_bin), "bekern-decode", "--input", str(bek_f), "--out", str(xml_f)],
-                                    capture_output=True, text=True, timeout=15,
-                                )
-                                if r1.returncode == 0 and xml_f.is_file():
-                                    r2 = subprocess.run(
-                                        [str(eharness_bin), "--gt", str(gt_xml), "--pred", str(xml_f), "--json"],
-                                        capture_output=True, text=True, timeout=15,
-                                    )
-                                    if r2.returncode == 0:
-                                        res = json.loads(r2.stdout)
-                                        note_f1 = float(res.get("strict_note_f1", res.get("note_f1", tok_f1)))
-                                        dec_ok = 1.0
-                                else:
-                                    dec_ok = 0.0
-                        except Exception:
-                            dec_ok = 0.0
+                hyp_toks, _ = eus.stitch_uni_tokens(pred_toks)
+                hyp_notes = rlvr_grpo.extract_pitch_dur_notes(hyp_toks)
+                note_f1 = float(rlvr_grpo.compute_sequence_f1(ref_notes, hyp_notes))
+                struct = rlvr_grpo.compute_unlabeled_structural_reward(
+                    hyp_toks, vocab=id_to_tok, terminated_eos=hit_eos
+                )
+                dec_ok = 1.0 if (len(hyp_notes) > 0 and float(struct.get("r_parse", 0.0)) > 0.0) else 0.0
+                tok_f1 = note_f1
 
                 bkey = f"{'hw' if is_hw else 'printed'}_{mode_key}"
                 buckets[bkey].append({"tok_f1": tok_f1, "note_f1": note_f1, "dec_ok": dec_ok})

@@ -385,12 +385,13 @@ class ViRTwoTierRouter(nn.Module):
             score = score * paper_gate
             if getattr(self, "adaptive_ink_target", False):
                 flat_ink = local_ink_grid.flatten(1)
-                paper_flat = effective_paper_f.flatten(1)
-                paper_cnt = paper_flat.sum(dim=-1, keepdim=True).clamp(min=1.0)
-                mean_ink = (flat_ink * paper_flat).sum(dim=-1, keepdim=True) / paper_cnt
-                var_ink = ((flat_ink - mean_ink) * (flat_ink - mean_ink) * paper_flat).sum(dim=-1, keepdim=True) / paper_cnt
-                std_ink = torch.sqrt(var_ink.clamp(min=0.0))
-                ink_thr = (mean_ink + 0.5 * std_ink).clamp(min=0.08, max=0.20).view(B, 1, 1, 1)
+                n_grid = int(flat_ink.shape[1])
+                if torch.onnx.is_in_onnx_export():
+                    k30 = max(1, min(n_grid, int(round(0.30 * max(0, n_grid - 1))) + 1))
+                    bg_p30 = torch.topk(flat_ink, k=k30, dim=1, largest=False, sorted=True).values[:, -1:]
+                else:
+                    bg_p30 = torch.quantile(flat_ink, 0.30, dim=1, keepdim=True)
+                ink_thr = (bg_p30 + 0.045).clamp(min=0.045, max=0.10).view(B, 1, 1, 1)
                 ink_target = ((local_ink_grid > ink_thr).to(torch.float32) * effective_paper_f)
             else:
                 ink_target = ((local_ink_grid > 0.04).to(torch.float32) * effective_paper_f)

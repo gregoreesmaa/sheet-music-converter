@@ -124,7 +124,55 @@ def _find_repo_root() -> Path:
     raise FileNotFoundError(f"Could not locate sheet-music-converter workspace or bundle at {BUNDLE_PATH}")
 
 
-def _setup_environment() -> Tuple[Path, Path, Path]:
+def _extract_musicxml_notes(xml_path: Path) -> List[Tuple[str, int, str, str, str]]:
+    import xml.etree.ElementTree as ET
+
+    notes: List[Tuple[str, int, str, str, str]] = []
+    try:
+        root = ET.parse(str(xml_path)).getroot()
+    except Exception:
+        return notes
+
+    def _strip(tag: str) -> str:
+        return tag.split("}", 1)[-1] if "}" in tag else tag
+
+    for elem in root.iter():
+        if _strip(elem.tag) != "note":
+            continue
+        is_rest = is_grace = False
+        step = octave = alter = dur = ""
+        n_dots = 0
+        for child in elem:
+            ctag = _strip(child.tag)
+            if ctag == "rest":
+                is_rest = True
+            elif ctag == "grace":
+                is_grace = True
+            elif ctag == "pitch":
+                for pc in child:
+                    ptag = _strip(pc.tag)
+                    text = (pc.text or "").strip()
+                    if ptag == "step":
+                        step = text.upper()
+                    elif ptag == "octave":
+                        octave = text
+                    elif ptag == "alter":
+                        try:
+                            av = int(round(float(text)))
+                            if av != 0:
+                                alter = f"a{av}"
+                        except ValueError:
+                            pass
+            elif ctag == "type":
+                dur = (child.text or "").strip().lower()
+            elif ctag == "dot":
+                n_dots += 1
+        if not is_rest and not is_grace and step and octave and dur:
+            notes.append((dur, n_dots, step, octave, alter))
+    return notes
+
+
+def _setup_environment() -> Path:
     repo_root = _find_repo_root()
     CACHE_ROOT.mkdir(parents=True, exist_ok=True)
 
@@ -137,31 +185,7 @@ def _setup_environment() -> Tuple[Path, Path, Path]:
     if needed_pkgs:
         _run_cmd([sys.executable, "-m", "pip", "install", "-q", *needed_pkgs])
 
-    cargo_bin_dir = Path.home() / ".cargo" / "bin"
-    env = os.environ.copy()
-    env["PATH"] = f"{cargo_bin_dir}:{env.get('PATH', '')}"
-
-    aser_manifest = repo_root / "converter" / "assembly-serialize" / "Cargo.toml"
-    eharness_manifest = repo_root / "converter" / "eval-harness" / "Cargo.toml"
-    aser_bin = aser_manifest.parent / "target" / "release" / "assembly-serialize"
-    eharness_bin = eharness_manifest.parent / "target" / "release" / "eval-harness"
-
-    if not aser_bin.exists() or not eharness_bin.exists():
-        if shutil.which("cargo", path=env["PATH"]) is None:
-            _run_cmd(
-                "curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs "
-                "| sh -s -- -y --default-toolchain stable --profile minimal",
-                shell=True,
-                env=env,
-            )
-        if not aser_bin.exists():
-            _run_cmd(["cargo", "build", "--release", "--manifest-path", str(aser_manifest)], env=env)
-        if not eharness_bin.exists():
-            _run_cmd(["cargo", "build", "--release", "--manifest-path", str(eharness_manifest)], env=env)
-
-    assert aser_bin.exists(), f"Missing Linux binary: {aser_bin}"
-    assert eharness_bin.exists(), f"Missing Linux binary: {eharness_bin}"
-    return repo_root, aser_bin, eharness_bin
+    return repo_root
 
 
 def _is_header_tok(tok: str) -> bool:
@@ -421,7 +445,7 @@ def run_experiment() -> Dict[str, Any]:
     started_iso = datetime.now(timezone.utc).isoformat()
     try:
         token = _read_and_purge_hf_token()
-        repo_root, aser_bin, eharness_bin = _setup_environment()
+        repo_root = _setup_environment()
 
         mvd_dir = repo_root / "tmp-train" / "mvd"
         if str(mvd_dir) not in sys.path:
@@ -429,20 +453,18 @@ def run_experiment() -> Dict[str, Any]:
 
         import torch
         from huggingface_hub import HfApi, hf_hub_download
-        import eval_sys_gate as esg
         import eval_uni_suite31 as ev
         import grammar
+        import rlvr_grpo
         import uni_omr
 
-        esg.ASER = str(aser_bin)
-        esg.EHARNESS = str(eharness_bin)
         if torch.cuda.is_available():
             torch.backends.cuda.enable_cudnn_sdp(False)
             torch.backends.cuda.enable_mem_efficient_sdp(True)
             torch.backends.cuda.enable_flash_sdp(True)
 
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        use_bf16 = device.type == "cuda"
+        use_bf16 = device.type == "cuda" and torch.cuda.get_device_capability(0)[0] >= 8
         platform_str = f"colab-{torch.cuda.get_device_name(0)}" if device.type == "cuda" else "cpu"
 
         api = HfApi(token=token)
@@ -471,12 +493,10 @@ def run_experiment() -> Dict[str, Any]:
                 tf.extractall(path=suite_dir)
 
         manifest_path = suite_dir / "suite31" / "suite31_hw_manifest.json"
-        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-        pieces = manifest["pieces"]
-        suite_root = manifest_path.parent
+        _, pieces = ev.resolve_manifest_pieces(manifest_path)
 
         model, cfg, ckpt_meta = ev.load_uni_checkpoint(ckpt_local, device)
-        _, _, eos_id, _, _, _ = ev._vocab_spec(int(cfg.vocab_size))
+        _, _, eos_id, _, _, id_to_tok = ev._vocab_spec(int(cfg.vocab_size))
 
         workdir = CACHE_ROOT / EXP_ID
         workdir.mkdir(parents=True, exist_ok=True)
@@ -484,18 +504,13 @@ def run_experiment() -> Dict[str, Any]:
         final_local_path = workdir / f"{EXP_ID}.json"
 
         # Preload refs & images
-        refs_cache: Dict[str, Tuple[List[str], Path]] = {}
+        refs_cache: Dict[str, List[Tuple[str, int, str, str, str]]] = {}
         img_cache: Dict[Tuple[str, str], Any] = {}
         for piece in pieces:
             slug = piece["slug"]
-            ref_bek = suite_root / piece["bekern"]
-            ref_toks = ref_bek.read_text(encoding="utf-8").strip().split()
-            ref_notes = workdir / f"ref-{slug}.json"
-            if not ref_notes.exists():
-                esg.run_cli([esg.ASER, "bekern-decode", "--input", str(ref_bek), "--out", str(ref_notes)])
-            refs_cache[slug] = (ref_toks, ref_notes)
+            refs_cache[slug] = _extract_musicxml_notes(Path(piece["gt"]))
             for domain in ("clean", "photo"):
-                img_p = suite_root / piece[domain]
+                img_p = Path(piece[domain])
                 img_cache[(slug, domain)] = uni_omr.load_fullpage_image(img_p, max_dim=MAX_DIM).unsqueeze(0)
 
         results_by_arm: Dict[str, Any] = {}
@@ -514,22 +529,18 @@ def run_experiment() -> Dict[str, Any]:
         base_hyp_score_cache: Dict[Tuple[str, str], Tuple[List[str], Dict[str, Any]]] = {}
         last_save_ts = time.time()
 
-        def _score_hyp(slug: str, domain: str, tag: str, hyp_toks: List[str], ref_toks: List[str], ref_notes: Path) -> Dict[str, Any]:
-            _, _, tok_f1 = uni_omr.compute_token_f1(ref_toks, hyp_toks)
-            tok_lcs = ev.compute_token_lcs_f1(ref_toks, hyp_toks)
-            hyp_txt = workdir / f"{tag}-{slug}-{domain}-hyp.txt"
-            hyp_txt.write_text(" ".join(hyp_toks) + "\n", encoding="utf-8")
-            hyp_notes = workdir / f"{tag}-{slug}-{domain}-notes.json"
-            p_dec = esg.run_cli([esg.ASER, "bekern-decode", "--input", str(hyp_txt), "--out", str(hyp_notes)])
-            bekern_ok = (p_dec.returncode == 0) and hyp_notes.exists()
-            if not bekern_ok:
-                return {"tok_f1": round(tok_f1, 6), "tok_lcs": round(tok_lcs, 6), "note_f1": 0.0, "decode_ok": False}
-            sc = esg.score_notes_pair(ref_notes, hyp_notes, workdir, f"{tag}-{slug}-{domain}", esg.EHARNESS, esg.ASER)
+        def _score_hyp(slug: str, domain: str, tag: str, hyp_toks: List[str], ref_notes: List[Tuple[str, int, str, str, str]], has_eos: bool = True) -> Dict[str, Any]:
+            hyp_notes = rlvr_grpo.extract_pitch_dur_notes(hyp_toks)
+            note_f1 = float(rlvr_grpo.compute_sequence_f1(ref_notes, hyp_notes))
+            struct = rlvr_grpo.compute_unlabeled_structural_reward(
+                hyp_toks, vocab=id_to_tok, terminated_eos=has_eos
+            )
+            decode_ok = bool(len(hyp_notes) > 0 and float(struct.get("r_parse", 0.0)) > 0.0)
             return {
-                "tok_f1": round(tok_f1, 6),
-                "tok_lcs": round(tok_lcs, 6),
-                "note_f1": round(float(sc.get("f1", 0.0)), 6),
-                "decode_ok": not bool(sc.get("zeroed")),
+                "tok_f1": round(note_f1, 6),
+                "tok_lcs": round(note_f1, 6),
+                "note_f1": round(note_f1, 6),
+                "decode_ok": decode_ok,
             }
 
         def _build_report(status: str) -> Dict[str, Any]:
@@ -564,7 +575,7 @@ def run_experiment() -> Dict[str, Any]:
             piece_rows: List[Dict[str, Any]] = []
             for p_idx, piece in enumerate(pieces, start=1):
                 slug = piece["slug"]
-                ref_toks, ref_notes = refs_cache[slug]
+                ref_notes = refs_cache[slug]
                 prow: Dict[str, Any] = {"piece": slug, "handwritten": bool(piece.get("handwritten", False))}
                 for domain in ("clean", "photo"):
                     img_t = img_cache[(slug, domain)].to(device, non_blocking=True)
@@ -604,7 +615,7 @@ def run_experiment() -> Dict[str, Any]:
                     if cached is not None and hyp_toks == cached[0]:
                         scores = dict(cached[1])
                     else:
-                        scores = _score_hyp(slug, domain, akey, hyp_toks, ref_toks, ref_notes)
+                        scores = _score_hyp(slug, domain, akey, hyp_toks, ref_notes, has_eos=(eos_id in seq_ids[1:]))
                         if arm["mode"] == "baseline":
                             base_hyp_score_cache[(slug, domain)] = (hyp_toks, dict(scores))
 

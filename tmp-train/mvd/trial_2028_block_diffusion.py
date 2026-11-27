@@ -31,12 +31,17 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+try:
+    from uni_omr import VOCAB_SIZE as _DEFAULT_VOCAB_SIZE
+except Exception:  # noqa: BLE001
+    _DEFAULT_VOCAB_SIZE = 265
+
 
 @dataclass
 class BlockDiffusionConfig:
     """Configuration for :class:`BlockDiffusionMeasureRefiner`."""
 
-    vocab_size: int = 237
+    vocab_size: int = _DEFAULT_VOCAB_SIZE
     d_model: int = 384
     n_heads: int = 6
     n_kv_heads: int = 2
@@ -487,7 +492,7 @@ def main() -> None:
         description="2027-2028 Trial: Masked Block-Diffusion Measure-Refinement Prototype"
     )
     parser.add_argument("--smoke", action="store_true", help="Run CPU smoke verification")
-    parser.add_argument("--vocab-size", type=int, default=237)
+    parser.add_argument("--vocab-size", type=int, default=_DEFAULT_VOCAB_SIZE)
     parser.add_argument("--d-model", type=int, default=384)
     parser.add_argument("--n-heads", type=int, default=6)
     parser.add_argument("--n-layers", type=int, default=4)

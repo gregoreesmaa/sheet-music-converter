@@ -352,10 +352,10 @@ class TestBucketCInferenceFixes(unittest.TestCase):
     # ------------------------------------------------------------------
 
     def test_fix5_max_mem_tokens_cli_and_override(self) -> None:
-        """--max-mem-tokens defaults to 4096, overrides v2 router.max_mem_tokens, and no-ops on v1."""
+        """--max-mem-tokens defaults to 4608, overrides v2 router.max_mem_tokens, and no-ops on v1."""
         ap = ev.build_arg_parser()
         ns_def = ap.parse_args(["--ckpt", "dummy.pt"])
-        self.assertEqual(ns_def.max_mem_tokens, 4096)
+        self.assertEqual(ns_def.max_mem_tokens, 4608)
         ns_custom = ap.parse_args(["--ckpt", "dummy.pt", "--max-mem-tokens", "5120"])
         self.assertEqual(ns_custom.max_mem_tokens, 5120)
 

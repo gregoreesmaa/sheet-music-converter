@@ -6339,7 +6339,7 @@ def run_train(args: argparse.Namespace, cfg: UniOMRConfig) -> Dict[str, Any]:
             if (
                 device.type == "cuda"
                 and (step - last_empty_cache_step) >= 25
-                and torch.cuda.memory_reserved(device) > int(13.8 * (1024 ** 3))
+                and torch.cuda.memory_reserved(device) > int(0.86 * torch.cuda.get_device_properties(device).total_memory)
             ):
                 torch.cuda.empty_cache()
                 last_empty_cache_step = step

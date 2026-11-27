@@ -118,6 +118,8 @@ def collate_image_tensors(tensors: Sequence[torch.Tensor]) -> torch.Tensor:
         else:
             # Pad with per-image p85 parchment tone so padding never introduces harsh white/black seams.
             flat = t.reshape(3, -1)
+            if flat.shape[-1] > 32768:
+                flat = flat[:, :: max(1, flat.shape[-1] // 32768)]
             fill = torch.quantile(flat, 0.85, dim=-1).view(3, 1, 1)
             batch[i].copy_(fill.expand(3, max_h, max_w))
             batch[i, :, :h, :w].copy_(t)

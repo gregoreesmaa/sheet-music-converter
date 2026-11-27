@@ -46,10 +46,25 @@ TIMES = frozenset(t for t in data.VOCAB if t.startswith('time-'))
 VOICES = frozenset(t for t in data.VOCAB if t.startswith('voice-'))
 TUPLET_STARTS = frozenset(t for t in data.VOCAB if t.startswith('tuplet-start-'))
 GRACE = 'grace'
-MODS = frozenset(['slur-start', 'slur-stop', 'stacc', 'accent', 'tenuto', 'fermata'])
+ARTS = frozenset(t for t in data.VOCAB if t.startswith('art-'))
+XSTAVES = frozenset(t for t in ('xstaff-up', 'xstaff-down') if t in data.TOKEN_TO_ID)
+CUE = 'cue'
+MODS = (
+    frozenset(['slur-start', 'slur-stop', 'stacc', 'accent', 'tenuto', 'fermata'])
+    | ARTS
+    | XSTAVES
+    | (frozenset([CUE]) if CUE in data.TOKEN_TO_ID else frozenset())
+)
 DYNS = frozenset(t for t in data.VOCAB if t.startswith('dyn-'))
 HAIRS = frozenset(t for t in data.VOCAB if t.startswith('hairpin-'))
+OTTAVAS = frozenset(t for t in data.VOCAB if t.startswith('ottava-'))
+VOLTAS = frozenset(t for t in data.VOCAB if t.startswith('volta-'))
 BAR_LEFT = frozenset(['bar-repeat-left'])
+DIR_TOKENS = DYNS | HAIRS | BAR_LEFT | OTTAVAS | VOLTAS
+STAFF_SEP = '<staff>'
+TUP_OPEN = 'tup-open'
+TUP_CLOSE = 'tup-close'
+TUP_OPEN_DIGITS = frozenset(str(d) for d in range(1, 9))
 BAR_RIGHT = frozenset(['bar-light-heavy', 'bar-repeat-right', 'bar-double'])
 BAR_LIKES = frozenset([BAR]) | BAR_RIGHT
 
@@ -83,6 +98,12 @@ _BAR_EPS = 1e-6
 MAX_CHORDS_PER_ONSET = 8
 MAX_CONSECUTIVE_GRACE = 8
 MAX_CONSECUTIVE_BAR_REST = 24
+MAX_CONSEC_DIR_TOKENS = 3
+MAX_STAVES_PER_BAR = 24
+MAX_MODS_PER_EVENT = 8
+MAX_DOTS_PER_EVENT = 3
+MAX_CONSEC_VOICE_SWITCHES = 2
+MAX_ALTERS_LAX = 2
 MAX_SYSTEMS = 24
 MAX_TOKENS_PER_BAR = 288
 MAX_BARS_PER_SYSTEM = 28
@@ -165,8 +186,13 @@ class PrefixState:
                  'tsig', 'pending_tsig', 'vcurs', 'vscales',
                  'pend_spans',
                  'ev_base', 'ev_dots', 'ev_chord', 'ev_grace',
+                 'ev_mods', 'ev_alters',
                  'chords_on_onset', 'grace_run',
                  'consec_bar_rest_bars', 'bar_has_pitched', 'bar_has_bar_rest',
+                 'seg_has_bar_rest', 'staves_in_bar',
+                 'dir_run', 'last_dir_tok',
+                 'midbar_clefs', 'midbar_keys', 'midbar_times',
+                 'voice_switch_run',
                  'sys_count', 'sys_has_event',
                  'bars_in_system', 'tokens_in_system',
                  'max_bars_per_system', 'max_tokens_per_system',
@@ -220,11 +246,21 @@ class PrefixState:
         self.ev_dots = 0
         self.ev_chord = False
         self.ev_grace = False
+        self.ev_mods = 0
+        self.ev_alters = 0
         self.chords_on_onset = 0
         self.grace_run = 0
         self.consec_bar_rest_bars = 0
         self.bar_has_pitched = False
         self.bar_has_bar_rest = False
+        self.seg_has_bar_rest = False
+        self.staves_in_bar = 0
+        self.dir_run = 0
+        self.last_dir_tok = None
+        self.midbar_clefs = 0
+        self.midbar_keys = 0
+        self.midbar_times = 0
+        self.voice_switch_run = 0
         self.sys_count = 0
         self.sys_has_event = False
         self.bars_in_system = 0
@@ -286,11 +322,21 @@ class PrefixState:
         c.ev_dots = self.ev_dots
         c.ev_chord = self.ev_chord
         c.ev_grace = self.ev_grace
+        c.ev_mods = self.ev_mods
+        c.ev_alters = self.ev_alters
         c.chords_on_onset = self.chords_on_onset
         c.grace_run = self.grace_run
         c.consec_bar_rest_bars = self.consec_bar_rest_bars
         c.bar_has_pitched = self.bar_has_pitched
         c.bar_has_bar_rest = self.bar_has_bar_rest
+        c.seg_has_bar_rest = self.seg_has_bar_rest
+        c.staves_in_bar = self.staves_in_bar
+        c.dir_run = self.dir_run
+        c.last_dir_tok = self.last_dir_tok
+        c.midbar_clefs = self.midbar_clefs
+        c.midbar_keys = self.midbar_keys
+        c.midbar_times = self.midbar_times
+        c.voice_switch_run = self.voice_switch_run
         c.sys_count = self.sys_count
         c.sys_has_event = self.sys_has_event
         c.bars_in_system = self.bars_in_system
@@ -350,8 +396,37 @@ class PrefixState:
         return False
 
     def has_open_tuplet(self):
-        """Return True iff any tuplet-start is queued (pending) or open (depth > 0)."""
-        return self.pending > 0 or any(d > 0 for d in self.depth)
+        """Return True iff any tuplet-start/tup-open is queued (pending), mid-ratio, or open (depth > 0)."""
+        return (
+            self.pending > 0
+            or any(d > 0 for d in self.depth)
+            or self.mode in ('tup-open-a', 'tup-open-n', 'tuplet-a', 'tuplet-n')
+        )
+
+    def _reset_event_guards(self):
+        """Reset zero-cursor anti-loop counters on musical/structural progress."""
+        self.dir_run = 0
+        self.last_dir_tok = None
+        self.midbar_clefs = 0
+        self.midbar_keys = 0
+        self.midbar_times = 0
+        self.voice_switch_run = 0
+
+    def _dir_token_ok(self, tok):
+        """Anti-loop guard for direction/span/bar-left tokens (Bug A).
+
+        Forbids consecutive identical direction/span/bar-left tokens (e.g.
+        `hairpin-stop hairpin-stop` or `dyn-pp dyn-pp`) and caps consecutive
+        direction tokens without an intervening note/rest/bar/<staff>/<sys>
+        at ``MAX_CONSEC_DIR_TOKENS`` (3).
+        """
+        if self.dir_run >= MAX_CONSEC_DIR_TOKENS:
+            return False
+        if self.last_dir_tok == tok:
+            return False
+        if self.recent and self.recent[-1] == tok:
+            return False
+        return True
 
     def _header_staff_cap(self):
         return max(self.first_sys_staves, MAX_HEADER_STAVES_DEFAULT)
@@ -369,7 +444,7 @@ class PrefixState:
 
     def _header_clef_ok(self):
         if not self.header_open:
-            return True
+            return self.midbar_clefs < 1
         if self.header_clefs >= self._header_staff_cap():
             return False
         if self._single_staff_hdr_repeat_capped():
@@ -378,7 +453,7 @@ class PrefixState:
 
     def _header_key_ok(self):
         if not self.header_open:
-            return True
+            return self.midbar_keys < 1
         if self.header_keys >= self._header_staff_cap():
             return False
         if self._single_staff_hdr_repeat_capped():
@@ -389,7 +464,7 @@ class PrefixState:
         if self.last_was_time:
             return False
         if not self.header_open:
-            return True
+            return self.midbar_times < 1
         if self.header_times >= self._header_staff_cap():
             return False
         if self._single_staff_hdr_repeat_capped():
@@ -529,10 +604,15 @@ class PrefixState:
         self.ev_dots = 0
         self.ev_chord = False
         self.ev_grace = False
+        self.ev_mods = 0
+        self.ev_alters = 0
         self.chords_on_onset = 0
         self.grace_run = 0
         self.bar_has_pitched = False
         self.bar_has_bar_rest = False
+        self.seg_has_bar_rest = False
+        self.staves_in_bar = 0
+        self._reset_event_guards()
         self.comp_num = 0
         self.comp_digits = 0
         self.comp_val = 0
@@ -597,6 +677,8 @@ class PrefixState:
         incrementing ``ev_dots``: chord tones add no duration and an
         absent time signature disables gating, so both stay legal.
         """
+        if self.ev_dots >= MAX_DOTS_PER_EVENT:
+            return False
         limit = self._beat_limit()
         if limit is None:
             return True
@@ -691,6 +773,8 @@ class PrefixState:
                 else:
                     self.cur_hdr_tuple[2] = t
                 self.header_times += 1
+            else:
+                self.midbar_times += 1
             self.last_was_time = False
             self.comp_num = 0
             self.comp_digits = 0
@@ -701,28 +785,33 @@ class PrefixState:
             # Mid-stream attribute changes (bekern+): clef/key/time
             # may appear at any measure start (or courtesy end of a full
             # measure). Forbid stray key*/time-* inside an incomplete bar,
-            # consecutive time-* tokens, and runaway repeated system headers.
+            # consecutive time-* tokens, runaway repeated system headers,
+            # and repeated mid-bar clef/key/time without intervening events.
             if (t in KEYS or t in TIMES) and not self._header_attr_ok():
                 raise ValueError('spurious mid-bar header %r' % t)
             if t in CLEFS or (self.allow_percussion_tab and t in TAB_CLEFS):
+                if not self._header_clef_ok():
+                    raise ValueError('header/mid-bar clef cap exceeded %r' % t)
                 if self.header_open:
-                    if not self._header_clef_ok():
-                        raise ValueError('header staff cap exceeded %r' % t)
                     if self.cur_hdr_tuple is not None:
                         self.completed_hdr_tuples.append(tuple(self.cur_hdr_tuple))
                     self.cur_hdr_tuple = [t, None, None]
                     self.header_clefs += 1
+                else:
+                    self.midbar_clefs += 1
                 self.last_was_time = False
                 return 'bound'
             if t in KEYS:
+                if not self._header_key_ok():
+                    raise ValueError('header/mid-bar key cap exceeded %r' % t)
                 if self.header_open:
-                    if not self._header_key_ok():
-                        raise ValueError('header key cap exceeded %r' % t)
                     if self.cur_hdr_tuple is None:
                         self.cur_hdr_tuple = [None, t, None]
                     else:
                         self.cur_hdr_tuple[1] = t
                     self.header_keys += 1
+                else:
+                    self.midbar_keys += 1
                 self.last_was_time = False
                 return 'bound'
             # t in TIMES
@@ -737,6 +826,8 @@ class PrefixState:
                 else:
                     self.cur_hdr_tuple[2] = t
                 self.header_times += 1
+            else:
+                self.midbar_times += 1
             self._apply_tsig(_beats_of(t))
             self.last_was_time = True
             return 'bound'
@@ -768,6 +859,9 @@ class PrefixState:
             self.tokens_since_bar = 0
             self.bar_has_pitched = False
             self.bar_has_bar_rest = False
+            self.seg_has_bar_rest = False
+            self.staves_in_bar = 0
+            self._reset_event_guards()
             # A stashed courtesy time-sig takes effect for the new
             # measure whose barline just arrived.
             if self.pending_tsig is not None:
@@ -783,6 +877,31 @@ class PrefixState:
             self.ev_dots = 0
             self.ev_chord = False
             self.ev_grace = False
+            self.ev_mods = 0
+            self.ev_alters = 0
+            self.chords_on_onset = 0
+            self.grace_run = 0
+            return 'bound'
+        if t == STAFF_SEP:
+            if self.has_open_tuplet():
+                raise ValueError('unclosed tuplet before staff separator %r' % t)
+            if self.staves_in_bar >= MAX_STAVES_PER_BAR:
+                raise ValueError('staves per bar cap exceeded (%d)' % MAX_STAVES_PER_BAR)
+            self.staves_in_bar += 1
+            self.seg_has_bar_rest = False
+            self._reset_event_guards()
+            self.seg_last = [False]
+            self.seg = 0
+            self.depth = [0]
+            self.opened = set()
+            self.vcurs = [0.0]
+            self.vscales = [[]]
+            self.ev_base = None
+            self.ev_dots = 0
+            self.ev_chord = False
+            self.ev_grace = False
+            self.ev_mods = 0
+            self.ev_alters = 0
             self.chords_on_onset = 0
             self.grace_run = 0
             return 'bound'
@@ -794,6 +913,8 @@ class PrefixState:
                 raise ValueError('bad voice token %r' % t)
             if len(self.recent) >= 2 and self.recent[-2] == t:
                 raise ValueError('duplicate voice marker %r' % t)
+            if self.voice_switch_run >= MAX_CONSEC_VOICE_SWITCHES:
+                raise ValueError('consecutive voice switch cap exceeded (%d)' % MAX_CONSEC_VOICE_SWITCHES)
             if self.strict:
                 if (n != 1 and (n - 1) not in self.opened
                         and n not in self.opened):
@@ -803,6 +924,8 @@ class PrefixState:
             self.opened.add(n)
             self.chords_on_onset = 0
             self.grace_run = 0
+            self.seg_has_bar_rest = False
+            self.voice_switch_run += 1
             return 'bound'
         if t in TUPLET_STARTS:
             if (self.depth[self.seg] + self.pending >= 1) or (
@@ -812,6 +935,12 @@ class PrefixState:
             _, _, a, n = t.split('-')
             self.pend_spans.append((int(a), int(n)))
             return 'bound'
+        if t == TUP_OPEN:
+            if (self.depth[self.seg] + self.pending >= 1) or (
+                    self.strict and self._bar_is_full()):
+                raise ValueError('tup-open blocked (chained/full bar): %r' % t)
+            self.comp_num = 0
+            return 'tup-open-a'
         if t == TUPLET_KW:
             if (self.depth[self.seg] + self.pending >= 1) or (
                     self.strict and self._bar_is_full()):
@@ -822,10 +951,13 @@ class PrefixState:
             return 'tuplet-a'
         if t == MULTIREST_KW:
             self.sys_has_event = True
+            self._reset_event_guards()
             self._drain()
             self._drained_scale()
             self.ev_base = None
             self.ev_dots = 0
+            self.ev_mods = 0
+            self.ev_alters = 0
             self.seg_last[self.seg] = False
             self.chords_on_onset = 0
             self.grace_run = 0
@@ -833,9 +965,9 @@ class PrefixState:
             self.comp_digits = 0
             self.comp_val = 0
             return 'multi-rest'
-        if t == TUPLET_STOP:
+        if t == TUPLET_STOP or t == TUP_CLOSE:
             if self.depth[self.seg] <= 0:
-                raise ValueError('unmatched tuplet-stop')
+                raise ValueError('unmatched %s' % t)
             self.depth[self.seg] -= 1
             if self.vscales[self.seg]:
                 self.vscales[self.seg].pop()
@@ -845,13 +977,23 @@ class PrefixState:
                 raise ValueError('grace run cap exceeded (%d)' % MAX_CONSECUTIVE_GRACE)
             self.grace_run += 1
             self.chords_on_onset = 0
+            self._reset_event_guards()
             return 'grace'
-        if t in DYNS or t in HAIRS or t in BAR_LEFT or (
+        if t in DIR_TOKENS or (
                 self.allow_percussion_tab and t in SLASH_MARKS):
-            # Measure dynamics, hairpin wedge events and opening
-            # repeats: measure scope, no cursor or span state.
+            # Measure dynamics, hairpin wedges, ottava spans, volta brackets
+            # and opening repeats: measure/staff scope with anti-loop caps.
+            if t in DIR_TOKENS:
+                # step() appends t to recent before dispatch; compare against
+                # recent[-2] and last_dir_tok to block consecutive identical spam.
+                prev_tok = self.recent[-2] if len(self.recent) >= 2 else None
+                if self.dir_run >= MAX_CONSEC_DIR_TOKENS or self.last_dir_tok == t or prev_tok == t:
+                    raise ValueError('consecutive or capped direction token %r' % t)
+                self.dir_run += 1
+                self.last_dir_tok = t
             return 'bound'
         if self.allow_percussion_tab and t == UNPITCHED:
+            self._reset_event_guards()
             return 'unpitched'
         if t == CHORD:
             if not self.seg_last[self.seg]:
@@ -860,9 +1002,11 @@ class PrefixState:
                 raise ValueError('chord cap exceeded (%d)' % MAX_CHORDS_PER_ONSET)
             self.chords_on_onset += 1
             self.ev_chord = True
+            self._reset_event_guards()
             return 'chord'
         if t in DURATIONS or t == REST or t == BAR_REST:
             self.sys_has_event = True
+            self._reset_event_guards()
             self._drain()
             if t in DURATIONS:
                 if self._blocks_duration(_WRITTEN[t]):
@@ -875,17 +1019,25 @@ class PrefixState:
                 self.ev_base = _WRITTEN[t]
                 self.ev_dots = 0
                 self.ev_grace = False
+                self.ev_mods = 0
+                self.ev_alters = 0
                 self.chords_on_onset = 0
                 self.grace_run = 0
                 self.bar_has_pitched = True
                 self.consec_bar_rest_bars = 0
+                self.seg_has_bar_rest = False
                 return 'dur'
             if t == REST:
                 self.ev_base = None
                 self.ev_dots = 0
+                self.ev_mods = 0
+                self.ev_alters = 0
                 self.chords_on_onset = 0
                 self.grace_run = 0
+                self.seg_has_bar_rest = False
                 return 'rest'
+            if self.seg_has_bar_rest:
+                raise ValueError('duplicate bar-rest in same voice segment')
             if not self.bar_has_pitched and self.consec_bar_rest_bars >= MAX_CONSECUTIVE_BAR_REST:
                 raise ValueError(
                     'consecutive bar-rest cap exceeded (%d)' % MAX_CONSECUTIVE_BAR_REST
@@ -898,10 +1050,13 @@ class PrefixState:
                                            self.tsig)
             self.ev_base = None
             self.ev_dots = 0
+            self.ev_mods = 0
+            self.ev_alters = 0
             self.seg_last[self.seg] = False
             self.chords_on_onset = 0
             self.grace_run = 0
             self.bar_has_bar_rest = True
+            self.seg_has_bar_rest = True
             return 'bound'
         raise ValueError('unexpected token %r' % t)
 
@@ -934,6 +1089,8 @@ class PrefixState:
             self.dot_seen = False
             self.ev_base = _WRITTEN[t]
             self.ev_dots = 0
+            self.ev_mods = 0
+            self.ev_alters = 0
             self.mode = 'dur'
         elif self.mode == 'grace':
             if self.allow_percussion_tab and t == UNPITCHED:
@@ -947,6 +1104,8 @@ class PrefixState:
             self.dot_seen = False
             self.ev_base = _WRITTEN[t]
             self.ev_dots = 0
+            self.ev_mods = 0
+            self.ev_alters = 0
             self.ev_grace = True
             self.mode = 'dur'
         elif self.mode == 'unpitched':
@@ -962,6 +1121,8 @@ class PrefixState:
             self.dot_seen = False
             self.ev_base = _WRITTEN[t]
             self.ev_dots = 0
+            self.ev_mods = 0
+            self.ev_alters = 0
             self.mode = 'dur'
         elif self.mode == 'dur':
             if t not in STEPS:
@@ -980,8 +1141,13 @@ class PrefixState:
                 raise ValueError('alter after dot')
             if t in ALTERS or t == DOT:
                 if t in ALTERS:
+                    if not self.strict and self.ev_alters >= MAX_ALTERS_LAX:
+                        raise ValueError('alter cap exceeded (%d)' % MAX_ALTERS_LAX)
                     self.alter_seen = True
+                    self.ev_alters += 1
                 else:
+                    if self.ev_dots >= MAX_DOTS_PER_EVENT:
+                        raise ValueError('dot cap exceeded (%d)' % MAX_DOTS_PER_EVENT)
                     self.dot_seen = True
                     self.ev_dots += 1
                     if self._dot_overshoots():
@@ -992,9 +1158,12 @@ class PrefixState:
                 return
             if t in MODS or (self.allow_percussion_tab and (
                     t in NOTEHEADS or t in TAB_STRINGS or t in TAB_FRETS)):
-                # Slur/articulation/fermata marks (plus opt-in Gate-D
-                # notehead/tab string/fret marks): tail position, no
-                # cursor, span or book state.
+                # Slur/articulation/ornament/cue/xstaff/fermata marks (plus
+                # opt-in Gate-D notehead/tab string/fret marks): tail position,
+                # capped per event to prevent unbounded modifier loops.
+                if self.ev_mods >= MAX_MODS_PER_EVENT:
+                    raise ValueError('modifier cap exceeded (%d)' % MAX_MODS_PER_EVENT)
+                self.ev_mods += 1
                 return
             if t == TIE_START:
                 self.mode = 'tiestart'
@@ -1011,6 +1180,9 @@ class PrefixState:
                 self.mode = 'bound'
                 return
             if t in MODS:
+                if self.ev_mods >= MAX_MODS_PER_EVENT:
+                    raise ValueError('modifier cap exceeded (%d)' % MAX_MODS_PER_EVENT)
+                self.ev_mods += 1
                 return
             self._close_event(True)
             self.mode = self._bound(t)
@@ -1024,9 +1196,13 @@ class PrefixState:
                        _WRITTEN[t] * self._open_scale(), self._beat_limit()))
             self.ev_base = _WRITTEN[t]
             self.ev_dots = 0
+            self.ev_mods = 0
+            self.ev_alters = 0
             self.mode = 'rest-tail'
         elif self.mode == 'rest-tail':
             if t == DOT:
+                if self.ev_dots >= MAX_DOTS_PER_EVENT:
+                    raise ValueError('dot cap exceeded (%d)' % MAX_DOTS_PER_EVENT)
                 self.ev_dots += 1
                 if self._dot_overshoots():
                     raise ValueError(
@@ -1035,10 +1211,25 @@ class PrefixState:
                            + self._pending_value(), self.tsig))
                 return
             if t in MODS:
-                # Fermatas over rests ride the rest tail.
+                # Fermatas / cue / xstaff / articulations over rests ride the rest tail.
+                if self.ev_mods >= MAX_MODS_PER_EVENT:
+                    raise ValueError('modifier cap exceeded (%d)' % MAX_MODS_PER_EVENT)
+                self.ev_mods += 1
                 return
             self._close_event(False)
             self.mode = self._bound(t)
+        elif self.mode == 'tup-open-a':
+            if t not in TUP_OPEN_DIGITS:
+                raise ValueError('bad tup-open actual digit %r' % t)
+            self.comp_num = int(t)
+            self.mode = 'tup-open-n'
+        elif self.mode == 'tup-open-n':
+            if t not in TUP_OPEN_DIGITS:
+                raise ValueError('bad tup-open normal digit %r' % t)
+            self.pending += 1
+            self.pend_spans.append((self.comp_num, int(t)))
+            self.comp_num = 0
+            self.mode = 'bound'
         elif self.mode == 'time-num':
             if t == SLASH:
                 if self.comp_digits == 0 or self.comp_val <= 0:
@@ -1175,6 +1366,8 @@ class PrefixState:
         self.ev_dots = 0
         self.ev_chord = False
         self.ev_grace = False
+        self.ev_mods = 0
+        self.ev_alters = 0
 
     def cycle_forbidden(
         self,
@@ -1295,7 +1488,10 @@ class PrefixState:
             open_tup = self.has_open_tuplet()
             if sys_capped:
                 if self.depth[self.seg] > 0:
-                    allow.add(vm[TUPLET_STOP])
+                    if TUPLET_STOP in vm:
+                        allow.add(vm[TUPLET_STOP])
+                    if TUP_CLOSE in vm:
+                        allow.add(vm[TUP_CLOSE])
                 elif self.pending > 0:
                     for t in DURATIONS:
                         if t in vm and not self._blocks_duration(_WRITTEN[t]):
@@ -1303,7 +1499,10 @@ class PrefixState:
                 return
             if bar_tok_capped:
                 if self.depth[self.seg] > 0:
-                    allow.add(vm[TUPLET_STOP])
+                    if TUPLET_STOP in vm:
+                        allow.add(vm[TUPLET_STOP])
+                    if TUP_CLOSE in vm:
+                        allow.add(vm[TUP_CLOSE])
                 elif self.pending > 0:
                     for t in DURATIONS:
                         if t in vm and not self._blocks_duration(_WRITTEN[t]):
@@ -1316,13 +1515,15 @@ class PrefixState:
             # a voice marker that step() would reject (non-sequential
             # open or consecutive duplicate), are masked here instead
             # of failing open after the fact. Non-strict keeps the
-            # legacy unconditional set. Both modes forbid bar* and voice-*
-            # while a tuplet is open.
+            # legacy unconditional set. Both modes forbid bar*, <staff>,
+            # and voice-* while a tuplet is open.
             if not open_tup and not (self.strict and self.recent
                     and self.recent[-1] in BAR_LIKES):
                 allow.add(vm[BAR])
                 allow.update(vm[t] for t in BAR_RIGHT if t in vm)
-            if not open_tup:
+            if not open_tup and STAFF_SEP in vm and self.staves_in_bar < MAX_STAVES_PER_BAR:
+                allow.add(vm[STAFF_SEP])
+            if not open_tup and self.voice_switch_run < MAX_CONSEC_VOICE_SWITCHES:
                 for _vt in VOICES:
                     if _vt not in vm:
                         continue
@@ -1337,6 +1538,8 @@ class PrefixState:
             if not (self.depth[self.seg] + self.pending >= 1
                     or (self.strict and self._bar_is_full())):
                 allow.update(vm[t] for t in TUPLET_STARTS if t in vm)
+                if TUP_OPEN in vm:
+                    allow.add(vm[TUP_OPEN])
                 if TUPLET_KW in vm:
                     allow.add(vm[TUPLET_KW])
             for t in DURATIONS:
@@ -1348,12 +1551,15 @@ class PrefixState:
             if not self._bar_is_full():
                 allow.add(vm[REST])
             # Iter-7/8 anti-loop: forbid BAR_REST when consecutive pure-rest
-            # bars hit MAX_CONSECUTIVE_BAR_REST (both modes), or when strict
-            # bar is full / non-empty.
+            # bars hit MAX_CONSECUTIVE_BAR_REST (both modes), when this voice
+            # segment already emitted a bar-rest, or when strict bar is full / non-empty.
             cur_used = self.vcurs[self.seg] + self._pending_value()
             bar_rest_capped = (
-                not self.bar_has_pitched
-                and self.consec_bar_rest_bars >= MAX_CONSECUTIVE_BAR_REST
+                self.seg_has_bar_rest
+                or (
+                    not self.bar_has_pitched
+                    and self.consec_bar_rest_bars >= MAX_CONSECUTIVE_BAR_REST
+                )
             )
             if not bar_rest_capped and not (
                 self.strict and (self._bar_is_full() or cur_used > _BAR_EPS)
@@ -1362,7 +1568,10 @@ class PrefixState:
                 if MULTIREST_KW in vm:
                     allow.add(vm[MULTIREST_KW])
             if self.depth[self.seg] > 0:
-                allow.add(vm[TUPLET_STOP])
+                if TUPLET_STOP in vm:
+                    allow.add(vm[TUPLET_STOP])
+                if TUP_CLOSE in vm:
+                    allow.add(vm[TUP_CLOSE])
             if (placed if placed is not None else self.seg_last[self.seg]) \
                     and self.chords_on_onset < MAX_CHORDS_PER_ONSET:
                 allow.add(vm[CHORD])
@@ -1381,7 +1590,9 @@ class PrefixState:
                         allow.add(vm[TIME_KW])
             if self.grace_run < MAX_CONSECUTIVE_GRACE:
                 allow.add(vm[GRACE])
-            allow.update(vm[t] for t in DYNS | HAIRS | BAR_LEFT if t in vm)
+            for t in DIR_TOKENS:
+                if t in vm and self._dir_token_ok(t):
+                    allow.add(vm[t])
             if self.allow_percussion_tab:
                 if self._header_clef_ok():
                     allow.update(vm[t] for t in TAB_CLEFS if t in vm)
@@ -1417,23 +1628,25 @@ class PrefixState:
             if not (bar_tok_capped or sys_capped):
                 # decode.rs consumes a single optional alter BEFORE the dot
                 # loop; a second alter, or an alter after dots, never parses.
-                if not (self.strict
-                        and (self.alter_seen or self.dot_seen)):
-                    allow.update(vm[t] for t in ALTERS)
+                if (not (self.strict and (self.alter_seen or self.dot_seen))
+                        and (self.strict or self.ev_alters < MAX_ALTERS_LAX)):
+                    allow.update(vm[t] for t in ALTERS if t in vm)
                 if self._dot_ok():
                     allow.add(vm[DOT])
                 allow.add(vm[TIE_START])
                 allow.add(vm[TIE_STOP])
-                allow.update(vm[t] for t in MODS)
-                if self.allow_percussion_tab:
-                    allow.update(vm[t] for t in NOTEHEADS | TAB_STRINGS | TAB_FRETS
-                                 if t in vm)
+                if self.ev_mods < MAX_MODS_PER_EVENT:
+                    allow.update(vm[t] for t in MODS if t in vm)
+                    if self.allow_percussion_tab:
+                        allow.update(vm[t] for t in NOTEHEADS | TAB_STRINGS | TAB_FRETS
+                                     if t in vm)
             add_boundary(placed=True)
             return allow, eos_ok
         if self.mode == 'tiestart':
             if not (bar_tok_capped or sys_capped):
                 allow.add(vm[TIE_STOP])
-                allow.update(vm[t] for t in MODS)
+                if self.ev_mods < MAX_MODS_PER_EVENT:
+                    allow.update(vm[t] for t in MODS if t in vm)
             add_boundary(placed=True)
             return allow, eos_ok
         if self.mode == 'rest':
@@ -1444,16 +1657,20 @@ class PrefixState:
                 # never reports full.
                 return allow, False
             for t in DURATIONS:
-                if not self._blocks_duration(_WRITTEN[t]):
+                if t in vm and not self._blocks_duration(_WRITTEN[t]):
                     allow.add(vm[t])
             return allow, False
         if self.mode == 'rest-tail':
             if not (bar_tok_capped or sys_capped):
                 if self._dot_ok():
                     allow.add(vm[DOT])
-                allow.update(vm[t] for t in MODS)
+                if self.ev_mods < MAX_MODS_PER_EVENT:
+                    allow.update(vm[t] for t in MODS if t in vm)
             add_boundary()
             return allow, eos_ok
+        if self.mode in ('tup-open-a', 'tup-open-n'):
+            allow.update(vm[t] for t in TUP_OPEN_DIGITS if t in vm)
+            return allow, False
         if self.mode == 'time-num':
             if self.comp_digits == 0:
                 allow.update(vm[t] for t in NONZERO_DIGITS if t in vm)
@@ -1547,7 +1764,7 @@ class _State:
         if t in CLEFS or t in KEYS or t in TIMES:
             return 'bound'
         self.header_open = False
-        if t == BAR or t in BAR_RIGHT:
+        if t == BAR or t in BAR_RIGHT or t == STAFF_SEP:
             self.seg_last = [False]
             self.seg = 0
             self.depth = [0]
@@ -1564,14 +1781,14 @@ class _State:
         if t in TUPLET_STARTS:
             self.pending += 1
             return 'bound'
-        if t == TUPLET_STOP:
+        if t == TUPLET_STOP or t == TUP_CLOSE:
             if self.depth[self.seg] <= 0:
-                raise ValueError('unmatched tuplet-stop')
+                raise ValueError('unmatched %s' % t)
             self.depth[self.seg] -= 1
             return 'bound'
         if t == GRACE:
             return 'grace'
-        if t in DYNS or t in HAIRS or t in BAR_LEFT:
+        if t in DIR_TOKENS:
             return 'bound'
         if t == CHORD:
             if not self.seg_last[self.seg]:

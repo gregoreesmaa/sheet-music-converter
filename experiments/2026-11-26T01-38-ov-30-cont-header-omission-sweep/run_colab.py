@@ -392,7 +392,10 @@ def apply_cont_header_omission(
 
         # Fill erased header strip with local paper median RGB + tiny paper grain
         band_rgb = x[:, y0:y1, max(0, x0 - 8):min(w, x1 + 24)]
-        paper_col = torch.quantile(band_rgb.reshape(3, -1), 0.90, dim=1).view(3, 1, 1)
+        flat_band = band_rgb.reshape(3, -1)
+        if flat_band.shape[-1] > 32768:
+            flat_band = flat_band[:, :: max(1, flat_band.shape[-1] // 32768)]
+        paper_col = torch.quantile(flat_band, 0.90, dim=1).view(3, 1, 1)
         patch_h = y1 - y0
         patch_w = x1 - x0
         if patch_h > 0 and patch_w > 0:
@@ -903,7 +906,7 @@ def _train_and_eval_arm(
 
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         optimizer.step()
-        gpu_ema.update(model)
+        gpu_ema.update(model, step)
 
         buf_loss.append(step_loss)
         buf_ce.append(step_ce)

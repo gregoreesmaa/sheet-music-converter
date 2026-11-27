@@ -376,8 +376,11 @@ def apply_droop_warp_broken_staff(
         n_lo, n_hi = preset["broken_count"]
         a_lo, a_hi = preset["broken_alpha"]
         n_breaks = rng.randint(int(n_lo), int(n_hi))
-        # Estimate local paper color from upper-quantile pixels
-        paper_col = torch.quantile(x.reshape(3, -1), 0.90, dim=1).view(3, 1, 1)
+        # Estimate local paper color from upper-quantile pixels (subsampled for CUDA quantile safety)
+        flat_x = x.reshape(3, -1)
+        if flat_x.shape[-1] > 32768:
+            flat_x = flat_x[:, :: max(1, flat_x.shape[-1] // 32768)]
+        paper_col = torch.quantile(flat_x, 0.90, dim=1).view(3, 1, 1)
         luma = x.mean(dim=0)
         dark_ys = torch.nonzero(luma.mean(dim=1) < 0.96, as_tuple=False).flatten()
         for _ in range(n_breaks):
@@ -842,7 +845,7 @@ def _train_and_eval_arm(
 
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         optimizer.step()
-        gpu_ema.update(model)
+        gpu_ema.update(model, step)
 
         buf_loss.append(step_loss)
         buf_ce.append(step_ce)

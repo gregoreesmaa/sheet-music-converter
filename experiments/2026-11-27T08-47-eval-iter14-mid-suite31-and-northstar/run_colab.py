@@ -66,7 +66,7 @@ SYSTEM_NAME = os.environ.get("NORTHSTAR_SYSTEM_NAME", "uni-omr-iter14-v2a-step68
 MAX_DIM = int(os.environ.get("UNIOMR_MAX_DIM", "1408"))
 SUITE31_MAX_LEN = int(os.environ.get("UNIOMR_SUITE31_MAX_LEN", "3072"))
 NORTHSTAR_MAX_LEN = int(os.environ.get("UNIOMR_NORTHSTAR_MAX_LEN", "3584"))
-MAX_MEM_TOKENS = int(os.environ.get("UNIOMR_MAX_MEM_TOKENS", "4096"))
+MAX_MEM_TOKENS = int(os.environ.get("UNIOMR_MAX_MEM_TOKENS", "4608"))
 USE_GRAMMAR = os.environ.get("UNIOMR_USE_GRAMMAR", "1") != "0"
 STRICT_GRAMMAR = os.environ.get("UNIOMR_STRICT_GRAMMAR", "0") == "1"
 USE_MTP_SPEC = os.environ.get("UNIOMR_USE_MTP_SPEC", "1") != "0"
@@ -785,10 +785,12 @@ def main() -> int:
             pass
 
     model, cfg, ckpt_meta = eus.load_uni_checkpoint(ckpt_path, device=device)
-    if MAX_MEM_TOKENS > 0 and hasattr(eus, "_override_max_mem_tokens"):
+    if MAX_MEM_TOKENS > 0:
         try:
-            eus._override_max_mem_tokens(model, MAX_MEM_TOKENS)
-            cfg.max_mem_tokens = MAX_MEM_TOKENS
+            router = getattr(getattr(model, "encoder", model), "router", None)
+            if router is not None and hasattr(router, "max_mem_tokens"):
+                router.max_mem_tokens = int(MAX_MEM_TOKENS)
+            cfg.max_mem_tokens = int(MAX_MEM_TOKENS)
         except Exception as exc:
             print(f"[model] WARN: Could not override max_mem_tokens={MAX_MEM_TOKENS}: {exc}", flush=True)
 

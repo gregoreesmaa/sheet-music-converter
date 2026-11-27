@@ -1738,6 +1738,9 @@ def load_uni_checkpoint(
     if is_v2:
         valid_fields = {f.name for f in fields(uni_omr_v2.UniOMRv2Config)}
         filtered_cfg = {k: v for k, v in cfg_dict.items() if k in valid_fields}
+        # Legacy v2 checkpoints trained before adaptive_ink_target existed used fixed 0.04 threshold.
+        if "adaptive_ink_target" not in filtered_cfg:
+            filtered_cfg["adaptive_ink_target"] = False
         for tup_k in ("backbone_channels", "backbone_blocks"):
             if tup_k in filtered_cfg and isinstance(filtered_cfg[tup_k], list):
                 filtered_cfg[tup_k] = tuple(int(x) for x in filtered_cfg[tup_k])
@@ -2260,7 +2263,7 @@ def evaluate_suite31(args: argparse.Namespace) -> Dict[str, Any]:
         float(ttt_conf_skip_thr_raw) if ttt_conf_skip_thr_raw is not None else None
     )
     max_keep_ratio_override = getattr(args, "max_keep_ratio_override", None)
-    max_mem_tokens_raw = getattr(args, "max_mem_tokens", 4096)
+    max_mem_tokens_raw = getattr(args, "max_mem_tokens", 4608)
     max_mem_tokens_override: Optional[int] = (
         int(max_mem_tokens_raw)
         if (max_mem_tokens_raw is not None and int(max_mem_tokens_raw) > 0)
@@ -2855,8 +2858,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
     ap.add_argument(
         "--max-mem-tokens",
         type=int,
-        default=4096,
-        help="Temporarily override model.router.max_mem_tokens at eval time when supported (default: 4096; <=0 keeps checkpoint value)",
+        default=4608,
+        help="Temporarily override model.router.max_mem_tokens at eval time when supported (default: 4608; <=0 keeps checkpoint value)",
     )
     ap.add_argument(
         "--tta-scales",
