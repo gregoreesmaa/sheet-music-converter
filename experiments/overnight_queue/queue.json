@@ -67,7 +67,7 @@
     "id": "2026-11-27T10-30-i15-37-modegate-dualhead-text-and-chained-mtp",
     "wave": 0,
     "priority": 5,
-    "status": "RUNNING",
+    "status": "COMPLETED",
     "gpu_pref": "H100",
     "script": "experiments/2026-11-27T10-30-i15-37-modegate-dualhead-text-and-chained-mtp/run_colab.py",
     "notes": "Weight-incompatible PRE-ITER-15: ModeGate music/text dual-head + DeepSeek-V3 Chained MTP-4",
@@ -81,7 +81,7 @@
     "id": "2026-11-27T10-30-i15-11-sheared-strip-conv-and-aniso-pitch-rope2d",
     "wave": 0,
     "priority": 6,
-    "status": "QUEUED",
+    "status": "RUNNING",
     "gpu_pref": "H100",
     "script": "experiments/2026-11-27T10-30-i15-11-sheared-strip-conv-and-aniso-pitch-rope2d/run_colab.py",
     "notes": "Weight-incompatible PRE-ITER-15: 3-angle sheared strips + pitch-biased aniso 2D-RoPE",
@@ -117,6 +117,22 @@
     "title": "Weight-incompatible PRE-ITER-15: S=16 competitive System Slot-Attention memory",
     "hf_eval_target": "evals/2026-11-27T10-30-i15-39-sysslot-mem-hierarchical-encoder.json",
     "depends_on": [],
+    "target_gpu": "A100"
+  },
+  {
+    "id": "2026-11-27T14-30-i15-37b-modegate-cmtp-muon-clean",
+    "wave": 0,
+    "priority": 9,
+    "status": "QUEUED",
+    "gpu_pref": "H100",
+    "script": "experiments/2026-11-27T14-30-i15-37b-modegate-cmtp-muon-clean/run_colab.py",
+    "notes": "Clean Muon+AdamW + INT4-QAT re-verification of i15-37 ModeGate + Chained MTP-4 (asserts opt.mode==muon+adamw on both arms)",
+    "est_minutes": 15,
+    "title": "Clean Muon+AdamW + INT4-QAT re-verification of i15-37 ModeGate + Chained MTP-4",
+    "hf_eval_target": "evals/2026-11-27T14-30-i15-37b-modegate-cmtp-muon-clean.json",
+    "depends_on": [
+      "2026-11-27T10-30-i15-37-modegate-dualhead-text-and-chained-mtp"
+    ],
     "target_gpu": "A100"
   },
   {

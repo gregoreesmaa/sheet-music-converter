@@ -231,3 +231,10 @@ Standing frontier prototypes built & CPU-verified ahead of schedule; queue on GP
    - **GO / NO-GO Criteria:**
      - **GO:** On duration-conflicting / low-confidence `suite31_hw` measures, 4-step parallel block-diffusion refinement fixes `>= 30%` of flagged measure errors (net page Strict Note F1 `>= +0.010`), runs `>= 3×` faster than AR beam-5 measure re-decoding, and adds `< 6M` parameters.
      - **NO-GO (KILL):** Measure repair rate `< 15%`, introduces new bar-duration violations on already-valid measures, or fails to beat AR beam-5 at equal wall-clock latency.
+
+---
+
+### Pre-Iter 15 Wave-0 Architecture Proxies (2026-11-27)
+
+- [x] **`i15-37` (`2026-11-27T10-30-i15-37-modegate-dualhead-text-and-chained-mtp`)** — `COMPLETED` → **`ITERATE`** (CONFOUNDED POSITIVE: `ema_val_ce 1.19205 vs 1.29243`, `val_ce 1.03970 vs 1.08365`, `spec_accept_len 1.1319 vs 0.8838` EMA / `1.3443 vs 1.1603` raw, `54.050 MB` INT4 w/ MTP, but Arm 1 fell back to `opt=adamw` via `"base."` prefix bug fixed in `95446af`/`b64fd64`).
+- [ ] **`i15-37b` (`2026-11-27T14-30-i15-37b-modegate-cmtp-muon-clean`)** — `QUEUED` (`wave=0`, `LOCAL_ELIGIBLE`): clean matched `opt.mode == "muon+adamw"` + `QATInt4ControllerV2` (`int4_dequant_val_ce`) + `EMA_DECAY=0.99` verification of ModeGate Dual-Head + Chained MTP-4.

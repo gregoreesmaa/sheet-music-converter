@@ -1,0 +1,12 @@
+{
+  "exp_id": "2026-11-27T10-30-i15-37-modegate-dualhead-text-and-chained-mtp",
+  "status": "COMPLETED",
+  "started_at": "2026-11-27T11:40:53Z",
+  "finished_at": "2026-11-27T12:23:20Z",
+  "elapsed_sec": 2547.2,
+  "n_arms_completed": 2,
+  "best_arm": "modegate_cmtp",
+  "best_ema_val_ce": 1.19205,
+  "eval_path": "evals/2026-11-27T10-30-i15-37-modegate-dualhead-text-and-chained-mtp.json",
+  "error": null
+}
