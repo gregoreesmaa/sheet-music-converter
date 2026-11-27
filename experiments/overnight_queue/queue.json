@@ -131,7 +131,7 @@
     "id": "2026-11-27T14-30-i15-37b-modegate-cmtp-muon-clean",
     "wave": 0,
     "priority": 9,
-    "status": "QUEUED",
+    "status": "RUNNING",
     "gpu_pref": "H100",
     "script": "experiments/2026-11-27T14-30-i15-37b-modegate-cmtp-muon-clean/run_colab.py",
     "notes": "Clean Muon+AdamW + INT4-QAT re-verification of i15-37 ModeGate + Chained MTP-4 (asserts opt.mode==muon+adamw on both arms)",
@@ -147,7 +147,7 @@
     "id": "2026-11-27T14-50-i15-41-xf-spdconv-coordattn-gridrect",
     "wave": 0,
     "priority": 10,
-    "status": "RUNNING",
+    "status": "COMPLETED",
     "target_gpu": "A100",
     "gpu_pref": "A100",
     "depends_on": [],
@@ -1957,22 +1957,23 @@
     "wave": 10,
     "priority": 3,
     "provider": "colab_l4",
-    "gpu": "L4",
+    "gpu": "A100",
     "est_minutes": 25,
     "est_cu": 2.0,
     "script": "experiments/2026-11-26T21-50-eval-northstar-score-reader/run_colab.py",
     "hf_eval_target": "evals/2026-11-26T21-50-eval-northstar-score-reader.json",
-    "status": "QUEUED",
+    "status": "RUNNING",
     "depends_on": [],
     "note": "Luckolite/Sheet-Music-Recognition (Apache-2.0 code+weights, ungated; uses isolated Py3.11 uv venv + Java 17).",
-    "started_at": "2026-11-26T21:31:48Z",
-    "log_path": "D:\\tmp\\overnight-queue-logs\\2026-11-26T21-50-eval-northstar-score-reader.modal.log",
+    "started_at": "2026-11-27T15:14:08Z",
+    "log_path": "D:\\tmp\\overnight-queue-logs\\2026-11-26T21-50-eval-northstar-score-reader.log",
     "modal_app_id": "",
     "modal_call_id": "",
     "completed_at": "2026-11-26T21:32:02Z",
     "elapsed_sec": 14.88,
     "returncode": -1,
-    "failure_reason": "modal run --detach failed for 2026-11-26T21-50-eval-northstar-score-reader (rc=1, app_id=None, call_id=None)"
+    "failure_reason": "modal run --detach failed for 2026-11-26T21-50-eval-northstar-score-reader (rc=1, app_id=None, call_id=None)",
+    "session": "2026-11-26t21-50-eval-no"
   },
   {
     "id": "2026-11-26T21-50-eval-northstar-omniomr-zeus",
@@ -2545,7 +2546,7 @@
     "plan": "experiments/2026-11-27T07-46-i15-02-tf-nll-dp-align-and-vcs-verifier/PLAN.md",
     "hf_eval_target": "evals/2026-11-27T07-46-i15-02-tf-nll-dp-align-and-vcs-verifier.json",
     "hf_run_target": "runs/2026-11-27T07-46-i15-02-tf-nll-dp-align-and-vcs-verifier.json",
-    "status": "RUNNING",
+    "status": "COMPLETED",
     "depends_on": [],
     "datasets": [
       "datasets/suite31_hw_eval.tar"
@@ -2553,7 +2554,10 @@
     "note": "Wave 13 Pivot Strategist 2 (100% permissive): Part A validates VCS (ink IoU + barline-X corr + 1280/1536 cross-scale agree + frozen encoder cosine) on 14 suite31_hw HW pieces (gate Pearson r >= 0.70 + ov-39 hallucination FP rejection); Part B benchmarks AR-free TF-NLL + Cross-Attention Monotonicity DP vs free-decoded alignment on multi-system HW spans (gate Top-1 >= 0.85 for 1,466 idle gold-XML archival pages).",
     "session": "2026-11-27t07-46-i15-02-",
     "started_at": "2026-11-27T14:17:50Z",
-    "log_path": "D:\\tmp\\overnight-queue-logs\\2026-11-27T07-46-i15-02-tf-nll-dp-align-and-vcs-verifier.log"
+    "log_path": "D:\\tmp\\overnight-queue-logs\\2026-11-27T07-46-i15-02-tf-nll-dp-align-and-vcs-verifier.log",
+    "completed_at": "2026-11-27T15:14:08Z",
+    "elapsed_sec": 3377.83,
+    "returncode": 0
   },
   {
     "id": "2026-11-27T07-46-i15-03-lyrics-textspotter-vs-deferred-bpe",
