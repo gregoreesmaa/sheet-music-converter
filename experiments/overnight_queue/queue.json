@@ -2494,7 +2494,7 @@
     "datasets": [
       "datasets/suite31_hw_eval.tar"
     ],
-    "note": "Re-queued after fixing dec_ok key bug (r_syntax -> r_parse in compute_unlabeled_structural_reward); 2-page sanity check already hit mean_note_f1=1.0000 on Colab L4.",
+    "note": "DISCARD: Arm C band-tiling regressed dense_subset -0.1266 F1 (0.4735->0.3469), all90 -0.0816 (0.4924->0.4108), dec_ok 0.8222->0.6222. Arm B 1792px +0.0174 printed / -0.0110 hw (+0.0085 all90). OUTCOME.md written.",
     "session": "2026-11-27t00-52-i14-04b",
     "started_at": "2026-11-27T11:41:09Z",
     "log_path": "D:\\tmp\\overnight-queue-logs\\2026-11-27T00-52-i14-04b-adaptive-band-tiling-fixed.log",
@@ -2552,7 +2552,7 @@
     ],
     "note": "Wave 13 Pivot Strategist 2 (100% permissive): Part A validates VCS (ink IoU + barline-X corr + 1280/1536 cross-scale agree + frozen encoder cosine) on 14 suite31_hw HW pieces (gate Pearson r >= 0.70 + ov-39 hallucination FP rejection); Part B benchmarks AR-free TF-NLL + Cross-Attention Monotonicity DP vs free-decoded alignment on multi-system HW spans (gate Top-1 >= 0.85 for 1,466 idle gold-XML archival pages).",
     "session": "2026-11-27t07-46-i15-02-",
-    "started_at": "2026-11-27T14:11:56Z",
+    "started_at": "2026-11-27T14:17:50Z",
     "log_path": "D:\\tmp\\overnight-queue-logs\\2026-11-27T07-46-i15-02-tf-nll-dp-align-and-vcs-verifier.log"
   },
   {
@@ -2795,7 +2795,7 @@
     "provider": "colab_l4",
     "session": "2026-11-27t14-15-i15-14-",
     "gpu": "A100",
-    "started_at": "2026-11-27T14:08:18Z",
+    "started_at": "2026-11-27T14:17:50Z",
     "log_path": "D:\\tmp\\overnight-queue-logs\\2026-11-27T14-15-i15-14-3axis-structural-dec-rope.log"
   }
 ]
