@@ -149,7 +149,8 @@ def collate_image_tensors(tensors: Sequence[torch.Tensor]) -> torch.Tensor:
             batch[i].copy_(t)
         else:
             flat = t.reshape(3, -1)
-            fill = torch.quantile(flat, 0.85, dim=-1).view(3, 1, 1)
+            sub = flat[:, ::64] if flat.shape[1] >= 64 else flat
+            fill = torch.quantile(sub, 0.85, dim=-1).view(3, 1, 1)
             batch[i].copy_(fill.expand(3, max_h, max_w))
             batch[i, :, :h, :w].copy_(t)
     return batch

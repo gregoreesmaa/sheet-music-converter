@@ -1,6 +1,6 @@
 <#
 .SYNOPSIS
-    Canonical 4-phase Iter 15 UniOMR v2 (edge85m + ax1_gl5 + Stage-0 V-JEPA+VICReg
+    Canonical 4-phase Iter 15 UniOMR v2 (edge85m + ax0_gl6 + Stage-0 V-JEPA+VICReg
     + bekern+v2 Phase A + Iter 14 265-vocab EMA Teacher KD + Late INT4 QAT) launcher
     with automatic suite31_hw (Fast, +ILMS, INT4-dequant parity), 125-page
     OMR-NorthStar, and WebGPU INT4 (< 55 MB) ONNX export verification.
@@ -69,12 +69,12 @@ New-Item -ItemType Directory -Force -Path $EvalOutDir      | Out-Null
 New-Item -ItemType Directory -Force -Path $NorthStarOutDir | Out-Null
 
 # ---------------------------------------------------------------------------
-# Phase 0: Stage-0 V-JEPA 2.1 + VICReg Pretraining (edge85m + ax1_gl5)
+# Phase 0: Stage-0 V-JEPA 2.1 + VICReg Pretraining (edge85m + ax0_gl6)
 # ---------------------------------------------------------------------------
 $Stage0Args = @(
     "--arch-preset", "edge85m",
-    "--n-axial-layers", "1",
-    "--n-global-layers", "5",
+    "--n-axial-layers", "0",
+    "--n-global-layers", "6",
     "--max-mem-tokens", "3072",
     "--adaptive-ink-target",
     "--image-dirs", $RismDirA, $RismDirB,
@@ -107,7 +107,7 @@ $Stage0Args = @(
 )
 
 if (-not $SkipPhase0) {
-    Write-Host "=== [Iter 15 Phase 0] Stage-0 V-JEPA+VICReg ($Stage0Steps steps, edge85m + ax1_gl5) -> $Stage0OutDir ==="
+    Write-Host "=== [Iter 15 Phase 0] Stage-0 V-JEPA+VICReg ($Stage0Steps steps, edge85m + ax0_gl6) -> $Stage0OutDir ==="
     & $Python -u $VjepaScript @Stage0Args
     if ($LASTEXITCODE -ne 0) {
         throw "Iter 15 Phase 0 (Stage-0 V-JEPA+VICReg) failed with exit code $LASTEXITCODE"
@@ -121,12 +121,12 @@ $Stage0Best = Join-Path $Stage0OutDir "uni_omr_v2_vjepa_best.pt"
 $Phase0Ckpt = if ($Stage1InitEnc) { $Stage1InitEnc } elseif (Test-Path $Stage0Last) { $Stage0Last } else { $Stage0Best }
 
 # ---------------------------------------------------------------------------
-# Phase 1: Stage-1 Strip Warmup (4,000 steps, edge85m + ax1_gl5)
+# Phase 1: Stage-1 Strip Warmup (4,000 steps, edge85m + ax0_gl6)
 # ---------------------------------------------------------------------------
 $Stage1Args = @(
     "--preset", "edge85m",
-    "--n-axial-layers", "1",
-    "--n-global-layers", "5",
+    "--n-axial-layers", "0",
+    "--n-global-layers", "6",
     "--max-mem-tokens", "3072",
     "--adaptive-ink-target",
     "--init-encoder-from", $Phase0Ckpt,
@@ -176,7 +176,7 @@ if (-not $SkipPhase1) {
     if (-not (Test-Path $Phase0Ckpt)) {
         throw "Phase 0 V-JEPA encoder checkpoint not found at $Phase0Ckpt"
     }
-    Write-Host "=== [Iter 15 Phase 1] Stage-1 Strip Warmup ($Stage1Steps steps, edge85m + ax1_gl5) -> $Stage1OutDir ==="
+    Write-Host "=== [Iter 15 Phase 1] Stage-1 Strip Warmup ($Stage1Steps steps, edge85m + ax0_gl6) -> $Stage1OutDir ==="
     & $Python -u $TrainScript @Stage1Args
     if ($LASTEXITCODE -ne 0) {
         throw "Iter 15 Phase 1 (Stage-1 Strip Warmup) failed with exit code $LASTEXITCODE"
@@ -194,8 +194,8 @@ $Phase1Ckpt   = if ($Stage2InitFrom) { $Stage2InitFrom } elseif (Test-Path $Stag
 # ---------------------------------------------------------------------------
 $Stage2Args = @(
     "--preset", "edge85m",
-    "--n-axial-layers", "1",
-    "--n-global-layers", "5",
+    "--n-axial-layers", "0",
+    "--n-global-layers", "6",
     "--max-mem-tokens", "3072",
     "--adaptive-ink-target",
     "--init-from", $Phase1Ckpt,
@@ -276,7 +276,7 @@ if (-not $SkipPhase2) {
     if (-not (Test-Path $Iter14TeacherCkpt)) {
         throw "Iter 14 265-vocab EMA teacher checkpoint not found at $Iter14TeacherCkpt"
     }
-    Write-Host "=== [Iter 15 Phase 2] Stage-2 Full-Page ($Stage2Steps steps, edge85m + ax1_gl5 + bekern+v2a + Iter 14 KD + Late INT4 QAT) -> $Stage2OutDir ==="
+    Write-Host "=== [Iter 15 Phase 2] Stage-2 Full-Page ($Stage2Steps steps, edge85m + ax0_gl6 + bekern+v2a + Iter 14 KD + Late INT4 QAT) -> $Stage2OutDir ==="
     & $Python -u $TrainScript @Stage2Args
     if ($LASTEXITCODE -ne 0) {
         throw "Iter 15 Phase 2 (Stage-2 Full-Page) failed with exit code $LASTEXITCODE"

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Iter 15 Stage-0 V-JEPA 2.1 + VICReg Encoder Pretrainer for UniOMR v2 (`edge85m`, `ax1_gl5`).
+"""Iter 15 Stage-0 V-JEPA 2.1 + VICReg Encoder Pretrainer for UniOMR v2 (`edge85m`, `ax0_gl6`).
 
 Production-ready Stage-0 SSL pretraining script incorporating the locked `ov-31b`
 winning recipe (`mask_ratio=0.45` in `[0.40, 0.50]` + VICReg `var_w=1.0, cov_w=0.04`,
@@ -7,7 +7,7 @@ which lifted frozen-encoder Ridge Staff R^2 from `0.210 -> 0.439` / `2.09x`):
 
   1. Architecture presets & depth overrides:
      - `--arch-preset edge85m|small_45m|tiny` (default: `edge85m`)
-     - `--n-axial-layers 1 --n-global-layers 5` (`ax1_gl5` Iter 15 layout)
+     - `--n-axial-layers 0 --n-global-layers 6` (`ax0_gl6` Iter 15 layout)
      - `--max-mem-tokens 3072`, `--adaptive-ink-target`
   2. Multi-source permissive corpus discovery + content dedup + ZERO eval overlap:
      - Reads BOTH `D:\\tmp\\unlabeled-10k-real\\rism_hw` (`5,707` pages) AND the
@@ -84,13 +84,13 @@ _PRINTED_DOMAINS: Set[str] = {
 
 
 # ---------------------------------------------------------------------------
-# 1. Config & Model Construction (`edge85m`, `small_45m`, `tiny` + `ax1_gl5`)
+# 1. Config & Model Construction (`edge85m`, `small_45m`, `tiny` + `ax0_gl6`)
 # ---------------------------------------------------------------------------
 
 def build_iter15_v2_config(
     arch_preset: str = "edge85m",
-    n_axial_layers: Optional[int] = 1,
-    n_global_layers: Optional[int] = 5,
+    n_axial_layers: Optional[int] = 0,
+    n_global_layers: Optional[int] = 6,
     max_mem_tokens: Optional[int] = 3072,
     grad_checkpoint: Optional[bool] = None,
     adaptive_ink_target: Optional[bool] = True,
@@ -964,7 +964,7 @@ def run_pretrain_iter15(args: argparse.Namespace) -> Dict[str, Any]:
 
 def build_argparser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
-        description="Iter 15 Stage-0 V-JEPA 2.1 + VICReg Encoder Pretrainer (edge85m + ax1_gl5)."
+        description="Iter 15 Stage-0 V-JEPA 2.1 + VICReg Encoder Pretrainer (edge85m + ax0_gl6)."
     )
     p.add_argument(
         "--arch-preset",
@@ -975,8 +975,8 @@ def build_argparser() -> argparse.ArgumentParser:
         default="edge85m",
         help="UniOMRv2 architecture preset (default: edge85m)",
     )
-    p.add_argument("--n-axial-layers", type=int, default=1, help="Encoder axial layers (default: 1 for ax1_gl5)")
-    p.add_argument("--n-global-layers", type=int, default=5, help="Encoder global layers (default: 5 for ax1_gl5)")
+    p.add_argument("--n-axial-layers", type=int, default=0, help="Encoder axial layers (default: 0 for ax0_gl6)")
+    p.add_argument("--n-global-layers", type=int, default=6, help="Encoder global layers (default: 6 for ax0_gl6)")
     p.add_argument("--max-mem-tokens", type=int, default=3072, help="Max routed memory tokens (default: 3072)")
     p.add_argument("--adaptive-ink-target", action="store_true", default=True)
     p.add_argument("--no-adaptive-ink-target", dest="adaptive_ink_target", action="store_false")

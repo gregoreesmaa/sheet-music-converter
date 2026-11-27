@@ -4275,12 +4275,193 @@ class StratifiedFullPageSampler:
         return out
 
 
+def build_aspect_len_buckets(
+    pairs: Sequence[Tuple[Any, ...]],
+    batch_size: int,
+) -> Tuple[List[int], List[int], int]:
+    """Compute 2D ``(aspect_bucket_id, bekern_bytes, n_buckets)`` metadata for full-page pairs."""
+    n_samples = len(pairs)
+    sample_bucket_id: List[int] = [0] * n_samples
+    sample_bytes: List[int] = [0] * n_samples
+    portrait_items: List[Tuple[float, int]] = []
+    landscape_items: List[Tuple[float, int]] = []
+    for i, entry in enumerate(pairs):
+        sz = _fast_image_size(entry[0])
+        if sz is not None and sz[1] > 0:
+            w_i, h_i = sz
+            aspect = float(w_i) / float(h_i)
+            is_land = w_i > h_i
+        else:
+            aspect = 0.75
+            is_land = False
+        sample_bytes[i] = _fast_bekern_bytes(entry[1])
+        if is_land:
+            landscape_items.append((aspect, i))
+        else:
+            portrait_items.append((aspect, i))
+
+    next_bid = 0
+    bs = max(1, int(batch_size))
+    for group in (portrait_items, landscape_items):
+        if not group:
+            continue
+        group.sort(key=lambda t: t[0])
+        n_g = len(group)
+        n_q = min(4, max(1, n_g // bs))
+        for q in range(n_q):
+            lo = (q * n_g) // n_q
+            hi = ((q + 1) * n_g) // n_q
+            for _, sample_idx in group[lo:hi]:
+                sample_bucket_id[sample_idx] = next_bid
+            next_bid += 1
+    return sample_bucket_id, sample_bytes, max(1, next_bid)
+
+
+def _normalize_aspect_len_buckets(
+    aspect_len_buckets: Any,
+    batch_size: int,
+) -> Tuple[List[int], List[int], int]:
+    """Normalize ``aspect_len_buckets`` (dataset, pairs, dict, or tuple) to ``(bucket_ids, bytes, n_buckets)``."""
+    if isinstance(aspect_len_buckets, dict):
+        b_ids = list(aspect_len_buckets["sample_bucket_id"])
+        s_bytes = list(aspect_len_buckets["sample_bytes"])
+        n_b = int(aspect_len_buckets.get("n_buckets", (max(b_ids) + 1) if b_ids else 1))
+        return b_ids, s_bytes, max(1, n_b)
+    if isinstance(aspect_len_buckets, (tuple, list)) and len(aspect_len_buckets) in (2, 3) and (
+        len(aspect_len_buckets[0]) == 0 or isinstance(aspect_len_buckets[0][0], int)
+    ):
+        b_ids = list(aspect_len_buckets[0])
+        s_bytes = list(aspect_len_buckets[1])
+        n_b = int(aspect_len_buckets[2]) if len(aspect_len_buckets) == 3 else ((max(b_ids) + 1) if b_ids else 1)
+        return b_ids, s_bytes, max(1, n_b)
+    pairs = getattr(aspect_len_buckets, "pairs", aspect_len_buckets)
+    return build_aspect_len_buckets(pairs, batch_size=batch_size)
+
+
+def build_2d_batches_with_neg_guard(
+    epoch_indices: Sequence[int],
+    sample_bucket_id: Sequence[int],
+    sample_bytes: Sequence[int],
+    n_buckets: int,
+    batch_size: int,
+    length_window: int = 64,
+    shuffle: bool = True,
+    rng: Optional[random.Random] = None,
+) -> List[List[int]]:
+    """Build 2D (aspect, length)-bucketed batches with a ``neg_control`` spread guard.
+
+    Guarantees at most 1 zero-byte (``sample_bytes[idx] == 0``) ``neg_control`` row per
+    batch whenever mathematically feasible (``n_neg <= ceil(n_pos / (batch_size - 1))``),
+    so optimizers like ``BatchedMuon`` never take a full-strength step on an all-``<eos>`` batch.
+    """
+    r = rng if rng is not None else random.Random()
+    bs = max(1, int(batch_size))
+    mega_w = max(bs, int(length_window))
+    nb = max(1, int(n_buckets))
+
+    pos_per_bucket: List[List[int]] = [[] for _ in range(nb)]
+    neg_per_bucket: List[List[int]] = [[] for _ in range(nb)]
+    for idx in epoch_indices:
+        bid = int(sample_bucket_id[idx])
+        if bid < 0 or bid >= nb:
+            bid = 0
+        if int(sample_bytes[idx]) <= 0:
+            neg_per_bucket[bid].append(idx)
+        else:
+            pos_per_bucket[bid].append(idx)
+
+    # Balance excess zero-byte neg_control rows across buckets so each bucket stays
+    # within its <=1-neg-per-batch capacity whenever total positive items allow it.
+    overflow_neg: List[int] = []
+    if bs >= 2:
+        max_neg_cap = [
+            ((len(pos_per_bucket[b]) + bs - 2) // (bs - 1)) if pos_per_bucket[b] else 0
+            for b in range(nb)
+        ]
+        for b in range(nb):
+            if shuffle and len(neg_per_bucket[b]) > 1:
+                r.shuffle(neg_per_bucket[b])
+            if len(neg_per_bucket[b]) > max_neg_cap[b]:
+                overflow_neg.extend(neg_per_bucket[b][max_neg_cap[b] :])
+                neg_per_bucket[b] = neg_per_bucket[b][: max_neg_cap[b]]
+        if overflow_neg:
+            if shuffle:
+                r.shuffle(overflow_neg)
+            for b in range(nb):
+                spare = max_neg_cap[b] - len(neg_per_bucket[b])
+                if spare > 0 and overflow_neg:
+                    take = min(spare, len(overflow_neg))
+                    neg_per_bucket[b].extend(overflow_neg[:take])
+                    del overflow_neg[:take]
+
+    batches: List[List[int]] = []
+    for b in range(nb):
+        pos_b = pos_per_bucket[b]
+        neg_b = neg_per_bucket[b]
+        if not pos_b and not neg_b:
+            continue
+        if shuffle:
+            r.shuffle(pos_b)
+            r.shuffle(neg_b)
+        # Mega-window length sort on positive (non-empty notation) rows.
+        sorted_pos: List[int] = []
+        for start in range(0, len(pos_b), mega_w):
+            chunk = pos_b[start : start + mega_w]
+            chunk.sort(key=lambda i: sample_bytes[i])
+            sorted_pos.extend(chunk)
+
+        k_neg = len(neg_b)
+        if k_neg == 0 or bs == 1:
+            combined = sorted_pos + neg_b
+            for j in range(0, len(combined), bs):
+                batches.append(combined[j : j + bs])
+            continue
+
+        # Distribute k_neg zero-byte rows at <= 1 per batch across n_b batches.
+        n_b = max(k_neg, (len(sorted_pos) + k_neg + bs - 1) // bs)
+        neg_slots = set((j * n_b) // k_neg for j in range(k_neg))
+        pos_budgets = [(bs - 1) if (slot in neg_slots) else bs for slot in range(n_b)]
+        excess = sum(pos_budgets) - len(sorted_pos)
+        for slot in range(n_b - 1, -1, -1):
+            if excess <= 0:
+                break
+            min_pos = 1 if (slot in neg_slots and len(sorted_pos) >= k_neg) else 0
+            reducible = max(0, pos_budgets[slot] - min_pos)
+            dec = min(reducible, excess)
+            pos_budgets[slot] -= dec
+            excess -= dec
+
+        pos_cursor = 0
+        neg_cursor = 0
+        for slot in range(n_b):
+            take_pos = pos_budgets[slot]
+            batch = sorted_pos[pos_cursor : pos_cursor + take_pos]
+            pos_cursor += take_pos
+            if slot in neg_slots and neg_cursor < k_neg:
+                batch.append(neg_b[neg_cursor])
+                neg_cursor += 1
+            if batch:
+                batches.append(batch)
+
+    # Fallback only if mathematically total_neg > ceil(total_pos / (bs - 1)).
+    if overflow_neg:
+        for j in range(0, len(overflow_neg), bs):
+            batches.append(overflow_neg[j : j + bs])
+
+    if shuffle:
+        r.shuffle(batches)
+    return batches
+
+
 class MultiScaleBatchSampler:
     """Batch sampler that assigns one shared ``target_dim`` to every item in a batch.
 
     Yields lists of ``(sample_idx, target_dim)`` tuples so ``UniFullPageDataset``
     resizes all batch items to the exact same resolution with zero white-pad waste
-    and full thread/worker safety.
+    and full thread/worker safety. When ``aspect_len_buckets`` metadata is provided
+    (dataset with ``.pairs``, dict, or ``(bucket_ids, sample_bytes[, n_buckets])``),
+    groups batches in 2D ``(aspect, length)`` buckets with a ``neg_control`` spread
+    guard (``<= 1`` zero-byte row per batch).
     """
 
     def __init__(
@@ -4291,6 +4472,8 @@ class MultiScaleBatchSampler:
         shuffle: bool = True,
         seed: Optional[int] = None,
         stratified_sampler: Optional[StratifiedFullPageSampler] = None,
+        aspect_len_buckets: Optional[Any] = None,
+        length_window: int = 64,
     ) -> None:
         self.num_samples = int(num_samples)
         self.batch_size = max(1, int(batch_size))
@@ -4298,36 +4481,62 @@ class MultiScaleBatchSampler:
         self.shuffle = bool(shuffle)
         self._rng = random.Random(seed) if seed is not None else None
         self.stratified_sampler = stratified_sampler
+        self._length_window = max(self.batch_size, int(length_window))
+        self._use_2d_buckets = False
+        self._sample_bucket_id: List[int] = []
+        self._sample_bytes: List[int] = []
+        self._n_buckets: int = 1
+        if aspect_len_buckets is not None and self.batch_size >= 2:
+            b_ids, s_bytes, n_b = _normalize_aspect_len_buckets(aspect_len_buckets, self.batch_size)
+            if len(b_ids) >= self.num_samples and len(s_bytes) >= self.num_samples:
+                self._sample_bucket_id = b_ids
+                self._sample_bytes = s_bytes
+                self._n_buckets = n_b
+                self._use_2d_buckets = True
 
     def __len__(self) -> int:
         n = self.stratified_sampler.epoch_size if self.stratified_sampler is not None else self.num_samples
         return (n + self.batch_size - 1) // self.batch_size
 
     def __iter__(self) -> Iterator[List[Tuple[int, int]]]:
+        r = self._rng if self._rng is not None else random.Random()
         if self.stratified_sampler is not None:
-            r = self._rng if self._rng is not None else random.Random()
             indices = self.stratified_sampler.sample_epoch(r)
         else:
             indices = list(range(self.num_samples))
-            if self.shuffle:
-                if self._rng is not None:
-                    self._rng.shuffle(indices)
-                else:
-                    random.shuffle(indices)
-        for i in range(0, len(indices), self.batch_size):
-            batch_idx = indices[i : i + self.batch_size]
-            batch_dim = _sample_weighted_fullpage_dim(self.base_dim, rng=self._rng)
-            yield [(idx, batch_dim) for idx in batch_idx]
+            if self.shuffle and not self._use_2d_buckets:
+                r.shuffle(indices)
+        if self._use_2d_buckets:
+            batches = build_2d_batches_with_neg_guard(
+                indices,
+                self._sample_bucket_id,
+                self._sample_bytes,
+                self._n_buckets,
+                batch_size=self.batch_size,
+                length_window=self._length_window,
+                shuffle=self.shuffle,
+                rng=r,
+            )
+            for batch_idx in batches:
+                batch_dim = _sample_weighted_fullpage_dim(self.base_dim, rng=self._rng)
+                yield [(idx, batch_dim) for idx in batch_idx]
+        else:
+            for i in range(0, len(indices), self.batch_size):
+                batch_idx = indices[i : i + self.batch_size]
+                batch_dim = _sample_weighted_fullpage_dim(self.base_dim, rng=self._rng)
+                yield [(idx, batch_dim) for idx in batch_idx]
 
 
 FIXED_HW_BUCKETS: Tuple[Tuple[int, int], ...] = (
     # Portrait (H >= W)
+    (896, 640),
     (1024, 768),
     (1152, 832),
     (1280, 960),
     (1408, 1024),
     (1408, 1152),
     # Landscape (W > H)
+    (640, 896),
     (768, 1024),
     (832, 1152),
     (960, 1280),
@@ -4528,37 +4737,11 @@ class AsyncThreadPrefetcher:
         self._batches: List[List[int]] = []
         self._batch_pos: int = 0
         if self._use_2d_buckets:
-            portrait_items: List[Tuple[float, int]] = []
-            landscape_items: List[Tuple[float, int]] = []
-            for i, entry in enumerate(dataset.pairs):  # type: ignore[attr-defined]
-                sz = _fast_image_size(entry[0])
-                if sz is not None and sz[1] > 0:
-                    w_i, h_i = sz
-                    aspect = float(w_i) / float(h_i)
-                    is_land = w_i > h_i
-                else:
-                    aspect = 0.75
-                    is_land = False
-                self._sample_bytes[i] = _fast_bekern_bytes(entry[1])
-                if is_land:
-                    landscape_items.append((aspect, i))
-                else:
-                    portrait_items.append((aspect, i))
-
-            next_bid = 0
-            for group in (portrait_items, landscape_items):
-                if not group:
-                    continue
-                group.sort(key=lambda t: t[0])
-                n_g = len(group)
-                n_q = min(4, max(1, n_g // max(1, self.batch_size)))
-                for q in range(n_q):
-                    lo = (q * n_g) // n_q
-                    hi = ((q + 1) * n_g) // n_q
-                    for _, sample_idx in group[lo:hi]:
-                        self._sample_bucket_id[sample_idx] = next_bid
-                    next_bid += 1
-            self._n_buckets = max(1, next_bid)
+            (
+                self._sample_bucket_id,
+                self._sample_bytes,
+                self._n_buckets,
+            ) = build_aspect_len_buckets(dataset.pairs, batch_size=self.batch_size)  # type: ignore[attr-defined]
         self._order: List[int] = []
         self._pos: int = 0
         self._closed: bool = False
@@ -4571,24 +4754,16 @@ class AsyncThreadPrefetcher:
             self._enqueue_one()
 
     def _build_2d_batches(self, epoch_indices: List[int]) -> List[List[int]]:
-        per_bucket: List[List[int]] = [[] for _ in range(self._n_buckets)]
-        for idx in epoch_indices:
-            per_bucket[self._sample_bucket_id[idx]].append(idx)
-        batches: List[List[int]] = []
-        mega_w = self._length_window
-        for b_idx in per_bucket:
-            if not b_idx:
-                continue
-            if self.shuffle:
-                self._rng.shuffle(b_idx)
-            for start in range(0, len(b_idx), mega_w):
-                chunk = b_idx[start : start + mega_w]
-                chunk.sort(key=lambda i: self._sample_bytes[i])
-                for j in range(0, len(chunk), self.batch_size):
-                    batches.append(chunk[j : j + self.batch_size])
-        if self.shuffle:
-            self._rng.shuffle(batches)
-        return batches
+        return build_2d_batches_with_neg_guard(
+            epoch_indices,
+            self._sample_bucket_id,
+            self._sample_bytes,
+            self._n_buckets,
+            batch_size=self.batch_size,
+            length_window=self._length_window,
+            shuffle=self.shuffle,
+            rng=self._rng,
+        )
 
     def _next_batch_spec(self) -> List[Any]:
         if self._use_2d_buckets:

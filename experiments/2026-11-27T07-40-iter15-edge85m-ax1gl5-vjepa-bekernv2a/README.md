@@ -4,15 +4,16 @@
 - **Status:** `PLANNED`
 - **Baseline Commit SHA:** `e426c28` *(+ Iter-15 `edge85m` + `ax1_gl5` + Stage-0 V-JEPA + v2-teacher KD preflight commit)*
 - **Architecture:** `UniOMRv2Net` preset **`edge85m`** (`d_model=512`, `~81M` total params, `< 55 MB` WebGPU INT4 ONNX) with **`ax1_gl5`** (`--n-axial-layers 1 --n-global-layers 5`)
-- **Platform / GPU:** Local `RTX 4080 SUPER` (`16 GB` VRAM, BF16 native, `$0` cloud cost)
+- **Platform / GPU:** Local `RTX 4080 SUPER` (`16 GB` VRAM, BF16 native, `$0` cloud cost) **or** Google Colab `H100-80GB` (auto-tuning with `A100-40GB` / `L4-24GB` fallback)
 - **Quick Links:**
   - Plan & Decision Tree: [PLAN.md](./PLAN.md)
-  - Self-Contained 4-Phase Launcher (Stage-0 V-JEPA + Stage-1 Strip + Stage-2 Full-Page + Auto Evals/INT4/ONNX): [launch_iter15.ps1](./launch_iter15.ps1)
+  - Self-Contained Local 4-Phase Launcher (Stage-0 V-JEPA + Stage-1 Strip + Stage-2 Full-Page + Auto Evals/INT4/ONNX): [launch_iter15.ps1](./launch_iter15.ps1)
+  - Recoverable Colab H100/A100/L4 4-Phase Runner (5-min HF checkpoint sync + zero-loss auto-resume): [run_colab_h100.py](./run_colab_h100.py)
   - Stage-0 Pretrainer Script: [pretrain_vjepa_iter15.py](../../tmp-train/mvd/pretrain_vjepa_iter15.py)
   - Outcome *(written on completion)*: `OUTCOME.md`
   - HF Repo Paths (`gregoreesmaa/sheet-music-converter-omr`):
     - Ledger: `runs/2026-11-27T07-40-iter15-edge85m-ax1gl5-vjepa-bekernv2a.json`
-    - Checkpoints: `checkpoints/2026-11-27T07-40-iter15-edge85m-ax1gl5-vjepa-bekernv2a/`
+    - Checkpoints (local / Colab H100 5-min sync): `checkpoints/2026-11-27T07-40-iter15-edge85m-ax1gl5-vjepa-bekernv2a/` and `checkpoints/iter15-edge85m-h100/`
     - Eval JSONs: `evals/2026-11-27T07-40-iter15-edge85m-ax1gl5-vjepa-bekernv2a_suite31_hw.json`
 - **Local Output Dirs:**
   - Phase 0 Stage-0 V-JEPA+VICReg (`3,000` steps): `D:\tmp\mvd-runs\uni-omr-iter15-edge85m-stage0-vjepa`
@@ -48,3 +49,25 @@ Iter 15 scales `UniOMR v2` from `small_45m` (`~41.3M`, `ax2_gl4`) to **`edge85m 
 | **Iter 13 `v2` (`small_45m`, `ema_latest`)** | `OMR-NorthStar` (`125p, --neg-control-gate`) | **`NS=34.08`**, `Tier-W NS=36.45`, `CDR=82.94`, `ALS=78.47`, `RWP=80.93`, `HWM=23.31`, `S_expr=0.5544`, `S_struct=0.7905`, `NMHR=0.0%` |
 | **Iter 14 `v2a` (`small_45m`, `ema_latest`)** | `suite31_hw` + `OMR-NorthStar` | *(Parent teacher baseline — record final measured numbers once Iter 14 completes)* |
 | **Iter 15 `edge85m` Target (`PROMOTE`)** | `suite31_hw` + `OMR-NorthStar` + INT4 + WebGPU | `all45_clean >= 0.740`, `all45_photo >= 0.730`, `NS >= 45.0`, `HWM >= 34.0`, `NMHR == 0.0%`, INT4 parity `<= 0.5 pp`, WebGPU `< 55 MB` |
+
+---
+
+## Colab H100 Recoverable Launch (Auto-Tunes to H100 / A100 / L4)
+
+`run_colab_h100.py` runs all 4 phases with automatic GPU tier detection (`H100 >= 70 GB`: `bs=8, ga=1`, no grad checkpoint; `A100 >= 36 GB`: `bs=4, ga=2`; `L4 < 36 GB`: `bs=2, ga=4`), `BF16` + cuDNN NCHW + `--fixed-hw-buckets` + `BatchedMuon`, a 5-minute background HF checkpoint syncer (`checkpoints/iter15-edge85m-h100/`), and zero-loss auto-resume from HF `phase_state.json` on reconnect.
+
+```powershell
+# 1. CPU dry-run self-test (GPU auto-tuner, D:\tmp -> /content/data remapper, 5-min HF syncer)
+$env:CUDA_VISIBLE_DEVICES = ""
+.\.venv\Scripts\python.exe experiments/2026-11-27T07-40-iter15-edge85m-ax1gl5-vjepa-bekernv2a/run_colab_h100.py --dry-run
+
+# 2. Launch on Colab H100 (named persistent session with clean teardown in finally)
+.\.venv\Scripts\colab.exe new -s iter15-h100 --gpu H100
+try {
+    .\.venv\Scripts\colab.exe upload -s iter15-h100 "$env:USERPROFILE\.cache\huggingface\token" /tmp/.hf_token
+    .\.venv\Scripts\colab.exe upload -s iter15-h100 iter15_bundle.tar.gz /content/iter15_bundle.tar.gz
+    .\.venv\Scripts\colab.exe exec -s iter15-h100 --timeout 0 -f experiments/2026-11-27T07-40-iter15-edge85m-ax1gl5-vjepa-bekernv2a/run_colab_h100.py
+} finally {
+    .\.venv\Scripts\colab.exe stop -s iter15-h100
+}
+```

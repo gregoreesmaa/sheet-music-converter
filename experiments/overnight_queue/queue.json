@@ -1776,17 +1776,18 @@
     "est_cu": 2.8,
     "script": "experiments/2026-11-26T22-18-i14-02-harmony-tempo-grammar-and-lyric-roi/run_colab.py",
     "hf_eval_target": "evals/2026-11-26T22-18-i14-02-harmony-tempo-grammar-and-lyric-roi.json",
-    "status": "QUEUED",
+    "status": "RUNNING",
     "depends_on": [],
     "note": "Wave 11 text-layer proxy (Safe B): tests +48 compositional harmony/tempo/rehearsal/anchor tokens + ~0.65M-param LyricRoICTCHead on iter10_5_proxy_2k.",
-    "started_at": "2026-11-26T21:31:42Z",
-    "log_path": "D:\\tmp\\overnight-queue-logs\\2026-11-26T22-18-i14-02-harmony-tempo-grammar-and-lyric-roi.modal.log",
+    "started_at": "2026-11-27T06:32:47Z",
+    "log_path": "D:\\tmp\\overnight-queue-logs\\2026-11-26T22-18-i14-02-harmony-tempo-grammar-and-lyric-roi.log",
     "modal_app_id": "",
     "modal_call_id": "",
     "completed_at": "2026-11-26T21:32:11Z",
     "elapsed_sec": 28.84,
     "returncode": -1,
-    "failure_reason": "modal run --detach failed for 2026-11-26T22-18-i14-02-harmony-tempo-grammar-and-lyric-roi (rc=1, app_id=None, call_id=None)"
+    "failure_reason": "modal run --detach failed for 2026-11-26T22-18-i14-02-harmony-tempo-grammar-and-lyric-roi (rc=1, app_id=None, call_id=None)",
+    "session": "2026-11-26t22-18-i14-02-"
   },
   {
     "id": "2026-11-26T22-18-i14-03-ocr-mask-declutter-pointer-fusion",
@@ -2082,7 +2083,7 @@
     "plan": "experiments/2026-11-26T23-35-i13-25b-axial-global-boundary-completion/PLAN.md",
     "hf_eval_target": "evals/2026-11-26T23-35-i13-25b-axial-global-boundary-completion.json",
     "hf_run_target": "runs/2026-11-26T23-35-i13-25b-axial-global-boundary-completion.json",
-    "status": "RUNNING",
+    "status": "COMPLETED",
     "depends_on": [
       "2026-11-26T07-40-i13-25-axial-global-layer-split"
     ],
@@ -2092,7 +2093,12 @@
     "note": "ITERATE follow-up to i13-25 (where ax1_gl5 beat ax2_gl4 by +3.92pp & +17.5% speed before timeout at ax3_gl3 step 350/400). Tests ax0_gl6 boundary + completes ax3_gl3.",
     "session": "i13-25",
     "started_at": "2026-11-27T05:57:23Z",
-    "log_path": "D:\\tmp\\overnight-queue-logs\\2026-11-26T23-35-i13-25b-axial-global-boundary-completion.log"
+    "log_path": "D:\\tmp\\overnight-queue-logs\\2026-11-26T23-35-i13-25b-axial-global-boundary-completion.log",
+    "completed_at": "2026-11-27T06:30:55Z",
+    "elapsed_sec": 2011.66,
+    "returncode": 0,
+    "hf_eval_exists": true,
+    "verdict": "PROMOTE"
   },
   {
     "id": "2026-11-27T00-01-i14-15-bekern-visual-sp-printed-acc",
@@ -2227,7 +2233,7 @@
     "wave": 13,
     "priority": 2,
     "provider": "colab_l4",
-    "gpu": "A100",
+    "gpu": "L4",
     "est_minutes": 30,
     "est_cu": 2.0,
     "script": "experiments/2026-11-27T07-46-i15-02-tf-nll-dp-align-and-vcs-verifier/run_colab.py",
@@ -2235,15 +2241,18 @@
     "plan": "experiments/2026-11-27T07-46-i15-02-tf-nll-dp-align-and-vcs-verifier/PLAN.md",
     "hf_eval_target": "evals/2026-11-27T07-46-i15-02-tf-nll-dp-align-and-vcs-verifier.json",
     "hf_run_target": "runs/2026-11-27T07-46-i15-02-tf-nll-dp-align-and-vcs-verifier.json",
-    "status": "QUEUED",
+    "status": "FAILED",
     "depends_on": [],
     "datasets": [
       "datasets/suite31_hw_eval.tar"
     ],
     "note": "Wave 13 Pivot Strategist 2 (100% permissive): Part A validates VCS (ink IoU + barline-X corr + 1280/1536 cross-scale agree + frozen encoder cosine) on 14 suite31_hw HW pieces (gate Pearson r >= 0.70 + ov-39 hallucination FP rejection); Part B benchmarks AR-free TF-NLL + Cross-Attention Monotonicity DP vs free-decoded alignment on multi-system HW spans (gate Top-1 >= 0.85 for 1,466 idle gold-XML archival pages).",
     "session": "2026-11-27t07-46-i15-02-",
-    "started_at": "2026-11-27T05:57:01Z",
-    "log_path": "D:\\tmp\\overnight-queue-logs\\2026-11-27T07-46-i15-02-tf-nll-dp-align-and-vcs-verifier.log"
+    "started_at": "2026-11-27T06:30:55Z",
+    "log_path": "D:\\tmp\\overnight-queue-logs\\2026-11-27T07-46-i15-02-tf-nll-dp-align-and-vcs-verifier.log",
+    "completed_at": "2026-11-27T06:32:47Z",
+    "elapsed_sec": 111.8,
+    "returncode": 1
   },
   {
     "id": "2026-11-27T07-46-i15-03-lyrics-textspotter-vs-deferred-bpe",

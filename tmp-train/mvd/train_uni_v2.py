@@ -46,6 +46,7 @@ import argparse
 from collections import deque
 import contextlib
 from dataclasses import asdict
+import functools
 import json
 import math
 import os
@@ -847,6 +848,62 @@ def extract_topk_from_logits(
     )
 
 
+def _linux_dl_kwargs(num_workers: int, device: torch.device) -> Dict[str, Any]:
+    """Return DataLoader worker/pinning kwargs (fast persistent workers on Linux, WDDM-safe on Windows)."""
+    nw = max(0, int(num_workers))
+    if nw > 0 and sys.platform != "win32":
+        return {
+            "num_workers": nw,
+            "persistent_workers": True,
+            "prefetch_factor": 4,
+            "pin_memory": True,
+        }
+    return {
+        "num_workers": nw,
+        "pin_memory": (device.type == "cuda"),
+    }
+
+
+def parse_prog_res_schedule(spec: str) -> List[Tuple[float, int]]:
+    """Parse progressive resolution schedule ``'0.0:896,0.35:1152,0.65:1408'`` into sorted ``(frac, dim)`` pairs."""
+    raw = str(spec or "").strip()
+    if not raw:
+        return []
+    stages: List[Tuple[float, int]] = []
+    for part in raw.split(","):
+        item = part.strip()
+        if not item:
+            continue
+        if ":" not in item:
+            raise ValueError(f"Invalid --prog-res-schedule entry {item!r} (expected 'frac:dim')")
+        frac_s, dim_s = item.split(":", 1)
+        frac = float(frac_s.strip())
+        dim = int(dim_s.strip())
+        if not (0.0 <= frac <= 1.0):
+            raise ValueError(f"--prog-res-schedule fraction must be in [0, 1], got {frac}")
+        if dim < 128:
+            raise ValueError(f"--prog-res-schedule dim must be >= 128, got {dim}")
+        stages.append((frac, dim))
+    stages.sort(key=lambda t: t[0])
+    return stages
+
+
+def resolve_prog_res_dim(
+    schedule: Sequence[Tuple[float, int]],
+    progress_frac: float,
+) -> Optional[int]:
+    """Return the active ``fullpage_max_dim`` for ``progress_frac`` in ``[0, 1]``."""
+    if not schedule:
+        return None
+    chosen: Optional[int] = None
+    for frac, dim in schedule:
+        if progress_frac >= frac:
+            chosen = int(dim)
+        else:
+            break
+    return chosen
+
+
 @torch.inference_mode()
 def precompute_teacher_cache(
     teacher: UniOMRNet,
@@ -860,6 +917,8 @@ def precompute_teacher_cache(
     skip_hw: bool = False,
     keep_ratio_override: Optional[float] = 0.45,
     compute_ink_recall: bool = False,
+    num_workers: Optional[int] = None,
+    teacher_max_dim: int = 0,
 ) -> TopKTeacherCache:
     """Run frozen v1 teacher on clean datasets and write an offline ``TopKTeacherCache``."""
     teacher.eval()
@@ -869,6 +928,12 @@ def precompute_teacher_cache(
         if (use_bf16 and device.type == "cuda")
         else contextlib.nullcontext()
     )
+    eff_workers = (
+        (0 if sys.platform == "win32" else min(8, os.cpu_count() or 4))
+        if num_workers is None
+        else max(0, int(num_workers))
+    )
+    t_max_d = int(teacher_max_dim)
 
     for ds_name, ds in datasets:
         if skip_hw and str(ds_name).strip().lower() == "hw_strips":
@@ -907,9 +972,8 @@ def precompute_teacher_cache(
             ds_to_run,
             batch_size=max(1, int(batch_size)),
             shuffle=False,
-            num_workers=0,
             collate_fn=collate_uni_batch,
-            pin_memory=(device.type == "cuda"),
+            **_linux_dl_kwargs(eff_workers, device),
         )
         t0 = time.perf_counter()
         n_before = len(records)
@@ -934,8 +998,6 @@ def precompute_teacher_cache(
                     active_idx = None
 
             images = _images_to_device_float(batch["images"], device, non_blocking=(device.type == "cuda"))
-            if images.dtype != t_dtype:
-                images = images.to(dtype=t_dtype)
             seq = batch["seq"].to(device, non_blocking=(device.type == "cuda"))
             if active_idx is not None:
                 idx_t = torch.tensor(active_idx, device=device, dtype=torch.long)
@@ -943,6 +1005,23 @@ def precompute_teacher_cache(
                 seq = seq.index_select(0, idx_t)
                 sids = [sids[i] for i in active_idx]
                 orig_lens = [orig_lens[i] for i in active_idx]
+            if t_max_d > 0:
+                th, tw = int(images.shape[-2]), int(images.shape[-1])
+                if max(th, tw) > t_max_d:
+                    scale = float(t_max_d) / float(max(th, tw))
+                    cap_32 = max(32, (t_max_d // 32) * 32)
+                    new_h = max(32, min(cap_32, (int(round(th * scale)) // 32) * 32))
+                    new_w = max(32, min(cap_32, (int(round(tw * scale)) // 32) * 32))
+                    interp_in = images.float() if images.dtype == torch.bfloat16 else images
+                    images = F.interpolate(
+                        interp_in,
+                        size=(new_h, new_w),
+                        mode="bilinear",
+                        align_corners=False,
+                        antialias=True,
+                    )
+            if images.dtype != t_dtype:
+                images = images.to(dtype=t_dtype)
 
             tgt_in = seq[:, :-1]
             with amp_ctx:
@@ -2575,9 +2654,8 @@ def _build_datasets_and_iters(
                     st_train_ds,
                     batch_size=strip_batch_size,
                     shuffle=True,
-                    num_workers=args.num_workers,
                     collate_fn=collate_uni_batch,
-                    pin_memory=(device.type == "cuda"),
+                    **_linux_dl_kwargs(args.num_workers, device),
                 )
             )
         print(f"[UniOMRv2 data] printed_strips: {len(st_tr)} train / {len(st_va)} val", flush=True)
@@ -2638,14 +2716,17 @@ def _build_datasets_and_iters(
                     hw_train_ds,
                     batch_size=strip_batch_size,
                     shuffle=True,
-                    num_workers=args.num_workers,
                     collate_fn=collate_uni_batch,
-                    pin_memory=(device.type == "cuda"),
+                    **_linux_dl_kwargs(args.num_workers, device),
                 )
             )
         print(f"[UniOMRv2 data] hw_strips: {len(hw_tr)} train / {len(hw_va)} val", flush=True)
 
+    fp_train_ds: Optional[UniFullPageDataset] = None
+    fp_batch_sampler: Optional[MultiScaleBatchSampler] = None
     if fp_tr or fp_va or fp_hw_va:
+        prog_res_sched = parse_prog_res_schedule(getattr(args, "prog_res_schedule", ""))
+        init_fp_max_dim = resolve_prog_res_dim(prog_res_sched, 0.0) or int(args.fullpage_max_dim)
         if args.stratified_fullpage and len(fp_tr) > 0:
             strat_preset = getattr(args, "stratified_preset", None)
             if strat_preset is None:
@@ -2666,7 +2747,7 @@ def _build_datasets_and_iters(
             fp_strat_sampler = None
         fp_train_ds = UniFullPageDataset(
             fp_tr,
-            fullpage_max_dim=args.fullpage_max_dim,
+            fullpage_max_dim=init_fp_max_dim,
             max_seq_len=args.max_seq_len,
             augment=args.augment,
             aug_prob=args.aug_prob,
@@ -2704,7 +2785,7 @@ def _build_datasets_and_iters(
         ) if fp_hw_va else None
         fixed_hw_buckets = bool(getattr(args, "fixed_hw_buckets", False))
         fp_collate_fn: Any = (
-            (lambda batch_samples: collate_uni_batch(batch_samples, fixed_hw_buckets=True))
+            functools.partial(collate_uni_batch, fixed_hw_buckets=True)
             if fixed_hw_buckets
             else collate_uni_batch
         )
@@ -2724,21 +2805,21 @@ def _build_datasets_and_iters(
             prefetchers.append(pf)
             fullpage_train_iter = pf
         elif args.multi_scale and len(fp_tr) > 0:
-            fp_bs = MultiScaleBatchSampler(
+            fp_batch_sampler = MultiScaleBatchSampler(
                 num_samples=len(fp_train_ds),
                 batch_size=args.batch_size,
-                base_dim=args.fullpage_max_dim,
+                base_dim=init_fp_max_dim,
                 shuffle=True,
                 seed=args.seed + 303,
                 stratified_sampler=fp_strat_sampler,
+                aspect_len_buckets=fp_train_ds,
             )
             fullpage_train_iter = _infinite_loader(
                 DataLoader(
                     fp_train_ds,
-                    batch_sampler=fp_bs,
-                    num_workers=args.num_workers,
+                    batch_sampler=fp_batch_sampler,
                     collate_fn=fp_collate_fn,
-                    pin_memory=(device.type == "cuda"),
+                    **_linux_dl_kwargs(args.num_workers, device),
                 )
             )
         elif len(fp_tr) > 0:
@@ -2747,9 +2828,8 @@ def _build_datasets_and_iters(
                     fp_train_ds,
                     batch_size=args.batch_size,
                     shuffle=True,
-                    num_workers=args.num_workers,
                     collate_fn=fp_collate_fn,
-                    pin_memory=(device.type == "cuda"),
+                    **_linux_dl_kwargs(args.num_workers, device),
                 )
             )
         hw_val_note = f" / {len(fp_hw_va)} real_hw_val" if fp_hw_va else ""
@@ -2759,6 +2839,8 @@ def _build_datasets_and_iters(
         "strip_train_iter": strip_train_iter,
         "hw_strip_train_iter": hw_strip_train_iter,
         "fullpage_train_iter": fullpage_train_iter,
+        "fp_train_ds": fp_train_ds,
+        "fp_batch_sampler": fp_batch_sampler,
         "strip_val_ds": strip_val_ds,
         "hw_strip_val_ds": hw_strip_val_ds,
         "fullpage_val_ds": fullpage_val_ds,
@@ -2779,14 +2861,25 @@ def run_train_v2(args: argparse.Namespace) -> Dict[str, Any]:
         torch.backends.cudnn.allow_tf32 = True
         if bool(getattr(args, "no_cudnn", False)):
             torch.backends.cudnn.enabled = False
-        # Force CUTLASS EFFICIENT_ATTENTION globally (covers frozen v1 teacher SDPA too;
-        # avoids cuDNN 9.10's ~640ms/shape CPU plan recompilation on variable (mem, T) shapes).
-        if hasattr(torch.backends.cuda, "enable_cudnn_sdp"):
-            torch.backends.cuda.enable_cudnn_sdp(False)
-        if hasattr(torch.backends.cuda, "enable_flash_sdp"):
-            torch.backends.cuda.enable_flash_sdp(False)
-        if hasattr(torch.backends.cuda, "enable_mem_efficient_sdp"):
-            torch.backends.cuda.enable_mem_efficient_sdp(True)
+        # On Linux Hopper (H100, cc >= 9.0), keep Flash + cuDNN SDPA enabled.
+        # On Windows (and pre-Hopper GPUs), force CUTLASS EFFICIENT_ATTENTION globally
+        # to avoid cuDNN 9.10's ~640ms/shape CPU plan recompilation on variable (mem, T) shapes.
+        _cc_major, _cc_minor = torch.cuda.get_device_capability(device)
+        _is_linux_hopper = (sys.platform != "win32") and (_cc_major >= 9)
+        if _is_linux_hopper:
+            if hasattr(torch.backends.cuda, "enable_cudnn_sdp"):
+                torch.backends.cuda.enable_cudnn_sdp(True)
+            if hasattr(torch.backends.cuda, "enable_flash_sdp"):
+                torch.backends.cuda.enable_flash_sdp(True)
+            if hasattr(torch.backends.cuda, "enable_mem_efficient_sdp"):
+                torch.backends.cuda.enable_mem_efficient_sdp(True)
+        else:
+            if hasattr(torch.backends.cuda, "enable_cudnn_sdp"):
+                torch.backends.cuda.enable_cudnn_sdp(False)
+            if hasattr(torch.backends.cuda, "enable_flash_sdp"):
+                torch.backends.cuda.enable_flash_sdp(False)
+            if hasattr(torch.backends.cuda, "enable_mem_efficient_sdp"):
+                torch.backends.cuda.enable_mem_efficient_sdp(True)
 
     prefetch_threads = (
         (6 if (device.type == "cuda" and not args.dry_run) else 0)
@@ -2848,18 +2941,24 @@ def run_train_v2(args: argparse.Namespace) -> Dict[str, Any]:
             args, cfg, device, strip_batch_size=strip_batch_size, prefetch_threads=0
         )
         try:
+            cache_bs = max(1, int(args.batch_size))
+            if device.type == "cuda":
+                vram_gb = float(torch.cuda.get_device_properties(device).total_memory) / float(1024 ** 3)
+                if vram_gb >= 40.0:
+                    cache_bs = max(cache_bs, 32)
             cache = precompute_teacher_cache(
                 teacher=teacher_v1,
                 datasets=ds_bundle["clean_datasets_for_cache"],
                 cache_dir=args.teacher_cache_dir,
                 device=device,
                 k=int(args.teacher_cache_k),
-                batch_size=max(1, int(args.batch_size)),
+                batch_size=cache_bs,
                 use_bf16=use_bf16,
                 teacher_ckpt=str(args.teacher_ckpt),
                 skip_hw=(float(getattr(args, "kd_hw_scale", 1.0)) <= 0.0),
                 keep_ratio_override=0.45,
                 compute_ink_recall=False,
+                teacher_max_dim=int(getattr(args, "teacher_max_dim", 0)),
             )
             n_cached = len(cache)
             cache.close()
@@ -2980,11 +3079,21 @@ def run_train_v2(args: argparse.Namespace) -> Dict[str, Any]:
     strip_train_iter = ds_bundle["strip_train_iter"]
     hw_strip_train_iter = ds_bundle["hw_strip_train_iter"]
     fullpage_train_iter = ds_bundle["fullpage_train_iter"]
+    fp_train_ds = ds_bundle.get("fp_train_ds")
+    fp_batch_sampler = ds_bundle.get("fp_batch_sampler")
     strip_val_ds = ds_bundle["strip_val_ds"]
     hw_strip_val_ds = ds_bundle["hw_strip_val_ds"]
     fullpage_val_ds = ds_bundle["fullpage_val_ds"]
     fullpage_hw_val_ds = ds_bundle.get("fullpage_hw_val_ds")
     prefetchers: List[AsyncThreadPrefetcher] = ds_bundle["prefetchers"]
+    prog_res_sched = parse_prog_res_schedule(getattr(args, "prog_res_schedule", ""))
+    cass_start_frac = float(getattr(args, "cass_start_frac", 0.0))
+    eval_ema_only = bool(getattr(args, "eval_ema_only", False))
+    empty_cache_threshold_bytes = (
+        int(0.86 * torch.cuda.get_device_properties(device).total_memory)
+        if device.type == "cuda"
+        else 0
+    )
 
     strip_mixer = StripDomainMixer(hw_frac=float(args.hw_frac))
     has_any_strip = (strip_train_iter is not None) or (hw_strip_train_iter is not None)
@@ -3228,6 +3337,20 @@ def run_train_v2(args: argparse.Namespace) -> Dict[str, Any]:
 
     try:
         for step in range(1, steps + 1):
+            step_frac = float(step) / float(max(1, steps))
+            if prog_res_sched and fp_train_ds is not None:
+                target_fp_dim = resolve_prog_res_dim(prog_res_sched, step_frac)
+                if target_fp_dim is not None and int(fp_train_ds.fullpage_max_dim) != int(target_fp_dim):
+                    prev_dim = int(fp_train_ds.fullpage_max_dim)
+                    fp_train_ds.fullpage_max_dim = int(target_fp_dim)
+                    if fp_batch_sampler is not None:
+                        fp_batch_sampler.base_dim = int(target_fp_dim)
+                    print(
+                        f"[UniOMRv2 prog-res] step {step}/{steps}: fullpage_max_dim {prev_dim} -> {target_fp_dim}",
+                        flush=True,
+                    )
+            cur_cass_prob = float(args.cass_prob) if step_frac >= cass_start_frac else 0.0
+
             if qat_ctrl is not None and (not qat_ctrl.enabled) and step >= qat_start_step:
                 qat_ctrl.enable()
                 print(
@@ -3296,7 +3419,7 @@ def run_train_v2(args: argparse.Namespace) -> Dict[str, Any]:
                         kd_hw_scale=kd_hw_scale,
                         kd_prob=float(getattr(args, "kd_prob", 1.0)),
                         teacher_max_dim=int(getattr(args, "teacher_max_dim", 0)),
-                        cass_prob=float(args.cass_prob),
+                        cass_prob=cur_cass_prob,
                         cass_batch_prob=float(getattr(args, "cass_batch_prob", 1.0)),
                         kind=kind,
                         mtp_loss_weight=float(args.mtp_loss_weight),
@@ -3342,7 +3465,7 @@ def run_train_v2(args: argparse.Namespace) -> Dict[str, Any]:
             if (
                 device.type == "cuda"
                 and (step - last_empty_cache_step) >= 25
-                and torch.cuda.memory_reserved(device) > int(13.8 * (1024 ** 3))
+                and torch.cuda.memory_reserved(device) > empty_cache_threshold_bytes
             ):
                 torch.cuda.empty_cache()
                 last_empty_cache_step = step
@@ -3434,31 +3557,41 @@ def run_train_v2(args: argparse.Namespace) -> Dict[str, Any]:
             if should_eval:
                 if device.type == "cuda":
                     torch.cuda.empty_cache()
-                eval_rec = _run_eval_suite(step)
-                sel_ser = float(eval_rec["composite_val_ser"])
+                skip_raw_eval = eval_ema_only and (gpu_ema is not None)
                 can_update_best = (step >= best_min_step) or (step == steps)
-                if out_dir is not None and can_update_best and sel_ser < best_val_ser:
-                    best_val_ser = sel_ser
-                    atomic_save_checkpoint(
-                        out_dir / "uni_omr_v2_best.pt",
-                        {
-                            "step": step,
-                            "val_ser": best_val_ser,
-                            "mean_val_ser": float(eval_rec["mean_val_ser"]),
-                            "composite_val_ser": best_val_ser,
-                            "fullpage_val_ser": eval_rec.get("fullpage_val_ser"),
-                            "fullpage_hw_val_ser": eval_rec.get("fullpage_hw_val_ser"),
-                            "cfg": asdict(cfg),
-                            "config": asdict(cfg),
-                            "vocab": list(data.VOCAB),
-                            "model": {k: v.detach().cpu() for k, v in model.state_dict().items()},
-                        },
-                    )
-                    print(f"  [best @ step {step}] updated uni_omr_v2_best.pt (composite_ser={best_val_ser:.4f})", flush=True)
+                if skip_raw_eval:
+                    eval_rec: Dict[str, Any] = {"step": step, "raw_eval_skipped": True}
+                else:
+                    eval_rec = _run_eval_suite(step)
+                    sel_ser = float(eval_rec["composite_val_ser"])
+                    if out_dir is not None and can_update_best and sel_ser < best_val_ser:
+                        best_val_ser = sel_ser
+                        atomic_save_checkpoint(
+                            out_dir / "uni_omr_v2_best.pt",
+                            {
+                                "step": step,
+                                "val_ser": best_val_ser,
+                                "mean_val_ser": float(eval_rec["mean_val_ser"]),
+                                "composite_val_ser": best_val_ser,
+                                "fullpage_val_ser": eval_rec.get("fullpage_val_ser"),
+                                "fullpage_hw_val_ser": eval_rec.get("fullpage_hw_val_ser"),
+                                "cfg": asdict(cfg),
+                                "config": asdict(cfg),
+                                "vocab": list(data.VOCAB),
+                                "model": {k: v.detach().cpu() for k, v in model.state_dict().items()},
+                            },
+                        )
+                        print(f"  [best @ step {step}] updated uni_omr_v2_best.pt (composite_ser={best_val_ser:.4f})", flush=True)
                 if gpu_ema is not None:
                     with gpu_ema.swap_into(model, qat_ctrl=qat_ctrl):
                         ema_eval = _run_eval_suite(f"{step} EMA")
                     eval_rec["ema_eval"] = ema_eval
+                    if skip_raw_eval:
+                        eval_rec["composite_val_ser"] = ema_eval["composite_val_ser"]
+                        eval_rec["mean_val_ser"] = ema_eval["mean_val_ser"]
+                        eval_rec["mean_val_f1"] = ema_eval["mean_val_f1"]
+                        eval_rec["fullpage_val_ser"] = ema_eval.get("fullpage_val_ser")
+                        eval_rec["fullpage_hw_val_ser"] = ema_eval.get("fullpage_hw_val_ser")
                     ema_ser = float(ema_eval["composite_val_ser"])
                     if out_dir is not None and can_update_best and ema_ser < best_ema_ser:
                         best_ema_ser = ema_ser
@@ -3682,6 +3815,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default=1.0,
         help="Probability of running the CASS draft decoder pass on a microbatch (default 1.0)",
     )
+    p.add_argument(
+        "--cass-start-frac",
+        type=float,
+        default=0.0,
+        help="Skip CASS draft passes until step / total_steps >= cass_start_frac (default: 0.0)",
+    )
     p.add_argument("--qat-int4", action="store_true")
     p.add_argument(
         "--qat-int4-start-frac",
@@ -3739,6 +3878,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--strip-height", type=int, default=192)
     p.add_argument("--max-strip-width", type=int, default=1024)
     p.add_argument("--fullpage-max-dim", type=int, default=1280)
+    p.add_argument(
+        "--prog-res-schedule",
+        type=str,
+        default="",
+        help="Optional progressive full-page resolution schedule 'frac:dim,...' (e.g. '0.0:896,0.35:1152,0.65:1408'; '' = off)",
+    )
     p.add_argument("--max-seq-len", type=int, default=2048)
     p.add_argument("--seq-len", type=int, default=64, help="Synthetic dry-run seq length")
     p.add_argument("--augment", action="store_true", default=True)
@@ -3796,6 +3941,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Deterministic count of real_hw full-page items reserved for fullpage_hw_val (0 = disabled)",
     )
     p.add_argument("--eval-every", type=int, default=500)
+    p.add_argument(
+        "--eval-ema-only",
+        action="store_true",
+        default=False,
+        help="When gpu_ema is active, skip redundant raw-model eval decode during training",
+    )
     p.add_argument("--eval-max-len", type=int, default=256)
     p.add_argument("--eval-batch-size", type=int, default=None)
     p.add_argument("--num-workers", type=int, default=0)
