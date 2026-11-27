@@ -3,7 +3,7 @@
     "id": "2026-11-27T10-30-eval-northstar-clarity-omr-v2",
     "wave": 0,
     "priority": 1,
-    "status": "QUEUED",
+    "status": "RUNNING",
     "gpu_pref": "H100",
     "script": "experiments/2026-11-27T10-30-eval-northstar-clarity-omr-v2/run_colab.py",
     "notes": "#2 contender Clarity-OMR rerun on omr-northstar db12da9 + 125 raw MusicXML HF archive",
@@ -15,7 +15,7 @@
     "provider": "colab_l4",
     "session": "2026-11-27t10-30-eval-no",
     "gpu": "A100",
-    "started_at": "2026-11-27T09:50:53Z",
+    "started_at": "2026-11-27T11:41:09Z",
     "log_path": "D:\\tmp\\overnight-queue-logs\\2026-11-27T10-30-eval-northstar-clarity-omr-v2.log",
     "completed_at": "2026-11-27T11:02:33Z",
     "elapsed_sec": 4300.17,
@@ -67,7 +67,7 @@
     "id": "2026-11-27T10-30-i15-37-modegate-dualhead-text-and-chained-mtp",
     "wave": 0,
     "priority": 5,
-    "status": "QUEUED",
+    "status": "RUNNING",
     "gpu_pref": "H100",
     "script": "experiments/2026-11-27T10-30-i15-37-modegate-dualhead-text-and-chained-mtp/run_colab.py",
     "notes": "Weight-incompatible PRE-ITER-15: ModeGate music/text dual-head + DeepSeek-V3 Chained MTP-4",
@@ -2313,7 +2313,7 @@
     "plan": "experiments/2026-11-27T00-52-i14-04b-adaptive-band-tiling-fixed/PLAN.md",
     "hf_eval_target": "evals/2026-11-27T00-52-i14-04b-adaptive-band-tiling-fixed.json",
     "hf_run_target": "runs/2026-11-27T00-52-i14-04b-adaptive-band-tiling-fixed.json",
-    "status": "QUEUED",
+    "status": "RUNNING",
     "depends_on": [
       "2026-11-26T22-18-i14-04-adaptive-band-tiling-eval"
     ],
@@ -2322,7 +2322,7 @@
     ],
     "note": "Re-queued after fixing dec_ok key bug (r_syntax -> r_parse in compute_unlabeled_structural_reward); 2-page sanity check already hit mean_note_f1=1.0000 on Colab L4.",
     "session": "2026-11-27t00-52-i14-04b",
-    "started_at": "2026-11-27T09:50:53Z",
+    "started_at": "2026-11-27T11:41:09Z",
     "log_path": "D:\\tmp\\overnight-queue-logs\\2026-11-27T00-52-i14-04b-adaptive-band-tiling-fixed.log",
     "completed_at": "2026-11-27T11:33:23Z",
     "elapsed_sec": 6149.56,
@@ -2343,7 +2343,7 @@
     "plan": "experiments/2026-11-27T07-46-i15-01-bandnet-strip-oracle-and-gauss-ptr/PLAN.md",
     "hf_eval_target": "evals/2026-11-27T07-46-i15-01-bandnet-strip-oracle-and-gauss-ptr.json",
     "hf_run_target": "runs/2026-11-27T07-46-i15-01-bandnet-strip-oracle-and-gauss-ptr.json",
-    "status": "QUEUED",
+    "status": "FAILED",
     "depends_on": [],
     "datasets": [
       "datasets/suite31_hw_eval.tar"
@@ -2351,7 +2351,10 @@
     "note": "Wave 13 Pivot Strategist 1: 3 zero-retrain arms on frozen UniOMRv2 EMA over suite31_hw (14 HW + 10 printed safety = 48 pages): fullpage_baseline vs StaffSegHead Gaussian cross-attn pointer vs BandNet strip-crop oracle.",
     "session": "2026-11-27t07-46-i15-01-",
     "started_at": "2026-11-27T11:02:34Z",
-    "log_path": "D:\\tmp\\overnight-queue-logs\\2026-11-27T07-46-i15-01-bandnet-strip-oracle-and-gauss-ptr.log"
+    "log_path": "D:\\tmp\\overnight-queue-logs\\2026-11-27T07-46-i15-01-bandnet-strip-oracle-and-gauss-ptr.log",
+    "completed_at": "2026-11-27T12:12:51Z",
+    "elapsed_sec": 4217.42,
+    "returncode": 1
   },
   {
     "id": "2026-11-27T07-46-i15-02-tf-nll-dp-align-and-vcs-verifier",
@@ -2575,5 +2578,39 @@
     "completed_at": "2026-11-27T07:12:58Z",
     "elapsed_sec": 700.0,
     "returncode": 0
+  },
+  {
+    "id": "2026-11-27T14-15-i15-33-diff-cross-attn",
+    "short_id": "i15-33",
+    "title": "Tier-2 Weight-Incompatible PRE-ITER-15: Differential Cross-Attention (DiffCrossAttn, Ye et al. 2024, +0.004 MB INT4)",
+    "wave": 1,
+    "priority": 1,
+    "status": "QUEUED",
+    "target_gpu": "A100",
+    "depends_on": [],
+    "est_minutes": 25,
+    "script": "experiments/2026-11-27T14-15-i15-33-diff-cross-attn/run_colab.py",
+    "script_path": "experiments/2026-11-27T14-15-i15-33-diff-cross-attn/run_colab.py",
+    "readme": "experiments/2026-11-27T14-15-i15-33-diff-cross-attn/README.md",
+    "plan": "experiments/2026-11-27T14-15-i15-33-diff-cross-attn/PLAN.md",
+    "hf_eval_target": "evals/2026-11-27T14-15-i15-33-diff-cross-attn.json",
+    "hf_run_target": "runs/2026-11-27T14-15-i15-33-diff-cross-attn.json"
+  },
+  {
+    "id": "2026-11-27T14-15-i15-14-3axis-structural-dec-rope",
+    "short_id": "i15-14",
+    "title": "Tier-2 Weight-Incompatible PRE-ITER-15: 3-Axis Structural Decoder RoPE (system, measure, intra-measure; 0.00 MB INT4)",
+    "wave": 1,
+    "priority": 2,
+    "status": "QUEUED",
+    "target_gpu": "A100",
+    "depends_on": [],
+    "est_minutes": 25,
+    "script": "experiments/2026-11-27T14-15-i15-14-3axis-structural-dec-rope/run_colab.py",
+    "script_path": "experiments/2026-11-27T14-15-i15-14-3axis-structural-dec-rope/run_colab.py",
+    "readme": "experiments/2026-11-27T14-15-i15-14-3axis-structural-dec-rope/README.md",
+    "plan": "experiments/2026-11-27T14-15-i15-14-3axis-structural-dec-rope/PLAN.md",
+    "hf_eval_target": "evals/2026-11-27T14-15-i15-14-3axis-structural-dec-rope.json",
+    "hf_run_target": "runs/2026-11-27T14-15-i15-14-3axis-structural-dec-rope.json"
   }
 ]

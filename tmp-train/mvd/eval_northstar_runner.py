@@ -105,6 +105,27 @@ def _atomic_write_json(path: pathlib.Path, payload: Mapping[str, Any]) -> None:
     os.replace(tmp, path)
 
 
+def backfill_legacy_manifest_metadata(manifest: dict[str, Any]) -> int:
+    """In-memory backfill of legacy pack metadata fields required by omr-northstar >= db12da9.
+
+    Non-destructive: mutates only the loaded manifest dict (never rewrites manifest.json on disk).
+    Returns the number of fields backfilled.
+    """
+    n_filled = 0
+    for rec in manifest.get("pages", []):
+        if isinstance(rec, dict):
+            opt = rec.get("optics_codec")
+            if isinstance(opt, dict) and not (isinstance(opt.get("codec"), str) and opt["codec"].strip()):
+                img_ext = pathlib.Path(str(rec.get("image_path", ""))).suffix.lstrip(".").lower()
+                opt["codec"] = img_ext or "png"
+                n_filled += 1
+            prov = rec.get("provenance")
+            if isinstance(prov, dict) and not (isinstance(prov.get("source_type"), str) and prov["source_type"].strip()):
+                prov["source_type"] = "northstar_eval_pack_125p"
+                n_filled += 1
+    return n_filled
+
+
 def evaluate_manifest(
     *,
     manifest_path: pathlib.Path,
@@ -121,6 +142,7 @@ def evaluate_manifest(
     cer, cli, scoring, stress, validate = _import_northstar(northstar_root)
 
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    backfill_legacy_manifest_metadata(manifest)
     if strict_validate:
         m_errs = validate.validate_manifest(manifest)
         if m_errs:

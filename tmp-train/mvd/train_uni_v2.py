@@ -1098,9 +1098,17 @@ def partition_muon_adamw_params(
     for name, p in model.named_parameters():
         if not p.requires_grad:
             continue
+        clean_name = name
+        changed = True
+        while changed:
+            changed = False
+            for _pfx in ("_orig_mod.", "module.", "base."):
+                if clean_name.startswith(_pfx):
+                    clean_name = clean_name[len(_pfx):]
+                    changed = True
         is_transformer_2d = (
             p.ndim == 2
-            and name.startswith(_MUON_TRANSFORMER_PREFIXES)
+            and clean_name.startswith(_MUON_TRANSFORMER_PREFIXES)
         )
         if is_transformer_2d:
             muon_named.append((name, p))
