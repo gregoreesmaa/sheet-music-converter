@@ -976,18 +976,40 @@ def _decode_page(
     amp_dtype: Optional["torch.dtype"],
     amp_enabled: bool,
 ) -> Tuple[List[str], List[int], bool, Any, Dict[str, Any]]:
-    """Decode one page canonically at `max_dim`, returning decoded tokens, raw IDs, EOS flag,
-    cached encoder memory, and router_info."""
+    """Decode one page canonically at `max_dim` using vocab-compat special IDs
+    (avoids OOB `BOS_ID` in `model.generate` when checkpoint vocab_size < current `data.VOCAB`),
+    returning decoded tokens, raw IDs, EOS flag, cached encoder memory, and router_info."""
     import torch
     import eval_uni_suite31 as eus
 
+    _, bos_id, eos_compat, _, _, _ = eus._vocab_spec(int(vocab_size))
     inp_t = _pil_to_canonical_tensor(img_pil, max_dim).unsqueeze(0).to(device)
     with torch.no_grad():
         with torch.amp.autocast("cuda", dtype=amp_dtype or torch.float16, enabled=amp_enabled):
             mem_levels, _, router_info = model.encode_image(inp_t, return_aux=False)
-            seq = model.generate(inp_t, max_len=max_len)
-    ids = seq[0].tolist()
-    hit_eos = eos_id in ids[1:]
+            cur_ids = torch.full((1, 1), bos_id, dtype=torch.long, device=device)
+            past_kvs: Optional[List[Any]] = (
+                model.precompute_cross_kv(mem_levels)
+                if hasattr(model, "precompute_cross_kv")
+                else None
+            )
+            out_ids: List[int] = [bos_id]
+            for _ in range(max_len):
+                logits, _, past_kvs = model.decode_tokens(
+                    cur_ids,
+                    memory=mem_levels if past_kvs is None else None,
+                    return_mtp=False,
+                    return_aux=False,
+                    past_kvs=past_kvs,
+                    use_cache=True,
+                )
+                next_id = int(logits[0, -1, :].argmax(dim=-1).item())
+                out_ids.append(next_id)
+                if next_id == eos_compat:
+                    break
+                cur_ids = torch.tensor([[next_id]], dtype=torch.long, device=device)
+    ids = out_ids
+    hit_eos = eos_compat in ids[1:]
     pred_toks = eus.decode_uni_compat(ids, vocab_size=vocab_size, skip_special=True)
     if not hit_eos:
         pred_toks = eus.trim_truncated_tokens(pred_toks)
