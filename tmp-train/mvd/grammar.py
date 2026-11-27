@@ -805,16 +805,16 @@ class PrefixState:
             self.grace_run = 0
             return 'bound'
         if t in TUPLET_STARTS:
-            if self.strict and (self.depth[self.seg] + self.pending >= 1
-                    or self._bar_is_full()):
+            if (self.depth[self.seg] + self.pending >= 1) or (
+                    self.strict and self._bar_is_full()):
                 raise ValueError('tuplet-start blocked (chained/full bar): %r' % t)
             self.pending += 1
             _, _, a, n = t.split('-')
             self.pend_spans.append((int(a), int(n)))
             return 'bound'
         if t == TUPLET_KW:
-            if self.strict and (self.depth[self.seg] + self.pending >= 1
-                    or self._bar_is_full()):
+            if (self.depth[self.seg] + self.pending >= 1) or (
+                    self.strict and self._bar_is_full()):
                 raise ValueError('tuplet-start blocked (chained/full bar): %r' % t)
             self.comp_num = 0
             self.comp_digits = 0
@@ -1334,8 +1334,8 @@ class PrefixState:
                                 and _vn not in self.opened:
                             continue
                     allow.add(vm[_vt])
-            if not (self.strict and (self.depth[self.seg] + self.pending >= 1
-                    or self._bar_is_full())):
+            if not (self.depth[self.seg] + self.pending >= 1
+                    or (self.strict and self._bar_is_full())):
                 allow.update(vm[t] for t in TUPLET_STARTS if t in vm)
                 if TUPLET_KW in vm:
                     allow.add(vm[TUPLET_KW])

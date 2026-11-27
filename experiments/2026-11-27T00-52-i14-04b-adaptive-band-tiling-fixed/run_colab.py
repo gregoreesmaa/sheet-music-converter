@@ -547,7 +547,7 @@ def _eval_arm(
 
     with torch.no_grad():
         for p_idx, entry in enumerate(pieces):
-            piece_id = str(entry.get("id", f"piece_{p_idx}"))
+            piece_id = str(entry.get("slug") or entry.get("id") or f"piece_{p_idx}")
             is_hw = bool(entry.get("handwritten", False))
             ref_notes = _extract_musicxml_notes(Path(entry["gt"]))
 
@@ -608,7 +608,7 @@ def _eval_arm(
                 struct = rlvr_grpo.compute_unlabeled_structural_reward(
                     hyp_toks, vocab=id_to_tok, terminated_eos=hit_eos
                 )
-                dec_ok = 1.0 if (len(hyp_notes) > 0 and float(struct.get("r_syntax", 0.0)) > 0.0) else 0.0
+                dec_ok = 1.0 if (len(hyp_notes) > 0 and float(struct.get("r_parse", 0.0)) > 0.0) else 0.0
                 mean_ir = sum(ink_recalls) / max(1, len(ink_recalls))
 
                 row = {

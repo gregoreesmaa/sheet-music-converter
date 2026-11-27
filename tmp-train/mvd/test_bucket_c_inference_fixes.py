@@ -166,6 +166,39 @@ class TestBucketCInferenceFixes(unittest.TestCase):
             self.assertIn(eos_id, allowed_ids3)
             self.assertIn(sys_id, allowed_ids3)
 
+    def test_fix2_nested_tuplet_starts_forbidden_both_modes(self) -> None:
+        """Forbid chained/nested tuplet-start-* in both lax and strict modes (prevents cpebach-h186 zero-tick spiral)."""
+        for strict in (False, True):
+            st = grammar.PrefixState(strict=strict)
+            for tok in ("clef-G-2", "key+3", "time-4-4", "voice-1", "tuplet-start-3-2"):
+                st.step(tok)
+            # While pending > 0 (before first note), a second tuplet-start-* must be masked & rejected.
+            allow_pend, _ = st.allowed()
+            for t in grammar.TUPLET_STARTS:
+                if t in _T:
+                    self.assertNotIn(_T[t], allow_pend, f"strict={strict}: pending nested {t} allowed")
+            with self.assertRaises(ValueError):
+                st.step("tuplet-start-3-2")
+
+            # After entering the tuplet (depth > 0), nested tuplet-start-* must still be masked & rejected.
+            for tok in ("16th", "B", "4"):
+                st.step(tok)
+            self.assertEqual(st.depth[st.seg], 1)
+            allow_open, _ = st.allowed()
+            for t in grammar.TUPLET_STARTS:
+                if t in _T:
+                    self.assertNotIn(_T[t], allow_open, f"strict={strict}: open nested {t} allowed")
+            with self.assertRaises(ValueError):
+                st.step("tuplet-start-6-4")
+
+            # Once closed with tuplet-stop (depth == 0), a new tuplet-start-* is allowed again.
+            st.step("tuplet-stop")
+            self.assertEqual(st.depth[st.seg], 0)
+            allow_closed, _ = st.allowed()
+            self.assertIn(_T["tuplet-start-3-2"], allow_closed)
+            st.step("tuplet-start-3-2")
+            self.assertEqual(st.pending, 1)
+
     def test_fix2_all_45_suite31_hw_gt_sequences_accepted(self) -> None:
         """All 45 suite31_hw GT sequences pass updated PrefixState(strict=False) with 0 blocks."""
         mpath = REPO_ROOT / "data-gen" / "score-corpus" / "suite31" / "suite31_hw_manifest.json"

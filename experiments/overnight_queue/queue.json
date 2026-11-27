@@ -1638,24 +1638,25 @@
     "title": "OMR-NorthStar 125p Competitor Eval: PRAIG SMT++ Polish Scores (PRAIG/smt-fp-polish-scores)",
     "wave": 10,
     "priority": 2,
-    "provider": "modal_l4",
+    "provider": "colab_l4",
     "gpu": "L4",
     "est_minutes": 20,
     "est_cu": 1.6,
     "script": "experiments/2026-11-26T21-50-eval-northstar-praig-smt-fp-polish/run_colab.py",
     "hf_eval_target": "evals/2026-11-26T21-50-eval-northstar-praig-smt-fp-polish.json",
-    "status": "QUEUED",
+    "status": "RUNNING",
     "depends_on": [],
     "note": "Broadest ungated full-page PRAIG checkpoint beyond smt-fp-grandstaff (MIT, ungated).",
-    "log_path": "D:\\tmp\\overnight-queue-logs\\2026-11-26T21-50-eval-northstar-praig-smt-fp-polish.modal.log",
+    "log_path": "D:\\tmp\\overnight-queue-logs\\2026-11-26T21-50-eval-northstar-praig-smt-fp-polish.log",
     "retry_note": "Fixed Colab transformers 5.x crash (SMTConfig._experts_implementation_internal) by pinning transformers>=4.45.0,<5.0.0 when major>=5.",
-    "started_at": "2026-11-26T21:31:32Z",
+    "started_at": "2026-11-27T03:35:51Z",
     "modal_app_id": "",
     "modal_call_id": "",
     "completed_at": "2026-11-26T21:31:47Z",
     "elapsed_sec": 15.11,
     "returncode": -1,
-    "failure_reason": "modal run --detach failed for 2026-11-26T21-50-eval-northstar-praig-smt-fp-polish (rc=1, app_id=None, call_id=None)"
+    "failure_reason": "modal run --detach failed for 2026-11-26T21-50-eval-northstar-praig-smt-fp-polish (rc=1, app_id=None, call_id=None)",
+    "session": "2026-11-26t21-50-eval-no"
   },
   {
     "id": "2026-11-26T21-50-eval-northstar-score-reader",
@@ -1849,12 +1850,17 @@
     "est_cu": 3.6,
     "script": "experiments/2026-11-26T22-18-i14-05-edge85m-int4-capacity-proxy/run_colab.py",
     "hf_eval_target": "evals/2026-11-26T22-18-i14-05-edge85m-int4-capacity-proxy.json",
-    "status": "RUNNING",
+    "status": "COMPLETED",
     "depends_on": [],
     "note": "Wave 11 Medium: d=512 edge85m QAT-INT4 vs small_45m with exact on-disk packed 4-bit nibble + FP16 scale <55MB verification.",
     "session": "2026-11-26t22-18-i14-05-",
     "started_at": "2026-11-26T21:31:46Z",
-    "log_path": "D:\\tmp\\overnight-queue-logs\\2026-11-26T22-18-i14-05-edge85m-int4-capacity-proxy.log"
+    "log_path": "D:\\tmp\\overnight-queue-logs\\2026-11-26T22-18-i14-05-edge85m-int4-capacity-proxy.log",
+    "completed_at": "2026-11-27T03:35:51Z",
+    "elapsed_sec": 21844.94,
+    "returncode": 0,
+    "hf_eval_exists": true,
+    "verdict": "PROMOTE"
   },
   {
     "id": "2026-11-26T22-18-i14-06-foveated-dualres-zoom-router",
@@ -2172,19 +2178,13 @@
     "plan": "experiments/2026-11-27T00-52-i14-04b-adaptive-band-tiling-fixed/PLAN.md",
     "hf_eval_target": "evals/2026-11-27T00-52-i14-04b-adaptive-band-tiling-fixed.json",
     "hf_run_target": "runs/2026-11-27T00-52-i14-04b-adaptive-band-tiling-fixed.json",
-    "status": "FAILED",
+    "status": "QUEUED",
     "depends_on": [
       "2026-11-26T22-18-i14-04-adaptive-band-tiling-eval"
     ],
     "datasets": [
       "datasets/suite31_hw_eval.tar"
     ],
-    "note": "ITERATE successor to i14-04 (which ran random-init model due to missing=349 ckpt loader bug + [-1,1] input norm + T4 FP32 fallback + row-bg staff-line erasure).",
-    "session": "2026-11-27t00-52-i14-04b",
-    "started_at": "2026-11-27T03:15:00Z",
-    "log_path": "D:\\tmp\\overnight-queue-logs\\2026-11-27T00-52-i14-04b-adaptive-band-tiling-fixed.log",
-    "completed_at": "2026-11-27T03:17:48Z",
-    "elapsed_sec": 168.11,
-    "returncode": 1
+    "note": "Re-queued after fixing dec_ok key bug (r_syntax -> r_parse in compute_unlabeled_structural_reward); 2-page sanity check already hit mean_note_f1=1.0000 on Colab L4."
   }
 ]
