@@ -44,7 +44,9 @@ HF_CKPT_CANDIDATES = (
 )
 HF_SUITE31_TAR = "datasets/suite31_hw_eval.tar"
 HF_EVAL_PATH = f"evals/{EXP_ID}.json"
+HF_PARTIAL_STATE_PATH = f"checkpoints/{EXP_ID}/partial_state.json"
 HF_RUN_PATH = f"runs/{EXP_ID}.json"
+HF_SYNC_EVERY_MINUTES = 10.0
 
 VOL_ROOT = Path("/vol") if Path("/vol").is_dir() else Path("/content/vol")
 HF_TOKEN_FILE = Path("/tmp/.hf_token")
@@ -504,6 +506,71 @@ def _extract_musicxml_notes(xml_path: Path) -> List[Tuple[str, int, str, str, st
     return notes
 
 
+def _restore_partial_state_from_hf(hf_token: str) -> Tuple[Dict[str, Any], Dict[str, List[Dict[str, Any]]]]:
+    """Best-effort download of partial arm/page state from HF (`checkpoints/<EXP_ID>/partial_state.json` or `evals/<EXP_ID>.json`)."""
+    from huggingface_hub import hf_hub_download
+
+    completed_arms: Dict[str, Any] = {}
+    in_progress_arms: Dict[str, List[Dict[str, Any]]] = {}
+    for repo_path in (HF_PARTIAL_STATE_PATH, HF_EVAL_PATH):
+        try:
+            dl_p = hf_hub_download(
+                repo_id=HF_REPO_ID,
+                filename=repo_path,
+                repo_type="dataset",
+                token=hf_token,
+                local_dir="/tmp/hf_dl",
+            )
+            payload = json.loads(Path(dl_p).read_text(encoding="utf-8"))
+            if isinstance(payload.get("completed_arms"), dict):
+                completed_arms.update(payload["completed_arms"])
+            if isinstance(payload.get("in_progress"), dict):
+                for k, v in payload["in_progress"].items():
+                    if isinstance(v, list) and k not in completed_arms:
+                        in_progress_arms[k] = v
+            for arm_k in ("arm_a_singlepass_1408", "arm_b_singlepass_1792", "arm_c_adaptive_band_tiling"):
+                if isinstance(payload.get(arm_k), dict) and arm_k not in completed_arms:
+                    completed_arms[arm_k] = payload[arm_k]
+        except Exception:
+            pass
+    if completed_arms or in_progress_arms:
+        print(
+            f"[{EXP_ID}][resume] Restored from HF: completed={sorted(completed_arms.keys())} "
+            f"in_progress={ {k: len(v) for k, v in in_progress_arms.items()} }",
+            flush=True,
+        )
+    return completed_arms, in_progress_arms
+
+
+def _sync_partial_state_to_hf(
+    *,
+    api: Any,
+    state_local: Path,
+    completed_arms: Dict[str, Any],
+    in_progress_arms: Dict[str, List[Dict[str, Any]]],
+    reason: str,
+) -> None:
+    """Best-effort upload of partial arm/page progress to HF `checkpoints/<EXP_ID>/partial_state.json`."""
+    try:
+        payload = {
+            "exp_id": EXP_ID,
+            "updated_utc": _utc_now(),
+            "completed_arms": completed_arms,
+            "in_progress": in_progress_arms,
+        }
+        _atomic_write_json(state_local, payload)
+        api.upload_file(
+            path_or_fileobj=str(state_local),
+            path_in_repo=HF_PARTIAL_STATE_PATH,
+            repo_id=HF_REPO_ID,
+            repo_type="dataset",
+            commit_message=f"ckpt({EXP_ID}): {reason}",
+        )
+        print(f"[{EXP_ID}][hf] Synced {HF_PARTIAL_STATE_PATH} ({reason})", flush=True)
+    except Exception as exc:
+        print(f"[{EXP_ID}][hf] WARN: partial sync failed ({type(exc).__name__}: {str(exc)[:120]})", flush=True)
+
+
 def _eval_arm(
     arm_name: str,
     *,
@@ -513,6 +580,8 @@ def _eval_arm(
     device: "torch.device",
     amp_dtype: Optional["torch.dtype"],
     sanity_check: bool = False,
+    resumed_per_page: Optional[List[Dict[str, Any]]] = None,
+    on_hf_sync: Optional[Any] = None,
 ) -> Dict[str, Any]:
     import torch
     from PIL import Image
@@ -540,10 +609,27 @@ def _eval_arm(
         "all90": [],
     }
     per_page: List[Dict[str, Any]] = []
+    done_keys = set()
+    if resumed_per_page:
+        for row in resumed_per_page:
+            key = (row.get("piece_id"), row.get("mode"))
+            if key in done_keys:
+                continue
+            done_keys.add(key)
+            per_page.append(row)
+            is_hw_r = bool(row.get("is_hw", False))
+            is_dense_r = bool(row.get("is_dense", False))
+            mode_r = str(row.get("mode", "clean"))
+            buckets[f"{'hw' if is_hw_r else 'printed'}_{mode_r}"].append(row)
+            buckets["dense_subset" if is_dense_r else "sparse_subset"].append(row)
+            buckets["all90"].append(row)
+        print(f"[{EXP_ID}][{arm_name}] Resumed {len(per_page)} pages from HF partial state", flush=True)
+
     t_arm0 = time.time()
     t_last_save = time.time()
+    t_last_hf_sync = time.time()
     amp_enabled = device.type == "cuda" and amp_dtype is not None
-    sanity_done = False
+    sanity_done = len(buckets["printed_clean"]) >= 2
 
     with torch.no_grad():
         for p_idx, entry in enumerate(pieces):
@@ -552,6 +638,8 @@ def _eval_arm(
             ref_notes = _extract_musicxml_notes(Path(entry["gt"]))
 
             for mode_key in ("clean", "photo"):
+                if (piece_id, mode_key) in done_keys:
+                    continue
                 img_p = Path(entry[mode_key])
                 if not img_p.is_file():
                     continue
@@ -649,6 +737,9 @@ def _eval_arm(
             if (time.time() - t_last_save) >= SAVE_EVERY_MINUTES * 60.0:
                 _atomic_write_json(arm_dir / "progress.json", {"done_pieces": p_idx + 1, "pages": len(per_page)})
                 t_last_save = time.time()
+            if on_hf_sync is not None and (time.time() - t_last_hf_sync) >= HF_SYNC_EVERY_MINUTES * 60.0:
+                on_hf_sync(per_page)
+                t_last_hf_sync = time.time()
 
     def _agg(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
         if not rows:
@@ -693,31 +784,54 @@ def main() -> None:
         ckpt_local, ckpt_source, manifest_path = _ensure_assets(hf_token)
         model, ckpt_meta = _load_frozen_model(ckpt_local, device)
 
-        arm_a = _eval_arm(
-            "arm_a_singlepass_1408",
-            mode="singlepass_1408",
-            model=model,
-            manifest_path=manifest_path,
-            device=device,
-            amp_dtype=amp_dtype,
-            sanity_check=True,
+        api = HfApi(token=hf_token)
+        state_local = VOL_ROOT / "ckpts" / EXP_ID / "partial_state.json"
+        completed_arms, in_progress_arms = _restore_partial_state_from_hf(hf_token)
+
+        arm_specs = (
+            ("arm_a_singlepass_1408", "singlepass_1408", True),
+            ("arm_b_singlepass_1792", "singlepass_1792", False),
+            ("arm_c_adaptive_band_tiling", "adaptive_band_tiling", False),
         )
-        arm_b = _eval_arm(
-            "arm_b_singlepass_1792",
-            mode="singlepass_1792",
-            model=model,
-            manifest_path=manifest_path,
-            device=device,
-            amp_dtype=amp_dtype,
-        )
-        arm_c = _eval_arm(
-            "arm_c_adaptive_band_tiling",
-            mode="adaptive_band_tiling",
-            model=model,
-            manifest_path=manifest_path,
-            device=device,
-            amp_dtype=amp_dtype,
-        )
+        for arm_name, arm_mode, do_sanity in arm_specs:
+            if arm_name in completed_arms:
+                print(f"[{EXP_ID}][resume] Skipping {arm_name} (loaded from HF)", flush=True)
+                continue
+
+            def _sync_cb(cur_pages: List[Dict[str, Any]], _arm: str = arm_name) -> None:
+                in_progress_arms[_arm] = list(cur_pages)
+                _sync_partial_state_to_hf(
+                    api=api,
+                    state_local=state_local,
+                    completed_arms=completed_arms,
+                    in_progress_arms=in_progress_arms,
+                    reason=f"{_arm} progress ({len(cur_pages)} pages)",
+                )
+
+            arm_res = _eval_arm(
+                arm_name,
+                mode=arm_mode,
+                model=model,
+                manifest_path=manifest_path,
+                device=device,
+                amp_dtype=amp_dtype,
+                sanity_check=do_sanity,
+                resumed_per_page=in_progress_arms.get(arm_name),
+                on_hf_sync=_sync_cb,
+            )
+            completed_arms[arm_name] = arm_res
+            in_progress_arms.pop(arm_name, None)
+            _sync_partial_state_to_hf(
+                api=api,
+                state_local=state_local,
+                completed_arms=completed_arms,
+                in_progress_arms=in_progress_arms,
+                reason=f"completed {arm_name}",
+            )
+
+        arm_a = completed_arms["arm_a_singlepass_1408"]
+        arm_b = completed_arms["arm_b_singlepass_1792"]
+        arm_c = completed_arms["arm_c_adaptive_band_tiling"]
 
         def _delta(b_val: Optional[float], a_val: Optional[float]) -> Optional[float]:
             return None if (b_val is None or a_val is None) else round(float(b_val) - float(a_val), 4)

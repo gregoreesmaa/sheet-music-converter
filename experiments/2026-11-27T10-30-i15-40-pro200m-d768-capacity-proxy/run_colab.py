@@ -543,6 +543,65 @@ def _run_cpu_smoke_test() -> int:
     return 0
 
 
+def _restore_partial_arms_from_hf(hf_token: str) -> Dict[str, Any]:
+    """Best-effort download of partial/completed `evals/<EXP_ID>.json` from HF for arm-level auto-resume."""
+    try:
+        from huggingface_hub import hf_hub_download
+
+        dl_p = hf_hub_download(
+            repo_id=HF_REPO_ID,
+            filename=HF_EVAL_PATH,
+            repo_type="dataset",
+            token=hf_token,
+            local_dir="/tmp/hf_dl",
+        )
+        payload = json.loads(Path(dl_p).read_text(encoding="utf-8"))
+        arms = payload.get("arms")
+        if isinstance(arms, dict) and arms:
+            print(f"[{EXP_ID}][resume] Restored completed arms from HF {HF_EVAL_PATH}: {sorted(arms.keys())}", flush=True)
+            return dict(arms)
+    except Exception as exc:
+        print(f"[{EXP_ID}][resume] No partial HF eval restored ({type(exc).__name__}: {str(exc)[:120]})", flush=True)
+    return {}
+
+
+def _sync_partial_arms_to_hf(
+    *,
+    api: Any,
+    eval_local: Path,
+    arms_done: Dict[str, Any],
+    started_iso: str,
+    t_start: float,
+    gpu_name: str,
+    use_bf16: bool,
+) -> None:
+    """Best-effort upload of partial arm results to `evals/<EXP_ID>.json` so completed arms survive preemption."""
+    try:
+        partial_report = {
+            "exp_id": EXP_ID,
+            "exp_code": EXP_CODE,
+            "status": "partial",
+            "started_utc": started_iso,
+            "updated_utc": _utc_now(),
+            "elapsed_secs": round(time.time() - t_start, 2),
+            "platform": f"colab-or-modal-{gpu_name}",
+            "bf16": use_bf16,
+            "steps_per_arm": TRAIN_STEPS,
+            "arms": arms_done,
+        }
+        _atomic_write_json(eval_local, partial_report)
+        api.upload_file(
+            path_or_fileobj=str(eval_local),
+            path_in_repo=HF_EVAL_PATH,
+            repo_id=HF_REPO_ID,
+            repo_type="dataset",
+            commit_message=f"ckpt({EXP_ID}): partial arm results ({','.join(sorted(arms_done.keys()))})",
+        )
+        print(f"[{EXP_ID}][hf] Synced partial {HF_EVAL_PATH} (arms={sorted(arms_done.keys())})", flush=True)
+    except Exception as exc:
+        print(f"[{EXP_ID}][hf] WARN: partial arm sync failed ({type(exc).__name__}: {str(exc)[:120]})", flush=True)
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--smoke-test", action="store_true", help="Run 1-step tiny CPU forward+backward smoke test")
@@ -568,12 +627,36 @@ def main() -> int:
         val_pairs = _load_manifest_pairs(val_abs)
         print(f"[{EXP_ID}] Loaded {len(train_pairs)} train / {len(val_pairs)} val on {gpu_name}", flush=True)
 
-        arm_ctrl = _train_arm(
-            "edge85m_ctrl", train_pairs=train_pairs, val_pairs=val_pairs, device=device, use_bf16=use_bf16
-        )
-        arm_pro = _train_arm(
-            "pro200m", train_pairs=train_pairs, val_pairs=val_pairs, device=device, use_bf16=use_bf16
-        )
+        api = HfApi(token=hf_token)
+        eval_local = VOL_ROOT / "evals" / f"{EXP_ID}.json"
+        run_local = VOL_ROOT / "runs" / f"{EXP_ID}.json"
+        resumed_arms = _restore_partial_arms_from_hf(hf_token)
+
+        if "edge85m_ctrl" in resumed_arms:
+            print(f"[{EXP_ID}][resume] Skipping edge85m_ctrl (already recorded in HF {HF_EVAL_PATH})", flush=True)
+            arm_ctrl = resumed_arms["edge85m_ctrl"]
+        else:
+            arm_ctrl = _train_arm(
+                "edge85m_ctrl", train_pairs=train_pairs, val_pairs=val_pairs, device=device, use_bf16=use_bf16
+            )
+            resumed_arms["edge85m_ctrl"] = arm_ctrl
+            _sync_partial_arms_to_hf(
+                api=api,
+                eval_local=eval_local,
+                arms_done=resumed_arms,
+                started_iso=started_iso,
+                t_start=t_start,
+                gpu_name=gpu_name,
+                use_bf16=use_bf16,
+            )
+
+        if "pro200m" in resumed_arms:
+            print(f"[{EXP_ID}][resume] Skipping pro200m (already recorded in HF {HF_EVAL_PATH})", flush=True)
+            arm_pro = resumed_arms["pro200m"]
+        else:
+            arm_pro = _train_arm(
+                "pro200m", train_pairs=train_pairs, val_pairs=val_pairs, device=device, use_bf16=use_bf16
+            )
 
         comparison = {
             "ema_val_ce_delta": round(arm_pro["ema_val_ce"] - arm_ctrl["ema_val_ce"], 5),
@@ -598,8 +681,6 @@ def main() -> int:
             "arms": {"edge85m_ctrl": arm_ctrl, "pro200m": arm_pro},
             "comparison_pro200m_minus_edge85m": comparison,
         }
-        eval_local = VOL_ROOT / "evals" / f"{EXP_ID}.json"
-        run_local = VOL_ROOT / "runs" / f"{EXP_ID}.json"
         _atomic_write_json(eval_local, report)
         _atomic_write_json(
             run_local,
@@ -613,7 +694,6 @@ def main() -> int:
                 "comparison": comparison,
             },
         )
-        api = HfApi(token=hf_token)
         api.upload_file(
             path_or_fileobj=str(eval_local),
             path_in_repo=HF_EVAL_PATH,

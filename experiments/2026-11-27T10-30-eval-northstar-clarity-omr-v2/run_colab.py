@@ -47,7 +47,9 @@ HF_PACK_TAR = "datasets/northstar_eval_pack_125p.tar.gz"
 HF_EVAL_PATH = f"evals/{EXP_ID}.json"
 HF_PER_PAGE_PATH = f"evals/{EXP_ID}_per_page.json"
 HF_MUSICXML_TAR_PATH = f"evals/{EXP_ID}_musicxml.tar.gz"
+HF_PARTIAL_TAR_PATH = f"checkpoints/{EXP_ID}/partial_musicxml.tar.gz"
 HF_RUN_PATH = f"runs/{EXP_ID}.json"
+PARTIAL_SYNC_EVERY_PAGES = 25
 
 NORTHSTAR_REPO_URL = "https://github.com/gregoreesmaa/omr-northstar.git"
 NORTHSTAR_LOCAL_DIR = pathlib.Path("/tmp/omr-northstar")
@@ -241,17 +243,94 @@ def _image_to_single_page_pdf(img_path: pathlib.Path, pdf_path: pathlib.Path, dp
     os.replace(tmp_pdf, pdf_path)
 
 
-def _archive_musicxml(mxml_dir: pathlib.Path, out_tar: pathlib.Path) -> int:
-    """Archive all predicted `.musicxml` files atomically into a `.tar.gz` for 4s CPU rescores."""
+def _archive_musicxml(mxml_dir: pathlib.Path, out_tar: pathlib.Path, *, timing_path: Optional[pathlib.Path] = None) -> int:
+    """Archive all predicted `.musicxml` files (and optional timing.json) atomically into a `.tar.gz`."""
     out_tar.parent.mkdir(parents=True, exist_ok=True)
     files = sorted(mxml_dir.glob("*.musicxml"))
     tmp_tar = out_tar.with_suffix(out_tar.suffix + ".tmp")
     with tarfile.open(tmp_tar, "w:gz") as tf:
         for p in files:
             tf.add(p, arcname=p.name)
+        if timing_path is not None and timing_path.is_file():
+            tf.add(timing_path, arcname="timing.json")
     os.replace(tmp_tar, out_tar)
     print(f"[archive] Archived {len(files)} MusicXML files -> {out_tar} ({out_tar.stat().st_size} bytes)", flush=True)
     return len(files)
+
+
+def _restore_partial_from_hf(
+    *,
+    hf_token: Optional[str],
+    mxml_dir: pathlib.Path,
+    timing_path: pathlib.Path,
+) -> int:
+    """Best-effort download and unpack of `checkpoints/<EXP_ID>/partial_musicxml.tar.gz` from HF."""
+    if not hf_token:
+        return 0
+    try:
+        from huggingface_hub import hf_hub_download
+
+        dl_path = pathlib.Path(
+            hf_hub_download(
+                repo_id=HF_REPO_ID,
+                repo_type="dataset",
+                filename=HF_PARTIAL_TAR_PATH,
+                token=hf_token,
+            )
+        )
+        restored = 0
+        with tarfile.open(dl_path, "r:gz") as tf:
+            for member in tf.getmembers():
+                if not member.isfile():
+                    continue
+                name = pathlib.Path(member.name).name
+                if name == "timing.json":
+                    if not timing_path.is_file():
+                        f = tf.extractfile(member)
+                        if f is not None:
+                            _atomic_write_text(timing_path, f.read().decode("utf-8", errors="replace"))
+                elif name.endswith(".musicxml"):
+                    dest = mxml_dir / name
+                    if not dest.is_file():
+                        f = tf.extractfile(member)
+                        if f is not None:
+                            tmp = dest.with_suffix(dest.suffix + ".tmp")
+                            tmp.write_bytes(f.read())
+                            os.replace(tmp, dest)
+                            restored += 1
+        print(f"[resume] Restored {restored} MusicXML files from HF {HF_PARTIAL_TAR_PATH}", flush=True)
+        return restored
+    except Exception as exc:
+        print(f"[resume] No partial HF checkpoint restored ({type(exc).__name__}: {str(exc)[:120]})", flush=True)
+        return 0
+
+
+def _sync_partial_to_hf(
+    *,
+    hf_token: Optional[str],
+    mxml_dir: pathlib.Path,
+    timing_path: pathlib.Path,
+    partial_tar_path: pathlib.Path,
+    n_done: int,
+) -> None:
+    """Best-effort atomic archive + upload of incremental MusicXML predictions to HF."""
+    if not hf_token or LIMIT_PAGES != 0:
+        return
+    try:
+        from huggingface_hub import HfApi
+
+        n_files = _archive_musicxml(mxml_dir, partial_tar_path, timing_path=timing_path)
+        api = HfApi(token=hf_token)
+        api.upload_file(
+            path_or_fileobj=str(partial_tar_path),
+            path_in_repo=HF_PARTIAL_TAR_PATH,
+            repo_id=HF_REPO_ID,
+            repo_type="dataset",
+            commit_message=f"ckpt({EXP_ID}): partial MusicXML checkpoint ({n_files} files, {n_done} pages)",
+        )
+        print(f"[hf] Synced partial checkpoint {HF_PARTIAL_TAR_PATH} ({n_files} files)", flush=True)
+    except Exception as exc:
+        print(f"[hf] WARN: partial checkpoint sync failed ({type(exc).__name__}: {str(exc)[:120]})", flush=True)
 
 
 def _score_northstar(
@@ -447,6 +526,9 @@ def main() -> int:
     pdf_dir.mkdir(parents=True, exist_ok=True)
     work_root.mkdir(parents=True, exist_ok=True)
     timing_path = run_dir / "timing.json"
+    partial_tar_path = run_dir / "partial_musicxml.tar.gz"
+
+    _restore_partial_from_hf(hf_token=hf_token, mxml_dir=mxml_dir, timing_path=timing_path)
 
     latencies: Dict[str, float] = {}
     conv_statuses: Dict[str, str] = {}
@@ -469,13 +551,14 @@ def main() -> int:
 
     n_ok = 0
     n_fail = 0
+    newly_completed = 0
     for idx, rec in enumerate(pages, start=1):
         pid = str(rec["page_id"])
         out_mxml = mxml_dir / f"{pid}.musicxml"
 
-        if out_mxml.is_file() and pid in latencies:
+        if out_mxml.is_file() and (pid in latencies or out_mxml.stat().st_size > 0):
             status = conv_statuses.get(pid, "resumed")
-            if status in ("ok", "no-staves-empty"):
+            if status in ("ok", "no-staves-empty", "resumed"):
                 n_ok += 1
             else:
                 n_fail += 1
@@ -573,6 +656,15 @@ def main() -> int:
             f"[{idx:03d}/{len(pages):03d}] {pid:42s} ok={str(ok):5s} ({status[:60]}) {elapsed:.2f}s",
             flush=True,
         )
+        newly_completed += 1
+        if newly_completed % PARTIAL_SYNC_EVERY_PAGES == 0:
+            _sync_partial_to_hf(
+                hf_token=hf_token,
+                mxml_dir=mxml_dir,
+                timing_path=timing_path,
+                partial_tar_path=partial_tar_path,
+                n_done=n_ok + n_fail,
+            )
 
     gc.collect()
     if device == "cuda":

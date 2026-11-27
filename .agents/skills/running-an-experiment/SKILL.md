@@ -54,9 +54,9 @@ Must detail ALL of the following:
    - Exact manifest(s) / HF `.tar` shard filenames + SHA-256 / sample counts + license confirmation (permissive only; ZERO `CC-BY-NC`).
    - Exact baseline checkpoint (`--init-from` / `--init-encoder-from`).
 4. **Exact Launch Command & Hyperparameters:** Full reproducible CLI invocation (zero secrets!).
-5. **5-Minute Checkpointing & Resume Plan (MANDATORY):**
+5. **5-Minute Checkpointing & Remote HF Resume Plan (MANDATORY):**
    - Confirm `--save-every-minutes 5.0` (atomic `.tmp` → `os.replace` for both raw & EMA checkpoints).
-   - Confirm cloud sync cadence (Modal `vol.commit()` every 5 min; HF Hub batched upload every 15–30 min + on new best + on exit/SIGTERM).
+   - **Ephemeral-VM HF Sync & Auto-Resume (MANDATORY on Colab / Kaggle):** Because Colab `/content` and Kaggle `/kaggle/working` are ephemeral, **every** remote script running `> 15 min` MUST (a) check HF Private Hub (`checkpoints/<exp_id>/`) on startup and automatically resume from the latest saved state/arm/page, and (b) push incremental state (per-arm JSONs, rolling training checkpoints every `10–15 min`, or per-25-page eval tarballs + `SIGTERM`/final flush) to HF Private Hub so a dropped terminal or VM preemption never loses work.
    - Exact resume command if preempted/timed out.
 6. **Evaluation Gate & Decision Tree ("What We Do With the Result"):**
    - Exact metric(s) to measure (e.g., 45-piece `suite31_hw` `printed_clean`, `printed_photo`, `hw_clean`, `hw_photo`, `all45_clean/photo`, plus speed/size if applicable).
