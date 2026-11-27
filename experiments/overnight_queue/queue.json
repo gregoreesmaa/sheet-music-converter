@@ -207,7 +207,7 @@
     "id": "2026-11-27T22-15-i15-44b-xf-verifier-kv-rewind-mbr-fixed",
     "wave": 0,
     "priority": 10,
-    "status": "RUNNING",
+    "status": "COMPLETED",
     "target_gpu": "A100",
     "gpu_pref": "A100",
     "depends_on": [
@@ -218,13 +218,17 @@
     "title": "Cross-field PRE-ITER-15: Fixed KV-cache rewind + MBR successor (MusicXML scorer, ban premature EOS, violation-only)",
     "notes": "Clean ITERATE successor to i15-44: fixes MusicXML Note F1/wFPP scorer, bans premature EOS, violation-only rewind trigger, K=2 low latency",
     "est_minutes": 10,
-    "hf_eval_target": "evals/2026-11-27T22-15-i15-44b-xf-verifier-kv-rewind-mbr-fixed.json"
+    "hf_eval_target": "evals/2026-11-27T22-15-i15-44b-xf-verifier-kv-rewind-mbr-fixed.json",
+    "completed_at": "2026-11-27T22:51:45Z",
+    "elapsed_sec": 383.7,
+    "returncode": 0,
+    "verdict": "DISCARD"
   },
   {
     "id": "2026-11-28T00-26-i15-48b-xf-orbgrand-syndrome-trellis-fixed",
     "wave": 0,
     "priority": 10,
-    "status": "QUEUED",
+    "status": "COMPLETED",
     "target_gpu": "A100",
     "gpu_pref": "A100",
     "depends_on": [
@@ -235,7 +239,11 @@
     "title": "Cross-field PRE-ITER-15: Fixed ORBGRAND/SOGRAND syndrome + Trellis-BMA successor (multi-voice/staff + MusicXML scorer)",
     "notes": "Clean ITERATE successor to i15-48: fixes per-(staff,voice) compute_bar_duration_syndrome, adds MusicXML note_f1/bsvr/wfpp/gate_pass",
     "est_minutes": 10,
-    "hf_eval_target": "evals/2026-11-28T00-26-i15-48b-xf-orbgrand-syndrome-trellis-fixed.json"
+    "hf_eval_target": "evals/2026-11-28T00-26-i15-48b-xf-orbgrand-syndrome-trellis-fixed.json",
+    "completed_at": "2026-11-27T22:56:00Z",
+    "elapsed_sec": 254.79,
+    "returncode": 0,
+    "verdict": "DISCARD"
   },
   {
     "id": "2026-11-27T14-50-i15-45-xf-qvla-mixedbit-quant",
@@ -2769,7 +2777,7 @@
     "plan": "experiments/2026-11-27T08-19-i15-09-data-mix-ratio-and-rep-cap-sweep/PLAN.md",
     "hf_eval_target": "evals/2026-11-27T08-19-i15-09-data-mix-ratio-and-rep-cap-sweep.json",
     "hf_run_target": "runs/2026-11-27T08-19-i15-09-data-mix-ratio-and-rep-cap-sweep.json",
-    "status": "QUEUED",
+    "status": "RUNNING",
     "depends_on": [],
     "datasets": [
       "datasets/iter10_5_proxy_2k.tar",
