@@ -6,7 +6,20 @@
     "status": "QUEUED",
     "gpu_pref": "H100",
     "script": "experiments/2026-11-27T10-30-eval-northstar-clarity-omr-v2/run_colab.py",
-    "notes": "#2 contender Clarity-OMR rerun on omr-northstar db12da9 + 125 raw MusicXML HF archive"
+    "notes": "#2 contender Clarity-OMR rerun on omr-northstar db12da9 + 125 raw MusicXML HF archive",
+    "est_minutes": 10,
+    "title": "#2 contender Clarity-OMR rerun on omr-northstar db12da9 + 125 raw MusicXML HF archive",
+    "hf_eval_target": "evals/2026-11-27T10-30-eval-northstar-clarity-omr-v2.json",
+    "depends_on": [],
+    "target_gpu": "A100",
+    "provider": "colab_l4",
+    "session": "2026-11-27t10-30-eval-no",
+    "gpu": "A100",
+    "started_at": "2026-11-27T09:50:53Z",
+    "log_path": "D:\\tmp\\overnight-queue-logs\\2026-11-27T10-30-eval-northstar-clarity-omr-v2.log",
+    "completed_at": "2026-11-27T11:02:33Z",
+    "elapsed_sec": 4300.17,
+    "returncode": 1
   },
   {
     "id": "2026-11-27T10-30-i15-40-pro200m-d768-capacity-proxy",
@@ -15,25 +28,40 @@
     "status": "QUEUED",
     "gpu_pref": "H100",
     "script": "experiments/2026-11-27T10-30-i15-40-pro200m-d768-capacity-proxy/run_colab.py",
-    "notes": "Weight-incompatible PRE-ITER-15: pro200m (d=768, 192M, 119.2 MB INT4) vs edge85m"
+    "notes": "Weight-incompatible PRE-ITER-15: pro200m (d=768, 192M, 119.2 MB INT4) vs edge85m",
+    "est_minutes": 12,
+    "title": "Weight-incompatible PRE-ITER-15: pro200m (d=768, 192M, 119.2 MB INT4) vs edge85m",
+    "hf_eval_target": "evals/2026-11-27T10-30-i15-40-pro200m-d768-capacity-proxy.json",
+    "depends_on": [],
+    "target_gpu": "A100"
   },
   {
     "id": "2026-11-27T10-30-i15-31-hrnet-music-dualres-s4",
     "wave": 0,
     "priority": 3,
-    "status": "QUEUED",
+    "status": "COMPLETED",
     "gpu_pref": "H100",
     "script": "experiments/2026-11-27T10-30-i15-31-hrnet-music-dualres-s4/run_colab.py",
-    "notes": "Weight-incompatible PRE-ITER-15: HRNet-Music parallel /4||/8 stage4 (-1.94 MB INT4)"
+    "notes": "Weight-incompatible PRE-ITER-15: HRNet-Music parallel /4||/8 stage4 (-1.94 MB INT4)",
+    "est_minutes": 13,
+    "title": "Weight-incompatible PRE-ITER-15: HRNet-Music parallel /4||/8 stage4 (-1.94 MB INT4)",
+    "hf_eval_target": "evals/2026-11-27T10-30-i15-31-hrnet-music-dualres-s4.json",
+    "depends_on": [],
+    "target_gpu": "A100"
   },
   {
     "id": "2026-11-27T10-30-i15-38-coordkey-ca-fourier-cross-attn",
     "wave": 0,
     "priority": 4,
-    "status": "QUEUED",
+    "status": "COMPLETED",
     "gpu_pref": "H100",
     "script": "experiments/2026-11-27T10-30-i15-38-coordkey-ca-fourier-cross-attn/run_colab.py",
-    "notes": "Weight-incompatible PRE-ITER-15: Decoupled 2D Fourier CoordKey cross-attn (+0.44 MB INT4)"
+    "notes": "Weight-incompatible PRE-ITER-15: Decoupled 2D Fourier CoordKey cross-attn (+0.44 MB INT4)",
+    "est_minutes": 14,
+    "title": "Weight-incompatible PRE-ITER-15: Decoupled 2D Fourier CoordKey cross-attn (+0.44 MB INT4)",
+    "hf_eval_target": "evals/2026-11-27T10-30-i15-38-coordkey-ca-fourier-cross-attn.json",
+    "depends_on": [],
+    "target_gpu": "A100"
   },
   {
     "id": "2026-11-27T10-30-i15-37-modegate-dualhead-text-and-chained-mtp",
@@ -42,7 +70,12 @@
     "status": "QUEUED",
     "gpu_pref": "H100",
     "script": "experiments/2026-11-27T10-30-i15-37-modegate-dualhead-text-and-chained-mtp/run_colab.py",
-    "notes": "Weight-incompatible PRE-ITER-15: ModeGate music/text dual-head + DeepSeek-V3 Chained MTP-4"
+    "notes": "Weight-incompatible PRE-ITER-15: ModeGate music/text dual-head + DeepSeek-V3 Chained MTP-4",
+    "est_minutes": 15,
+    "title": "Weight-incompatible PRE-ITER-15: ModeGate music/text dual-head + DeepSeek-V3 Chained MTP-4",
+    "hf_eval_target": "evals/2026-11-27T10-30-i15-37-modegate-dualhead-text-and-chained-mtp.json",
+    "depends_on": [],
+    "target_gpu": "A100"
   },
   {
     "id": "2026-11-27T10-30-i15-11-sheared-strip-conv-and-aniso-pitch-rope2d",
@@ -51,7 +84,12 @@
     "status": "QUEUED",
     "gpu_pref": "H100",
     "script": "experiments/2026-11-27T10-30-i15-11-sheared-strip-conv-and-aniso-pitch-rope2d/run_colab.py",
-    "notes": "Weight-incompatible PRE-ITER-15: 3-angle sheared strips + pitch-biased aniso 2D-RoPE"
+    "notes": "Weight-incompatible PRE-ITER-15: 3-angle sheared strips + pitch-biased aniso 2D-RoPE",
+    "est_minutes": 16,
+    "title": "Weight-incompatible PRE-ITER-15: 3-angle sheared strips + pitch-biased aniso 2D-RoPE",
+    "hf_eval_target": "evals/2026-11-27T10-30-i15-11-sheared-strip-conv-and-aniso-pitch-rope2d.json",
+    "depends_on": [],
+    "target_gpu": "A100"
   },
   {
     "id": "2026-11-27T10-30-i15-36-yoco-cla-resformer-12l-decoder",
@@ -60,7 +98,12 @@
     "status": "QUEUED",
     "gpu_pref": "H100",
     "script": "experiments/2026-11-27T10-30-i15-36-yoco-cla-resformer-12l-decoder/run_colab.py",
-    "notes": "Weight-incompatible PRE-ITER-15: YOCO-3Bank Cross-KV + CLA-2:1 + ResFormer 12L (-40% KV)"
+    "notes": "Weight-incompatible PRE-ITER-15: YOCO-3Bank Cross-KV + CLA-2:1 + ResFormer 12L (-40% KV)",
+    "est_minutes": 17,
+    "title": "Weight-incompatible PRE-ITER-15: YOCO-3Bank Cross-KV + CLA-2:1 + ResFormer 12L (-40% KV)",
+    "hf_eval_target": "evals/2026-11-27T10-30-i15-36-yoco-cla-resformer-12l-decoder.json",
+    "depends_on": [],
+    "target_gpu": "A100"
   },
   {
     "id": "2026-11-27T10-30-i15-39-sysslot-mem-hierarchical-encoder",
@@ -69,7 +112,12 @@
     "status": "QUEUED",
     "gpu_pref": "H100",
     "script": "experiments/2026-11-27T10-30-i15-39-sysslot-mem-hierarchical-encoder/run_colab.py",
-    "notes": "Weight-incompatible PRE-ITER-15: S=16 competitive System Slot-Attention memory"
+    "notes": "Weight-incompatible PRE-ITER-15: S=16 competitive System Slot-Attention memory",
+    "est_minutes": 18,
+    "title": "Weight-incompatible PRE-ITER-15: S=16 competitive System Slot-Attention memory",
+    "hf_eval_target": "evals/2026-11-27T10-30-i15-39-sysslot-mem-hierarchical-encoder.json",
+    "depends_on": [],
+    "target_gpu": "A100"
   },
   {
     "id": "2026-11-26T01-38-ov-36-hw-multiview-tta-voting",
@@ -2213,7 +2261,7 @@
     "plan": "experiments/2026-11-27T00-01-i14-16-bekern-monotonic-sys-y-anchors/PLAN.md",
     "hf_eval_target": "evals/2026-11-27T00-01-i14-16-bekern-monotonic-sys-y-anchors.json",
     "hf_run_target": "runs/2026-11-27T00-01-i14-16-bekern-monotonic-sys-y-anchors.json",
-    "status": "RUNNING",
+    "status": "COMPLETED",
     "depends_on": [],
     "datasets": [
       "datasets/iter10_5_proxy_2k.tar",
@@ -2222,7 +2270,10 @@
     "note": "Wave 12 Bekern Theorist 3 (Safe): 600 steps/arm A/B proxy comparing ungrounded <sys> vs append-only <sys> <y-bin-00..63> + monotonic decode mask (y[k] > y[k-1]) on suite31_hw Note F1, sys-count MAE, copy-loop rate.",
     "session": "2026-11-27t00-01-i14-16-",
     "started_at": "2026-11-27T07:12:58Z",
-    "log_path": "D:\\tmp\\overnight-queue-logs\\2026-11-27T00-01-i14-16-bekern-monotonic-sys-y-anchors.log"
+    "log_path": "D:\\tmp\\overnight-queue-logs\\2026-11-27T00-01-i14-16-bekern-monotonic-sys-y-anchors.log",
+    "completed_at": "2026-11-27T10:13:24Z",
+    "elapsed_sec": 10826.44,
+    "returncode": 0
   },
   {
     "id": "2026-11-27T00-01-i14-17-bekern-dur-dot-first-and-mbpe",
@@ -2254,7 +2305,7 @@
     "wave": 11,
     "priority": 1,
     "provider": "colab_l4",
-    "gpu": "H100",
+    "gpu": "A100",
     "est_minutes": 15,
     "est_cu": 1.2,
     "script": "experiments/2026-11-27T00-52-i14-04b-adaptive-band-tiling-fixed/run_colab.py",
@@ -2262,7 +2313,7 @@
     "plan": "experiments/2026-11-27T00-52-i14-04b-adaptive-band-tiling-fixed/PLAN.md",
     "hf_eval_target": "evals/2026-11-27T00-52-i14-04b-adaptive-band-tiling-fixed.json",
     "hf_run_target": "runs/2026-11-27T00-52-i14-04b-adaptive-band-tiling-fixed.json",
-    "status": "RUNNING",
+    "status": "QUEUED",
     "depends_on": [
       "2026-11-26T22-18-i14-04-adaptive-band-tiling-eval"
     ],
@@ -2271,8 +2322,11 @@
     ],
     "note": "Re-queued after fixing dec_ok key bug (r_syntax -> r_parse in compute_unlabeled_structural_reward); 2-page sanity check already hit mean_note_f1=1.0000 on Colab L4.",
     "session": "2026-11-27t00-52-i14-04b",
-    "started_at": "2026-11-27T06:15:21Z",
-    "log_path": "D:\\tmp\\overnight-queue-logs\\2026-11-27T00-52-i14-04b-adaptive-band-tiling-fixed.log"
+    "started_at": "2026-11-27T09:50:53Z",
+    "log_path": "D:\\tmp\\overnight-queue-logs\\2026-11-27T00-52-i14-04b-adaptive-band-tiling-fixed.log",
+    "completed_at": "2026-11-27T11:33:23Z",
+    "elapsed_sec": 6149.56,
+    "returncode": 130
   },
   {
     "id": "2026-11-27T07-46-i15-01-bandnet-strip-oracle-and-gauss-ptr",
@@ -2281,7 +2335,7 @@
     "wave": 13,
     "priority": 1,
     "provider": "colab_l4",
-    "gpu": "H100",
+    "gpu": "A100",
     "est_minutes": 20,
     "est_cu": 1.5,
     "script": "experiments/2026-11-27T07-46-i15-01-bandnet-strip-oracle-and-gauss-ptr/run_colab.py",
@@ -2289,14 +2343,14 @@
     "plan": "experiments/2026-11-27T07-46-i15-01-bandnet-strip-oracle-and-gauss-ptr/PLAN.md",
     "hf_eval_target": "evals/2026-11-27T07-46-i15-01-bandnet-strip-oracle-and-gauss-ptr.json",
     "hf_run_target": "runs/2026-11-27T07-46-i15-01-bandnet-strip-oracle-and-gauss-ptr.json",
-    "status": "RUNNING",
+    "status": "QUEUED",
     "depends_on": [],
     "datasets": [
       "datasets/suite31_hw_eval.tar"
     ],
     "note": "Wave 13 Pivot Strategist 1: 3 zero-retrain arms on frozen UniOMRv2 EMA over suite31_hw (14 HW + 10 printed safety = 48 pages): fullpage_baseline vs StaffSegHead Gaussian cross-attn pointer vs BandNet strip-crop oracle.",
     "session": "2026-11-27t07-46-i15-01-",
-    "started_at": "2026-11-27T06:15:21Z",
+    "started_at": "2026-11-27T11:02:34Z",
     "log_path": "D:\\tmp\\overnight-queue-logs\\2026-11-27T07-46-i15-01-bandnet-strip-oracle-and-gauss-ptr.log"
   },
   {
@@ -2456,7 +2510,7 @@
     "plan": "experiments/2026-11-27T07-52-i15-08-bekern3-expressive-oracle-and-compress/PLAN.md",
     "hf_eval_target": "evals/2026-11-27T07-52-i15-08-bekern3-expressive-oracle-and-compress.json",
     "hf_run_target": "runs/2026-11-27T07-52-i15-08-bekern3-expressive-oracle-and-compress.json",
-    "status": "RUNNING",
+    "status": "COMPLETED",
     "depends_on": [],
     "datasets": [
       "datasets/iter10_5_proxy_2k.tar",
@@ -2465,7 +2519,10 @@
     "note": "Wave 13 bekern3 Architect 3: Part A 125-page OMR-NorthStar Oracle Closure (NS>=98.0, S_expr>=0.980) + Part B 3-arm 600-step MTP-4 bake-off (arm0_bekern_v2a vs arm1_profile_a_comp -20.2% vs arm2_profile_a_plus_core_pitch -41.1%, gate >=1.45x MTP-4 speedup & >=-0.2pp Note F1).",
     "session": "2026-11-27t07-52-i15-08-",
     "started_at": "2026-11-27T07:20:56Z",
-    "log_path": "D:\\tmp\\overnight-queue-logs\\2026-11-27T07-52-i15-08-bekern3-expressive-oracle-and-compress.log"
+    "log_path": "D:\\tmp\\overnight-queue-logs\\2026-11-27T07-52-i15-08-bekern3-expressive-oracle-and-compress.log",
+    "completed_at": "2026-11-27T09:15:54Z",
+    "elapsed_sec": 6898.09,
+    "returncode": 0
   },
   {
     "id": "2026-11-27T08-19-i15-09-data-mix-ratio-and-rep-cap-sweep",

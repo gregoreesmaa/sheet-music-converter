@@ -35,6 +35,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 EXP_ID = "2026-11-27T10-30-i15-37-modegate-dualhead-text-and-chained-mtp"
+EXP_CODE = "i15-37"
 HF_REPO_ID = "gregoreesmaa/sheet-music-converter-omr"
 HF_PROXY_TAR = "datasets/iter10_5_proxy_2k.tar"
 HF_EVAL_PATH = f"evals/{EXP_ID}.json"
@@ -809,7 +810,7 @@ def _run_arm(
     t_train0 = time.perf_counter()
 
     for step in range(1, STEPS_PER_ARM + 1):
-        opt.set_lr_scale(_wsd_mult(step, STEPS_PER_ARM, WARMUP_STEPS))
+        opt.set_lr(_wsd_mult(step, STEPS_PER_ARM, WARMUP_STEPS))
         opt.zero_grad(set_to_none=True)
         step_loss_val = 0.0
         for _ in range(GRAD_ACCUM):

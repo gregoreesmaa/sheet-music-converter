@@ -146,7 +146,7 @@ def _ensure_proxy_dataset(hf_token: str) -> Tuple[Path, Path]:
         filename=HF_PROXY_TAR,
         repo_type="dataset",
         token=hf_token,
-        local_dir="/tmp/hf_dl",
+        local_dir=str(VOL_ROOT / "hf_dl"),
     )
     with tarfile.open(tar_p, "r:*") as tf:
         tf.extractall(path=ds_dir)
