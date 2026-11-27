@@ -1,0 +1,35 @@
+{
+  "exp_id": "2026-11-26T22-18-i14-14-cascade-ttt-mbr-zoom-chamfer-rerank",
+  "wave": 11,
+  "started_at": "2026-11-27T00:52:37Z",
+  "completed_at": "2026-11-27T01:45:57Z",
+  "n_pages": 52,
+  "arms": {
+    "arm0_tier0_fast1x": {
+      "all_note_f1": 0.4418,
+      "hw_note_f1": 0.21903,
+      "printed_note_f1": 0.7017,
+      "latency_mult": 1.0
+    },
+    "arm1_tier0_plus_tier1_ttt_mbr": {
+      "all_note_f1": 0.41937,
+      "hw_note_f1": 0.20008,
+      "printed_note_f1": 0.67521,
+      "tier1_rate": 0.9615,
+      "latency_mult": 5.32
+    },
+    "arm2_full_cascade_verifier_only": {
+      "all_note_f1": 0.41839,
+      "hw_note_f1": 0.20272,
+      "printed_note_f1": 0.67001,
+      "tier2_rate": 0.9423
+    },
+    "arm3_full_cascade_chamfer_iou": {
+      "all_note_f1": 0.41543,
+      "hw_note_f1": 0.19723,
+      "printed_note_f1": 0.67001,
+      "tier2_rate": 0.9423,
+      "latency_mult": 7.587
+    }
+  }
+}
