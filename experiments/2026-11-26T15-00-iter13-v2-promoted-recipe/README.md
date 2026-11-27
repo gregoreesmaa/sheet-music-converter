@@ -1,7 +1,7 @@
 # Iter 13 — `UniOMR v2` (`small_45m`, Promoted Recipe + All Iter-13 Bug Fixes)
 
 - **Experiment ID:** `2026-11-26T15-00-iter13-v2-promoted-recipe`
-- **Status:** `PLANNED` *(verified ready-to-launch; NOT yet launched)*
+- **Status:** `COMPLETED` — **`PROMOTE`** (see [OUTCOME.md](./OUTCOME.md))
 - **Baseline Commit SHA:** `36484e2` (Iter-13 bug fixes landed in `f089d62`)
 - **Platform / GPU:** Local `RTX 4080 SUPER` (`16 GB` VRAM, BF16 native, `$0` cloud cost)
 - **Quick Links:**
