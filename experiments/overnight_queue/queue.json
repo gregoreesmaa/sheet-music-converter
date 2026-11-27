@@ -25,7 +25,7 @@
     "id": "2026-11-27T10-30-i15-40-pro200m-d768-capacity-proxy",
     "wave": 0,
     "priority": 2,
-    "status": "RUNNING",
+    "status": "COMPLETED",
     "gpu_pref": "H100",
     "script": "experiments/2026-11-27T10-30-i15-40-pro200m-d768-capacity-proxy/run_colab.py",
     "notes": "Weight-incompatible PRE-ITER-15: pro200m (d=768, 192M, 119.2 MB INT4) vs edge85m",
@@ -38,7 +38,10 @@
     "session": "2026-11-27t10-30-i15-40-",
     "gpu": "A100",
     "started_at": "2026-11-27T13:01:43Z",
-    "log_path": "D:\\tmp\\overnight-queue-logs\\2026-11-27T10-30-i15-40-pro200m-d768-capacity-proxy.log"
+    "log_path": "D:\\tmp\\overnight-queue-logs\\2026-11-27T10-30-i15-40-pro200m-d768-capacity-proxy.log",
+    "completed_at": "2026-11-27T14:08:18Z",
+    "elapsed_sec": 3995.11,
+    "returncode": 0
   },
   {
     "id": "2026-11-27T10-30-i15-31-hrnet-music-dualres-s4",
@@ -2484,7 +2487,7 @@
     "plan": "experiments/2026-11-27T00-52-i14-04b-adaptive-band-tiling-fixed/PLAN.md",
     "hf_eval_target": "evals/2026-11-27T00-52-i14-04b-adaptive-band-tiling-fixed.json",
     "hf_run_target": "runs/2026-11-27T00-52-i14-04b-adaptive-band-tiling-fixed.json",
-    "status": "RUNNING",
+    "status": "COMPLETED",
     "depends_on": [
       "2026-11-26T22-18-i14-04-adaptive-band-tiling-eval"
     ],
@@ -2495,9 +2498,9 @@
     "session": "2026-11-27t00-52-i14-04b",
     "started_at": "2026-11-27T11:41:09Z",
     "log_path": "D:\\tmp\\overnight-queue-logs\\2026-11-27T00-52-i14-04b-adaptive-band-tiling-fixed.log",
-    "completed_at": "2026-11-27T11:33:23Z",
-    "elapsed_sec": 6149.56,
-    "returncode": 130
+    "completed_at": "2026-11-27T14:11:55Z",
+    "elapsed_sec": 9046.56,
+    "returncode": 0
   },
   {
     "id": "2026-11-27T07-46-i15-01-bandnet-strip-oracle-and-gauss-ptr",
@@ -2534,7 +2537,7 @@
     "wave": 13,
     "priority": 2,
     "provider": "colab_l4",
-    "gpu": "L4",
+    "gpu": "A100",
     "est_minutes": 30,
     "est_cu": 2.0,
     "script": "experiments/2026-11-27T07-46-i15-02-tf-nll-dp-align-and-vcs-verifier/run_colab.py",
@@ -2542,12 +2545,15 @@
     "plan": "experiments/2026-11-27T07-46-i15-02-tf-nll-dp-align-and-vcs-verifier/PLAN.md",
     "hf_eval_target": "evals/2026-11-27T07-46-i15-02-tf-nll-dp-align-and-vcs-verifier.json",
     "hf_run_target": "runs/2026-11-27T07-46-i15-02-tf-nll-dp-align-and-vcs-verifier.json",
-    "status": "QUEUED",
+    "status": "RUNNING",
     "depends_on": [],
     "datasets": [
       "datasets/suite31_hw_eval.tar"
     ],
-    "note": "Wave 13 Pivot Strategist 2 (100% permissive): Part A validates VCS (ink IoU + barline-X corr + 1280/1536 cross-scale agree + frozen encoder cosine) on 14 suite31_hw HW pieces (gate Pearson r >= 0.70 + ov-39 hallucination FP rejection); Part B benchmarks AR-free TF-NLL + Cross-Attention Monotonicity DP vs free-decoded alignment on multi-system HW spans (gate Top-1 >= 0.85 for 1,466 idle gold-XML archival pages)."
+    "note": "Wave 13 Pivot Strategist 2 (100% permissive): Part A validates VCS (ink IoU + barline-X corr + 1280/1536 cross-scale agree + frozen encoder cosine) on 14 suite31_hw HW pieces (gate Pearson r >= 0.70 + ov-39 hallucination FP rejection); Part B benchmarks AR-free TF-NLL + Cross-Attention Monotonicity DP vs free-decoded alignment on multi-system HW spans (gate Top-1 >= 0.85 for 1,466 idle gold-XML archival pages).",
+    "session": "2026-11-27t07-46-i15-02-",
+    "started_at": "2026-11-27T14:11:56Z",
+    "log_path": "D:\\tmp\\overnight-queue-logs\\2026-11-27T07-46-i15-02-tf-nll-dp-align-and-vcs-verifier.log"
   },
   {
     "id": "2026-11-27T07-46-i15-03-lyrics-textspotter-vs-deferred-bpe",
@@ -2776,7 +2782,7 @@
     "title": "Tier-2 Weight-Incompatible PRE-ITER-15: 3-Axis Structural Decoder RoPE (system, measure, intra-measure; 0.00 MB INT4)",
     "wave": 1,
     "priority": 2,
-    "status": "QUEUED",
+    "status": "RUNNING",
     "target_gpu": "A100",
     "depends_on": [],
     "est_minutes": 25,
@@ -2785,6 +2791,11 @@
     "readme": "experiments/2026-11-27T14-15-i15-14-3axis-structural-dec-rope/README.md",
     "plan": "experiments/2026-11-27T14-15-i15-14-3axis-structural-dec-rope/PLAN.md",
     "hf_eval_target": "evals/2026-11-27T14-15-i15-14-3axis-structural-dec-rope.json",
-    "hf_run_target": "runs/2026-11-27T14-15-i15-14-3axis-structural-dec-rope.json"
+    "hf_run_target": "runs/2026-11-27T14-15-i15-14-3axis-structural-dec-rope.json",
+    "provider": "colab_l4",
+    "session": "2026-11-27t14-15-i15-14-",
+    "gpu": "A100",
+    "started_at": "2026-11-27T14:08:18Z",
+    "log_path": "D:\\tmp\\overnight-queue-logs\\2026-11-27T14-15-i15-14-3axis-structural-dec-rope.log"
   }
 ]
