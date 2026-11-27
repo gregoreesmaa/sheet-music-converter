@@ -207,7 +207,7 @@
     "id": "2026-11-27T22-15-i15-44b-xf-verifier-kv-rewind-mbr-fixed",
     "wave": 0,
     "priority": 10,
-    "status": "QUEUED",
+    "status": "RUNNING",
     "target_gpu": "A100",
     "gpu_pref": "A100",
     "depends_on": [
@@ -316,7 +316,7 @@
     "id": "2026-11-27T14-55-i15-50-xf-remora-modifiers-daq-fape",
     "wave": 0,
     "priority": 19,
-    "status": "RUNNING",
+    "status": "COMPLETED",
     "target_gpu": "A100",
     "gpu_pref": "A100",
     "depends_on": [],
