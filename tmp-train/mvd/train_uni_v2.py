@@ -1298,6 +1298,11 @@ class HybridOptimizerV2:
             for pg in opt.param_groups:
                 pg["lr"] = base_lr * s
 
+    @property
+    def optimizers(self) -> List[torch.optim.Optimizer]:
+        """Return underlying torch optimizers for checkpoint save/resume."""
+        return [opt for opt, _ in self._opts]
+
 
 def build_optimizer_v2(
     model: nn.Module,

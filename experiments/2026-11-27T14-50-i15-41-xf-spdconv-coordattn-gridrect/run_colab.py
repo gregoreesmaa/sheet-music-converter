@@ -739,8 +739,9 @@ def _train_arm(
         ck = torch.load(str(latest_pt), map_location=device, weights_only=False)
         model.load_state_dict(ck["model_state_dict"], strict=True)
         ema_state = {k: v.to(device) for k, v in ck["ema_state_dict"].items()}
-        if "opt_state_dicts" in ck and len(ck["opt_state_dicts"]) == len(opt.optimizers):
-            for o_obj, sd in zip(opt.optimizers, ck["opt_state_dicts"]):
+        opt_list = getattr(opt, "optimizers", [o for o, _ in opt._opts])
+        if "opt_state_dicts" in ck and len(ck["opt_state_dicts"]) == len(opt_list):
+            for o_obj, sd in zip(opt_list, ck["opt_state_dicts"]):
                 o_obj.load_state_dict(sd)
         if "rng_state" in ck:
             rng.setstate(ck["rng_state"])
@@ -821,7 +822,7 @@ def _train_arm(
                     "step": step,
                     "model_state_dict": model.state_dict(),
                     "ema_state_dict": ema_state,
-                    "opt_state_dicts": [o.state_dict() for o in opt.optimizers],
+                    "opt_state_dicts": [o.state_dict() for o in getattr(opt, "optimizers", [o for o, _ in opt._opts])],
                     "rng_state": rng.getstate(),
                     "loss_hist": loss_hist,
                     "step_ms_hist": step_ms_hist,
