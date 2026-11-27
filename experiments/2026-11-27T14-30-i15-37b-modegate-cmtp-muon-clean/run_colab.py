@@ -927,9 +927,8 @@ def _run_arm(
     qat_target = model.base if hasattr(model, "base") else model
     qat_ctrl = train_uni_v2.QATInt4ControllerV2(
         qat_target,
-        group_size=INT4_GROUP_SIZE,
-        start_step=QAT_START_STEP,
-        enable=True,
+        block_size=INT4_GROUP_SIZE,
+        enabled=False,
     )
     ema = _EMA(model, decay=GPU_EMA_DECAY)
 
@@ -959,7 +958,8 @@ def _run_arm(
     t_train0 = time.perf_counter()
 
     for step in range(1, STEPS_PER_ARM + 1):
-        qat_ctrl.maybe_enable(step)
+        if step == QAT_START_STEP and not qat_ctrl.enabled:
+            qat_ctrl.enable()
         opt.set_lr(_wsd_mult(step, STEPS_PER_ARM, WARMUP_STEPS))
         opt.zero_grad(set_to_none=True)
         step_loss_val = 0.0
@@ -1008,7 +1008,7 @@ def _run_arm(
                 f"  [{arm['name']}] step {step:4d}/{STEPS_PER_ARM} | loss={step_loss_val:.4f} "
                 f"| ce={float(ldict['ce_loss'].detach().item()):.4f} "
                 f"| mtp={float(ldict['mtp_loss'].detach().item()):.4f} "
-                f"| qat={int(qat_ctrl.active)} | {step_ms:.1f} ms/step",
+                f"| qat={int(qat_ctrl.enabled)} | {step_ms:.1f} ms/step",
                 flush=True,
             )
 
@@ -1020,7 +1020,7 @@ def _run_arm(
     train_elapsed = time.perf_counter() - t_train0
     step_ms = (train_elapsed / max(1, STEPS_PER_ARM)) * 1000.0
 
-    qat_ctrl.remove()
+    qat_ctrl.detach()
     raw_eval = _eval_val_ce_and_mtp(model, val_batches, device, use_bf16, is_chained=is_chained)
     with ema.apply(model):
         ema_eval = _eval_val_ce_and_mtp(model, val_batches, device, use_bf16, is_chained=is_chained)
@@ -1094,6 +1094,10 @@ def run_cpu_smoke_test() -> Dict[str, Any]:
             )
             assert opt.mode == "muon+adamw", f"Smoke test failed: {arm['name']} got opt.mode={opt.mode!r}"
             assert len(opt.muon_param_names) > 0, f"Smoke test failed: {arm['name']} has 0 Muon params"
+            qat_target = model.base if hasattr(model, "base") else model
+            qat_ctrl = train_uni_v2.QATInt4ControllerV2(qat_target, block_size=INT4_GROUP_SIZE, enabled=False)
+            qat_ctrl.enable()
+            assert qat_ctrl.enabled and qat_ctrl.num_layers > 0, f"Smoke test failed: {arm['name']} QAT not active"
 
             imgs = torch.rand(2, 3, 64, 96)
             seq = torch.randint(0, 40, (2, 16), dtype=torch.long)
@@ -1111,6 +1115,7 @@ def run_cpu_smoke_test() -> Dict[str, Any]:
             ldict = model.compute_loss(out, tgt_out, images=imgs, sys_y_loss_weight=0.0, staff_seg_loss_weight=0.0)
             ldict["loss"].backward()
             opt.step()
+            qat_ctrl.detach()
 
             eval_res = _eval_val_ce_and_mtp(model, [(imgs, seq)], device, use_bf16=False, is_chained=is_chained)
             deq_model, int4_disk = _pack_and_dequant_hybrid_int4(
