@@ -43,7 +43,7 @@ If any new cloud, hardware, PyTorch, or tooling quirk was discovered, **immediat
 
 | Verdict | Mandatory Immediate Action |
 |---|---|
-| **`PROMOTE`** | Wire the winning flag, architecture, data source, or checkpoint into the next main training run (e.g. Iter 11+) and update `todo.md` + `progress.md`. |
+| **`PROMOTE`** | **MANDATORY IMMEDIATE IMPLEMENTATION — NEVER leave a `PROMOTE` sitting in `OUTCOME.md`!** Immediately implement and wire the winning flag, architecture, loss, data source, or inference upgrade into the **next main model iteration** (`train_uni_v2.py` / `uni_omr_v2.py` / `eval_uni_suite31.py` / companion repo AND `experiments/.../launch_iter{N+1}.ps1`), add & run CPU unit tests (`CUDA_VISIBLE_DEVICES=""`), update `todo.md` + `progress.md`, and commit & push cleanly to `origin main`. |
 | **`ITERATE`** | **ALWAYS immediately formulate, implement, and queue a follow-up experiment** (`experiments/YYYY-MM-DDTHH-MM-<slug>/{README.md, PLAN.md, run_*.py}`) directly targeting the diagnosed bottleneck/asymmetry, register it in the DAG queue (`experiments/overnight_queue/queue.json` with `depends_on: ["<this_exp_id>"]`), and link the successor ID inside this experiment's `OUTCOME.md`. **NEVER leave an `ITERATE` verdict dangling without a queued successor!** |
 | **`DISCARD`** | Document the exact root cause and falsified hypothesis in `OUTCOME.md` + `todo.md` so no future agent wastes compute repeating it. |
 
@@ -53,4 +53,4 @@ If any new cloud, hardware, PyTorch, or tooling quirk was discovered, **immediat
 - **OMR-NorthStar trigger:** Whenever ANY `eval-northstar-*` run completes (for UniOMR or a competitor baseline), **immediately activate `learn-from-northstar`** (`.agents/skills/learn-from-northstar/SKILL.md`) to log the full NorthStar ledger, run the 6-scout CPU forensic swarm, categorize fixes (`Model` / `Export` / `Inference` / `Harness`), and feed them into the next iteration.
 
 ### 7. Git Commit & Push
-- Commit `OUTCOME.md`, any skill amendments, and any newly queued `ITERATE` follow-up experiment (`Gregor Eesmaa <6941817+gregoreesmaa@users.noreply.github.com>`) and push to `origin master`.
+- Commit `OUTCOME.md`, any newly wired `PROMOTE` implementation + unit tests, any skill amendments, and any newly queued `ITERATE` follow-up experiment (`Gregor Eesmaa <6941817+gregoreesmaa@users.noreply.github.com>`) and push to `origin main` (never `origin master`, whose legacy root carries old `.hf-cache` blobs).
