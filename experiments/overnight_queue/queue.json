@@ -221,6 +221,23 @@
     "hf_eval_target": "evals/2026-11-27T22-15-i15-44b-xf-verifier-kv-rewind-mbr-fixed.json"
   },
   {
+    "id": "2026-11-28T00-26-i15-48b-xf-orbgrand-syndrome-trellis-fixed",
+    "wave": 0,
+    "priority": 10,
+    "status": "QUEUED",
+    "target_gpu": "A100",
+    "gpu_pref": "A100",
+    "depends_on": [
+      "2026-11-27T14-55-i15-48-xf-orbgrand-syndrome-and-trellis-bma"
+    ],
+    "script": "experiments/2026-11-28T00-26-i15-48b-xf-orbgrand-syndrome-trellis-fixed/run_colab.py",
+    "script_path": "experiments/2026-11-28T00-26-i15-48b-xf-orbgrand-syndrome-trellis-fixed/run_colab.py",
+    "title": "Cross-field PRE-ITER-15: Fixed ORBGRAND/SOGRAND syndrome + Trellis-BMA successor (multi-voice/staff + MusicXML scorer)",
+    "notes": "Clean ITERATE successor to i15-48: fixes per-(staff,voice) compute_bar_duration_syndrome, adds MusicXML note_f1/bsvr/wfpp/gate_pass",
+    "est_minutes": 10,
+    "hf_eval_target": "evals/2026-11-28T00-26-i15-48b-xf-orbgrand-syndrome-trellis-fixed.json"
+  },
+  {
     "id": "2026-11-27T14-50-i15-45-xf-qvla-mixedbit-quant",
     "wave": 0,
     "priority": 14,
