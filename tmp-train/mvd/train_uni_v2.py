@@ -174,6 +174,38 @@ def _extract_state_dict(ckpt: Any) -> Dict[str, torch.Tensor]:
     raise ValueError(f"Unsupported checkpoint payload type: {type(ckpt)!r}")
 
 
+_VOCAB_EXPAND_KEY_MARKERS: Tuple[str, ...] = (
+    "tok_emb",
+    "lm_head",
+    "mtp_head",
+    "mtp_heads",
+)
+
+
+def _expand_vocab_tensor(
+    old_t: torch.Tensor,
+    new_t: torch.Tensor,
+    old_v: int,
+    new_v: int,
+) -> torch.Tensor:
+    """Append-only vocab expansion preserving ``0..old_v-5`` and remapping trailing 4 specials.
+
+    UniOMR vocab layout is ``[base_tokens (0..V-5), PAD (V-4), BOS (V-3), EOS (V-2), SYS (V-1)]``.
+    When expanding ``old_v -> new_v`` (e.g. ``237 -> 265`` for ``bekern+v2`` Phase A), regular
+    token rows ``0..old_base-1`` are copied verbatim, trailing 4 special token rows
+    ``old_base..old_v-1`` are remapped to ``new_base..new_v-1``, and newly appended token rows
+    ``old_base..new_base-1`` keep ``new_t``'s fresh initialization.
+    """
+    if old_v < 4 or new_v <= old_v:
+        raise ValueError(f"Invalid vocab expansion {old_v} -> {new_v}")
+    old_base = old_v - 4
+    new_base = new_v - 4
+    out = new_t.clone()
+    out[:old_base] = old_t[:old_base].to(dtype=out.dtype)
+    out[new_base:new_v] = old_t[old_base:old_v].to(dtype=out.dtype)
+    return out
+
+
 def load_v2_checkpoint(
     model: UniOMRv2Net,
     ckpt_path: Path | str,
@@ -183,17 +215,64 @@ def load_v2_checkpoint(
 
     When ``encoder_only=True``, only ``backbone.*`` and ``encoder.*`` keys from the
     checkpoint are loaded into ``model`` (compatible with ``pretrain_ijepa_rism_v2.py``).
+
+    When ``encoder_only=False`` and the checkpoint has an append-only smaller vocabulary
+    (e.g. Iter 13 ``vocab_size=237`` -> Iter 14 ``bekern+v2`` Phase A ``vocab_size=265``),
+    vocab-axis weights (``tok_emb``, ``lm_head``, ``mtp_heads``) are expanded cleanly:
+    regular tokens ``0..old_base-1`` are copied verbatim, the 4 trailing special tokens
+    (``PAD/BOS/EOS/SYS``) are remapped to ``new_base..new_v-1``, and newly appended token
+    rows keep their fresh initialization.
     """
     ck = torch.load(str(ckpt_path), map_location="cpu", weights_only=True)
     raw_sd = _extract_state_dict(ck)
     model_sd = model.state_dict()
 
+    new_v = int(getattr(model.cfg, "vocab_size", VOCAB_SIZE))
+    old_v: Optional[int] = None
+    ckpt_vocab: Optional[List[str]] = None
+    if isinstance(ck, dict):
+        raw_cfg = ck.get("cfg") or ck.get("config")
+        if isinstance(raw_cfg, dict) and raw_cfg.get("vocab_size") is not None:
+            old_v = int(raw_cfg["vocab_size"])
+        if isinstance(ck.get("vocab"), list):
+            ckpt_vocab = [str(t) for t in ck["vocab"]]
+            if old_v is None:
+                old_v = len(ckpt_vocab) + 4
+    if old_v is None and "tok_emb.weight" in raw_sd and raw_sd["tok_emb.weight"].ndim == 2:
+        old_v = int(raw_sd["tok_emb.weight"].shape[0])
+
+    can_vocab_expand = (
+        (not encoder_only)
+        and (old_v is not None)
+        and (old_v >= 4)
+        and (new_v > old_v)
+    )
+    if can_vocab_expand and ckpt_vocab is not None:
+        if list(data.VOCAB[: len(ckpt_vocab)]) != ckpt_vocab:
+            raise ValueError(
+                f"Cannot vocab-expand {ckpt_path}: checkpoint vocab (len={len(ckpt_vocab)}) "
+                f"is not an exact prefix of current data.VOCAB (len={len(data.VOCAB)})"
+            )
+
     filtered_sd: Dict[str, torch.Tensor] = {}
     shape_skipped: List[str] = []
+    vocab_expanded: List[str] = []
     for k, v in raw_sd.items():
         if encoder_only and not (k.startswith("backbone.") or k.startswith("encoder.")):
             continue
         if k in model_sd and tuple(v.shape) != tuple(model_sd[k].shape):
+            if (
+                can_vocab_expand
+                and old_v is not None
+                and v.ndim >= 1
+                and int(v.shape[0]) == old_v
+                and int(model_sd[k].shape[0]) == new_v
+                and tuple(v.shape[1:]) == tuple(model_sd[k].shape[1:])
+                and any(marker in k for marker in _VOCAB_EXPAND_KEY_MARKERS)
+            ):
+                filtered_sd[k] = _expand_vocab_tensor(v, model_sd[k], old_v, new_v)
+                vocab_expanded.append(k)
+                continue
             shape_skipped.append(f"{k}:{tuple(v.shape)}!={tuple(model_sd[k].shape)}")
             continue
         filtered_sd[k] = v
@@ -202,10 +281,21 @@ def load_v2_checkpoint(
     tag = "init-encoder-from" if encoder_only else "init-from"
     print(
         f"[UniOMRv2 {tag}] loaded {ckpt_path} "
-        f"(loaded={len(filtered_sd)}, missing={len(inc.missing_keys)}, "
-        f"unexpected={len(inc.unexpected_keys)}, shape_skipped={len(shape_skipped)})",
+        f"(loaded={len(filtered_sd)}, vocab_expanded={len(vocab_expanded)}, "
+        f"missing={len(inc.missing_keys)}, unexpected={len(inc.unexpected_keys)}, "
+        f"shape_skipped={len(shape_skipped)})",
         flush=True,
     )
+    if vocab_expanded and old_v is not None:
+        old_base = old_v - 4
+        new_base = new_v - 4
+        print(
+            f"  [UniOMRv2 {tag}] vocab-expanded {', '.join(vocab_expanded)}: "
+            f"{old_v} -> {new_v} (copied 0..{old_base - 1}, remapped specials "
+            f"{old_base}..{old_v - 1} -> {new_base}..{new_v - 1}, "
+            f"fresh-init {old_base}..{new_base - 1})",
+            flush=True,
+        )
     if inc.missing_keys:
         preview = ", ".join(inc.missing_keys[:6])
         suffix = f", ... (+{len(inc.missing_keys) - 6} more)" if len(inc.missing_keys) > 6 else ""
@@ -219,6 +309,7 @@ def load_v2_checkpoint(
 
     return {
         "loaded_count": len(filtered_sd),
+        "vocab_expanded": vocab_expanded,
         "missing_keys": list(inc.missing_keys),
         "unexpected_keys": list(inc.unexpected_keys),
         "shape_skipped": shape_skipped,
@@ -1697,16 +1788,44 @@ def forward_and_loss_v2(
                                     antialias=True,
                                 )
                         t_images = src_imgs.to(dtype=t_dtype) if src_imgs.dtype != t_dtype else src_imgs
+                        t_v = int(getattr(teacher_v1.cfg, "vocab_size", out["logits"].shape[-1]))
+                        s_v = int(out["logits"].shape[-1])
+                        t_vocab_smaller = (t_v < s_v) and (t_v >= 4)
+                        if t_vocab_smaller:
+                            t_base = t_v - 4
+                            s_base = s_v - 4
+                            t_pad_id = t_base
+                            delta_v = s_v - t_v
+                            is_s_special = src_tgt_in >= s_base
+                            is_new_tok = (src_tgt_in >= t_base) & (src_tgt_in < s_base)
+                            t_tgt_in = torch.where(
+                                is_s_special,
+                                src_tgt_in - delta_v,
+                                torch.where(is_new_tok, torch.full_like(src_tgt_in, t_pad_id), src_tgt_in),
+                            )
+                        else:
+                            t_tgt_in = src_tgt_in
                         t_out = teacher_v1(
                             t_images,
-                            src_tgt_in,
+                            t_tgt_in,
                             keep_ratio_override=0.45,
                             return_aux=False,
                             return_mtp=False,
                             compute_ink_recall=False,
                         )
                         t_logits_inf = t_out["logits"]
-                        del t_out, t_images, src_imgs, src_tgt_in
+                        if t_vocab_smaller:
+                            t_base = t_v - 4
+                            s_base = s_v - 4
+                            exp_logits = t_logits_inf.new_full(
+                                (t_logits_inf.shape[0], t_logits_inf.shape[1], s_v),
+                                -1e4,
+                            )
+                            exp_logits[..., :t_base] = t_logits_inf[..., :t_base]
+                            exp_logits[..., s_base:s_v] = t_logits_inf[..., t_base:t_v]
+                            t_logits_inf = exp_logits
+                            del exp_logits
+                        del t_out, t_images, src_imgs, src_tgt_in, t_tgt_in
                     # _GeneralizedJSDAutograd consumes teacher_logits inside no_grad without saving it,
                     # so no extra (B, T, V) clone is needed.
                     if slice_active:
@@ -1717,6 +1836,17 @@ def forward_and_loss_v2(
                         s_logits_kd = out["logits"]
                         tgt_out_kd = tgt_out
                         sw_kd = sample_kd_weights
+                    if t_vocab_smaller:
+                        # Mask newly appended student-only tokens (t_base..s_base-1) out of teacher KD.
+                        t_base = t_v - 4
+                        s_base = s_v - 4
+                        new_tok_mask = (tgt_out_kd >= t_base) & (tgt_out_kd < s_base)
+                        if new_tok_mask.any():
+                            tgt_out_kd = torch.where(
+                                new_tok_mask,
+                                torch.full_like(tgt_out_kd, PAD_ID),
+                                tgt_out_kd,
+                            )
                     kd_loss, kd_gate_frac = compute_generalized_jsd_loss(
                         s_logits_kd,
                         t_logits_inf,

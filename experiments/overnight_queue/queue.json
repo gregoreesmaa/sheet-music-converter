@@ -1466,7 +1466,7 @@
     "est_cu": 1.7,
     "script": "experiments/2026-11-26T14-30-i13-16b-mathpix-conf-gated-redecode-fixed/run_colab.py",
     "hf_eval_target": "evals/2026-11-26T14-30-i13-16b-mathpix-conf-gated-redecode-fixed.json",
-    "status": "RUNNING",
+    "status": "FAILED",
     "depends_on": [
       "2026-11-26T07-40-i13-16-mathpix-conf-gated-redecode"
     ],
@@ -1475,7 +1475,10 @@
     "log_path": "D:\\tmp\\overnight-queue-logs\\2026-11-26T14-30-i13-16b-mathpix-conf-gated-redecode-fixed.log",
     "note": "re-queued after fixing _select_beam_kv cross_kv batch-dim mismatch bug (2026-11-26)",
     "modal_app_id": "ap-JcGVTzbgRCQnY97qIMK8GF",
-    "modal_call_id": "fc-01M8CP25WQESZ6EQRDC262YXM3"
+    "modal_call_id": "fc-01M8CP25WQESZ6EQRDC262YXM3",
+    "completed_at": "2026-11-27T02:45:37Z",
+    "elapsed_sec": 18830.66,
+    "returncode": 4294967295
   },
   {
     "id": "2026-11-26T14-30-i13-18b-conf-gated-ilms-blank",
@@ -2012,23 +2015,25 @@
     "title": "OMR-NorthStar v0.1 125p Eval \u2014 UniOMR Iter 13 Stage 2 Mid (v2, step 744 EMA, max_mem=3072)",
     "wave": 10,
     "priority": 1,
-    "provider": "modal_l4",
+    "provider": "colab_l4",
     "gpu": "L4",
     "est_minutes": 15,
     "est_cu": 1.2,
     "script": "experiments/2026-11-26T22-41-eval-northstar-iter13-mid/run_colab.py",
     "hf_eval_target": "evals/2026-11-26T22-41-eval-northstar-iter13-mid.json",
-    "status": "QUEUED",
+    "status": "COMPLETED",
     "depends_on": [],
     "note": "Early mid-training NorthStar v0.1 125p readout for Iter 13 Stage 2 EMA (step 744, max_mem_tokens=3072). Downloads prebuilt static Linux Rust tools/assembly-serialize-linux-x86_64 (mscz-rs) as first choice; persists pred_raw + stitched bekern per page.",
-    "started_at": "2026-11-26T21:31:31Z",
-    "log_path": "D:\\tmp\\overnight-queue-logs\\2026-11-26T22-41-eval-northstar-iter13-mid.modal.log",
+    "started_at": "2026-11-27T02:45:37Z",
+    "log_path": "D:\\tmp\\overnight-queue-logs\\2026-11-26T22-41-eval-northstar-iter13-mid.log",
     "modal_app_id": "",
     "modal_call_id": "",
-    "completed_at": "2026-11-26T21:31:32Z",
-    "elapsed_sec": 1.33,
-    "returncode": -1,
-    "failure_reason": "modal run --detach failed for 2026-11-26T22-41-eval-northstar-iter13-mid (rc=1, app_id=None, call_id=None)"
+    "completed_at": "2026-11-27T03:02:27Z",
+    "elapsed_sec": 1010.14,
+    "returncode": 0,
+    "hf_eval_exists": true,
+    "verdict": "PROMOTE",
+    "session": "2026-11-26t22-41-eval-no"
   },
   {
     "id": "2026-11-26T22-47-eval-northstar-iter10_5-v1-msczrs",
@@ -2036,23 +2041,25 @@
     "title": "OMR-NorthStar v0.1 125p Eval \u2014 UniOMR Iter 10.5 (v1, 8k EMA) with Rust mscz-rs Exporter",
     "wave": 10,
     "priority": 1,
-    "provider": "modal_l4",
+    "provider": "colab_l4",
     "gpu": "L4",
     "est_minutes": 15,
     "est_cu": 1.2,
     "script": "experiments/2026-11-26T22-47-eval-northstar-iter10_5-v1-msczrs/run_colab.py",
     "hf_eval_target": "evals/2026-11-26T22-47-eval-northstar-iter10_5-v1-msczrs.json",
-    "status": "QUEUED",
+    "status": "COMPLETED",
     "depends_on": [],
     "note": "Clean apples-to-apples Iter 10.5 v1 (8k EMA) NorthStar 125p re-run using prebuilt static Linux Rust tools/assembly-serialize-linux-x86_64 (mscz-rs) + persisting pred_raw & stitched bekern per page.",
-    "started_at": "2026-11-26T21:31:32Z",
-    "log_path": "D:\\tmp\\overnight-queue-logs\\2026-11-26T22-47-eval-northstar-iter10_5-v1-msczrs.modal.log",
+    "started_at": "2026-11-27T03:02:27Z",
+    "log_path": "D:\\tmp\\overnight-queue-logs\\2026-11-26T22-47-eval-northstar-iter10_5-v1-msczrs.log",
     "modal_app_id": "",
     "modal_call_id": "",
-    "completed_at": "2026-11-26T21:31:42Z",
-    "elapsed_sec": 9.42,
-    "returncode": -1,
-    "failure_reason": "modal run --detach failed for 2026-11-26T22-47-eval-northstar-iter10_5-v1-msczrs (rc=1, app_id=None, call_id=None)"
+    "completed_at": "2026-11-27T03:15:00Z",
+    "elapsed_sec": 752.78,
+    "returncode": 0,
+    "hf_eval_exists": true,
+    "verdict": "RECORD",
+    "session": "2026-11-26t22-47-eval-no"
   },
   {
     "id": "2026-11-26T23-35-i13-25b-axial-global-boundary-completion",
@@ -2093,13 +2100,16 @@
     "plan": "experiments/2026-11-27T00-01-i14-15-bekern-visual-sp-printed-acc/PLAN.md",
     "hf_eval_target": "evals/2026-11-27T00-01-i14-15-bekern-visual-sp-printed-acc.json",
     "hf_run_target": "runs/2026-11-27T00-01-i14-15-bekern-visual-sp-printed-acc.json",
-    "status": "QUEUED",
+    "status": "RUNNING",
     "depends_on": [],
     "datasets": [
       "datasets/iter10_5_proxy_2k.tar",
       "datasets/suite31_hw_eval.tar"
     ],
-    "note": "Wave 12 Bekern Theorist 1 (Safe): 600 steps/arm A/B proxy comparing sounding pitch vs visual sp<k>+printed acc-* (deterministic clef/key/bar resolution) on suite31_hw + C-clef/key-heavy subset."
+    "note": "Wave 12 Bekern Theorist 1 (Safe): 600 steps/arm A/B proxy comparing sounding pitch vs visual sp<k>+printed acc-* (deterministic clef/key/bar resolution) on suite31_hw + C-clef/key-heavy subset.",
+    "session": "2026-11-27t00-01-i14-15-",
+    "started_at": "2026-11-27T03:17:49Z",
+    "log_path": "D:\\tmp\\overnight-queue-logs\\2026-11-27T00-01-i14-15-bekern-visual-sp-printed-acc.log"
   },
   {
     "id": "2026-11-27T00-01-i14-16-bekern-monotonic-sys-y-anchors",
@@ -2162,13 +2172,19 @@
     "plan": "experiments/2026-11-27T00-52-i14-04b-adaptive-band-tiling-fixed/PLAN.md",
     "hf_eval_target": "evals/2026-11-27T00-52-i14-04b-adaptive-band-tiling-fixed.json",
     "hf_run_target": "runs/2026-11-27T00-52-i14-04b-adaptive-band-tiling-fixed.json",
-    "status": "QUEUED",
+    "status": "FAILED",
     "depends_on": [
       "2026-11-26T22-18-i14-04-adaptive-band-tiling-eval"
     ],
     "datasets": [
       "datasets/suite31_hw_eval.tar"
     ],
-    "note": "ITERATE successor to i14-04 (which ran random-init model due to missing=349 ckpt loader bug + [-1,1] input norm + T4 FP32 fallback + row-bg staff-line erasure)."
+    "note": "ITERATE successor to i14-04 (which ran random-init model due to missing=349 ckpt loader bug + [-1,1] input norm + T4 FP32 fallback + row-bg staff-line erasure).",
+    "session": "2026-11-27t00-52-i14-04b",
+    "started_at": "2026-11-27T03:15:00Z",
+    "log_path": "D:\\tmp\\overnight-queue-logs\\2026-11-27T00-52-i14-04b-adaptive-band-tiling-fixed.log",
+    "completed_at": "2026-11-27T03:17:48Z",
+    "elapsed_sec": 168.11,
+    "returncode": 1
   }
 ]
