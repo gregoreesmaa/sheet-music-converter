@@ -1938,16 +1938,22 @@
     "title": "Asymmetric GQA (n_kv_heads_self=2, n_kv_heads_cross=8) vs 2/2 vs 8/8 at 800 Steps",
     "wave": 10,
     "priority": 8,
-    "provider": "colab_l4",
-    "gpu": "L4",
+    "provider": "local_4080s",
+    "gpu": "RTX 4080 SUPER",
     "est_minutes": 50,
-    "est_cu": 3.8,
+    "est_cu": 0.0,
     "script": "experiments/2026-11-26T19-35-i13-26b-asymmetric-gqa-cross-mha/run_colab.py",
     "hf_eval_target": "evals/2026-11-26T19-35-i13-26b-asymmetric-gqa-cross-mha.json",
     "status": "COMPLETED",
     "depends_on": [
       "2026-11-26T07-40-i13-26-gqa-kv-heads-sweep"
-    ]
+    ],
+    "started_at": "2026-11-28T01:23:09Z",
+    "completed_at": "2026-11-28T02:07:53Z",
+    "elapsed_sec": 2683.95,
+    "returncode": 0,
+    "verdict": "PROMOTE",
+    "summary": "kv8_sym (8/8 full MHA) beats asym_s2_c8 (2/8) by +1.14 pp EMA Token F1 (0.3004 vs 0.2890; +1.65 pp Raw 0.3312 vs 0.3147) and beats kv2_sym (2/2) by +9.50 pp EMA (+2.76 pp Raw, +18.75 pp Raw sys_exact). Note: edge85m+ax0_gl6+kv8 is 57.46 MB INT4 (>55 MB WebGPU cap; kv4 is 54.51 MB)."
   },
   {
     "id": "2026-11-26T21-50-eval-northstar-clarity-omr",
