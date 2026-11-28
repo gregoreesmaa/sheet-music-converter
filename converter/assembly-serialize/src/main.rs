@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use assembly_serialize::{
-    bekern::{to_bekern, to_bekern_v2},
+    bekern::{to_bekern, to_bekern_full, to_bekern_v2},
     decode::{decode_bekern, decode_bekern_unmerged},
     lattice::{rank_measures, read_lattice},
     example_input, has_errors,
@@ -157,6 +157,11 @@ struct BekernArgs {
     /// ottava/mid-bar context, extended dynamics/articulations, cue, volta).
     #[arg(long, default_value_t = false)]
     v2: bool,
+    /// Emit 4-layer `bekern-full` (`<schema:full>`, Layers 0–3: structure/
+    /// multi-part, microtones/beams/percussion/TAB, lossless expressive split,
+    /// end-of-system anchored lyrics & text spans).
+    #[arg(long, default_value_t = false)]
+    full: bool,
 }
 
 #[derive(Args, Debug)]
@@ -645,7 +650,9 @@ fn cmd_bekern(a: &BekernArgs) -> Result<(), Err> {
     } else {
         staff_headers(&xml).map_err(|e| format!("{}: {e}", a.input.display()))?
     };
-    let (toks, graces) = if a.v2 {
+    let (toks, graces) = if a.full {
+        to_bekern_full(&events, &headers)
+    } else if a.v2 {
         to_bekern_v2(&events, &headers)
     } else {
         to_bekern(&events, &headers)
@@ -993,5 +1000,40 @@ mod cli_tests {
         })
         .expect_err("bad lattice must fail");
         assert!(err.to_string().contains("confidence"), "names the violation: {err}");
+    }
+
+    #[test]
+    fn bekern_full_cli_and_bekern2musicxml_roundtrip() {
+        let dir = scratch_dir("bekern-full-cli");
+        let xml_path = dir.join("score.musicxml");
+        fs::write(&xml_path, SPLIT_XML).expect("write xml");
+        let out_bek = dir.join("bek");
+        cmd_bekern(&BekernArgs {
+            input: xml_path,
+            out: out_bek.clone(),
+            page: Some(1),
+            measures: None,
+            stem: "p1".to_string(),
+            v2: false,
+            full: true,
+        })
+        .expect("bekern --full succeeds");
+        let tok_path = out_bek.join("p1-bekern.txt");
+        let toks = fs::read_to_string(&tok_path).expect("read bekern-full");
+        assert!(toks.starts_with("<schema:full> "), "got: {toks}");
+        assert!(toks.contains("<part>"));
+        assert!(toks.contains("<staff-def>"));
+
+        let out_mxl = dir.join("mxl");
+        cmd_bekern2musicxml(&Bekern2MusicxmlArgs {
+            input: tok_path,
+            out: out_mxl.clone(),
+            stem: Some("p1".to_string()),
+            lattice_in: None,
+        })
+        .expect("bekern2musicxml auto-detects <schema:full>");
+        let out_xml = fs::read_to_string(out_mxl.join("p1.musicxml")).expect("read xml");
+        assert!(out_xml.contains("<step>C</step>"));
+        assert!(out_xml.contains("<step>D</step>"));
     }
 }

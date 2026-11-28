@@ -73,6 +73,7 @@ _THIS_DIR = Path(__file__).resolve().parent
 if str(_THIS_DIR) not in sys.path:
     sys.path.insert(0, str(_THIS_DIR))
 
+import bekern_full  # noqa: E402
 import data  # noqa: E402
 from uni_omr import (  # noqa: E402
     BOS_ID,
@@ -115,6 +116,8 @@ from uni_omr_v2 import (  # noqa: E402
     UniOMRv2Config,
     UniOMRv2Net,
     compute_stroke_hog_loss,
+    set_bekern_full_stage,
+    warm_start_from_v265_checkpoint,
 )
 
 
@@ -142,6 +145,16 @@ def uni_omr_v2_iter15_pro200m(**overrides: Any) -> UniOMRv2Config:
     return UniOMRv2Config.iter15_pro200m(**overrides)
 
 
+def uni_omr_v2_iter16_pro200m(**overrides: Any) -> UniOMRv2Config:
+    """Return ``UniOMRv2Config`` for the Iter 16 bekern-full ``iter16_pro200m`` preset."""
+    return UniOMRv2Config.iter16_pro200m(**overrides)
+
+
+def uni_omr_v2_iter16_edge85m(**overrides: Any) -> UniOMRv2Config:
+    """Return ``UniOMRv2Config`` for the Iter 16 WebGPU bekern-full ``iter16_edge85m`` preset."""
+    return UniOMRv2Config.iter16_edge85m(**overrides)
+
+
 def uni_omr_v2_tiny(**overrides: Any) -> UniOMRv2Config:
     """Return a tiny CPU-fast ``UniOMRv2Config`` for smoke tests & unit verification."""
     params: Dict[str, Any] = dict(
@@ -165,7 +178,7 @@ def uni_omr_v2_tiny(**overrides: Any) -> UniOMRv2Config:
 
 
 def build_v2_config(preset: str, **overrides: Any) -> UniOMRv2Config:
-    """Build a ``UniOMRv2Config`` from ``small_45m``, ``edge85m``, ``pro200m``, ``iter15_pro200m``, or ``tiny``."""
+    """Build a ``UniOMRv2Config`` from ``small_45m``, ``edge85m``, ``pro200m``, ``iter15_pro200m``, ``iter16_pro200m``, ``iter16_edge85m``, or ``tiny``."""
     p = str(preset).strip().lower()
     if p == "small_45m":
         return uni_omr_v2_small_45m(**overrides)
@@ -175,10 +188,14 @@ def build_v2_config(preset: str, **overrides: Any) -> UniOMRv2Config:
         return uni_omr_v2_pro200m(**overrides)
     if p == "iter15_pro200m":
         return uni_omr_v2_iter15_pro200m(**overrides)
+    if p == "iter16_pro200m":
+        return uni_omr_v2_iter16_pro200m(**overrides)
+    if p == "iter16_edge85m":
+        return uni_omr_v2_iter16_edge85m(**overrides)
     if p == "tiny":
         return uni_omr_v2_tiny(**overrides)
     raise ValueError(
-        f"Unknown preset={preset!r}; expected one of: small_45m, edge85m, pro200m, iter15_pro200m, tiny"
+        f"Unknown preset={preset!r}; expected one of: small_45m, edge85m, pro200m, iter15_pro200m, iter16_pro200m, iter16_edge85m, tiny"
     )
 
 
@@ -259,6 +276,26 @@ def load_v2_checkpoint(
                 old_v = len(ckpt_vocab) + 4
     if old_v is None and "tok_emb.weight" in raw_sd and raw_sd["tok_emb.weight"].ndim == 2:
         old_v = int(raw_sd["tok_emb.weight"].shape[0])
+
+    # Iter 16 bekern-full warm-start: legacy vocab_size=265 -> bekern-full vocab_size=446
+    # Preserves special tokens 261..264 in-place and appends 265..445 cleanly.
+    if (
+        (not encoder_only)
+        and (old_v == bekern_full.LEGACY_VOCAB_SIZE)
+        and (new_v == bekern_full.FULL_VOCAB_SIZE or bool(getattr(model.cfg, "bekern_full", False)))
+        and (new_v > old_v)
+    ):
+        info = warm_start_from_v265_checkpoint(model, ck)
+        print(
+            f"[UniOMRv2 init-from bekern-full] warm-started {ckpt_path} "
+            f"({old_v} -> {new_v}, loaded={info['loaded_count']}, "
+            f"vocab_expanded={info['vocab_expanded']}, "
+            f"register_expanded={info['register_expanded']}, "
+            f"missing={len(info['missing_keys'])}, "
+            f"shape_skipped={len(info['shape_skipped'])})",
+            flush=True,
+        )
+        return info
 
     can_vocab_expand = (
         (not encoder_only)
@@ -3520,6 +3557,16 @@ def run_train_v2(args: argparse.Namespace) -> Dict[str, Any]:
             load_v2_checkpoint(model, args.init_encoder_from, encoder_only=True)
         if args.init_from:
             load_v2_checkpoint(model, args.init_from, encoder_only=False)
+    bekern_stage = int(getattr(args, "bekern_full_stage", 0))
+    if bekern_stage in (1, 2):
+        stage_info = set_bekern_full_stage(model, bekern_stage)
+        print(
+            f"[UniOMRv2 bekern-full] stage={stage_info['stage']} | "
+            f"trainable_params={stage_info['trainable_params']:,} | "
+            f"frozen_params={stage_info['frozen_params']:,} | "
+            f"grad_hooks={stage_info['n_hooks']}",
+            flush=True,
+        )
     if args.channels_last:
         model.backbone.to(memory_format=torch.channels_last)
         if device.type == "cuda":
@@ -4423,8 +4470,23 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--preset",
         "--arch-preset",
         dest="preset",
-        choices=["small_45m", "edge85m", "pro200m", "iter15_pro200m", "tiny"],
+        choices=[
+            "small_45m",
+            "edge85m",
+            "pro200m",
+            "iter15_pro200m",
+            "iter16_pro200m",
+            "iter16_edge85m",
+            "tiny",
+        ],
         default="small_45m",
+    )
+    p.add_argument(
+        "--bekern-full-stage",
+        type=int,
+        choices=[0, 1, 2],
+        default=0,
+        help="Iter 16 bekern-full 2-stage freeze/unfreeze: 0=off/standard, 1=freeze core (new tokens+registers+ModeGate+text head only), 2=joint unfreeze",
     )
     p.add_argument("--init-from", type=str, default=None, help="Warm-start full UniOMRv2 weights (strict=False, step resets to 0)")
     p.add_argument(
