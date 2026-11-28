@@ -3441,6 +3441,10 @@ def run_train_v2(args: argparse.Namespace) -> Dict[str, Any]:
         cfg_overrides["n_global_layers"] = int(args.n_global_layers)
     if getattr(args, "vrfm_band_alpha", None) is not None:
         cfg_overrides["vrfm_band_alpha"] = float(args.vrfm_band_alpha)
+    if getattr(args, "n_register_tokens", None) is not None:
+        cfg_overrides["n_register_tokens"] = int(args.n_register_tokens)
+    if getattr(args, "rope_jitter", None) is not None:
+        cfg_overrides["rope_jitter"] = float(args.rope_jitter)
     cfg = build_v2_config(args.preset, **cfg_overrides)
 
     use_bf16 = bool(args.bf16 and device.type == "cuda")
@@ -4469,6 +4473,18 @@ def build_arg_parser() -> argparse.ArgumentParser:
         type=float,
         default=None,
         help="Override router 3-row staff-band saliency smoothing alpha (default: None = config default 0.30)",
+    )
+    p.add_argument(
+        "--n-register-tokens",
+        type=int,
+        default=None,
+        help="Override preset encoder n_register_tokens (default: None = preset default; ov-17 promoted 8 for iter15_pro200m)",
+    )
+    p.add_argument(
+        "--rope-jitter",
+        type=float,
+        default=None,
+        help="Override preset encoder V2PE rope_jitter (default: None = preset default 0.08)",
     )
     p.add_argument("--mtp-k", type=int, default=4)
     p.add_argument("--use-sys-y-aux", action="store_true", default=True)

@@ -481,12 +481,17 @@
     "est_cu": 3.4,
     "script": "experiments/2026-11-26T01-38-ov-17-irope-registers-jitter-sweep/run_colab.py",
     "hf_eval_target": "evals/2026-11-26T01-38-ov-17-irope-registers-jitter-sweep.json",
-    "status": "RUNNING",
+    "status": "COMPLETED",
     "depends_on": [],
     "note": "re-queued after triage fix 2026-11-26 (round 2)",
     "session": "ov-17",
     "started_at": "2026-11-28T04:40:16Z",
-    "log_path": "D:\\tmp\\overnight-queue-logs\\2026-11-26T01-38-ov-17-irope-registers-jitter-sweep.log"
+    "log_path": "D:\\tmp\\overnight-queue-logs\\2026-11-26T01-38-ov-17-irope-registers-jitter-sweep.log",
+    "completed_at": "2026-11-28T06:20:23Z",
+    "elapsed_sec": 6006.72,
+    "returncode": 0,
+    "verdict": "PROMOTE",
+    "summary": "A100 6/6 arms (300 steps, small_45m, 1280px, 0 NaNs): reg8_jit008 wins at 0.2735 EMA Token F1 / 0.8629 EMA SER (+4.05 pp vs reg0 0.2330, +0.50 pp vs reg4 0.2685, clears >=+0.4 pp gate) with zero speed/VRAM cost (461.4s vs 492.7s, 9301MB); reg16 collapses (0.1467, -12.68 pp); rope_jitter flat on EMA (0.00: 0.2675 / 0.08: 0.2685 / 0.16: 0.2684 -> keep 0.08). Wired n_register_tokens=8 into iter15_pro200m + --n-register-tokens/--rope-jitter CLI overrides."
   },
   {
     "id": "2026-11-26T01-38-ov-21-paper-gate-border-threshold",
@@ -2285,9 +2290,12 @@
     "est_cu": 3.5,
     "script": "experiments/2026-11-26T22-18-i14-08-verifier-gated-rism-selftrain-flywheel/run_colab.py",
     "hf_eval_target": "evals/2026-11-26T22-18-i14-08-verifier-gated-rism-selftrain-flywheel.json",
-    "status": "QUEUED",
+    "status": "RUNNING",
     "depends_on": [],
-    "note": "Wave 11 Safe/Medium (Theorist 8 Flywheel): builds on ov-39 with pHash/8-gram decontamination, multi-scale MBR, zero-dropped-system check, w_t=p_t^2, and 30% GT anchor."
+    "note": "Wave 11 Safe/Medium (Theorist 8 Flywheel): builds on ov-39 with pHash/8-gram decontamination, multi-scale MBR, zero-dropped-system check, w_t=p_t^2, and 30% GT anchor.",
+    "session": "2026-11-26t22-18-i14-08-",
+    "started_at": "2026-11-28T06:20:23Z",
+    "log_path": "D:\\tmp\\overnight-queue-logs\\2026-11-26T22-18-i14-08-verifier-gated-rism-selftrain-flywheel.log"
   },
   {
     "id": "2026-11-26T22-18-i14-09-ink-aware-vjepa-dino-archival-pretrain",

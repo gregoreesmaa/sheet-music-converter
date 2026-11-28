@@ -1,7 +1,7 @@
 # `2026-11-26T01-38-ov-17-irope-registers-jitter-sweep`
 
 **Title:** Overnight Exp 17 — ViT-5/DINOv3 Register Tokens (`0`, `4`, `8`, `16`) & RoPE Box-Jitter Sweep on `UniOMR v2 small_45m`
-**Status:** `QUEUED` (Overnight Batch 02, Wave 4)
+**Status:** `COMPLETED` — **Verdict: `PROMOTE`** (`n_register_tokens=8`, keep `rope_jitter=0.08`; `+4.05 pp` vs `reg0`, `+0.50 pp` vs `reg4` EMA Token F1, zero speed/VRAM cost)
 **Baseline Commit SHA:** `164852f`
 **Target Platform:** Google Colab `L4` (24 GB VRAM, BF16 native, ~38–42 min total, ~3.4 CU)
 

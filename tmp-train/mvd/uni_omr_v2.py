@@ -598,6 +598,7 @@ class UniOMRv2Config:
             max_mem_tokens=3072,
             mtp_k=4,
             # Promoted Iter 15 winners:
+            n_register_tokens=8,
             use_yoco_cla=True,
             yoco_cross_banks=(0, 3, 7),
             yoco_cross_kv_heads=12,
