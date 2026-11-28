@@ -2212,15 +2212,16 @@
     "est_cu": 3.4,
     "script": "experiments/2026-11-26T22-18-i14-06-foveated-dualres-zoom-router/run_colab.py",
     "hf_eval_target": "evals/2026-11-26T22-18-i14-06-foveated-dualres-zoom-router.json",
-    "status": "RUNNING",
+    "status": "COMPLETED",
     "depends_on": [],
     "note": "Wave 11 Wild: Single-pass 1024px global + top-12 2x native-res dense crops packed inside max_mem_tokens=3072 via shared backbone & continuous global 2D-RoPE.",
     "started_at": "2026-11-27T21:04:45Z",
     "log_path": "D:\\tmp\\overnight-queue-logs\\2026-11-26T22-18-i14-06-foveated-dualres-zoom-router.log",
     "session": "2026-11-26t22-18-i14-06-",
-    "completed_at": "2026-11-27T16:50:34Z",
-    "elapsed_sec": 2094.52,
-    "returncode": 1
+    "completed_at": "2026-11-28T00:52:31Z",
+    "elapsed_sec": 13665.92,
+    "returncode": 0,
+    "verdict": "DISCARD"
   },
   {
     "id": "2026-11-26T22-18-i14-07-retinex-norm-and-clean-router-masks",
@@ -2647,7 +2648,7 @@
     "wave": 13,
     "priority": 4,
     "provider": "colab_l4",
-    "gpu": "L4",
+    "gpu": "A100",
     "est_minutes": 60,
     "est_cu": 4.5,
     "script": "experiments/2026-11-27T07-46-i15-04-risk-gated-visual-ttc-and-sys-dagger/run_colab.py",
@@ -2655,14 +2656,17 @@
     "plan": "experiments/2026-11-27T07-46-i15-04-risk-gated-visual-ttc-and-sys-dagger/PLAN.md",
     "hf_eval_target": "evals/2026-11-27T07-46-i15-04-risk-gated-visual-ttc-and-sys-dagger.json",
     "hf_run_target": "runs/2026-11-27T07-46-i15-04-risk-gated-visual-ttc-and-sys-dagger.json",
-    "status": "QUEUED",
+    "status": "RUNNING",
     "depends_on": [],
     "datasets": [
       "datasets/northstar_eval_pack_125p.tar.gz",
       "datasets/iter10_5_proxy_2k.tar",
       "datasets/suite31_hw_eval.tar"
     ],
-    "note": "Wave 13 Strategist 4 (Pivots 3 & 2): Part A zero-train Risk-Gated Visual-Coverage TTC on NorthStar 125p (fixes all 5 i14-14 defects + bsvr=0.997 blind spot; gates: CDR esc<=15%, lat<=1.45x, 0.0pp printed reg, NS>=+3.0); Part B 1,200-step <sys>-aligned On-Policy DAgger + Counterfactual Anti-Prior (75% SFT + 25% DAgger/Anti-Prior, ignore_index=-100 on prefix, 3x <sys> header weight) vs SFT control on suite31_hw (gates: HWM Note F1>=+3.0pp, printed>=-0.3pp)."
+    "note": "Wave 13 Strategist 4 (Pivots 3 & 2): Part A zero-train Risk-Gated Visual-Coverage TTC on NorthStar 125p (fixes all 5 i14-14 defects + bsvr=0.997 blind spot; gates: CDR esc<=15%, lat<=1.45x, 0.0pp printed reg, NS>=+3.0); Part B 1,200-step <sys>-aligned On-Policy DAgger + Counterfactual Anti-Prior (75% SFT + 25% DAgger/Anti-Prior, ignore_index=-100 on prefix, 3x <sys> header weight) vs SFT control on suite31_hw (gates: HWM Note F1>=+3.0pp, printed>=-0.3pp).",
+    "session": "2026-11-27t07-46-i15-04-",
+    "started_at": "2026-11-28T00:52:32Z",
+    "log_path": "D:\\tmp\\overnight-queue-logs\\2026-11-27T07-46-i15-04-risk-gated-visual-ttc-and-sys-dagger.log"
   },
   {
     "id": "2026-11-27T07-46-i15-05-spx13-band-tiling-and-hw-lora",
