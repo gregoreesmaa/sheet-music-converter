@@ -347,12 +347,13 @@ def test_grammar_pauses_rhythmic_fsa_inside_layer3_text_span():
     for tok in ("<schema:full>", "clef-G-2", "time-4-4", "quarter", "C", "4", "quarter", "D", "4"):
         st.step(tok)
 
-    # Snapshot rhythmic cursor before entering text span
-    vcurs_before = list(st.music_state.vcurs_rat)
-
-    # Open Layer 3 <sys_lyr> span; rhythmic FSA must pause and <eos>/<sys> must be blocked
+    # Open Layer 3 <sys_lyr> span; pending 2nd quarter note closes cleanly (2 beats committed),
+    # rhythmic FSA pauses, and <eos>/<sys> are blocked
     st.step("<sys_lyr>")
     assert st.in_text_span is True
+    assert st.music_state.mode == "bound"
+    vcurs_in_span = list(st.music_state.vcurs_rat)
+    assert vcurs_in_span == [(2, 1)]
     allow_txt, eos_ok = st.allowed()
     assert eos_ok is False
     assert bf.SYS_ID not in allow_txt
@@ -363,12 +364,12 @@ def test_grammar_pauses_rhythmic_fsa_inside_layer3_text_span():
 
     for tok in ("v=1", "@0", "lyr-beg", "@1", "lyr-end"):
         st.step(tok)
-    assert st.music_state.vcurs_rat == vcurs_before
+    assert st.music_state.vcurs_rat == vcurs_in_span
 
     # Close text span -> rhythmic FSA resumes cleanly with 2 beats remaining!
     st.step("</text_span>")
     assert st.in_text_span is False
-    assert st.music_state.vcurs_rat == vcurs_before
+    assert st.music_state.vcurs_rat == vcurs_in_span
 
     # A whole note (4 beats) would overshoot the 2 remaining beats -> still blocked!
     with pytest.raises(ValueError):
@@ -383,3 +384,307 @@ def test_grammar_pauses_rhythmic_fsa_inside_layer3_text_span():
     st_copy.step("<harm>")
     assert st_copy.in_text_span is True
     assert st.in_text_span is False
+
+
+# ---------------------------------------------------------------------------
+# 6. Round 1 Regression Tests (label_smoothing, codec, depth, FSA hardening)
+# ---------------------------------------------------------------------------
+
+def test_masked_layer_ce_label_smoothing_finite_and_zero_sum_active_grad():
+    t = bf.FULL_TOKEN_TO_ID
+    target_ids = torch.tensor([[t["quarter"], t["C"], t["4"]]], dtype=torch.long)
+    layer_masks = torch.tensor([bf.SCHEMA_LAYER_BITS["v1"]], dtype=torch.long)
+
+    logits = torch.randn((1, 3, bf.FULL_VOCAB_SIZE), requires_grad=True)
+    loss = bf.masked_layer_cross_entropy(logits, target_ids, layer_masks, label_smoothing=0.1)
+    assert torch.isfinite(loss), f"loss was not finite: {loss}"
+    loss.backward()
+
+    _, suppress = bf.build_layer_ce_masks(target_ids, layer_masks)
+    active = ~suppress[0]
+    grad = logits.grad[0]  # (3, V)
+    # Suppressed classes must have identically 0 gradient
+    assert torch.all(grad[:, suppress[0]] == 0.0)
+    # Active classes must sum to 0 per token (unbiased simplex gradient)
+    active_grad_sum = grad[:, active].sum(dim=-1)
+    assert torch.allclose(active_grad_sum, torch.zeros_like(active_grad_sum), atol=1e-5)
+
+    # Also test with per-token class weights
+    logits2 = torch.randn((1, 3, bf.FULL_VOCAB_SIZE), requires_grad=True)
+    w = torch.ones(bf.FULL_VOCAB_SIZE)
+    w[t["quarter"]] = 2.0
+    loss2 = bf.masked_layer_cross_entropy(logits2, target_ids, layer_masks, label_smoothing=0.1, weight=w)
+    assert torch.isfinite(loss2)
+    loss2.backward()
+    assert torch.all(logits2.grad[0][:, suppress[0]] == 0.0)
+
+
+def test_finite_argument_tokens_and_valid_music_body_ids():
+    # Layer 0 new argument tokens
+    for tok in ("brace", "bracket", "barline", "lines-1", "lines-6", "-12", "-2", "+1", "+12", "9", "10", "11", "12", ":"):
+        assert bf.FULL_TOKEN_TO_ID[tok] >= 265
+        assert bf.token_layer_of(tok) == 0
+    # Layer 1 new argument tokens
+    for tok in ("str-1", "str-6", "fret-0", "fret-24", "clef-T-4", "clef-T-5", "clef-T-6", "xstaff-9", "xstaff-16"):
+        assert bf.FULL_TOKEN_TO_ID[tok] >= 265
+        assert bf.token_layer_of(tok) == 1
+    # Layer 2 compat alias
+    assert bf.FULL_TOKEN_TO_ID["15-stop"] >= 265
+    assert bf.token_layer_of("15-stop") == 2
+    # Layer 3 expanded anchors & verses
+    for tok in ("@0", "@64", "@255", "v=1", "v=5", "v=8"):
+        assert bf.FULL_TOKEN_TO_ID[tok] >= bf.MUSIC_VOCAB_END
+        assert bf.token_layer_of(tok) == 3
+
+    # VALID_MUSIC_BODY_TOKEN_IDS strictly excludes PAD/BOS/EOS/SYS, SCHEMA_TOKEN_IDS, and Layer 3
+    valid_set = set(bf.VALID_MUSIC_BODY_TOKEN_IDS)
+    for forbidden in (bf.PAD_ID, bf.BOS_ID, bf.EOS_ID, bf.SYS_ID, *bf.SCHEMA_TOKEN_IDS):
+        assert forbidden not in valid_set
+    assert all(0 <= i < bf.MUSIC_VOCAB_END for i in valid_set)
+
+
+def test_dual_head_sequence_codec_roundtrip_zero_oov():
+    sample = (
+        "<schema:full> <part> brace lines-5 clef-G-2 time-4-4 "
+        "tup-open-3:2 eighth C 4 eighth D 4 eighth E 4 tup-close "
+        "multirest-16 bar "
+        "<tempo> Allegro ma non troppo </text_span> "
+        "<sys_lyr v=1> @0 lyr-beg Über @1 lyr-end Gipfeln </text_span> "
+        "<harm> C#m7/G# </text_span>"
+    )
+    enc = bf.encode_bekern_full_sequence(sample, add_bos_eos=True)
+    assert enc["music_ids"][0] == bf.BOS_ID
+    assert enc["music_ids"][-1] == bf.EOS_ID
+    assert len(enc["text_spans"]) == 3
+    assert bf.decode_text_span_utf8(enc["text_spans"][0]) == "Allegro ma non troppo"
+    assert bf.decode_text_span_utf8(enc["text_spans"][1]) == "v=1 @0 lyr-beg Über @1 lyr-end Gipfeln"
+    assert bf.decode_text_span_utf8(enc["text_spans"][2]) == "C#m7/G#"
+
+    dec = bf.decode_bekern_full_sequence(enc["music_ids"], enc["text_spans"])
+    assert "Allegro ma non troppo" in dec
+    assert "Über" in dec
+    assert "C#m7/G#" in dec
+    assert "tup-open-3:2" in dec
+    assert "<multirest> multirest-16" in dec
+
+
+def test_compute_is_music_body_mask_nested_and_stray_close():
+    t = bf.FULL_TOKEN_TO_ID
+    seq = torch.tensor([[
+        t["</text_span>"],  # stray close before any open -> must NOT break subsequent open
+        t["quarter"],       # body -> True
+        t["<sys_lyr>"],     # depth 0 -> 1 -> False
+        t["<harm>"],        # nested depth 1 -> 2 -> False
+        t["quarter"],       # inside nested span -> False
+        t["</text_span>"],  # depth 2 -> 1 -> False
+        t["quarter"],       # still depth 1 -> False!
+        t["</text_span>"],  # depth 1 -> 0 -> False
+        t["C"],             # outside span -> True
+    ]], dtype=torch.long)
+    mask = bf.compute_is_music_body_mask(seq)
+    assert mask[0].tolist() == [False, True, False, False, False, False, False, False, True]
+
+
+def test_grammar_hardening_aliases_per_staff_spanners_caps_and_eos():
+    st = bf.BekernFullGrammarState(strict=True)
+    st.step("<schema:full>")
+    # Right after <schema:full> with 0 music events, eos_ok must be False
+    _, eos_ok = st.allowed()
+    assert eos_ok is False
+
+    for tok in ("clef-G-2", "time-4-4", "quarter", "C", "4"):
+        st.step(tok)
+    # <chord> delegates to chord; after <chord>, mid-note mode blocks <sys>
+    allow_chord, _ = st.allowed()
+    assert bf.FULL_TOKEN_TO_ID["<chord>"] in allow_chord
+    st.step("<chord>")
+    assert st.can_emit_sys() is False
+    st.step("quarter")
+    st.step("E")
+    st.step("4")
+
+    # Opening text span in pitch-tail closes pending event cleanly -> mode == "bound"
+    st.step("<tempo>")
+    assert st.music_state.mode == "bound"
+    # Anti-loop cap MAX_LAYER3_SPAN_TOKENS = 128
+    for _ in range(bf.MAX_LAYER3_SPAN_TOKENS):
+        st.step("@0")
+    allow_cap, _ = st.allowed()
+    assert allow_cap == {bf.TEXT_SPAN_CLOSE_TOKEN_ID}
+    with pytest.raises(ValueError):
+        st.step("@0")
+    st.step("</text_span>")
+
+    # Per-staff slur channels: open slur-1 on staff 0, switch to staff 1 via <staff> -> slur-1 is free on staff 1!
+    st.step("quarter")
+    st.step("D")
+    st.step("4")
+    st.step("slur-1-open")
+    assert 1 in st.open_slurs
+    st.step("<staff>")
+    assert 1 not in st.open_slurs
+    st.step("clef-F-4")
+    st.step("quarter")
+    st.step("C")
+    st.step("3")
+    st.step("slur-1-open")
+    assert 1 in st.open_slurs
+
+    # Percussion/tab delegation when allow_percussion_tab=True
+    st_pt = bf.BekernFullGrammarState(strict=False, allow_percussion_tab=True)
+    for tok in ("clef-G-2", "time-4-4", "unpitched", "quarter", "C", "4", "nh-x"):
+        st_pt.step(tok)
+
+
+# ---------------------------------------------------------------------------
+# 7. Round 2 Regression Tests (R2-2 & R2-4: LS NaN, Rust<->Py round-trip, FSA)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize("use_weight", [False, True])
+def test_masked_layer_ce_label_smoothing_suppressed_target_and_neg100_finite(dtype, use_weight):
+    """R2-2: label_smoothing=0.1 with suppressed target + -100 + PAD must be finite (no +inf*0 NaN)."""
+    t = bf.FULL_TOKEN_TO_ID
+    # Row 0 is v1 (L1 only): dyn-f (L2), <part> (L0), <sys_lyr> (L3) are SUPPRESSED!
+    # Also include -100 and PAD_ID alongside valid L1 tokens (quarter, C).
+    target_ids = torch.tensor(
+        [[t["quarter"], t["dyn-f"], t["<part>"], t["<sys_lyr>"], -100, bf.PAD_ID, t["C"]]],
+        dtype=torch.long,
+    )
+    layer_masks = torch.tensor([bf.SCHEMA_LAYER_BITS["v1"]], dtype=torch.long)
+
+    logits = torch.randn((1, target_ids.shape[1], bf.FULL_VOCAB_SIZE), dtype=dtype, requires_grad=True)
+    w = torch.ones(bf.FULL_VOCAB_SIZE, dtype=dtype) if use_weight else None
+    if w is not None:
+        w[t["quarter"]] = 2.0
+
+    loss = bf.masked_layer_cross_entropy(
+        logits, target_ids, layer_masks, label_smoothing=0.1, weight=w
+    )
+    assert torch.isfinite(loss), f"non-finite loss ({dtype}, weight={use_weight}): {loss}"
+    loss.backward()
+    assert logits.grad is not None and torch.isfinite(logits.grad).all()
+    _, suppress = bf.build_layer_ce_masks(target_ids, layer_masks)
+    assert torch.all(logits.grad[0][:, suppress[0]] == 0.0)
+
+
+def test_encode_grammar_decode_roundtrip_tuplets_multirest_transpose_and_rest_tail():
+    """R2-2 & R2-4: tup-open-11:8, tup-open-3:2, <multirest> multirest-16, <transpose> -8 -14, rest-tail."""
+    sample = (
+        "<schema:full> <part> <transpose> -8 -14 clef-G-2 time-4-4 "
+        "tup-open-11:8 eighth C 4 eighth D 4 eighth E 4 eighth F 4 tup-close bar "
+        "tup-open-3:2 eighth G 4 eighth A 4 eighth B 4 tup-close bar "
+        "<multirest> multirest-16 bar "
+        "rest quarter <dir> dolce </text_span>"
+    )
+    enc = bf.encode_bekern_full_sequence(sample, add_bos_eos=True)
+    toks = bf.decode_full(enc["music_ids"], skip_special=True)
+    # Must NOT duplicate <multirest> when input already has `<multirest> multirest-16`!
+    assert toks.count("<multirest>") == 1
+    assert "-8" in toks and "-14" in toks
+
+    # Walk every single music token through BekernFullGrammarState!
+    st = bf.BekernFullGrammarState(strict=False)
+    for tok in toks:
+        allow, _ = st.allowed()
+        assert bf.FULL_TOKEN_TO_ID[tok] in allow, f"FSA rejected {tok!r} at pos={st.pos}"
+        st.step(tok)
+    assert st.transpose_args_left == 0
+    assert st.tup_mode is None
+
+    # Also verify legacy v2 `tup-open 3 2` works cleanly in BekernFullGrammarState!
+    st_leg = bf.BekernFullGrammarState(strict=True)
+    for tok in ("clef-G-2", "time-4-4", "tup-open", "3", "2", "eighth", "C", "4", "eighth", "D", "4", "eighth", "E", "4", "tup-close"):
+        allow, _ = st_leg.allowed()
+        assert bf.FULL_TOKEN_TO_ID[tok] in allow, f"legacy tup-open rejected {tok!r}"
+        st_leg.step(tok)
+
+    # Verify rest-tail Layer 3 open calls _close_event(placed=False) (no pitch placed)!
+    st_rest = bf.BekernFullGrammarState(strict=True)
+    for tok in ("<schema:full>", "clef-G-2", "time-4-4", "rest", "quarter"):
+        st_rest.step(tok)
+    assert st_rest.music_state.mode == "rest-tail"
+    st_rest.step("<tempo>")
+    assert st_rest.in_text_span is True
+    assert st_rest.music_state.mode == "bound"
+    st_rest.step("</text_span>")
+
+    # Verify decode_bekern_full_sequence recomposes tup-open-{a}:{n} and <multirest> multirest-{n}!
+    dec = bf.decode_bekern_full_sequence(enc["music_ids"], enc["text_spans"])
+    assert "tup-open-11:8" in dec
+    assert "tup-open-3:2" in dec
+    assert "<multirest> multirest-16" in dec
+    assert "<multirest> <multirest>" not in dec
+    assert "<transpose> -8 -14" in dec
+    assert "<dir> dolce </text_span>" in dec
+
+
+def test_live_rust_assembly_serialize_bekern_full_roundtrip(tmp_path):
+    """R2-2: Live assembly-serialize.exe bekern --full -> Python -> bekern2musicxml round-trip."""
+    import subprocess
+
+    repo_root = _MVD_DIR.parent.parent
+    exe = repo_root / "converter" / "assembly-serialize" / "target" / "release" / "assembly-serialize.exe"
+    if not exe.is_file():
+        exe = repo_root / "converter" / "assembly-serialize" / "target" / "debug" / "assembly-serialize.exe"
+    if not exe.is_file():
+        pytest.skip("assembly-serialize.exe not built")
+
+    mxml = """<?xml version="1.0" encoding="UTF-8"?>
+<score-partwise version="3.1">
+  <part-list>
+    <score-part id="P1"><part-name>Clarinet</part-name></score-part>
+  </part-list>
+  <part id="P1">
+    <measure number="1">
+      <attributes>
+        <divisions>2</divisions>
+        <key><fifths>0</fifths></key>
+        <time><beats>4</beats><beat-type>4</beat-type></time>
+        <clef><sign>G</sign><line>2</line></clef>
+        <transpose><diatonic>-8</diatonic><chromatic>-14</chromatic></transpose>
+      </attributes>
+      <note><pitch><step>C</step><octave>4</octave></pitch><duration>2</duration><type>quarter</type></note>
+      <note><pitch><step>D</step><octave>4</octave></pitch><duration>2</duration><type>quarter</type></note>
+      <note><pitch><step>E</step><octave>4</octave></pitch><duration>2</duration><type>quarter</type></note>
+      <note><pitch><step>F</step><octave>4</octave></pitch><duration>2</duration><type>quarter</type></note>
+    </measure>
+  </part>
+</score-partwise>
+"""
+    in_xml = tmp_path / "in.musicxml"
+    in_xml.write_text(mxml, encoding="utf-8")
+    bk_dir = tmp_path / "bk"
+    bk_dir.mkdir()
+
+    subprocess.run(
+        [
+            str(exe), "bekern",
+            "--input", str(in_xml),
+            "--out", str(bk_dir),
+            "--stem", "rt",
+            "--measures", "1..1",
+            "--full",
+        ],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    rust_bekern = (bk_dir / "rt-bekern.txt").read_text(encoding="utf-8").strip()
+    assert rust_bekern, "assembly-serialize bekern --full produced empty output"
+
+    enc = bf.encode_bekern_full_sequence(rust_bekern, add_bos_eos=True)
+    dec = bf.decode_bekern_full_sequence(enc["music_ids"], enc["text_spans"])
+
+    bk_file = tmp_path / "roundtrip-bekern.txt"
+    bk_file.write_text(dec, encoding="utf-8")
+    out_dir = tmp_path / "out"
+    out_dir.mkdir()
+    p2 = subprocess.run(
+        [str(exe), "bekern2musicxml", "--input", str(bk_file), "--out", str(out_dir), "--stem", "roundtrip"],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    out_xml = out_dir / "roundtrip.musicxml"
+    assert out_xml.is_file() and "<score-partwise" in out_xml.read_text(encoding="utf-8"), p2.stderr

@@ -42,6 +42,7 @@ _THIS_DIR = Path(__file__).resolve().parent
 if str(_THIS_DIR) not in sys.path:
     sys.path.insert(0, str(_THIS_DIR))
 
+import bekern_full  # noqa: E402
 import data  # noqa: E402
 import eval_sys_gate as esg  # noqa: E402
 import grammar  # noqa: E402
@@ -63,17 +64,28 @@ def _vocab_spec(
     """Derive special IDs and token maps for any append-only UniOMR ``vocab_size``.
 
     Keeps legacy 182-vocab checkpoints (178 base + PAD/BOS/EOS/SYS) 100%
-    evaluable alongside expanded vocabs (e.g. Option D1: 233 base + 4 = 237).
+    evaluable alongside expanded vocabs (e.g. Option D1: 233 base + 4 = 237)
+    and Iter 16 ``bekern-full`` (``FULL_VOCAB_SIZE`` with specials fixed at 261..264).
     """
-    n_base = int(vocab_size) - 4
+    vsz = int(vocab_size)
+    if vsz == bekern_full.FULL_VOCAB_SIZE:
+        return (
+            bekern_full.PAD_ID,
+            bekern_full.BOS_ID,
+            bekern_full.EOS_ID,
+            bekern_full.SYS_ID,
+            dict(bekern_full.FULL_TOKEN_TO_ID),
+            dict(bekern_full.FULL_ID_TO_TOKEN),
+        )
+    n_base = vsz - 4
     if n_base < 0 or n_base > len(data.VOCAB):
         raise ValueError(
-            f"Unsupported vocab_size={vocab_size} (expected 4..{len(data.VOCAB) + 4})"
+            f"Unsupported vocab_size={vocab_size} (expected 4..{len(data.VOCAB) + 4} or {bekern_full.FULL_VOCAB_SIZE})"
         )
-    pad_id = vocab_size - 4
-    bos_id = vocab_size - 3
-    eos_id = vocab_size - 2
-    sys_id = vocab_size - 1
+    pad_id = vsz - 4
+    bos_id = vsz - 3
+    eos_id = vsz - 2
+    sys_id = vsz - 1
     base_vocab = data.VOCAB[:n_base]
     tok_to_id = {t: i for i, t in enumerate(base_vocab)}
     id_to_tok = {i: t for i, t in enumerate(base_vocab)}
@@ -156,7 +168,7 @@ def _allowed_ids_for_state(state: grammar.PrefixState, vocab_size: int) -> List[
         ]
 
     allow_set, eos_ok = state.allowed()
-    allow_ids = {i for i in allow_set if 0 <= i < pad_id}
+    allow_ids = {i for i in allow_set if 0 <= i < vocab_size and i not in (pad_id, bos_id)}
 
     # Suppress tight-loop cycle extension in BOTH strict=False and strict=True
     # modes whenever alternatives exist.

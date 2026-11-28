@@ -144,12 +144,12 @@ def test_iter16_pro200m_and_edge85m_presets_and_int4_budget():
     assert cfg_pro.d_model == 768
     assert cfg_pro.n_register_tokens == 8
     assert cfg_pro.bekern_full is True
-    assert cfg_pro.vocab_size == bf.FULL_VOCAB_SIZE == 446
+    assert cfg_pro.vocab_size == bf.FULL_VOCAB_SIZE
     assert cfg_pro.pad_id == 261
     assert cfg_pro.bos_id == 262
     assert cfg_pro.eos_id == 263
     assert cfg_pro.sys_id == 264
-    assert cfg_pro.music_vocab_end == bf.MUSIC_VOCAB_END == 367
+    assert cfg_pro.music_vocab_end == bf.MUSIC_VOCAB_END
     assert cfg_pro.use_text_aux_head is True
     assert cfg_pro.text_vocab_size == bf.TEXT_VOCAB_SIZE == 259
     assert cfg_pro.mode_gate_conf_thresh == pytest.approx(0.75)
@@ -158,15 +158,17 @@ def test_iter16_pro200m_and_edge85m_presets_and_int4_budget():
     assert cfg_edge.d_model == 512
     assert cfg_edge.n_register_tokens == 8
     assert cfg_edge.bekern_full is True
-    assert cfg_edge.vocab_size == bf.FULL_VOCAB_SIZE == 446
+    assert cfg_edge.vocab_size == bf.FULL_VOCAB_SIZE
     assert cfg_edge.text_vocab_size == bf.TEXT_VOCAB_SIZE == 259
     assert cfg_edge.mode_gate_conf_thresh == pytest.approx(0.75)
 
     # Construct full edge85m and verify Hybrid FP16/INT4 with scales < 55 MB
     model_edge = uv2.UniOMRv2Net(cfg_edge)
-    assert model_edge.lm_head.out_features == 446
+    assert model_edge.lm_head.out_features == bf.FULL_VOCAB_SIZE
     assert model_edge.lm_head_text is not None
     assert model_edge.lm_head_text.out_features == 259
+    assert model_edge.tok_emb_text is not None
+    assert model_edge.tok_emb_text.num_embeddings == 259
     assert model_edge.text_mode_gate is not None
     summary = model_edge.param_summary()
     assert summary["hybrid_fp16_int4_with_scales_mb"] < 55.0, (
@@ -175,8 +177,8 @@ def test_iter16_pro200m_and_edge85m_presets_and_int4_budget():
     )
 
     # Fast forward pass on tiny bekern-full (and verify pro200m construction via build_v2_config)
-    assert tv2.build_v2_config("iter16_pro200m").vocab_size == 446
-    assert tv2.build_v2_config("iter16_edge85m").vocab_size == 446
+    assert tv2.build_v2_config("iter16_pro200m").vocab_size == bf.FULL_VOCAB_SIZE
+    assert tv2.build_v2_config("iter16_edge85m").vocab_size == bf.FULL_VOCAB_SIZE
 
     tiny_model = uv2.UniOMRv2Net(_tiny_bekern_full_cfg())
     imgs = torch.randn(1, 3, 64, 64)
@@ -221,7 +223,7 @@ def test_warm_start_from_v265_checkpoint_exact_copy_and_fresh_tail(tmp_path):
     dst_model2 = uv2.UniOMRv2Net(_tiny_bekern_full_cfg())
     info2 = tv2.load_v2_checkpoint(dst_model2, ckpt_path, encoder_only=False)
     assert info2["old_vocab_size"] == 265
-    assert info2["new_vocab_size"] == 446
+    assert info2["new_vocab_size"] == bf.FULL_VOCAB_SIZE
     assert torch.equal(dst_model2.tok_emb.weight[:265], src_model.tok_emb.weight)
     assert torch.equal(dst_model2.lm_head.weight[:265], src_model.lm_head.weight)
 
@@ -394,3 +396,354 @@ def test_cli_flags_iter16_presets_and_bekern_full_stage():
     args2 = parser.parse_args(["--preset", "iter16_edge85m", "--bekern-full-stage", "2"])
     assert args2.preset == "iter16_edge85m"
     assert args2.bekern_full_stage == 2
+
+
+# ---------------------------------------------------------------------------
+# 5. Round 1 Critical Fix Regressions (AdamW wd invariance, text gate/UTF-8,
+#    generate() music<->text, label_smoothing, eval & ONNX vocab parity)
+# ---------------------------------------------------------------------------
+
+def test_stage1_adamw_weight_decay_bit_exact_legacy_invariance():
+    torch.manual_seed(11)
+    src_model = uv2.UniOMRv2Net(_tiny_v265_cfg())
+    model = uv2.UniOMRv2Net(_tiny_bekern_full_cfg())
+    uv2.warm_start_from_v265_checkpoint(model, {"model": src_model.state_dict()})
+
+    uv2.set_bekern_full_stage(model, 1)
+    emb_snap = model.tok_emb.weight[:265].detach().clone()
+    lm_snap = model.lm_head.weight[:265].detach().clone()
+    lm_tail_snap = model.lm_head.weight[265:].detach().clone()
+    reg_snap = model.encoder.register_tokens[:, :4, :].detach().clone()
+
+    opt = torch.optim.AdamW([p for p in model.parameters() if p.requires_grad], lr=1e-2, weight_decay=0.1)
+    opt.register_step_post_hook(lambda *_: uv2.restore_bekern_full_stage1_frozen_slices(model))
+
+    imgs = torch.randn(1, 3, 64, 64)
+    t = bf.FULL_TOKEN_TO_ID
+    tgt_in = torch.tensor([[bf.BOS_ID, t["<schema:full>"], t["quarter"], t["marcato"]]])
+    tgt_out = torch.tensor([[t["<schema:full>"], t["quarter"], t["marcato"], bf.EOS_ID]])
+    out = model(imgs, tgt_in, return_aux=True, return_mtp=False)
+    losses = model.compute_loss(out, tgt_out, layer_masks=torch.tensor([bf.SCHEMA_LAYER_BITS["full"]]))
+    losses["loss"].backward()
+    opt.step()
+
+    # Legacy [:265] and warm-started register_tokens[:, :4, :] MUST be bit-exact invariant!
+    assert torch.equal(model.tok_emb.weight[:265], emb_snap)
+    assert torch.equal(model.lm_head.weight[:265], lm_snap)
+    assert torch.equal(model.encoder.register_tokens[:, :4, :], reg_snap)
+    # New rows [265:] MUST have updated
+    assert not torch.equal(model.lm_head.weight[265:], lm_tail_snap)
+
+
+def test_text_mode_gate_supervision_and_utf8_text_head_ce():
+    torch.manual_seed(22)
+    model = uv2.UniOMRv2Net(_tiny_bekern_full_cfg())
+    imgs = torch.randn(1, 3, 64, 64)
+    t = bf.FULL_TOKEN_TO_ID
+    tgt_in = torch.tensor([[bf.BOS_ID, t["<schema:full>"], t["quarter"], t["<tempo>"]]])
+    tgt_out = torch.tensor([[t["<schema:full>"], t["quarter"], t["<tempo>"], t["</text_span>"]]])
+
+    # 1. With text_byte_targets=None, bekern_full must NOT run legacy build_text_aux_targets
+    out = model(imgs, tgt_in, return_aux=True, return_mtp=True)
+    assert "text_gate_logits" in out
+    assert out["text_gate_logits"].shape == (1, 4)
+    losses = model.compute_loss(
+        out,
+        tgt_out,
+        layer_masks=torch.tensor([bf.SCHEMA_LAYER_BITS["full"]]),
+        label_smoothing=0.1,
+    )
+    assert torch.isfinite(losses["loss"])
+    assert losses["text_aux_loss"].item() == 0.0
+    assert losses["text_gate_loss"].item() > 0.0
+    losses["loss"].backward()
+    assert model.text_mode_gate.weight.grad is not None
+    assert model.text_mode_gate.weight.grad.abs().sum().item() > 0.0
+
+    # 2. With UTF-8 text_byte_inputs & text_byte_targets, lm_head_text + tok_emb_text get UTF-8 CE grads
+    model.zero_grad(set_to_none=True)
+    utf8_seq = bf.encode_text_span_utf8("Allegro", add_bos_eos=True)
+    tb_in = torch.tensor([utf8_seq[:-1]], dtype=torch.long)
+    tb_tgt = torch.tensor([utf8_seq[1:]], dtype=torch.long)
+    out2 = model(imgs, tgt_in, return_aux=True, return_mtp=False)
+    losses2 = model.compute_loss(
+        out2,
+        tgt_out,
+        layer_masks=torch.tensor([bf.SCHEMA_LAYER_BITS["full"]]),
+        text_byte_inputs=tb_in,
+        text_byte_targets=tb_tgt,
+    )
+    assert losses2["text_aux_loss"].item() > 0.0
+    losses2["loss"].backward()
+    assert model.lm_head_text.weight.grad is not None
+    assert model.lm_head_text.weight.grad.abs().sum().item() > 0.0
+    assert model.tok_emb_text.weight.grad is not None
+    assert model.tok_emb_text.weight.grad.abs().sum().item() > 0.0
+
+
+def test_generate_music_to_text_utf8_span_decode():
+    torch.manual_seed(33)
+    model = uv2.UniOMRv2Net(_tiny_bekern_full_cfg())
+    model.eval()
+    t = bf.FULL_TOKEN_TO_ID
+    imgs = torch.randn(1, 3, 64, 64)
+
+    # Probe exact music & context-conditioned text hidden directions so bias-free linear heads pick <tempo> and 'A'
+    with torch.no_grad():
+        mem, _, rinfo = model.encode_image(imgs, return_aux=False)
+        coord_feat = rinfo.get("coord_feat")
+        init_kvs = model.precompute_cross_kv(mem, coord_feat=coord_feat)
+        extra_m = {}
+        _, _, _, _, kvs_after_bos = model._decode_tokens_impl(
+            torch.tensor([[bf.BOS_ID]]), None, return_mtp=False, return_aux=False,
+            past_kvs=init_kvs, use_cache=True, out_extra=extra_m,
+        )
+        h_m = extra_m["h_last"][0, 0]
+        _, _, _, _, kvs_after_open = model._decode_tokens_impl(
+            torch.tensor([[t["<tempo>"]]]), None, return_mtp=False, return_aux=False,
+            past_kvs=kvs_after_bos, use_cache=True, use_text_emb=False,
+        )
+        extra_t = {}
+        model._decode_tokens_impl(
+            torch.tensor([[bf.TEXT_BOS_ID]]), None, return_mtp=False, return_aux=False,
+            past_kvs=kvs_after_open, use_cache=True, use_text_emb=True, out_extra=extra_t,
+        )
+        h_t = extra_t["h_last"][0, 0]
+
+        model.text_mode_gate.weight.zero_()
+        model.text_mode_gate.bias.fill_(5.0)
+        model.lm_head.weight.zero_()
+        model.lm_head.weight[t["<tempo>"]] = h_m
+        model.lm_head_text.weight.zero_()
+        model.lm_head_text.weight[ord("A")] = h_t
+        # Ensure all text steps align with h_t by making tok_emb_text('A') == tok_emb_text(TEXT_BOS)
+        model.tok_emb_text.weight[ord("A")].copy_(model.tok_emb_text.weight[bf.TEXT_BOS_ID])
+
+    seq, spans = model.generate(
+        imgs, max_len=3, return_text_spans=True, max_text_span_len=3, use_mtp_draft=True
+    )
+    assert seq[0, 1].item() == t["<tempo>"]
+    assert seq[0, 2].item() == t["</text_span>"]
+    assert len(spans) == 1 and len(spans[0]) >= 1
+    assert bf.decode_text_span_utf8(spans[0][0]) == "AAA"
+
+
+def test_warm_start_prefixes_ema_and_zero_match_guard():
+    src = uv2.UniOMRv2Net(_tiny_v265_cfg())
+    dst = uv2.UniOMRv2Net(_tiny_bekern_full_cfg())
+    prefixed = {f"_orig_mod.{k}": v for k, v in src.state_dict().items()}
+    prefixed["bogus_extra_key"] = torch.zeros(2)
+    info = uv2.warm_start_from_v265_checkpoint(dst, {"ema_state_dict": prefixed})
+    assert info["loaded_count"] > 0
+    assert "bogus_extra_key" in info["unexpected_keys"]
+
+    with pytest.raises(RuntimeError):
+        uv2.warm_start_from_v265_checkpoint(dst, {"model": {"completely_unrelated": torch.zeros(1)}})
+
+
+def test_eval_and_onnx_vocab_spec_for_bekern_full():
+    import eval_uni_suite31 as ev31
+    import export_uni_v2_onnx as exp_v2
+
+    pad_id, bos_id, eos_id, sys_id, tok_to_id, id_to_tok = ev31._vocab_spec(bf.FULL_VOCAB_SIZE)
+    assert (pad_id, bos_id, eos_id, sys_id) == (261, 262, 263, 264)
+    assert tok_to_id["<schema:full>"] >= 265
+    assert id_to_tok[tok_to_id["marcato"]] == "marcato"
+
+    cfg_full = uv2.UniOMRv2Config.iter16_edge85m()
+    vjson = exp_v2.build_vocab_json_v2(cfg_full)
+    assert vjson["vocab_size"] == bf.FULL_VOCAB_SIZE
+    assert len(vjson["vocab"]) == bf.FULL_VOCAB_SIZE
+    assert (vjson["pad_id"], vjson["bos_id"], vjson["eos_id"], vjson["sys_id"]) == (261, 262, 263, 264)
+    assert vjson["vocab"][261:265] == ["<pad>", "<bos>", "<eos>", "<sys>"]
+    assert "<schema:full>" in vjson["vocab"]
+
+
+def test_train_v2_bekern_full_helpers_and_guards(tmp_path):
+    # 1. _model_vocab_list returns FULL_VOCAB for bekern_full and data.VOCAB for iter15
+    assert len(tv2._model_vocab_list(uv2.UniOMRv2Config.iter16_edge85m())) == bf.FULL_VOCAB_SIZE
+    assert len(tv2._model_vocab_list(uv2.UniOMRv2Config.iter15_pro200m())) == 261
+
+    # 2. build_ce_token_weights covers >= 265 tokens for bekern-full
+    w = tv2.build_ce_token_weights(bf.FULL_VOCAB_SIZE, state_weight=1.5, expr_weight=2.0)
+    assert w[bf.FULL_TOKEN_TO_ID["clef-T-4"]].item() == pytest.approx(1.5)
+    assert w[bf.FULL_TOKEN_TO_ID["hairpin-1-cresc"]].item() == pytest.approx(2.0)
+
+    # 3. load_v2_checkpoint forbids mismatched non-265 vocab into bekern-full
+    bad_ckpt = tmp_path / "bad_v237.pt"
+    torch.save({"cfg": {"vocab_size": 237}, "model": {"tok_emb.weight": torch.zeros(237, 64)}}, bad_ckpt)
+    dst = uv2.UniOMRv2Net(_tiny_bekern_full_cfg())
+    with pytest.raises(ValueError):
+        tv2.load_v2_checkpoint(dst, bad_ckpt, encoder_only=False)
+
+
+# ---------------------------------------------------------------------------
+# 6. Round 2 Regression Tests (R2-3 & R2-5: BD3 NaN, all-TEXT_PAD NaN,
+#    context-conditioned text span, DeepStack mem_levels parity, v2a default,
+#    resolved_*_id, Stage-1 register_tokens resume)
+# ---------------------------------------------------------------------------
+
+def test_bd3_repair_loss_finite_with_partial_layer_masks_and_unannotated_tokens():
+    """R2-3: compute_bd3_repair_loss must remain finite when layer_masks suppresses target tokens."""
+    torch.manual_seed(101)
+    model = uv2.UniOMRv2Net(_tiny_bekern_full_cfg())
+    imgs = torch.randn(1, 3, 64, 64)
+    t = bf.FULL_TOKEN_TO_ID
+    # Include unannotated L0 (<part>) and L2 (dyn-f, marcato) tokens under v1 (L1-only) mask
+    tgt_out = torch.tensor(
+        [[t["<part>"], t["quarter"], t["C"], t["4"], t["dyn-f"], t["marcato"], t["half"], bf.EOS_ID]],
+        dtype=torch.long,
+    )
+    mem, _, _ = model.encode_image(imgs, return_aux=False)
+    layer_masks = torch.tensor([bf.SCHEMA_LAYER_BITS["v1"]], dtype=torch.long)
+    loss = uv2.compute_bd3_repair_loss(model, mem[-1], tgt_out, n_views=2, layer_masks=layer_masks)
+    assert torch.isfinite(loss), f"BD3 repair loss was non-finite: {loss}"
+    loss.backward()
+
+
+def test_compute_loss_all_text_pad_targets_finite():
+    """R2-3: all-TEXT_PAD_ID text_byte_targets must return finite 0 loss (never NaN) in both branches."""
+    torch.manual_seed(102)
+    model = uv2.UniOMRv2Net(_tiny_bekern_full_cfg())
+    imgs = torch.randn(1, 3, 64, 64)
+    t = bf.FULL_TOKEN_TO_ID
+    tgt_in = torch.tensor([[bf.BOS_ID, t["<schema:full>"], t["quarter"], t["C"]]])
+    tgt_out = torch.tensor([[t["<schema:full>"], t["quarter"], t["C"], bf.EOS_ID]])
+    out = model(imgs, tgt_in, return_aux=True, return_mtp=False)
+
+    # Branch 1: byte_logits via text_byte_inputs
+    tb_in = torch.full((1, 4), bf.TEXT_PAD_ID, dtype=torch.long)
+    tb_tgt = torch.full((1, 4), bf.TEXT_PAD_ID, dtype=torch.long)
+    losses1 = model.compute_loss(
+        out,
+        tgt_out,
+        layer_masks=torch.tensor([bf.SCHEMA_LAYER_BITS["full"]]),
+        text_byte_inputs=tb_in,
+        text_byte_targets=tb_tgt,
+    )
+    assert torch.isfinite(losses1["text_aux_loss"]) and losses1["text_aux_loss"].item() == 0.0
+    assert torch.isfinite(losses1["loss"])
+
+    # Branch 2: text_logits fallback (text_byte_inputs=None)
+    losses2 = model.compute_loss(
+        out,
+        tgt_out,
+        layer_masks=torch.tensor([bf.SCHEMA_LAYER_BITS["full"]]),
+        text_byte_inputs=None,
+        text_byte_targets=tb_tgt,
+    )
+    assert torch.isfinite(losses2["text_aux_loss"]) and losses2["text_aux_loss"].item() == 0.0
+    assert torch.isfinite(losses2["loss"])
+
+
+def test_decode_utf8_text_span_conditions_on_music_past_kvs_without_mutation_and_deepstack_parity():
+    """R2-5: _decode_utf8_text_span attends to live music past_kvs without mutating it, & mem_levels parity."""
+    torch.manual_seed(103)
+    model = uv2.UniOMRv2Net(_tiny_bekern_full_cfg())
+    model.eval()
+    t = bf.FULL_TOKEN_TO_ID
+    imgs = torch.randn(1, 3, 64, 64)
+
+    with torch.no_grad():
+        mem, _, rinfo = model.encode_image(imgs, return_aux=False)
+        coord_feat = rinfo.get("coord_feat")
+
+        # DeepStack mem_levels exported in forward()
+        tgt_in = torch.tensor([[bf.BOS_ID, t["<schema:full>"], t["quarter"], t["C"]]])
+        out = model(imgs, tgt_in, return_aux=True, return_mtp=False)
+        assert "mem_levels" in out and isinstance(out["mem_levels"], tuple) and len(out["mem_levels"]) == 3
+
+        # Build two distinct music past_kvs contexts on the SAME image
+        kvs_a = model.precompute_cross_kv(mem, coord_feat=coord_feat)
+        _, _, _, _, kvs_a = model._decode_tokens_impl(
+            torch.tensor([[bf.BOS_ID, t["quarter"], t["C"], t["4"]]]),
+            None, return_mtp=False, return_aux=False, past_kvs=kvs_a, use_cache=True,
+        )
+        kvs_b = model.precompute_cross_kv(mem, coord_feat=coord_feat)
+        _, _, _, _, kvs_b = model._decode_tokens_impl(
+            torch.tensor([[bf.BOS_ID, t["half"], t["G"], t["5"], t["bar"]]]),
+            None, return_mtp=False, return_aux=False, past_kvs=kvs_b, use_cache=True,
+        )
+
+        # Snapshot kvs_a self-bank length & values to verify zero mutation
+        snap_len = kvs_a["self_banks"][0][0].shape[2]
+        snap_k = kvs_a["self_banks"][0][0].clone()
+
+        # Run 1-step text logits conditioned on kvs_a+<tempo> vs kvs_b+<harm>
+        _, _, _, _, sk_a = model._decode_tokens_impl(
+            torch.tensor([[t["<tempo>"]]]), None, return_mtp=False, return_aux=False,
+            past_kvs=model._slice_past_kvs_batch(kvs_a, 0), use_cache=True, use_text_emb=False,
+        )
+        _, _, _, logits_a, _ = model._decode_tokens_impl(
+            torch.tensor([[bf.TEXT_BOS_ID]]), None, return_mtp=False, return_aux=False,
+            past_kvs=sk_a, use_cache=True, use_text_emb=True,
+        )
+        _, _, _, _, sk_b = model._decode_tokens_impl(
+            torch.tensor([[t["<harm>"]]]), None, return_mtp=False, return_aux=False,
+            past_kvs=model._slice_past_kvs_batch(kvs_b, 0), use_cache=True, use_text_emb=False,
+        )
+        _, _, _, logits_b, _ = model._decode_tokens_impl(
+            torch.tensor([[bf.TEXT_BOS_ID]]), None, return_mtp=False, return_aux=False,
+            past_kvs=sk_b, use_cache=True, use_text_emb=True,
+        )
+        assert not torch.allclose(logits_a, logits_b, atol=1e-5), (
+            "Text span logits did not condition on distinct music past_kvs contexts!"
+        )
+
+        # Verify _decode_utf8_text_span does NOT mutate the caller's kvs_a
+        _ = model._decode_utf8_text_span(
+            mem, coord_feat, max_len=4,
+            past_kvs_b=model._slice_past_kvs_batch(kvs_a, 0),
+            open_tok_id=t["<tempo>"],
+        )
+        assert kvs_a["self_banks"][0][0].shape[2] == snap_len
+        assert torch.equal(kvs_a["self_banks"][0][0], snap_k)
+
+
+def test_forward_and_loss_v2_defaults_unprefixed_v2a_to_0b0110_and_config_resolved_ids(tmp_path):
+    """R2-5: unprefixed v2a rows default to 0b0110 (not 0b1111); resolved_*_id works with None; Stage-1 resume."""
+    # 1. resolved_*_id returns bekern_full IDs when bekern_full=True and explicit IDs are None
+    cfg_none = _tiny_bekern_full_cfg(pad_id=None, bos_id=None, eos_id=None, sys_id=None, music_vocab_end=None)
+    assert cfg_none.resolved_pad_id() == bf.PAD_ID
+    assert cfg_none.resolved_bos_id() == bf.BOS_ID
+    assert cfg_none.resolved_eos_id() == bf.EOS_ID
+    assert cfg_none.resolved_sys_id() == bf.SYS_ID
+    assert cfg_none.resolved_music_vocab_end() == bf.MUSIC_VOCAB_END
+
+    # 2. forward_and_loss_v2 defaults unprefixed rows to v2a (0b0110), NOT full (0b1111)!
+    torch.manual_seed(104)
+    model = uv2.UniOMRv2Net(_tiny_bekern_full_cfg())
+    t = bf.FULL_TOKEN_TO_ID
+    imgs = torch.randn(2, 3, 64, 64)
+    # Row 0: unprefixed legacy v2a (starts with clef-G-2); Row 1: <schema:full>
+    seq = torch.tensor(
+        [
+            [bf.BOS_ID, t["clef-G-2"], t["quarter"], t["C"], bf.EOS_ID],
+            [bf.BOS_ID, t["<schema:full>"], t["<part>"], t["quarter"], bf.EOS_ID],
+        ],
+        dtype=torch.long,
+    )
+    captured_lm = {}
+    orig_compute_loss = model.compute_loss
+
+    def _spy_compute_loss(*args, **kwargs):
+        captured_lm["layer_masks"] = kwargs.get("layer_masks")
+        return orig_compute_loss(*args, **kwargs)
+
+    model.compute_loss = _spy_compute_loss
+    losses, _ = tv2.forward_and_loss_v2(model, imgs, seq, label_smoothing=0.05)
+    assert torch.isfinite(losses["loss"])
+    assert captured_lm["layer_masks"] is not None
+    assert captured_lm["layer_masks"].tolist() == [
+        bf.SCHEMA_LAYER_BITS["v2a"],
+        bf.SCHEMA_LAYER_BITS["full"],
+    ]
+
+    # 3. prepare_v2_latest_payloads persists warm_start_old_registers for Stage-1 --resume
+    src_model = uv2.UniOMRv2Net(_tiny_v265_cfg())
+    dst_model = uv2.UniOMRv2Net(_tiny_bekern_full_cfg())
+    uv2.warm_start_from_v265_checkpoint(dst_model, {"model": src_model.state_dict()})
+    _, payload, _, _ = tv2.prepare_v2_latest_payloads(
+        out_dir=tmp_path, model=dst_model, cfg=dst_model.cfg, step=5, include_rng_state=False
+    )
+    assert payload["warm_start_old_registers"] == 4

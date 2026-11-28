@@ -116,9 +116,17 @@ from uni_omr_v2 import (  # noqa: E402
     UniOMRv2Config,
     UniOMRv2Net,
     compute_stroke_hog_loss,
+    restore_bekern_full_stage1_frozen_slices,
     set_bekern_full_stage,
     warm_start_from_v265_checkpoint,
 )
+
+
+def _model_vocab_list(cfg: UniOMRv2Config) -> List[str]:
+    """Return the exact serialized vocab list for ``cfg`` (``FULL_VOCAB`` for bekern-full else ``data.VOCAB``)."""
+    if bool(getattr(cfg, "bekern_full", False)) or int(getattr(cfg, "vocab_size", VOCAB_SIZE)) == bekern_full.FULL_VOCAB_SIZE:
+        return list(bekern_full.FULL_VOCAB)
+    return list(data.VOCAB)
 
 
 # ---------------------------------------------------------------------------
@@ -296,6 +304,21 @@ def load_v2_checkpoint(
             flush=True,
         )
         return info
+
+    # Guard: never fall through to legacy _expand_vocab_tensor (which shifts trailing 4 specials)
+    # when loading into a bekern-full model from a non-265 mismatched vocab size!
+    if (
+        (not encoder_only)
+        and bool(getattr(model.cfg, "bekern_full", False))
+        and (old_v is not None)
+        and (old_v != new_v)
+        and (old_v != bekern_full.LEGACY_VOCAB_SIZE)
+    ):
+        raise ValueError(
+            f"Cannot load {ckpt_path} with vocab_size={old_v} into bekern-full model "
+            f"(vocab_size={new_v}): only exact match ({new_v}) or v265 warm-start "
+            f"({bekern_full.LEGACY_VOCAB_SIZE}) is supported."
+        )
 
     can_vocab_expand = (
         (not encoder_only)
@@ -1397,13 +1420,18 @@ def build_optimizer_v2(
     def _build_adamw_groups(
         named_params: Sequence[Tuple[str, nn.Parameter]],
     ) -> Tuple[Any, List[str]]:
-        if not no_decay_1d:
+        stage1_frozen = bool(getattr(model, "_stage1_frozen_slices", None))
+        if (not no_decay_1d) and (not stage1_frozen):
             return [p for _, p in named_params], []
         decay_p: List[nn.Parameter] = []
         nodecay_p: List[nn.Parameter] = []
         nodecay_names: List[str] = []
         for n, p in named_params:
-            if _is_no_decay_param(n, p):
+            is_stage1_exempt = stage1_frozen and (
+                n in ("tok_emb.weight", "lm_head.weight", "lm_head.bias")
+                or n.endswith("register_tokens")
+            )
+            if (no_decay_1d and _is_no_decay_param(n, p)) or is_stage1_exempt:
                 nodecay_p.append(p)
                 nodecay_names.append(n)
             else:
@@ -1594,10 +1622,11 @@ def prepare_v2_latest_payloads(
     latest_payload: Dict[str, Any] = {
         "cfg": cfg_dict,
         "config": cfg_dict,
-        "vocab": list(data.VOCAB),
+        "vocab": _model_vocab_list(cfg),
         "step": int(step),
         "best_val_ser": float(best_val_ser),
         "best_ema_ser": float(best_ema_ser),
+        "warm_start_old_registers": int(getattr(model, "_warm_start_old_registers", 0)),
         "model": model_sd,
     }
     if opt is not None:
@@ -1620,7 +1649,7 @@ def prepare_v2_latest_payloads(
         ema_payload = {
             "cfg": cfg_dict,
             "config": cfg_dict,
-            "vocab": list(data.VOCAB),
+            "vocab": _model_vocab_list(cfg),
             "step": int(step),
             "best_val_ser": float(best_ema_ser),
             "ema_decay": float(gpu_ema.decay),
@@ -1701,7 +1730,7 @@ def atomic_save_v2_ema_milestone(
         {
             "cfg": cfg_dict,
             "config": cfg_dict,
-            "vocab": list(data.VOCAB),
+            "vocab": _model_vocab_list(cfg),
             "step": int(step),
             "best_val_ser": float(best_ema_ser),
             "ema_decay": float(gpu_ema.decay),
@@ -1755,7 +1784,7 @@ def ensure_v2_best_checkpoints(
                 "val_ser": float(best_val_ser),
                 "cfg": cfg_dict,
                 "config": cfg_dict,
-                "vocab": list(data.VOCAB),
+                "vocab": _model_vocab_list(cfg),
                 "model": {k: v.detach().cpu() for k, v in model.state_dict().items()},
             },
         )
@@ -1775,7 +1804,7 @@ def ensure_v2_best_checkpoints(
                 "ema_decay": float(gpu_ema.decay) if gpu_ema is not None else 0.0,
                 "cfg": cfg_dict,
                 "config": cfg_dict,
-                "vocab": list(data.VOCAB),
+                "vocab": _model_vocab_list(cfg),
                 "model": ema_state,
             },
         )
@@ -1933,10 +1962,15 @@ def build_ce_token_weights(
     if cached is not None:
         return cached
     weights = torch.ones((int(vocab_size),), device=device, dtype=dtype)
+    id_to_tok = (
+        bekern_full.FULL_ID_TO_TOKEN
+        if int(vocab_size) > bekern_full.LEGACY_VOCAB_SIZE
+        else data.ID_TO_TOKEN
+    )
     if st_w != 1.0:
         state_ids = [
             int(tid)
-            for tid, tok in data.ID_TO_TOKEN.items()
+            for tid, tok in id_to_tok.items()
             if int(tid) < int(vocab_size) and str(tok).startswith(_STATE_TOKEN_PREFIXES)
         ]
         if state_ids:
@@ -1944,7 +1978,7 @@ def build_ce_token_weights(
     if ex_w != 1.0:
         expr_ids = [
             int(tid)
-            for tid, tok in data.ID_TO_TOKEN.items()
+            for tid, tok in id_to_tok.items()
             if int(tid) < int(vocab_size) and _is_expr_token(tok)
         ]
         if expr_ids:
@@ -2017,6 +2051,9 @@ def forward_and_loss_v2(
     is_v1_schema: Optional[torch.Tensor] = None,
     has_v1_schema: Optional[bool] = None,
     schema_mask_v1: bool = True,
+    layer_masks: Optional[torch.Tensor] = None,
+    text_byte_targets: Optional[torch.Tensor] = None,
+    text_byte_inputs: Optional[torch.Tensor] = None,
     sys_y_target: Optional[torch.Tensor] = None,
     sys_y_mask: Optional[torch.Tensor] = None,
     staff_seg_target: Optional[torch.Tensor] = None,
@@ -2097,6 +2134,7 @@ def forward_and_loss_v2(
                         [tgt_in[:, :1], torch.where(cass_mask, pred_ids[:, :-1], tail_in)],
                         dim=1,
                     )
+                cass_extra: Dict[str, Any] = {}
                 logits, mtp_logits, sys_y_pred, text_logits, _ = model._decode_tokens_impl(
                     dec_in,
                     mem_levels,
@@ -2105,6 +2143,7 @@ def forward_and_loss_v2(
                     apply_tok_dropout=False,
                     coord_feat=coord_feat,
                     targets=tgt_out,
+                    out_extra=cass_extra if model.cfg.bekern_full else None,
                 )
                 out: Dict[str, Any] = {
                     "logits": logits,
@@ -2117,8 +2156,12 @@ def forward_and_loss_v2(
                 }
                 if text_logits is not None:
                     out["text_logits"] = text_logits
-                if model.bd3_repair_head is not None:
+                if "text_gate_logits" in cass_extra:
+                    out["text_gate_logits"] = cass_extra["text_gate_logits"]
+                if model.bd3_repair_head is not None or model.cfg.bekern_full:
                     out["mem_final"] = mem_levels[-1]
+                if model.cfg.bekern_full:
+                    out["mem_levels"] = mem_levels
             else:
                 out = model(
                     images,
@@ -2145,8 +2188,33 @@ def forward_and_loss_v2(
                 dtype=s_logits.dtype,
             )
 
+        # Derive 4-bit layer_masks for bekern-full models from batch layer_masks or <schema:*> prefix tokens.
+        eff_layer_masks: Optional[torch.Tensor] = layer_masks
+        if bool(getattr(model.cfg, "bekern_full", False)) and eff_layer_masks is None:
+            bsz_lm = int(tgt_out.shape[0])
+            default_bits = bekern_full.SCHEMA_LAYER_BITS["v2a"]
+            eff_layer_masks = torch.full(
+                (bsz_lm,), default_bits, device=tgt_out.device, dtype=torch.long
+            )
+            if is_v1_schema is not None:
+                v1_b = is_v1_schema.to(device=tgt_out.device, dtype=torch.bool)
+                eff_layer_masks = torch.where(
+                    v1_b,
+                    torch.full_like(eff_layer_masks, bekern_full.SCHEMA_LAYER_BITS["v1"]),
+                    eff_layer_masks,
+                )
+            if tgt_out.shape[1] > 0:
+                first_toks = tgt_out[:, 0]
+                for s_tok, s_bits in bekern_full.SCHEMA_TOKEN_TO_BITS.items():
+                    s_tid = bekern_full.FULL_TOKEN_TO_ID[s_tok]
+                    eff_layer_masks = torch.where(
+                        first_toks == s_tid,
+                        torch.full_like(eff_layer_masks, s_bits),
+                        eff_layer_masks,
+                    )
+
         # Schema conditioning: mask the 28 bekern+v2a-only token logits to -1e4 on v1 rows
-        # (prevents false-negative poisoning on v1/HW rows while keeping vocab_size=265 KD-compatible).
+        # (disabled when 4-bit layer_masks is active for bekern-full).
         # Preserve s_logits_raw BEFORE mutating out["logits"] so 265-vocab KD never sees -1e4 spikes.
         s_logits_raw: torch.Tensor = out["logits"]
         applied_v1_mask = False
@@ -2154,7 +2222,8 @@ def forward_and_loss_v2(
         v_dim_masked = 0
         v2a_ids: Optional[torch.Tensor] = None
         _do_v1_mask = (
-            schema_mask_v1
+            (eff_layer_masks is None)
+            and schema_mask_v1
             and is_v1_schema is not None
             and (bool(has_v1_schema) if has_v1_schema is not None else bool(is_v1_schema.any()))
         )
@@ -2194,6 +2263,13 @@ def forward_and_loss_v2(
                 extra_loss_kwargs["v2a_token_ids"] = v2a_ids
             if _has_v1_kw[2]:
                 extra_loss_kwargs["has_v1_schema"] = True
+
+        if eff_layer_masks is not None:
+            extra_loss_kwargs["layer_masks"] = eff_layer_masks
+        if text_byte_targets is not None:
+            extra_loss_kwargs["text_byte_targets"] = text_byte_targets
+        if text_byte_inputs is not None:
+            extra_loss_kwargs["text_byte_inputs"] = text_byte_inputs
 
         losses = model.compute_loss(
             out,
@@ -2676,9 +2752,14 @@ def eval_dataset_v2(
 
         pred_cpu = pred_ids.detach().cpu().tolist()
         ref_cpu = seqs.detach().cpu().tolist()
+        _use_bf_dec = (
+            bool(getattr(model.cfg, "bekern_full", False))
+            or int(getattr(model.cfg, "vocab_size", VOCAB_SIZE)) == bekern_full.FULL_VOCAB_SIZE
+        )
+        _decode_fn = bekern_full.decode_full if _use_bf_dec else decode_uni
         for p_row, r_row in zip(pred_cpu, ref_cpu):
-            pred_toks = decode_uni(p_row, skip_special=True)
-            ref_toks = decode_uni(r_row, skip_special=True)
+            pred_toks = _decode_fn(p_row, skip_special=True)
+            ref_toks = _decode_fn(r_row, skip_special=True)
             edits = levenshtein_distance(ref_toks, pred_toks)
             total_edits += edits
             total_ref_toks += len(ref_toks)
@@ -3547,6 +3628,8 @@ def run_train_v2(args: argparse.Namespace) -> Dict[str, Any]:
         except Exception:
             resume_ckpt = torch.load(str(resume_path), map_location="cpu", weights_only=False)
         model.load_state_dict(_extract_state_dict(resume_ckpt), strict=True)
+        if isinstance(resume_ckpt, dict) and resume_ckpt.get("warm_start_old_registers") is not None:
+            model._warm_start_old_registers = int(resume_ckpt["warm_start_old_registers"])
         print(
             f"[UniOMRv2 resume] loaded model weights from {resume_path} "
             f"(step={int(resume_ckpt.get('step', 0))})",
@@ -3688,13 +3771,20 @@ def run_train_v2(args: argparse.Namespace) -> Dict[str, Any]:
                 gpu_ema.load_state_dict(ema_sd)
         saved_opt_states = resume_ckpt.get("optimizer_states")
         if isinstance(saved_opt_states, list) and len(saved_opt_states) == len(opt.optimizers):
-            for o_inst, o_sd in zip(opt.optimizers, saved_opt_states):
-                o_inst.load_state_dict(o_sd)
-            print(
-                f"[UniOMRv2 resume] restored {len(saved_opt_states)} optimizer state(s) "
-                f"(mode={resume_ckpt.get('optimizer_mode', opt.mode)})",
-                flush=True,
-            )
+            try:
+                for o_inst, o_sd in zip(opt.optimizers, saved_opt_states):
+                    o_inst.load_state_dict(o_sd)
+                print(
+                    f"[UniOMRv2 resume] restored {len(saved_opt_states)} optimizer state(s) "
+                    f"(mode={resume_ckpt.get('optimizer_mode', opt.mode)})",
+                    flush=True,
+                )
+            except ValueError as exc:
+                print(
+                    f"[WARN] --resume optimizer state mismatch (e.g. --bekern-full-stage changed): "
+                    f"{exc}; continuing with fresh optimizer state",
+                    flush=True,
+                )
         elif saved_opt_states is not None:
             print(
                 f"[WARN] --resume optimizer count mismatch "
@@ -3789,7 +3879,18 @@ def run_train_v2(args: argparse.Namespace) -> Dict[str, Any]:
         step_idx: int,
         micro_idx: int,
         want_fp: bool,
-    ) -> Tuple[torch.Tensor, torch.Tensor, List[str], str, List[str], Optional[torch.Tensor], bool]:
+    ) -> Tuple[
+        torch.Tensor,
+        torch.Tensor,
+        List[str],
+        str,
+        List[str],
+        Optional[torch.Tensor],
+        bool,
+        Optional[torch.Tensor],
+        Optional[torch.Tensor],
+        Optional[torch.Tensor],
+    ]:
         if not use_real_data:
             bs_syn = args.batch_size if want_fp else strip_batch_size
             imgs, sq, _ = _make_synthetic_batch(
@@ -3801,7 +3902,20 @@ def run_train_v2(args: argparse.Namespace) -> Dict[str, Any]:
                 with_uv=False,
             )
             sids = [f"syn_{step_idx}_{micro_idx}_{i}" for i in range(bs_syn)]
-            return imgs, sq, sids, ("fullpage" if want_fp else "strip"), [""] * bs_syn, None, False
+            return imgs, sq, sids, ("fullpage" if want_fp else "strip"), [""] * bs_syn, None, False, None, None, None
+
+        def _extract_bekern_extras(
+            batch_dict: Dict[str, Any],
+        ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor], Optional[torch.Tensor]]:
+            nb = device.type == "cuda"
+            lm = batch_dict.get("layer_masks")
+            tbi = batch_dict.get("text_byte_inputs")
+            tbt = batch_dict.get("text_byte_targets")
+            return (
+                lm.to(device, non_blocking=nb) if isinstance(lm, torch.Tensor) else None,
+                tbi.to(device, non_blocking=nb) if isinstance(tbi, torch.Tensor) else None,
+                tbt.to(device, non_blocking=nb) if isinstance(tbt, torch.Tensor) else None,
+            )
 
         img_dtype = torch.bfloat16 if use_bf16 else torch.float32
         if want_fp and fullpage_train_iter is not None:
@@ -3816,6 +3930,7 @@ def run_train_v2(args: argparse.Namespace) -> Dict[str, Any]:
             if isinstance(is_v1, torch.Tensor):
                 has_v1 = bool(is_v1.any())
                 is_v1 = is_v1.to(device, non_blocking=(device.type == "cuda"))
+            lm, tbi, tbt = _extract_bekern_extras(b)
             return (
                 imgs,
                 b["seq"].to(device, non_blocking=(device.type == "cuda")),
@@ -3824,6 +3939,9 @@ def run_train_v2(args: argparse.Namespace) -> Dict[str, Any]:
                 list(b.get("domains", [])),
                 is_v1,
                 has_v1,
+                lm,
+                tbi,
+                tbt,
             )
 
         if mix_strip_domains:
@@ -3855,6 +3973,7 @@ def run_train_v2(args: argparse.Namespace) -> Dict[str, Any]:
             if isinstance(is_v1, torch.Tensor):
                 has_v1 = bool(is_v1.any())
                 is_v1 = is_v1.to(device, non_blocking=(device.type == "cuda"))
+            lm, tbi, tbt = _extract_bekern_extras(b)
             return (
                 imgs,
                 b["seq"].to(device, non_blocking=(device.type == "cuda")),
@@ -3863,6 +3982,9 @@ def run_train_v2(args: argparse.Namespace) -> Dict[str, Any]:
                 doms,
                 is_v1,
                 has_v1,
+                lm,
+                tbi,
+                tbt,
             )
 
         if strip_train_iter is not None and hw_strip_train_iter is not None:
@@ -3882,6 +4004,7 @@ def run_train_v2(args: argparse.Namespace) -> Dict[str, Any]:
             if isinstance(is_v1, torch.Tensor):
                 has_v1 = bool(is_v1.any())
                 is_v1 = is_v1.to(device, non_blocking=(device.type == "cuda"))
+            lm, tbi, tbt = _extract_bekern_extras(b)
             return (
                 imgs,
                 b["seq"].to(device, non_blocking=(device.type == "cuda")),
@@ -3890,6 +4013,9 @@ def run_train_v2(args: argparse.Namespace) -> Dict[str, Any]:
                 list(b.get("domains", [])),
                 is_v1,
                 has_v1,
+                lm,
+                tbi,
+                tbt,
             )
         it = hw_strip_train_iter if hw_strip_train_iter is not None else strip_train_iter
         kind = "hw_strip" if hw_strip_train_iter is not None else "strip"
@@ -3905,6 +4031,7 @@ def run_train_v2(args: argparse.Namespace) -> Dict[str, Any]:
         if isinstance(is_v1, torch.Tensor):
             has_v1 = bool(is_v1.any())
             is_v1 = is_v1.to(device, non_blocking=(device.type == "cuda"))
+        lm, tbi, tbt = _extract_bekern_extras(b)
         return (
             imgs,
             b["seq"].to(device, non_blocking=(device.type == "cuda")),
@@ -3913,6 +4040,9 @@ def run_train_v2(args: argparse.Namespace) -> Dict[str, Any]:
             list(b.get("domains", [])),
             is_v1,
             has_v1,
+            lm,
+            tbi,
+            tbt,
         )
 
     def _run_eval_suite(step_label: Any) -> Dict[str, Any]:
@@ -4114,7 +4244,18 @@ def run_train_v2(args: argparse.Namespace) -> Dict[str, Any]:
             oom_hit = False
 
             for micro in range(step_ga):
-                images, seq, sample_ids, kind, domains, is_v1_schema, has_v1_schema = _next_batch(
+                (
+                    images,
+                    seq,
+                    sample_ids,
+                    kind,
+                    domains,
+                    is_v1_schema,
+                    has_v1_schema,
+                    batch_layer_masks,
+                    batch_text_byte_inputs,
+                    batch_text_byte_targets,
+                ) = _next_batch(
                     step, micro, want_fp=step_is_fp
                 )
                 try:
@@ -4148,6 +4289,9 @@ def run_train_v2(args: argparse.Namespace) -> Dict[str, Any]:
                         text_aux_loss_weight=text_aux_loss_weight,
                         bd3_repair_weight=float(getattr(args, "bd3_repair_weight", 0.0)),
                         bd3_n_views=int(getattr(args, "bd3_n_views", 2)),
+                        layer_masks=batch_layer_masks,
+                        text_byte_inputs=batch_text_byte_inputs,
+                        text_byte_targets=batch_text_byte_targets,
                         is_v1_schema=is_v1_schema,
                         has_v1_schema=has_v1_schema,
                         schema_mask_v1=schema_mask_v1,
@@ -4180,6 +4324,8 @@ def run_train_v2(args: argparse.Namespace) -> Dict[str, Any]:
             if grad_clip > 0.0:
                 torch.nn.utils.clip_grad_norm_(trainable_params, grad_clip)
             opt.step()
+            if bekern_stage == 1:
+                restore_bekern_full_stage1_frozen_slices(model)
             if qat_ctrl is not None and qat_ctrl.enabled:
                 qat_ctrl.refresh_cache()
             if (
@@ -4359,7 +4505,7 @@ def run_train_v2(args: argparse.Namespace) -> Dict[str, Any]:
                                 "fullpage_hw_val_ser": eval_rec.get("fullpage_hw_val_ser"),
                                 "cfg": asdict(cfg),
                                 "config": asdict(cfg),
-                                "vocab": list(data.VOCAB),
+                                "vocab": _model_vocab_list(cfg),
                                 "model": {k: v.detach().cpu() for k, v in model.state_dict().items()},
                             },
                         )
@@ -4389,7 +4535,7 @@ def run_train_v2(args: argparse.Namespace) -> Dict[str, Any]:
                                 "ema_decay": gpu_ema_decay,
                                 "cfg": asdict(cfg),
                                 "config": asdict(cfg),
-                                "vocab": list(data.VOCAB),
+                                "vocab": _model_vocab_list(cfg),
                                 "model": gpu_ema.cpu_state_dict(model),
                             },
                         )

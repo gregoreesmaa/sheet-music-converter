@@ -47,6 +47,7 @@ _THIS_DIR = Path(__file__).resolve().parent
 if str(_THIS_DIR) not in sys.path:
     sys.path.insert(0, str(_THIS_DIR))
 
+import bekern_full  # noqa: E402
 import data  # noqa: E402
 import uni_omr_v2  # noqa: E402
 
@@ -1297,13 +1298,24 @@ def build_vocab_json_v2(
     ckpt_vocab: Optional[List[str]] = None,
 ) -> Dict[str, Any]:
     vocab_size = int(cfg.vocab_size)
-    n_base = vocab_size - 4
-    base_vocab = list(ckpt_vocab) if ckpt_vocab and len(ckpt_vocab) == n_base else list(data.VOCAB[:n_base])
-    pad_id = vocab_size - 4
-    bos_id = vocab_size - 3
-    eos_id = vocab_size - 2
-    sys_id = vocab_size - 1
-    full_vocab = base_vocab + ["<pad>", "<bos>", "<eos>", uni_omr_v2.SYS_TOKEN]
+    if bool(getattr(cfg, "bekern_full", False)) or vocab_size == bekern_full.FULL_VOCAB_SIZE:
+        full_vocab = (
+            list(ckpt_vocab)
+            if (ckpt_vocab and len(ckpt_vocab) == vocab_size)
+            else list(bekern_full.FULL_VOCAB)
+        )
+        pad_id = cfg.resolved_pad_id()
+        bos_id = cfg.resolved_bos_id()
+        eos_id = cfg.resolved_eos_id()
+        sys_id = cfg.resolved_sys_id()
+    else:
+        n_base = vocab_size - 4
+        base_vocab = list(ckpt_vocab) if ckpt_vocab and len(ckpt_vocab) == n_base else list(data.VOCAB[:n_base])
+        pad_id = vocab_size - 4
+        bos_id = vocab_size - 3
+        eos_id = vocab_size - 2
+        sys_id = vocab_size - 1
+        full_vocab = base_vocab + ["<pad>", "<bos>", "<eos>", uni_omr_v2.SYS_TOKEN]
     assert len(full_vocab) == vocab_size
     return {
         "arch": "uni_omr_v2",
@@ -1388,7 +1400,7 @@ def _export_dynamic_target(
 
     # 2. Export Dynamic-KV All-T MTP Decoder
     # Trace with past_len=3, step_pos=2, T=4 so both dynamic seq_len and KV slicing stay dynamic!
-    bos_id = int(cfg.vocab_size) - 3
+    bos_id = cfg.resolved_bos_id()
     dummy_toks = torch.full((1, 4), bos_id, dtype=torch.long)
     dummy_pos = torch.tensor([2], dtype=torch.long)
     dummy_past_ks = [torch.zeros(1, n_kv_heads, 3, head_dim, dtype=torch.float32) for _ in range(n_dec)]
@@ -1569,7 +1581,7 @@ def _export_npu_target(
         )
 
     # 2. Export 100% Static Ring-Buffer KV Decoder (NO dynamic_axes!)
-    bos_id = int(cfg.vocab_size) - 3
+    bos_id = cfg.resolved_bos_id()
     dummy_toks = torch.full((1, npu_dec_t), bos_id, dtype=torch.long)
     dummy_pos = torch.tensor([0], dtype=torch.long)
     dummy_past_ks = [torch.zeros(1, n_kv_heads, npu_kv_max_len, head_dim, dtype=torch.float32) for _ in range(n_dec)]

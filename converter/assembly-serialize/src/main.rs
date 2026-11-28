@@ -160,7 +160,7 @@ struct BekernArgs {
     /// Emit 4-layer `bekern-full` (`<schema:full>`, Layers 0–3: structure/
     /// multi-part, microtones/beams/percussion/TAB, lossless expressive split,
     /// end-of-system anchored lyrics & text spans).
-    #[arg(long, default_value_t = false)]
+    #[arg(long, default_value_t = false, conflicts_with = "v2")]
     full: bool,
 }
 

@@ -38,9 +38,10 @@ backward compatibility** with Iter 15's frozen ``data.py`` (``len(VOCAB)=261``,
 
 from __future__ import annotations
 
+import re
 import sys
 from pathlib import Path
-from typing import Dict, FrozenSet, List, Optional, Sequence, Set, Tuple, Union
+from typing import Any, Dict, FrozenSet, List, Optional, Sequence, Set, Tuple, Union
 
 _THIS_DIR = Path(__file__).resolve().parent
 if str(_THIS_DIR) not in sys.path:
@@ -75,6 +76,7 @@ __all__ = [
     "TEXT_SPAN_CLOSE_TOKEN_ID",
     "MODE_SWITCH_TOKENS",
     "MODE_SWITCH_TOKEN_IDS",
+    "VALID_MUSIC_BODY_TOKEN_IDS",
     "is_mode_switch_token",
     # Layer bitmask & CE masking
     "LAYER_BIT_L0",
@@ -99,7 +101,10 @@ __all__ = [
     # Encode / decode helpers
     "encode_full",
     "decode_full",
+    "encode_bekern_full_sequence",
+    "decode_bekern_full_sequence",
     # Grammar FSA
+    "MAX_LAYER3_SPAN_TOKENS",
     "BekernFullGrammarState",
 ]
 
@@ -143,6 +148,15 @@ LAYER0_TOKENS: Tuple[str, ...] = (
     "Segno",
     "Coda",
     "Fine",
+    # Finite Layer 0 structural / grouping / staff-line / transpose / count arguments
+    "brace",
+    "bracket",
+    "barline",
+    "lines-1", "lines-2", "lines-3", "lines-4", "lines-5", "lines-6",
+    *(str(i) for i in range(-24, -1)),
+    "+1", "+2", "+3", "+4", "+5", "+6", "+7", "+8", "+9", "+10", "+11", "+12",
+    *(str(i) for i in range(9, 25)),
+    ":",
 )
 
 LAYER1_NEW_TOKENS: Tuple[str, ...] = (
@@ -183,6 +197,12 @@ LAYER1_NEW_TOKENS: Tuple[str, ...] = (
     "xstaff-6",
     "xstaff-7",
     "xstaff-8",
+    # Finite Layer 1 TAB string/fret, TAB clef, and extended cross-staff arguments
+    "str-1", "str-2", "str-3", "str-4", "str-5", "str-6",
+    *(f"fret-{i}" for i in range(25)),
+    "clef-T-4", "clef-T-5", "clef-T-6",
+    "xstaff-9", "xstaff-10", "xstaff-11", "xstaff-12",
+    "xstaff-13", "xstaff-14", "xstaff-15", "xstaff-16",
 )
 
 LAYER2_NEW_TOKENS: Tuple[str, ...] = (
@@ -199,6 +219,7 @@ LAYER2_NEW_TOKENS: Tuple[str, ...] = (
     "15ma-close",
     "15mb-open",
     "15mb-close",
+    "15-stop",
     "pedal-sost-open",
     "pedal-sost-close",
     "pedal-uc-open",
@@ -241,8 +262,8 @@ LAYER3_LYRIC_MARKERS: Tuple[str, ...] = (
     "lyr-end",
     "lyr-ext",
 )
-LAYER3_ANCHORS: Tuple[str, ...] = tuple(f"@{i}" for i in range(64))
-LAYER3_VERSES: Tuple[str, ...] = tuple(f"v={i}" for i in range(1, 5))
+LAYER3_ANCHORS: Tuple[str, ...] = tuple(f"@{i}" for i in range(256))
+LAYER3_VERSES: Tuple[str, ...] = tuple(f"v={i}" for i in range(1, 9))
 
 LAYER3_TOKENS: Tuple[str, ...] = (
     TEXT_SPAN_OPEN_TOKENS
@@ -473,8 +494,14 @@ def masked_layer_cross_entropy(
     target_ids,
     layer_masks,
     label_smoothing: float = 0.0,
+    weight=None,
 ):
-    """Compute layer-masked CE loss applying both target and logit-suppression masks."""
+    """Compute layer-masked CE loss applying both target and logit-suppression masks.
+
+    When ``label_smoothing > 0.0``, computes manual ``log_softmax`` and averages the
+    uniform smoothing term **strictly over active (unsuppressed) classes** so
+    ``-inf`` suppressed classes never produce ``loss = +inf`` or biased gradients.
+    """
     import torch
     import torch.nn.functional as F
 
@@ -483,19 +510,47 @@ def masked_layer_cross_entropy(
         target_ids, layer_masks, vocab_size=vocab_size
     )
     masked_logits = logits.masked_fill(logit_suppress_mask.unsqueeze(1), float("-inf"))
-    masked_targets = torch.where(
-        target_mask,
-        target_ids.to(dtype=torch.long),
-        torch.full_like(target_ids, -100, dtype=torch.long),
-    )
     if not bool(target_mask.any()):
         return logits.sum() * 0.0
-    return F.cross_entropy(
-        masked_logits.reshape(bsz * seq_len, vocab_size),
-        masked_targets.reshape(bsz * seq_len),
-        ignore_index=-100,
-        label_smoothing=float(label_smoothing),
-    )
+
+    eps = float(label_smoothing)
+    if eps <= 0.0:
+        masked_targets = torch.where(
+            target_mask,
+            target_ids.to(dtype=torch.long),
+            torch.full_like(target_ids, -100, dtype=torch.long),
+        )
+        w = weight.to(device=logits.device, dtype=logits.dtype) if weight is not None else None
+        return F.cross_entropy(
+            masked_logits.reshape(bsz * seq_len, vocab_size),
+            masked_targets.reshape(bsz * seq_len),
+            weight=w,
+            ignore_index=-100,
+            label_smoothing=0.0,
+        )
+
+    # Manual active-class-only label smoothing in float32 for numerical stability.
+    active_mask = ~logit_suppress_mask  # (B, V)
+    log_probs = F.log_softmax(masked_logits.float(), dim=-1)  # (B, T, V)
+    safe_tgt = target_ids.to(dtype=torch.long).clamp(min=0, max=max(0, vocab_size - 1))
+
+    # Zero out suppressed (-inf) entries BEFORE gathering nll or summing so suppressed
+    # targets never produce +inf * 0 = NaN.
+    active_lp = torch.where(active_mask.unsqueeze(1), log_probs, torch.zeros_like(log_probs))
+    nll = -active_lp.gather(dim=-1, index=safe_tgt.unsqueeze(-1)).squeeze(-1)  # (B, T)
+    active_cnt = active_mask.sum(dim=-1, keepdim=True).clamp(min=1).to(log_probs.dtype)  # (B, 1)
+    smooth_loss = -active_lp.sum(dim=-1) / active_cnt  # (B, T)
+
+    per_tok = (1.0 - eps) * nll + eps * smooth_loss  # (B, T)
+    per_tok = torch.where(target_mask, per_tok, torch.zeros_like(per_tok))
+    valid_f = target_mask.to(per_tok.dtype)
+    if weight is not None:
+        w_f = weight.to(device=logits.device, dtype=per_tok.dtype)
+        tok_w = torch.where(target_mask, w_f[safe_tgt], torch.zeros_like(per_tok))
+        loss = (per_tok * tok_w).sum() / tok_w.sum().clamp(min=1e-12)
+    else:
+        loss = per_tok.sum() / valid_f.sum().clamp(min=1.0)
+    return loss.to(logits.dtype)
 
 
 # ---------------------------------------------------------------------------
@@ -506,6 +561,33 @@ _NON_BODY_SPECIAL_IDS: FrozenSet[int] = frozenset(
     (PAD_ID, BOS_ID, EOS_ID, SYS_ID)
 ) | SCHEMA_TOKEN_IDS
 
+VALID_MUSIC_BODY_TOKEN_IDS: Tuple[int, ...] = tuple(
+    i
+    for i in range(MUSIC_VOCAB_END)
+    if i not in _NON_BODY_SPECIAL_IDS and TOKEN_LAYER_ID[i] in (0, 1, 2)
+)
+
+_IS_BODY_LUT_CACHE: Dict[Any, Any] = {}
+_OPEN_IDS_TENSOR_CACHE: Dict[Any, Any] = {}
+
+
+def _get_body_luts(device):
+    """Return device-cached ``(is_body_lut, is_open_lut)`` boolean tensors of size ``FULL_VOCAB_SIZE``."""
+    import torch
+
+    cached = _IS_BODY_LUT_CACHE.get(device)
+    if cached is not None:
+        return cached
+    body_lut = torch.zeros(FULL_VOCAB_SIZE, dtype=torch.bool, device=device)
+    if VALID_MUSIC_BODY_TOKEN_IDS:
+        body_lut[list(VALID_MUSIC_BODY_TOKEN_IDS)] = True
+    open_lut = torch.zeros(FULL_VOCAB_SIZE, dtype=torch.bool, device=device)
+    if TEXT_SPAN_OPEN_TOKEN_IDS:
+        open_lut[sorted(TEXT_SPAN_OPEN_TOKEN_IDS)] = True
+    val = (body_lut, open_lut)
+    _IS_BODY_LUT_CACHE[device] = val
+    return val
+
 
 def compute_is_music_body_mask(token_ids):
     """Return BoolTensor True ONLY for Layers 0-2 music body tokens (Mitigation #7).
@@ -514,8 +596,11 @@ def compute_is_music_body_mask(token_ids):
     - ``<pad>``, ``<bos>``, ``<eos>``, ``<sys>``, and ``<schema:*>`` prefixes;
     - Any token inside a Layer 3 text span (from ``<sys_lyr>`` / ``<harm>`` /
       ``<tempo>`` / ``<dir>`` / ``<reh>`` / ``<fb>`` through and including
-      ``</text_span>``);
+      ``</text_span>``, tracking nested ``span_depth`` cleanly);
     - Any stray Layer 3 token outside an explicit span.
+
+    Implemented purely on-device via vectorized PyTorch ``cumsum`` + ``cummin``
+    with zero GPU->CPU synchronization.
     """
     import torch
 
@@ -529,32 +614,25 @@ def compute_is_music_body_mask(token_ids):
         raise ValueError(f"token_ids must be 1D or 2D, got shape {tuple(toks.shape)}")
 
     device = toks_2d.device
-    rows = toks_2d.detach().cpu().tolist()
-    out_rows: List[List[bool]] = []
-    for row in rows:
-        in_span = False
-        mask_row: List[bool] = []
-        for raw_tid in row:
-            tid = int(raw_tid)
-            if tid in TEXT_SPAN_OPEN_TOKEN_IDS:
-                in_span = True
-                mask_row.append(False)
-                continue
-            if tid == TEXT_SPAN_CLOSE_TOKEN_ID:
-                in_span = False
-                mask_row.append(False)
-                continue
-            if in_span:
-                mask_row.append(False)
-                continue
-            if tid in _NON_BODY_SPECIAL_IDS:
-                mask_row.append(False)
-                continue
-            layer = token_layer_of(tid)
-            mask_row.append(layer in (0, 1, 2))
-        out_rows.append(mask_row)
+    body_lut, open_lut = _get_body_luts(device)
+    in_range = (toks_2d >= 0) & (toks_2d < FULL_VOCAB_SIZE)
+    safe_ids = toks_2d.clamp(min=0, max=FULL_VOCAB_SIZE - 1)
 
-    mask = torch.tensor(out_rows, dtype=torch.bool, device=device)
+    is_open = in_range & open_lut[safe_ids]
+    is_close = in_range & (safe_ids == TEXT_SPAN_CLOSE_TOKEN_ID)
+
+    # Exact running span depth d_t = max(0, d_{t-1} + open_t - close_t) on-device:
+    delta = is_open.to(torch.int64) - is_close.to(torch.int64)
+    raw_depth = delta.cumsum(dim=1)
+    if raw_depth.shape[1] > 0:
+        min_prefix = torch.cummin(raw_depth, dim=1).values.clamp(max=0)
+        span_depth = raw_depth - min_prefix
+    else:
+        span_depth = raw_depth
+
+    in_or_edge_span = (span_depth > 0) | is_open | is_close
+    is_body_tok = in_range & body_lut[safe_ids]
+    mask = is_body_tok & (~in_or_edge_span)
     return mask.squeeze(0) if squeezed else mask
 
 
@@ -624,6 +702,206 @@ def decode_full(ids: Sequence[int], skip_special: bool = True) -> List[str]:
     return out
 
 
+_SYS_LYR_ATTR_RE = re.compile(r"<sys_lyr\s+(v=\d+)>")
+_TUP_OPEN_PARAM_RE = re.compile(r"^tup-open-(\d+):(\d+)$")
+_MULTIREST_PARAM_RE = re.compile(r"^multirest-(\d+)$")
+
+
+def _decompose_uint_tokens(num_str: str) -> List[str]:
+    """Decompose an unsigned integer string into finite vocab tokens (exact if <=12 else digits)."""
+    if num_str in FULL_TOKEN_TO_ID:
+        return [num_str]
+    return [ch for ch in num_str]
+
+
+def encode_bekern_full_sequence(
+    text: str,
+    add_bos_eos: bool = True,
+) -> Dict[str, Any]:
+    """Split a ``bekern-full`` string into dual-head ``music_ids`` + UTF-8 ``text_spans``.
+
+    - Handles parameterized ``tup-open-{a}:{n}`` -> ``[tup-open, a, :, n]`` and
+      ``multirest-{n}`` -> ``[<multirest>, digits]`` with ZERO OOVs.
+    - Normalizes ``<sys_lyr v=N>`` to ``<sys_lyr>`` + ``v=N`` cleanly.
+    - Extracts every Layer 3 text payload (``<sys_lyr>``, ``<harm>``, ``<tempo>``,
+      ``<dir>``, ``<reh>``, ``<fb>`` ... ``</text_span>``) into UTF-8 byte ID lists
+      via ``encode_text_span_utf8()``.
+    """
+    norm = _SYS_LYR_ATTR_RE.sub(r"<sys_lyr> \1", text)
+    raw_toks = norm.split()
+
+    music_ids: List[int] = [BOS_ID] if add_bos_eos else []
+    text_spans: List[List[int]] = []
+    text_span_meta: List[Dict[str, Any]] = []
+
+    in_span = False
+    cur_tag: Optional[str] = None
+    cur_open_idx = -1
+    cur_payload: List[str] = []
+
+    for tok in raw_toks:
+        if in_span:
+            if tok == TEXT_SPAN_CLOSE_TOKEN:
+                payload_str = " ".join(cur_payload)
+                byte_ids = encode_text_span_utf8(payload_str, add_bos_eos=True)
+                text_spans.append(byte_ids)
+                text_span_meta.append(
+                    {
+                        "tag": cur_tag,
+                        "music_open_idx": cur_open_idx,
+                        "text": payload_str,
+                    }
+                )
+                music_ids.append(TEXT_SPAN_CLOSE_TOKEN_ID)
+                in_span = False
+                cur_tag = None
+                cur_payload = []
+            else:
+                cur_payload.append(tok)
+            continue
+
+        if tok in TEXT_SPAN_OPEN_TOKENS:
+            cur_open_idx = len(music_ids)
+            music_ids.append(FULL_TOKEN_TO_ID[tok])
+            in_span = True
+            cur_tag = tok
+            cur_payload = []
+            continue
+
+        m_tup = _TUP_OPEN_PARAM_RE.match(tok)
+        if m_tup is not None:
+            a_str, n_str = m_tup.group(1), m_tup.group(2)
+            parts = ["tup-open"] + _decompose_uint_tokens(a_str) + [":"] + _decompose_uint_tokens(n_str)
+            for p in parts:
+                music_ids.append(FULL_TOKEN_TO_ID[p])
+            continue
+
+        m_mr = _MULTIREST_PARAM_RE.match(tok)
+        if m_mr is not None:
+            mr_id = FULL_TOKEN_TO_ID["<multirest>"]
+            if not music_ids or music_ids[-1] != mr_id:
+                music_ids.append(mr_id)
+            for p in _decompose_uint_tokens(m_mr.group(1)):
+                music_ids.append(FULL_TOKEN_TO_ID[p])
+            continue
+
+        tid = FULL_TOKEN_TO_ID.get(tok)
+        if tid is None:
+            raise ValueError(f"unknown bekern-full token: {tok!r}")
+        music_ids.append(tid)
+
+    if in_span:
+        payload_str = " ".join(cur_payload)
+        byte_ids = encode_text_span_utf8(payload_str, add_bos_eos=True)
+        text_spans.append(byte_ids)
+        text_span_meta.append(
+            {
+                "tag": cur_tag,
+                "music_open_idx": cur_open_idx,
+                "text": payload_str,
+            }
+        )
+        music_ids.append(TEXT_SPAN_CLOSE_TOKEN_ID)
+
+    if add_bos_eos:
+        music_ids.append(EOS_ID)
+
+    return {
+        "music_ids": music_ids,
+        "text_spans": text_spans,
+        "text_span_meta": text_span_meta,
+    }
+
+
+_UINT_ARG_SET: FrozenSet[str] = frozenset(
+    tok for tok in (str(i) for i in range(0, 25)) if tok in FULL_TOKEN_TO_ID
+)
+_UINT_POS_SET: FrozenSet[str] = frozenset(
+    tok for tok in (str(i) for i in range(1, 25)) if tok in FULL_TOKEN_TO_ID
+)
+_UINT_ARG_IDS: FrozenSet[int] = frozenset(FULL_TOKEN_TO_ID[t] for t in _UINT_ARG_SET)
+_UINT_POS_IDS: FrozenSet[int] = frozenset(FULL_TOKEN_TO_ID[t] for t in _UINT_POS_SET)
+_TRANSPOSE_ARG_SET: FrozenSet[str] = frozenset(
+    tok
+    for tok in (
+        [str(i) for i in range(-24, 25)]
+        + [f"+{i}" for i in range(1, 13)]
+    )
+    if tok in FULL_TOKEN_TO_ID
+)
+_TRANSPOSE_ARG_IDS: FrozenSet[int] = frozenset(FULL_TOKEN_TO_ID[t] for t in _TRANSPOSE_ARG_SET)
+
+
+def decode_bekern_full_sequence(
+    music_ids: Sequence[int],
+    text_spans: Optional[Sequence[Union[Sequence[int], str]]] = None,
+    skip_special: bool = True,
+) -> str:
+    """Reconstruct a ``bekern-full`` string from ``music_ids`` and UTF-8 ``text_spans``.
+
+    Recomposes ``tup-open <a_toks...> : <n_toks...>`` back into ``tup-open-{a}:{n}``
+    and ``<multirest> <digits...>`` back into ``<multirest> multirest-{n}`` so
+    ``assembly-serialize bekern2musicxml`` parses the decoded sequence cleanly.
+    """
+    spans_list = list(text_spans) if text_spans is not None else []
+    span_idx = 0
+    tok_stream: List[Tuple[int, str]] = []
+    for raw_i in music_ids:
+        i = int(raw_i)
+        if skip_special and i in (PAD_ID, BOS_ID, EOS_ID):
+            if i == EOS_ID:
+                break
+            continue
+        tok = FULL_ID_TO_TOKEN.get(i)
+        if tok is not None:
+            tok_stream.append((i, tok))
+
+    out: List[str] = []
+    idx = 0
+    n_toks = len(tok_stream)
+    while idx < n_toks:
+        i, tok = tok_stream[idx]
+        if tok == "tup-open":
+            j = idx + 1
+            a_parts: List[str] = []
+            while j < n_toks and tok_stream[j][1] in _UINT_ARG_SET:
+                a_parts.append(tok_stream[j][1])
+                j += 1
+            if a_parts and j < n_toks and tok_stream[j][1] == ":":
+                k = j + 1
+                n_parts: List[str] = []
+                while k < n_toks and tok_stream[k][1] in _UINT_ARG_SET:
+                    n_parts.append(tok_stream[k][1])
+                    k += 1
+                if n_parts:
+                    out.append(f"tup-open-{''.join(a_parts)}:{''.join(n_parts)}")
+                    idx = k
+                    continue
+        if tok == "<multirest>":
+            j = idx + 1
+            d_parts: List[str] = []
+            while j < n_toks and tok_stream[j][1] in _UINT_ARG_SET:
+                d_parts.append(tok_stream[j][1])
+                j += 1
+            out.append("<multirest>")
+            if d_parts:
+                out.append(f"multirest-{''.join(d_parts)}")
+                idx = j
+            else:
+                idx += 1
+            continue
+
+        out.append(tok)
+        if i in TEXT_SPAN_OPEN_TOKEN_IDS and span_idx < len(spans_list):
+            sp = spans_list[span_idx]
+            span_idx += 1
+            decoded = sp if isinstance(sp, str) else decode_text_span_utf8(sp)
+            if decoded:
+                out.append(decoded)
+        idx += 1
+    return " ".join(out)
+
+
 # ---------------------------------------------------------------------------
 # 7. BekernFullGrammarState FSA (Mitigations #3 & #8)
 # ---------------------------------------------------------------------------
@@ -650,18 +928,37 @@ _NUMBERED_SPANNER_SET: FrozenSet[str] = frozenset(
     list(_SLUR_OPEN_MAP) + list(_SLUR_CLOSE_MAP)
     + list(_HAIRPIN_OPEN_MAP) + list(_HAIRPIN_CLOSE_MAP)
 )
+_DELEGATED_ALIAS_MAP: Dict[str, str] = {
+    "<chord>": "chord",
+    "grace-slash": "grace",
+}
+_PERC_TAB_DELEGATE_SET: FrozenSet[str] = (
+    frozenset((grammar.UNPITCHED,))
+    | grammar.NOTEHEADS
+    | grammar.TAB_STRINGS
+    | grammar.TAB_FRETS
+)
 _EXT_MUSIC_PASSTHROUGH_SET: FrozenSet[str] = (
     (frozenset(LAYER0_TOKENS) | frozenset(LAYER1_NEW_TOKENS) | frozenset(LAYER2_NEW_TOKENS))
     - _LEGACY_MUSIC_SET
     - _NUMBERED_SPANNER_SET
+    - frozenset(_DELEGATED_ALIAS_MAP.keys())
+    - frozenset((":",))
+    - _TRANSPOSE_ARG_SET
 )
 _EXT_MUSIC_PASSTHROUGH_IDS: FrozenSet[int] = frozenset(
     FULL_TOKEN_TO_ID[t] for t in _EXT_MUSIC_PASSTHROUGH_SET
+)
+_EXT_MUSIC_PASSTHROUGH_NO_PERCTAB_IDS: FrozenSet[int] = frozenset(
+    FULL_TOKEN_TO_ID[t]
+    for t in (_EXT_MUSIC_PASSTHROUGH_SET - _PERC_TAB_DELEGATE_SET)
 )
 
 # PrefixState modes where a boundary/tail-level extension or Layer 3 text span
 # may cleanly start (never mid-pitch `dur`/`step`, mid-chord, or mid-ratio).
 _SAFE_SPAN_MODES: FrozenSet[str] = frozenset(("bound", "pitch-tail", "tiestart", "rest-tail"))
+
+MAX_LAYER3_SPAN_TOKENS: int = 128
 
 
 class BekernFullGrammarState:
@@ -673,10 +970,11 @@ class BekernFullGrammarState:
     2. Layer 3 text-span pause: inside ``<sys_lyr>`` / ``<harm>`` / ``<tempo>``
        / ``<dir>`` / ``<reh>`` / ``<fb>`` ... ``</text_span>``, the rhythmic
        bar-duration FSA is completely paused so lyrics/text never corrupt
-       measure duration tracking or note alignment.
-    3. Numbered spanner parity: tracks open channels for ``slur-1..4`` and
-       ``hairpin-1..3``, forbidding double-opening an already-open channel or
-       closing an unopened channel.
+       measure duration tracking or note alignment (with anti-loop cap
+       ``MAX_LAYER3_SPAN_TOKENS = 128``).
+    3. Per-staff numbered spanner parity: tracks open channels for ``slur-1..4``
+       and ``hairpin-1..3`` keyed by ``music_state.staves_in_bar``, forbidding
+       double-opening an already-open channel or closing an unopened channel.
     """
 
     def __init__(
@@ -696,8 +994,25 @@ class BekernFullGrammarState:
         self.in_text_span: bool = False
         self.active_text_tag: Optional[str] = None
         self.text_span_tokens: int = 0
-        self.open_slurs: Set[int] = set()
-        self.open_hairpins: Set[int] = set()
+        self.open_slurs_by_staff: Dict[int, Set[int]] = {}
+        self.open_hairpins_by_staff: Dict[int, Set[int]] = {}
+        # Explicit mini-states for <transpose>, <multirest>, and tup-open (v2 + colon syntax).
+        self.transpose_args_left: int = 0
+        self.multirest_state: int = 0  # 0=off, 1=need >=1 digit/int, 2=optional extra digits/ints
+        self.tup_mode: Optional[str] = None  # None | "a" | "a_or_legacy_n" | "n_colon"
+        self.tup_a_str: str = ""
+        self.tup_second_tok: str = ""
+        self.tup_n_str: str = ""
+
+    @property
+    def open_slurs(self) -> Set[int]:
+        """Open slur channels on the current staff (``music_state.staves_in_bar``)."""
+        return self.open_slurs_by_staff.get(self.music_state.staves_in_bar, set())
+
+    @property
+    def open_hairpins(self) -> Set[int]:
+        """Open hairpin channels on the current staff (``music_state.staves_in_bar``)."""
+        return self.open_hairpins_by_staff.get(self.music_state.staves_in_bar, set())
 
     def copy(self) -> "BekernFullGrammarState":
         c = BekernFullGrammarState.__new__(BekernFullGrammarState)
@@ -707,8 +1022,14 @@ class BekernFullGrammarState:
         c.in_text_span = self.in_text_span
         c.active_text_tag = self.active_text_tag
         c.text_span_tokens = self.text_span_tokens
-        c.open_slurs = set(self.open_slurs)
-        c.open_hairpins = set(self.open_hairpins)
+        c.open_slurs_by_staff = {k: set(v) for k, v in self.open_slurs_by_staff.items()}
+        c.open_hairpins_by_staff = {k: set(v) for k, v in self.open_hairpins_by_staff.items()}
+        c.transpose_args_left = self.transpose_args_left
+        c.multirest_state = self.multirest_state
+        c.tup_mode = self.tup_mode
+        c.tup_a_str = self.tup_a_str
+        c.tup_second_tok = self.tup_second_tok
+        c.tup_n_str = self.tup_n_str
         return c
 
     def _resolve_tok(self, tok_or_id: Union[int, str]) -> str:
@@ -721,60 +1042,283 @@ class BekernFullGrammarState:
             raise ValueError(f"unknown bekern-full token id: {tid!r}")
         return FULL_ID_TO_TOKEN[tid]
 
+    def _record_ext_step(self, tok: str) -> None:
+        ms = self.music_state
+        ms.tokens_in_system += 1
+        ms.tokens_since_bar += 1
+        ms.recent.append(tok)
+        if len(ms.recent) > grammar.RECENT_WINDOW_CAP:
+            ms.recent = ms.recent[-grammar.RECENT_WINDOW_KEEP:]
+
+    def _commit_tuplet_ratio(self, actual: int, normal: int) -> None:
+        if actual <= 0 or normal <= 0 or actual > grammar.MAX_TUPLET_VAL or normal > grammar.MAX_TUPLET_VAL:
+            raise ValueError(f"invalid tuplet ratio {actual}:{normal}")
+        if actual == normal:
+            raise ValueError(f"identity tuplet {actual}:{normal} forbidden")
+        ms = self.music_state
+        ms.pending += 1
+        ms.pend_spans.append((actual, normal))
+        ms.comp_num = 0
+        ms.comp_digits = 0
+        ms.comp_val = 0
+        ms.mode = "bound"
+        self.tup_mode = None
+        self.tup_a_str = ""
+        self.tup_second_tok = ""
+        self.tup_n_str = ""
+
     def can_emit_sys(self) -> bool:
-        if self.in_text_span:
+        if self.in_text_span or self.transpose_args_left > 0 or self.multirest_state == 1 or self.tup_mode is not None:
+            return False
+        if self.music_state.mode not in _SAFE_SPAN_MODES:
             return False
         return self.music_state.can_emit_sys()
 
     def can_emit_eos(self, cur_len: Optional[int] = None, max_len: Optional[int] = None) -> bool:
-        if self.in_text_span:
+        if self.in_text_span or self.transpose_args_left > 0 or self.multirest_state == 1 or self.tup_mode is not None:
             return False
         return self.music_state.can_emit_eos(cur_len=cur_len, max_len=max_len)
 
     def _allowed_numbered_spanners(self) -> Set[int]:
+        if not self.music_state.strict:
+            return {FULL_TOKEN_TO_ID[t] for t in _NUMBERED_SPANNER_SET}
         allow: Set[int] = set()
+        staff_slurs = self.open_slurs
+        staff_hairpins = self.open_hairpins
         for tok, ch in _SLUR_OPEN_MAP.items():
-            if ch not in self.open_slurs:
+            if ch not in staff_slurs:
                 allow.add(FULL_TOKEN_TO_ID[tok])
         for tok, ch in _SLUR_CLOSE_MAP.items():
-            if ch in self.open_slurs:
+            if ch in staff_slurs:
                 allow.add(FULL_TOKEN_TO_ID[tok])
         for tok, ch in _HAIRPIN_OPEN_MAP.items():
-            if ch not in self.open_hairpins:
+            if ch not in staff_hairpins:
                 allow.add(FULL_TOKEN_TO_ID[tok])
         for tok, ch in _HAIRPIN_CLOSE_MAP.items():
-            if ch in self.open_hairpins:
+            if ch in staff_hairpins:
                 allow.add(FULL_TOKEN_TO_ID[tok])
         return allow
 
-    def allowed(self) -> Tuple[Set[int], bool]:
-        """Return ``(allowed_token_ids, eos_ok)`` for the current FSA state."""
-        if self.in_text_span:
-            allow: Set[int] = set(_LAYER3_BODY_IDS)
-            allow.add(TEXT_SPAN_CLOSE_TOKEN_ID)
-            return allow, False
-
+    def _allowed_normal_music(self) -> Tuple[Set[int], bool]:
         allow, eos_ok = self.music_state.allowed()
         allow = set(allow)
+
+        # Mirror delegated aliases (<chord> <-> chord, grace-slash <-> grace).
+        for alias_tok, base_tok in _DELEGATED_ALIAS_MAP.items():
+            if FULL_TOKEN_TO_ID[base_tok] in allow:
+                allow.add(FULL_TOKEN_TO_ID[alias_tok])
 
         # Optional <schema:*> token allowed ONLY at position 0.
         if self.pos == 0:
             allow.update(SCHEMA_TOKEN_IDS)
+        else:
+            eos_ok = bool(eos_ok and self.can_emit_eos())
 
         if self.can_emit_sys():
             allow.add(SYS_ID)
 
-        if self.music_state.mode in _SAFE_SPAN_MODES:
+        not_capped = (
+            (not self.music_state._sys_is_capped())
+            and (self.music_state.tokens_since_bar < grammar.MAX_TOKENS_PER_BAR)
+        )
+        if not_capped and self.music_state.mode in _SAFE_SPAN_MODES:
             allow.update(self._allowed_numbered_spanners())
-            allow.update(_EXT_MUSIC_PASSTHROUGH_IDS)
+            if self.music_state.allow_percussion_tab:
+                allow.update(_EXT_MUSIC_PASSTHROUGH_NO_PERCTAB_IDS)
+            else:
+                allow.update(_EXT_MUSIC_PASSTHROUGH_IDS)
             if not self.music_state.has_open_tuplet():
                 allow.update(TEXT_SPAN_OPEN_TOKEN_IDS)
 
         return allow, eos_ok
 
+    def allowed(self) -> Tuple[Set[int], bool]:
+        """Return ``(allowed_token_ids, eos_ok)`` for the current FSA state."""
+        if self.in_text_span:
+            if self.text_span_tokens >= MAX_LAYER3_SPAN_TOKENS:
+                return {TEXT_SPAN_CLOSE_TOKEN_ID}, False
+            allow: Set[int] = set(_LAYER3_BODY_IDS)
+            allow.add(TEXT_SPAN_CLOSE_TOKEN_ID)
+            return allow, False
+
+        if self.transpose_args_left > 0:
+            return set(_TRANSPOSE_ARG_IDS), False
+
+        if self.multirest_state == 1:
+            return set(_UINT_POS_IDS), False
+
+        if self.tup_mode == "a":
+            allow_t: Set[int] = set()
+            if not self.tup_a_str:
+                for tok in _UINT_POS_SET:
+                    if int(tok) <= grammar.MAX_TUPLET_VAL:
+                        allow_t.add(FULL_TOKEN_TO_ID[tok])
+            else:
+                allow_t.add(FULL_TOKEN_TO_ID[":"])
+                a_val = int(self.tup_a_str)
+                for tok in _UINT_ARG_SET:
+                    # Allow 2nd digit of multi-digit A (if <= MAX_TUPLET_VAL) OR legacy N (if != A).
+                    can_extend_a = len(tok) == 1 and int(self.tup_a_str + tok) <= grammar.MAX_TUPLET_VAL
+                    can_legacy_n = (tok in _UINT_POS_SET) and int(tok) <= grammar.MAX_TUPLET_VAL and int(tok) != a_val
+                    if can_extend_a or can_legacy_n:
+                        allow_t.add(FULL_TOKEN_TO_ID[tok])
+            return allow_t, False
+
+        if self.tup_mode == "a_or_legacy_n":
+            allow_t = set()
+            if len(self.tup_second_tok) == 1 and int(self.tup_a_str + self.tup_second_tok) <= grammar.MAX_TUPLET_VAL:
+                allow_t.add(FULL_TOKEN_TO_ID[":"])
+            a_val = int(self.tup_a_str)
+            n_val = int(self.tup_second_tok)
+            if n_val > 0 and n_val != a_val and n_val <= grammar.MAX_TUPLET_VAL:
+                ms = self.music_state
+                saved_mode = ms.mode
+                ms.pending += 1
+                ms.pend_spans.append((a_val, n_val))
+                ms.mode = "bound"
+                try:
+                    sub_allow, _ = self._allowed_normal_music()
+                    allow_t.update(sub_allow)
+                finally:
+                    ms.pending -= 1
+                    ms.pend_spans.pop()
+                    ms.mode = saved_mode
+            return allow_t, False
+
+        if self.tup_mode == "n_colon":
+            allow_t = set()
+            a_val = int(self.tup_a_str)
+            if not self.tup_n_str:
+                for tok in _UINT_POS_SET:
+                    v = int(tok)
+                    if v <= grammar.MAX_TUPLET_VAL and (v != a_val or v * 10 <= grammar.MAX_TUPLET_VAL):
+                        allow_t.add(FULL_TOKEN_TO_ID[tok])
+                return allow_t, False
+            # Have at least 1 token in tup_n_str: allow extra digits (if <= cap) OR normal music tokens.
+            for d in "0123456789":
+                if d in FULL_TOKEN_TO_ID:
+                    nv = int(self.tup_n_str + d)
+                    if nv <= grammar.MAX_TUPLET_VAL and nv != a_val:
+                        allow_t.add(FULL_TOKEN_TO_ID[d])
+            n_val = int(self.tup_n_str)
+            if n_val > 0 and n_val != a_val and n_val <= grammar.MAX_TUPLET_VAL:
+                ms = self.music_state
+                saved_mode = ms.mode
+                ms.pending += 1
+                ms.pend_spans.append((a_val, n_val))
+                ms.mode = "bound"
+                try:
+                    sub_allow, _ = self._allowed_normal_music()
+                    allow_t.update(sub_allow)
+                finally:
+                    ms.pending -= 1
+                    ms.pend_spans.pop()
+                    ms.mode = saved_mode
+            return allow_t, False
+
+        allow, eos_ok = self._allowed_normal_music()
+        if self.multirest_state == 2:
+            allow.update(_UINT_ARG_IDS)
+        return allow, eos_ok
+
     def step(self, tok_or_id: Union[int, str]) -> None:
         """Advance the FSA by one token string or ID (raises ``ValueError`` if illegal)."""
         tok = self._resolve_tok(tok_or_id)
+
+        # 0. Active argument mini-states (<transpose>, <multirest>, tup-open).
+        if self.transpose_args_left > 0:
+            if tok not in _TRANSPOSE_ARG_SET:
+                raise ValueError(
+                    f"expected signed transpose integer argument, got {tok!r}"
+                )
+            self.transpose_args_left -= 1
+            self._record_ext_step(tok)
+            self.pos += 1
+            return
+
+        if self.multirest_state == 1:
+            if tok not in _UINT_POS_SET:
+                raise ValueError(
+                    f"expected positive integer/digit after <multirest>, got {tok!r}"
+                )
+            self.multirest_state = 2
+            self._record_ext_step(tok)
+            self.pos += 1
+            return
+
+        if self.multirest_state == 2:
+            if tok in _UINT_ARG_SET:
+                self._record_ext_step(tok)
+                self.pos += 1
+                return
+            self.multirest_state = 0
+            # Fall through to process non-digit token in normal mode.
+
+        if self.tup_mode == "a":
+            if not self.tup_a_str:
+                if tok not in _UINT_POS_SET or int(tok) > grammar.MAX_TUPLET_VAL:
+                    raise ValueError(f"bad tup-open actual count token {tok!r}")
+                self.tup_a_str = tok
+                self._record_ext_step(tok)
+                self.pos += 1
+                return
+            if tok == ":":
+                self.tup_mode = "n_colon"
+                self.tup_n_str = ""
+                self._record_ext_step(tok)
+                self.pos += 1
+                return
+            if tok in _UINT_ARG_SET:
+                can_extend_a = len(tok) == 1 and int(self.tup_a_str + tok) <= grammar.MAX_TUPLET_VAL
+                can_legacy_n = (
+                    tok in _UINT_POS_SET
+                    and int(tok) <= grammar.MAX_TUPLET_VAL
+                    and int(tok) != int(self.tup_a_str)
+                )
+                if not (can_extend_a or can_legacy_n):
+                    raise ValueError(f"bad tup-open second token {tok!r} after actual {self.tup_a_str!r}")
+                self.tup_second_tok = tok
+                self.tup_mode = "a_or_legacy_n"
+                self._record_ext_step(tok)
+                self.pos += 1
+                return
+            raise ValueError(f"expected ':' or integer in tup-open, got {tok!r}")
+
+        if self.tup_mode == "a_or_legacy_n":
+            if tok == ":":
+                combined = self.tup_a_str + self.tup_second_tok
+                if len(self.tup_second_tok) != 1 or int(combined) > grammar.MAX_TUPLET_VAL:
+                    raise ValueError(f"invalid multi-digit tup-open actual {combined!r}")
+                self.tup_a_str = combined
+                self.tup_second_tok = ""
+                self.tup_mode = "n_colon"
+                self.tup_n_str = ""
+                self._record_ext_step(tok)
+                self.pos += 1
+                return
+            # Legacy v2 `tup-open A N` completed -> commit (A, N) and fall through to process `tok`!
+            self._commit_tuplet_ratio(int(self.tup_a_str), int(self.tup_second_tok))
+
+        if self.tup_mode == "n_colon":
+            if not self.tup_n_str:
+                if tok not in _UINT_POS_SET or int(tok) > grammar.MAX_TUPLET_VAL:
+                    raise ValueError(f"bad tup-open normal count token {tok!r}")
+                self.tup_n_str = tok
+                self._record_ext_step(tok)
+                self.pos += 1
+                return
+            if len(tok) == 1 and tok in "0123456789":
+                nv = int(self.tup_n_str + tok)
+                if nv <= grammar.MAX_TUPLET_VAL and nv != int(self.tup_a_str):
+                    self.tup_n_str = self.tup_n_str + tok
+                    self._record_ext_step(tok)
+                    self.pos += 1
+                    return
+                raise ValueError(
+                    f"tup-open normal count {nv} invalid (cap={grammar.MAX_TUPLET_VAL}, actual={self.tup_a_str})"
+                )
+            # Non-digit token -> commit (A, N) and fall through to process `tok`!
+            self._commit_tuplet_ratio(int(self.tup_a_str), int(self.tup_n_str))
 
         # 1. Schema prefix token: strictly position 0 only.
         if tok in SCHEMA_TOKENS:
@@ -792,25 +1336,35 @@ class BekernFullGrammarState:
                 self.in_text_span = False
                 self.active_text_tag = None
                 self.text_span_tokens = 0
+                self._record_ext_step(tok)
                 self.pos += 1
                 return
             if tok in _LAYER3_BODY_SET:
+                if self.text_span_tokens >= MAX_LAYER3_SPAN_TOKENS:
+                    raise ValueError(
+                        f"Layer 3 text span exceeded MAX_LAYER3_SPAN_TOKENS={MAX_LAYER3_SPAN_TOKENS}"
+                    )
                 self.text_span_tokens += 1
+                self._record_ext_step(tok)
                 self.pos += 1
                 return
             raise ValueError(
                 f"illegal token {tok!r} inside Layer 3 text span {self.active_text_tag!r}"
             )
 
-        # 3. Opening a Layer 3 text span: pause rhythmic FSA cleanly.
+        # 3. Opening a Layer 3 text span: close pending event & pause rhythmic FSA cleanly.
         if tok in TEXT_SPAN_OPEN_TOKENS:
             if self.music_state.mode not in _SAFE_SPAN_MODES or self.music_state.has_open_tuplet():
                 raise ValueError(
                     f"cannot open text span {tok!r} in music mode {self.music_state.mode!r}"
                 )
+            if self.music_state.mode in ("pitch-tail", "tiestart", "rest-tail"):
+                self.music_state._close_event(placed=(self.music_state.mode != "rest-tail"))
+                self.music_state.mode = "bound"
             self.in_text_span = True
             self.active_text_tag = tok
             self.text_span_tokens = 0
+            self._record_ext_step(tok)
             self.pos += 1
             return
 
@@ -828,14 +1382,44 @@ class BekernFullGrammarState:
             self.pos += 1
             return
 
-        # 5. Numbered spanners: slur-1..4 and hairpin-1..3 parity.
+        # 4b. Mini-state openers (<transpose>, <multirest>, tup-open).
+        if tok == "<transpose>":
+            if self.music_state.mode not in _SAFE_SPAN_MODES:
+                raise ValueError(f"<transpose> not allowed in mode {self.music_state.mode!r}")
+            self.transpose_args_left = 2
+            self._record_ext_step(tok)
+            self.pos += 1
+            return
+
+        if tok == "<multirest>":
+            if self.music_state.mode not in _SAFE_SPAN_MODES:
+                raise ValueError(f"<multirest> not allowed in mode {self.music_state.mode!r}")
+            self.multirest_state = 1
+            self._record_ext_step(tok)
+            self.pos += 1
+            return
+
+        if tok == "tup-open":
+            self.music_state.step("tup-open")
+            self.tup_mode = "a"
+            self.tup_a_str = ""
+            self.tup_second_tok = ""
+            self.tup_n_str = ""
+            self.pos += 1
+            return
+
+        # 5. Per-staff numbered spanners: strict channel parity in strict=True; permissive in strict=False
+        # (supports cross-staff hairpins/slurs, multi-voice channel reuse, and page-2+ continuations).
+        staff_idx = self.music_state.staves_in_bar
         if tok in _SLUR_OPEN_MAP:
             if self.music_state.mode not in _SAFE_SPAN_MODES:
                 raise ValueError(f"slur token {tok!r} not allowed in mode {self.music_state.mode!r}")
             ch = _SLUR_OPEN_MAP[tok]
-            if ch in self.open_slurs:
-                raise ValueError(f"slur channel {ch} already open ({tok!r})")
-            self.open_slurs.add(ch)
+            s_set = self.open_slurs_by_staff.setdefault(staff_idx, set())
+            if self.music_state.strict and ch in s_set:
+                raise ValueError(f"slur channel {ch} already open on staff {staff_idx} ({tok!r})")
+            s_set.add(ch)
+            self._record_ext_step(tok)
             self.pos += 1
             return
 
@@ -843,9 +1427,14 @@ class BekernFullGrammarState:
             if self.music_state.mode not in _SAFE_SPAN_MODES:
                 raise ValueError(f"slur token {tok!r} not allowed in mode {self.music_state.mode!r}")
             ch = _SLUR_CLOSE_MAP[tok]
-            if ch not in self.open_slurs:
-                raise ValueError(f"cannot close unopened slur channel {ch} ({tok!r})")
-            self.open_slurs.remove(ch)
+            s_set = self.open_slurs_by_staff.get(staff_idx)
+            if self.music_state.strict and (not s_set or ch not in s_set):
+                raise ValueError(f"cannot close unopened slur channel {ch} on staff {staff_idx} ({tok!r})")
+            if s_set is not None:
+                s_set.discard(ch)
+                if not s_set:
+                    self.open_slurs_by_staff.pop(staff_idx, None)
+            self._record_ext_step(tok)
             self.pos += 1
             return
 
@@ -853,9 +1442,11 @@ class BekernFullGrammarState:
             if self.music_state.mode not in _SAFE_SPAN_MODES:
                 raise ValueError(f"hairpin token {tok!r} not allowed in mode {self.music_state.mode!r}")
             ch = _HAIRPIN_OPEN_MAP[tok]
-            if ch in self.open_hairpins:
-                raise ValueError(f"hairpin channel {ch} already open ({tok!r})")
-            self.open_hairpins.add(ch)
+            h_set = self.open_hairpins_by_staff.setdefault(staff_idx, set())
+            if self.music_state.strict and ch in h_set:
+                raise ValueError(f"hairpin channel {ch} already open on staff {staff_idx} ({tok!r})")
+            h_set.add(ch)
+            self._record_ext_step(tok)
             self.pos += 1
             return
 
@@ -863,22 +1454,40 @@ class BekernFullGrammarState:
             if self.music_state.mode not in _SAFE_SPAN_MODES:
                 raise ValueError(f"hairpin token {tok!r} not allowed in mode {self.music_state.mode!r}")
             ch = _HAIRPIN_CLOSE_MAP[tok]
-            if ch not in self.open_hairpins:
-                raise ValueError(f"cannot close unopened hairpin channel {ch} ({tok!r})")
-            self.open_hairpins.remove(ch)
+            h_set = self.open_hairpins_by_staff.get(staff_idx)
+            if self.music_state.strict and (not h_set or ch not in h_set):
+                raise ValueError(f"cannot close unopened hairpin channel {ch} on staff {staff_idx} ({tok!r})")
+            if h_set is not None:
+                h_set.discard(ch)
+                if not h_set:
+                    self.open_hairpins_by_staff.pop(staff_idx, None)
+            self._record_ext_step(tok)
             self.pos += 1
             return
 
-        # 6. Extended Layer 0/1/2 music tokens (outside data.VOCAB).
+        # 6. Delegated aliases (<chord> -> chord, grace-slash -> grace).
+        if tok in _DELEGATED_ALIAS_MAP:
+            self.music_state.step(_DELEGATED_ALIAS_MAP[tok])
+            self.pos += 1
+            return
+
+        # 7. Percussion / TAB tokens delegated to PrefixState when allow_percussion_tab=True.
+        if self.music_state.allow_percussion_tab and tok in _PERC_TAB_DELEGATE_SET:
+            self.music_state.step(tok)
+            self.pos += 1
+            return
+
+        # 8. Extended Layer 0/1/2 music tokens (outside data.VOCAB).
         if tok in _EXT_MUSIC_PASSTHROUGH_SET:
             if self.music_state.mode not in _SAFE_SPAN_MODES:
                 raise ValueError(
                     f"extended music token {tok!r} not allowed in mode {self.music_state.mode!r}"
                 )
+            self._record_ext_step(tok)
             self.pos += 1
             return
 
-        # 7. Core legacy music tokens (0..260): delegate to grammar.PrefixState.
+        # 9. Core legacy music tokens (0..260): delegate to grammar.PrefixState.
         if tok in _LEGACY_MUSIC_SET:
             self.music_state.step(tok)
             self.pos += 1

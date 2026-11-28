@@ -138,6 +138,7 @@ __all__ = [
     "compute_bd3_repair_loss",
     "warm_start_from_v265_checkpoint",
     "set_bekern_full_stage",
+    "restore_bekern_full_stage1_frozen_slices",
     "fake_quant_int4_ste",
     "QATInt4Controller",
 ]
@@ -483,31 +484,39 @@ class UniOMRv2Config:
         self.mode_gate_conf_thresh = float(max(0.0, min(1.0, self.mode_gate_conf_thresh)))
 
     def resolved_pad_id(self) -> int:
-        """Return explicit ``pad_id`` if set, else legacy fallback (``PAD_ID`` or ``vocab_size - 4``)."""
+        """Return explicit ``pad_id`` if set, else bekern-full/legacy fallback."""
         if self.pad_id is not None:
             return int(self.pad_id)
         v = int(self.vocab_size)
+        if self.bekern_full or v == bekern_full.FULL_VOCAB_SIZE:
+            return bekern_full.PAD_ID
         return PAD_ID if v == VOCAB_SIZE else (v - 4)
 
     def resolved_bos_id(self) -> int:
-        """Return explicit ``bos_id`` if set, else legacy fallback (``BOS_ID`` or ``vocab_size - 3``)."""
+        """Return explicit ``bos_id`` if set, else bekern-full/legacy fallback."""
         if self.bos_id is not None:
             return int(self.bos_id)
         v = int(self.vocab_size)
+        if self.bekern_full or v == bekern_full.FULL_VOCAB_SIZE:
+            return bekern_full.BOS_ID
         return BOS_ID if v == VOCAB_SIZE else (v - 3)
 
     def resolved_eos_id(self) -> int:
-        """Return explicit ``eos_id`` if set, else legacy fallback (``EOS_ID`` or ``vocab_size - 2``)."""
+        """Return explicit ``eos_id`` if set, else bekern-full/legacy fallback."""
         if self.eos_id is not None:
             return int(self.eos_id)
         v = int(self.vocab_size)
+        if self.bekern_full or v == bekern_full.FULL_VOCAB_SIZE:
+            return bekern_full.EOS_ID
         return EOS_ID if v == VOCAB_SIZE else (v - 2)
 
     def resolved_sys_id(self) -> int:
-        """Return explicit ``sys_id`` if set, else legacy fallback (``SYS_ID`` or ``vocab_size - 1``)."""
+        """Return explicit ``sys_id`` if set, else bekern-full/legacy fallback."""
         if self.sys_id is not None:
             return int(self.sys_id)
         v = int(self.vocab_size)
+        if self.bekern_full or v == bekern_full.FULL_VOCAB_SIZE:
+            return bekern_full.SYS_ID
         return SYS_ID if v == VOCAB_SIZE else (v - 1)
 
     def resolved_music_vocab_end(self) -> int:
@@ -515,6 +524,8 @@ class UniOMRv2Config:
         if self.music_vocab_end is not None:
             return int(self.music_vocab_end)
         v = int(self.vocab_size)
+        if self.bekern_full or v == bekern_full.FULL_VOCAB_SIZE:
+            return bekern_full.MUSIC_VOCAB_END
         if v == VOCAB_SIZE:
             return len(data.VOCAB)
         pad_id = self.resolved_pad_id()
@@ -2340,9 +2351,18 @@ def sample_bd3_complementary_views(
         masks.append((torch.rand(tgt_y.shape, device=tgt_y.device) < p_mask) & valid)
 
     views: List[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = []
+    valid_body_pool: Optional[torch.Tensor] = (
+        torch.tensor(bekern_full.VALID_MUSIC_BODY_TOKEN_IDS, device=tgt_y.device, dtype=tgt_y.dtype)
+        if bekern_full_mode
+        else None
+    )
     for m in masks:
         corrupt_unmasked = (torch.rand(tgt_y.shape, device=tgt_y.device) < 0.10) & valid & (~m)
-        rand_toks = torch.randint(lo_vocab, hi_vocab, tgt_y.shape, device=tgt_y.device, dtype=tgt_y.dtype)
+        if valid_body_pool is not None and valid_body_pool.numel() > 0:
+            rand_idx = torch.randint(0, int(valid_body_pool.numel()), tgt_y.shape, device=tgt_y.device)
+            rand_toks = valid_body_pool[rand_idx]
+        else:
+            rand_toks = torch.randint(lo_vocab, hi_vocab, tgt_y.shape, device=tgt_y.device, dtype=tgt_y.dtype)
         corrupt_ids = torch.where(corrupt_unmasked, rand_toks, tgt_y)
         supervise = m | corrupt_unmasked
         has_sup = supervise.any()
@@ -2403,9 +2423,9 @@ def compute_bd3_repair_loss(
             v1_v2a_mask = is_v1_bool[:, None, None] & v2a_col_mask[None, None, :]
     total_loss = torch.zeros((), device=tgt_y.device, dtype=torch.float32)
     safe_targets = tgt_y.clamp(0, int(model.cfg.vocab_size) - 1).reshape(-1)
+    key_valid_mask = tgt_y != pad_id
     for corrupt_ids, mask_flags, supervise in views:
         tok_emb = model.tok_emb(corrupt_ids)
-        key_valid_mask = corrupt_ids != pad_id
         logits = model.bd3_repair_head(
             tok_emb,
             mask_flags,
@@ -2413,20 +2433,30 @@ def compute_bd3_repair_loss(
             model.lm_head,
             key_valid_mask=key_valid_mask,
         )
+        eff_sup = supervise & layer_target_mask if layer_target_mask is not None else supervise
+        if not bool(eff_sup.any()):
+            total_loss = total_loss + (logits.sum() * 0.0).float()
+            continue
         if layer_suppress_mask is not None:
             logits = logits.masked_fill(layer_suppress_mask.unsqueeze(1), float("-inf"))
         elif v1_v2a_mask is not None:
             logits = logits.masked_fill(v1_v2a_mask, -1e4)
-        eff_sup = supervise & layer_target_mask if layer_target_mask is not None else supervise
-        if not bool(eff_sup.any()):
-            continue
+        eff_sup_flat = eff_sup.reshape(-1)
+        masked_targets = torch.where(
+            eff_sup_flat,
+            safe_targets,
+            torch.full_like(safe_targets, -100),
+        )
         per_tok = F.cross_entropy(
             logits.reshape(-1, logits.size(-1)),
-            safe_targets,
+            masked_targets,
+            ignore_index=-100,
             reduction="none",
         )
-        sup_f = eff_sup.reshape(-1).float()
-        loss_v = (per_tok.float() * sup_f).sum() / sup_f.sum().clamp(min=1.0)
+        per_tok_safe = torch.where(
+            eff_sup_flat, per_tok.float(), torch.zeros_like(per_tok, dtype=torch.float32)
+        )
+        loss_v = per_tok_safe.sum() / eff_sup_flat.float().sum().clamp(min=1.0)
         total_loss = total_loss + loss_v
     return (total_loss / float(len(views))).to(mem_final.dtype)
 
@@ -3244,7 +3274,15 @@ class UniOMRv2Net(nn.Module):
             if eff_text_vocab > 0
             else None
         )
-        # Iter 16 bekern-full Layer 3 text mode gate (None when bekern_full=False -> 0 legacy params)
+        # Iter 16 bekern-full Layer 3 UTF-8 byte embedding + text mode gate (None when bekern_full=False -> 0 legacy params)
+        if c.bekern_full and eff_text_vocab > 0:
+            self.tok_emb_text: Optional[nn.Embedding] = nn.Embedding(
+                eff_text_vocab,
+                c.d_model,
+                padding_idx=bekern_full.TEXT_PAD_ID if bekern_full.TEXT_PAD_ID < eff_text_vocab else None,
+            )
+        else:
+            self.tok_emb_text = None
         if c.bekern_full:
             self.text_mode_gate: Optional[nn.Linear] = nn.Linear(c.d_model, 1, bias=True)
             nn.init.zeros_(self.text_mode_gate.weight)
@@ -3253,6 +3291,8 @@ class UniOMRv2Net(nn.Module):
             self.text_mode_gate = None
         self._last_text_gate_prob: Optional[torch.Tensor] = None
         self._bekern_stage1_hooks: List[Any] = []
+        self._stage1_frozen_slices: Dict[str, Tuple[int, int, torch.Tensor]] = {}
+        self._warm_start_old_registers: int = 0
 
         n_extra_mtp = max(0, int(c.mtp_k) - 1)
         if c.use_chained_mtp:
@@ -3402,6 +3442,8 @@ class UniOMRv2Net(nn.Module):
         coord_feat: Optional[torch.Tensor] = None,
         targets: Optional[torch.Tensor] = None,
         greedy_chain_mtp: bool = False,
+        use_text_emb: bool = False,
+        out_extra: Optional[Dict[str, Any]] = None,
     ) -> Tuple[
         torch.Tensor,
         List[torch.Tensor],
@@ -3411,27 +3453,44 @@ class UniOMRv2Net(nn.Module):
     ]:
         _, T = tgt_ids.shape
         inp_ids = tgt_ids
-        if self.training and apply_tok_dropout and self.cfg.tok_dropout > 0.0 and not use_cache:
+        if self.training and apply_tok_dropout and self.cfg.tok_dropout > 0.0 and not use_cache and not use_text_emb:
             pad_id = self.cfg.resolved_pad_id()
             bos_id = self.cfg.resolved_bos_id()
             eos_id = self.cfg.resolved_eos_id()
             sys_id = self.cfg.resolved_sys_id()
-            music_end = self.cfg.resolved_music_vocab_end()
-            rand_toks = torch.randint(0, music_end, inp_ids.shape, device=inp_ids.device, dtype=inp_ids.dtype)
-            drop_mask = (
-                (torch.rand_like(inp_ids, dtype=torch.float32) < self.cfg.tok_dropout)
-                & (inp_ids != pad_id)
-                & (inp_ids != bos_id)
-                & (inp_ids != eos_id)
-                & (inp_ids != sys_id)
-                & (rand_toks != pad_id)
-                & (rand_toks != bos_id)
-                & (rand_toks != eos_id)
-                & (rand_toks != sys_id)
-            )
+            if self.cfg.bekern_full:
+                body_pool = torch.tensor(
+                    bekern_full.VALID_MUSIC_BODY_TOKEN_IDS,
+                    device=inp_ids.device,
+                    dtype=inp_ids.dtype,
+                )
+                rand_toks = body_pool[
+                    torch.randint(0, int(body_pool.numel()), inp_ids.shape, device=inp_ids.device)
+                ]
+                body_mask = bekern_full.compute_is_music_body_mask(inp_ids).to(
+                    device=inp_ids.device, dtype=torch.bool
+                )
+                drop_mask = (torch.rand_like(inp_ids, dtype=torch.float32) < self.cfg.tok_dropout) & body_mask
+            else:
+                music_end = self.cfg.resolved_music_vocab_end()
+                rand_toks = torch.randint(0, music_end, inp_ids.shape, device=inp_ids.device, dtype=inp_ids.dtype)
+                drop_mask = (
+                    (torch.rand_like(inp_ids, dtype=torch.float32) < self.cfg.tok_dropout)
+                    & (inp_ids != pad_id)
+                    & (inp_ids != bos_id)
+                    & (inp_ids != eos_id)
+                    & (inp_ids != sys_id)
+                    & (rand_toks != pad_id)
+                    & (rand_toks != bos_id)
+                    & (rand_toks != eos_id)
+                    & (rand_toks != sys_id)
+                )
             inp_ids = torch.where(drop_mask, rand_toks, inp_ids)
 
-        x = self.tok_emb(inp_ids)
+        if use_text_emb and self.tok_emb_text is not None:
+            x = self.tok_emb_text(inp_ids)
+        else:
+            x = self.tok_emb(inp_ids)
         compute_dtype = _active_compute_dtype(x)
         if x.dtype != compute_dtype:
             x = x.to(dtype=compute_dtype)
@@ -3707,9 +3766,17 @@ class UniOMRv2Net(nn.Module):
         want_aux = self.training if return_aux is None else bool(return_aux)
         sys_y_pred: Optional[torch.Tensor] = None
         text_logits: Optional[torch.Tensor] = None
-        if self.cfg.bekern_full and self.text_mode_gate is not None:
-            self._last_text_gate_prob = torch.sigmoid(self.text_mode_gate(h[:, -1, :])).squeeze(-1)
-        if want_aux and not use_cache:
+        if self.cfg.bekern_full and self.text_mode_gate is not None and not use_text_emb:
+            if use_cache:
+                with torch.no_grad():
+                    self._last_text_gate_prob = torch.sigmoid(self.text_mode_gate(h[:, -1, :])).squeeze(-1)
+            elif out_extra is not None:
+                out_extra["text_gate_logits"] = self.text_mode_gate(h).squeeze(-1)
+        if out_extra is not None:
+            out_extra["h_last"] = h[:, -1:, :]
+        if use_text_emb and self.lm_head_text is not None:
+            text_logits = self.lm_head_text(h)
+        elif want_aux and not use_cache:
             if self.sys_y_head is not None:
                 sys_y_pred = self.sys_y_head(h)
             if self.lm_head_text is not None:
@@ -3795,6 +3862,98 @@ class UniOMRv2Net(nn.Module):
             prev_tok = torch.tensor([[tok_k]], device=h_cur.device, dtype=torch.long)
         return drafted
 
+    def _slice_mem_batch(self, mem: Any, b: int) -> Any:
+        if isinstance(mem, tuple):
+            return tuple(m[b : b + 1] for m in mem)
+        if isinstance(mem, list):
+            return [m[b : b + 1] for m in mem]
+        return mem[b : b + 1]
+
+    def _slice_past_kvs_batch(self, past_kvs: Any, b: int) -> Any:
+        """Clone single-sample ``b`` view of ``past_kvs`` without mutating the live music cache."""
+        if past_kvs is None:
+            return None
+        if isinstance(past_kvs, dict):
+            return {
+                "self_banks": [
+                    (kv[0][b : b + 1].clone(), kv[1][b : b + 1].clone()) if kv is not None else None
+                    for kv in past_kvs["self_banks"]
+                ],
+                "cross_banks": [
+                    (kv[0][b : b + 1].clone(), kv[1][b : b + 1].clone()) if kv is not None else None
+                    for kv in past_kvs["cross_banks"]
+                ],
+            }
+        sliced: List[Any] = []
+        for entry in past_kvs:
+            if entry is None:
+                sliced.append(None)
+            else:
+                skv, ckv = entry
+                s_out = (skv[0][b : b + 1].clone(), skv[1][b : b + 1].clone()) if skv is not None else None
+                c_out = (ckv[0][b : b + 1].clone(), ckv[1][b : b + 1].clone()) if ckv is not None else None
+                sliced.append((s_out, c_out))
+        return sliced
+
+    @torch.no_grad()
+    def _decode_utf8_text_span(
+        self,
+        mem_b: Any,
+        coord_b: Optional[torch.Tensor],
+        max_len: int = 128,
+        past_kvs_b: Optional[Any] = None,
+        open_tok_id: Optional[int] = None,
+    ) -> List[int]:
+        """Decode one Layer 3 UTF-8 byte span conditioned on the live music-stream ``past_kvs``."""
+        if self.tok_emb_text is None or self.lm_head_text is None:
+            return [bekern_full.TEXT_BOS_ID, bekern_full.TEXT_EOS_ID]
+        ref_t = mem_b[-1] if isinstance(mem_b, (tuple, list)) else mem_b
+        device = ref_t.device
+        if past_kvs_b is not None:
+            text_kvs: Any = past_kvs_b
+            if open_tok_id is not None:
+                open_t = torch.tensor([[int(open_tok_id)]], dtype=torch.long, device=device)
+                _, _, _, _, text_kvs = self._decode_tokens_impl(
+                    open_t,
+                    memory=None,
+                    return_mtp=False,
+                    return_aux=False,
+                    past_kvs=text_kvs,
+                    use_cache=True,
+                    apply_tok_dropout=False,
+                    use_text_emb=False,
+                )
+        else:
+            text_kvs = self.precompute_cross_kv(mem_b, coord_feat=coord_b)
+        cur = torch.full((1, 1), bekern_full.TEXT_BOS_ID, dtype=torch.long, device=device)
+        out_bytes: List[int] = [bekern_full.TEXT_BOS_ID]
+        for _ in range(max(1, int(max_len))):
+            _, _, _, txt_logits, text_kvs = self._decode_tokens_impl(
+                cur,
+                memory=None,
+                return_mtp=False,
+                return_aux=False,
+                past_kvs=text_kvs,
+                use_cache=True,
+                apply_tok_dropout=False,
+                use_text_emb=True,
+            )
+            assert txt_logits is not None
+            step_logits = txt_logits[0, -1, :].clone()
+            # Never emit TEXT_BOS or TEXT_PAD inside a decoded UTF-8 byte span
+            if bekern_full.TEXT_BOS_ID < step_logits.shape[0]:
+                step_logits[bekern_full.TEXT_BOS_ID] = float("-inf")
+            if bekern_full.TEXT_PAD_ID < step_logits.shape[0]:
+                step_logits[bekern_full.TEXT_PAD_ID] = float("-inf")
+            nxt = int(step_logits.argmax(dim=-1).item())
+            out_bytes.append(nxt)
+            if nxt == bekern_full.TEXT_EOS_ID:
+                break
+            cur = torch.tensor([[nxt]], dtype=torch.long, device=device)
+        if out_bytes[-1] != bekern_full.TEXT_EOS_ID:
+            out_bytes.append(bekern_full.TEXT_EOS_ID)
+        return out_bytes
+
     @torch.no_grad()
     def generate(
         self,
@@ -3802,8 +3961,11 @@ class UniOMRv2Net(nn.Module):
         max_len: int = 256,
         keep_ratio_override: Optional[float] = None,
         return_info: bool = False,
+        return_text_spans: bool = False,
+        max_text_span_len: int = 128,
+        use_mtp_draft: bool = False,
     ) -> Any:
-        """Fast KV-cached GQA greedy decoding (0% aux/MTP overhead, compact KV cache)."""
+        """Fast KV-cached GQA greedy decoding (with optional bekern-full UTF-8 text span decoding)."""
         mem, _, router_info = self.encode_image(
             images, keep_ratio_override=keep_ratio_override, return_aux=False
         )
@@ -3822,15 +3984,26 @@ class UniOMRv2Net(nn.Module):
             if (self.cfg.bekern_full and self.text_mode_gate is not None)
             else None
         )
+        text_spans_per_batch: List[List[List[int]]] = [[] for _ in range(B)]
+        pending_close = torch.zeros(B, dtype=torch.bool, device=device)
+        can_decode_text = (
+            bool(self.cfg.bekern_full)
+            and (self.tok_emb_text is not None)
+            and (self.lm_head_text is not None)
+        )
 
-        for _ in range(max_len):
-            logits, _, past_kvs = self.decode_tokens(
+        step = 0
+        while step < max_len:
+            extra: Dict[str, Any] = {}
+            logits, _, _, _, past_kvs = self._decode_tokens_impl(
                 cur_ids,
                 memory=None,
                 return_mtp=False,
                 return_aux=False,
                 past_kvs=past_kvs,
                 use_cache=True,
+                apply_tok_dropout=False,
+                out_extra=extra if use_mtp_draft else None,
             )
             step_logits = logits[:, -1, :]
             # Mitigation #5: confidence-gated Layer 3 text span entry (p_text >= mode_gate_conf_thresh)
@@ -3838,16 +4011,61 @@ class UniOMRv2Net(nn.Module):
                 gate_block = self._last_text_gate_prob < float(self.cfg.mode_gate_conf_thresh)
                 if bool(gate_block.any()):
                     step_logits = step_logits.clone()
-                    step_logits[gate_block.unsqueeze(1) & torch.zeros_like(step_logits, dtype=torch.bool).scatter_(1, text_open_ids.unsqueeze(0).expand(B, -1), True)] = float("-inf")
+                    mask_open = torch.zeros_like(step_logits, dtype=torch.bool).scatter_(
+                        1, text_open_ids.unsqueeze(0).expand(B, -1), True
+                    )
+                    step_logits[gate_block.unsqueeze(1) & mask_open] = float("-inf")
             next_tok = step_logits.argmax(dim=-1)
+            # If previous step opened a Layer 3 text span, close it cleanly in the music stream.
+            if can_decode_text and bool(pending_close.any()):
+                next_tok = torch.where(
+                    pending_close,
+                    torch.full_like(next_tok, bekern_full.TEXT_SPAN_CLOSE_TOKEN_ID),
+                    next_tok,
+                )
+                pending_close.zero_()
             next_tok = torch.where(finished, torch.full_like(next_tok, pad_id), next_tok)
             out_tokens.append(next_tok.unsqueeze(1))
+            step += 1
+
+            # Dual-head music -> UTF-8 text span decoding when an open tag is emitted.
+            if can_decode_text:
+                for b in range(B):
+                    if not bool(finished[b].item()) and int(next_tok[b].item()) in bekern_full.TEXT_SPAN_OPEN_TOKEN_IDS:
+                        mem_b = self._slice_mem_batch(mem, b)
+                        coord_b = coord_feat[b : b + 1] if coord_feat is not None else None
+                        past_kvs_b = self._slice_past_kvs_batch(past_kvs, b)
+                        span_bytes = self._decode_utf8_text_span(
+                            mem_b,
+                            coord_b,
+                            max_len=max_text_span_len,
+                            past_kvs_b=past_kvs_b,
+                            open_tok_id=int(next_tok[b].item()),
+                        )
+                        text_spans_per_batch[b].append(span_bytes)
+                        pending_close[b] = True
+
+            # Optional speculative MTP-4 drafting (guarded by bekern_full.is_mode_switch_token).
+            if (
+                use_mtp_draft
+                and B == 1
+                and not bool(finished[0].item())
+                and not bool(pending_close[0].item())
+                and len(self.mtp_heads) > 0
+                and "h_last" in extra
+            ):
+                _ = self.draft_mtp_tokens(extra["h_last"], int(next_tok[0].item()))
+
             finished = finished | (next_tok == eos_id)
             if bool(finished.all()):
                 break
             cur_ids = next_tok.unsqueeze(1)
 
         seq = torch.cat(out_tokens, dim=1)
+        if return_text_spans and return_info:
+            return seq, text_spans_per_batch, router_info
+        if return_text_spans:
+            return seq, text_spans_per_batch
         if return_info:
             return seq, router_info
         return seq
@@ -3866,6 +4084,7 @@ class UniOMRv2Net(nn.Module):
             images, keep_ratio_override=keep_ratio_override, return_aux=return_aux
         )
         eff_coord_feat = coord_feat if coord_feat is not None else router_info.get("coord_feat")
+        extra: Dict[str, Any] = {}
         logits, mtp_logits, sys_y_pred, text_logits, _ = self._decode_tokens_impl(
             tgt_ids,
             mem,
@@ -3873,6 +4092,7 @@ class UniOMRv2Net(nn.Module):
             return_aux=return_aux,
             coord_feat=eff_coord_feat,
             targets=targets,
+            out_extra=extra if self.cfg.bekern_full else None,
         )
         out: Dict[str, Any] = {
             "logits": logits,
@@ -3885,8 +4105,12 @@ class UniOMRv2Net(nn.Module):
         }
         if text_logits is not None:
             out["text_logits"] = text_logits
-        if self.bd3_repair_head is not None:
+        if "text_gate_logits" in extra:
+            out["text_gate_logits"] = extra["text_gate_logits"]
+        if self.bd3_repair_head is not None or self.cfg.bekern_full:
             out["mem_final"] = mem[-1]
+        if self.cfg.bekern_full:
+            out["mem_levels"] = mem
         return out
 
     def compute_loss(
@@ -3913,6 +4137,9 @@ class UniOMRv2Net(nn.Module):
         v2a_token_ids: Optional[Any] = None,
         has_v1_schema: Optional[bool] = None,
         layer_masks: Optional[torch.Tensor] = None,
+        text_byte_targets: Optional[torch.Tensor] = None,
+        text_byte_inputs: Optional[torch.Tensor] = None,
+        text_gate_loss_weight: float = 0.1,
     ) -> Dict[str, torch.Tensor]:
         """Compute combined CE + MTP-4 + router saliency + layout & stroke-HOG + optional text/BD3 losses."""
         logits: torch.Tensor = out["logits"]
@@ -3925,30 +4152,9 @@ class UniOMRv2Net(nn.Module):
         )
         pad_id = self.cfg.resolved_pad_id()
         if layer_masks is not None:
-            if ce_w is None:
-                ce_loss = bekern_full.masked_layer_cross_entropy(
-                    logits, targets, layer_masks, label_smoothing=ls
-                )
-            else:
-                tgt_mask, suppress_mask = bekern_full.build_layer_ce_masks(
-                    targets, layer_masks, vocab_size=V
-                )
-                masked_logits = logits.masked_fill(suppress_mask.unsqueeze(1), float("-inf"))
-                masked_targets = torch.where(
-                    tgt_mask,
-                    targets.to(dtype=torch.long),
-                    torch.full_like(targets, -100, dtype=torch.long),
-                )
-                if bool(tgt_mask.any()):
-                    ce_loss = F.cross_entropy(
-                        masked_logits.reshape(-1, V),
-                        masked_targets.reshape(-1),
-                        weight=ce_w,
-                        ignore_index=-100,
-                        label_smoothing=ls,
-                    )
-                else:
-                    ce_loss = logits.sum() * 0.0
+            ce_loss = bekern_full.masked_layer_cross_entropy(
+                logits, targets, layer_masks, label_smoothing=ls, weight=ce_w
+            )
         else:
             ce_loss = F.cross_entropy(
                 logits.reshape(-1, V),
@@ -4033,14 +4239,57 @@ class UniOMRv2Net(nn.Module):
         else:
             stroke_hog_loss = logits.new_zeros(())
 
-        # Optional text-aux head loss (zero cost when disabled)
+        # Optional text-aux / Layer 3 UTF-8 byte head loss
         eff_text_aux_w = (
             float(self.cfg.text_aux_loss_weight)
             if text_aux_loss_weight is None
             else float(text_aux_loss_weight)
         )
         text_logits: Optional[torch.Tensor] = out.get("text_logits")
-        if text_logits is not None and eff_text_aux_w > 0.0:
+        if self.cfg.bekern_full:
+            # bekern-full: NEVER call legacy build_text_aux_targets; supervise lm_head_text strictly on UTF-8 byte targets.
+            if text_byte_targets is not None and self.lm_head_text is not None and eff_text_aux_w > 0.0:
+                tbt = text_byte_targets.reshape(-1).to(device=logits.device, dtype=torch.long)
+                valid_tb = tbt != bekern_full.TEXT_PAD_ID
+                mem_for_text = out.get("mem_levels", out.get("mem_final"))
+                if (
+                    text_byte_inputs is not None
+                    and self.tok_emb_text is not None
+                    and mem_for_text is not None
+                ):
+                    _, _, _, byte_logits, _ = self._decode_tokens_impl(
+                        text_byte_inputs,
+                        mem_for_text,
+                        return_mtp=False,
+                        return_aux=False,
+                        use_cache=False,
+                        apply_tok_dropout=False,
+                        coord_feat=rinfo.get("coord_feat"),
+                        use_text_emb=True,
+                    )
+                    assert byte_logits is not None
+                    if bool(valid_tb.any()):
+                        text_aux_loss = F.cross_entropy(
+                            byte_logits.reshape(-1, byte_logits.shape[-1]),
+                            tbt.to(device=byte_logits.device),
+                            ignore_index=bekern_full.TEXT_PAD_ID,
+                        ).to(logits.dtype)
+                    else:
+                        text_aux_loss = (byte_logits.sum() * 0.0).to(logits.dtype)
+                elif text_logits is not None and text_logits.shape[:2] == text_byte_targets.shape[:2]:
+                    if bool(valid_tb.any()):
+                        text_aux_loss = F.cross_entropy(
+                            text_logits.reshape(-1, text_logits.shape[-1]),
+                            tbt.to(device=text_logits.device),
+                            ignore_index=bekern_full.TEXT_PAD_ID,
+                        ).to(logits.dtype)
+                    else:
+                        text_aux_loss = (text_logits.sum() * 0.0).to(logits.dtype)
+                else:
+                    text_aux_loss = logits.new_zeros(())
+            else:
+                text_aux_loss = logits.new_zeros(())
+        elif text_logits is not None and eff_text_aux_w > 0.0:
             text_tgt, _ = build_text_aux_targets(
                 targets,
                 int(self.cfg.vocab_size),
@@ -4054,6 +4303,38 @@ class UniOMRv2Net(nn.Module):
             ).to(logits.dtype)
         else:
             text_aux_loss = logits.new_zeros(())
+
+        # bekern-full Layer 3 text_mode_gate BCE supervision (predicts text-span open tokens on L3-annotated rows)
+        text_gate_logits: Optional[torch.Tensor] = out.get("text_gate_logits")
+        eff_text_gate_w = float(text_gate_loss_weight) if self.cfg.bekern_full else 0.0
+        if self.cfg.bekern_full and text_gate_logits is not None and eff_text_gate_w > 0.0:
+            open_ids_t = torch.tensor(
+                sorted(bekern_full.TEXT_SPAN_OPEN_TOKEN_IDS),
+                device=targets.device,
+                dtype=targets.dtype,
+            )
+            is_text_open_target = torch.isin(targets, open_ids_t).to(torch.float32)
+            gate_valid = targets != pad_id
+            if layer_masks is not None:
+                lm_t = (
+                    layer_masks.to(device=targets.device, dtype=torch.long)
+                    if isinstance(layer_masks, torch.Tensor)
+                    else torch.as_tensor(layer_masks, device=targets.device, dtype=torch.long)
+                )
+                if lm_t.ndim == 0:
+                    lm_t = lm_t.expand(targets.shape[0])
+                l3_row = ((lm_t & bekern_full.LAYER_BIT_L3) != 0).unsqueeze(1)
+                gate_valid = gate_valid & l3_row
+            if bool(gate_valid.any()):
+                per_pos_bce = F.binary_cross_entropy_with_logits(
+                    text_gate_logits.float(), is_text_open_target, reduction="none"
+                )
+                gv_f = gate_valid.to(torch.float32)
+                text_gate_loss = ((per_pos_bce * gv_f).sum() / gv_f.sum().clamp(min=1.0)).to(logits.dtype)
+            else:
+                text_gate_loss = text_gate_logits.sum() * 0.0
+        else:
+            text_gate_loss = logits.new_zeros(())
 
         # Optional BD3-LM + ReMDM-conf complementary masked-diffusion repair loss
         eff_bd3_w = float(bd3_repair_weight)
@@ -4081,6 +4362,7 @@ class UniOMRv2Net(nn.Module):
             + staff_seg_loss_weight * staff_seg_loss
             + stroke_hog_loss_weight * stroke_hog_loss
             + eff_text_aux_w * text_aux_loss
+            + eff_text_gate_w * text_gate_loss
             + eff_bd3_w * bd3_repair_loss
         )
         return {
@@ -4093,6 +4375,7 @@ class UniOMRv2Net(nn.Module):
             "staff_seg_loss": staff_seg_loss,
             "stroke_hog_loss": stroke_hog_loss,
             "text_aux_loss": text_aux_loss,
+            "text_gate_loss": text_gate_loss,
             "bd3_repair_loss": bd3_repair_loss,
         }
 
@@ -4110,6 +4393,7 @@ class UniOMRv2Net(nn.Module):
         bd3_params = _count(self.bd3_repair_head)
         decoder_params = (
             _count(self.tok_emb)
+            + _count(self.tok_emb_text)
             + deepstack_params
             + _count(self.dec_layers)
             + _count(self.dec_norm)
@@ -4194,7 +4478,7 @@ def warm_start_from_v265_checkpoint(
     ckpt_or_path: Any,
     new_tok_std: float = 0.02,
 ) -> Dict[str, Any]:
-    """Warm-start a ``bekern-full`` (``vocab_size=446``) model from a legacy ``vocab_size=265`` checkpoint.
+    """Warm-start a ``bekern-full`` model from a legacy ``vocab_size=265`` checkpoint.
 
     Safely copies:
       - ``tok_emb.weight[:265]``, ``lm_head.weight[:265]`` (and bias if any), and any
@@ -4202,23 +4486,43 @@ def warm_start_from_v265_checkpoint(
         freshly initialized with small normal std (``new_tok_std=0.02``; biases zeroed).
       - ``encoder.register_tokens`` across ``0 -> 8`` or ``4 -> 8`` (copying ``[:, :min_r, :]``
         and leaving extra register slots freshly initialized with std ``new_tok_std``).
-      - Newly added or resized Layer 3 ``lm_head_text`` / ``text_mode_gate`` weights without
-        failing ``strict=False``.
+      - Newly added or resized Layer 3 ``tok_emb_text`` / ``lm_head_text`` / ``text_mode_gate``
+        weights without failing ``strict=False``.
     """
     if isinstance(ckpt_or_path, (str, Path)):
-        raw_ckpt = torch.load(str(ckpt_or_path), map_location="cpu", weights_only=True)
+        try:
+            raw_ckpt = torch.load(str(ckpt_or_path), map_location="cpu", weights_only=True)
+        except Exception:
+            raw_ckpt = torch.load(str(ckpt_or_path), map_location="cpu", weights_only=False)
     else:
         raw_ckpt = ckpt_or_path
 
     if isinstance(raw_ckpt, dict):
         if "model" in raw_ckpt and isinstance(raw_ckpt["model"], dict):
-            raw_sd: Dict[str, torch.Tensor] = raw_ckpt["model"]
+            raw_sd_in: Dict[str, torch.Tensor] = raw_ckpt["model"]
         elif "state_dict" in raw_ckpt and isinstance(raw_ckpt["state_dict"], dict):
-            raw_sd = raw_ckpt["state_dict"]
+            raw_sd_in = raw_ckpt["state_dict"]
+        elif "ema_state_dict" in raw_ckpt and isinstance(raw_ckpt["ema_state_dict"], dict):
+            raw_sd_in = raw_ckpt["ema_state_dict"]
+        elif "ema_model" in raw_ckpt and isinstance(raw_ckpt["ema_model"], dict):
+            raw_sd_in = raw_ckpt["ema_model"]
         else:
-            raw_sd = raw_ckpt
+            raw_sd_in = raw_ckpt
     else:
         raise ValueError(f"Unsupported checkpoint payload type: {type(raw_ckpt)!r}")
+
+    # Strip torch.compile / DDP prefixes (_orig_mod., module.) cleanly.
+    raw_sd: Dict[str, torch.Tensor] = {}
+    for raw_k, raw_v in raw_sd_in.items():
+        if not isinstance(raw_v, torch.Tensor):
+            continue
+        k = str(raw_k)
+        while k.startswith("_orig_mod.") or k.startswith("module."):
+            if k.startswith("_orig_mod."):
+                k = k[len("_orig_mod."):]
+            elif k.startswith("module."):
+                k = k[len("module."):]
+        raw_sd[k] = raw_v
 
     model_sd = model.state_dict()
     old_v = int(bekern_full.LEGACY_VOCAB_SIZE)  # 265
@@ -4231,9 +4535,11 @@ def warm_start_from_v265_checkpoint(
     vocab_expanded: List[str] = []
     register_expanded: List[str] = []
     shape_skipped: List[str] = []
+    unexpected_keys: List[str] = []
 
     for k, v in raw_sd.items():
         if k not in model_sd:
+            unexpected_keys.append(k)
             continue
         dst = model_sd[k]
         if tuple(v.shape) == tuple(dst.shape):
@@ -4249,6 +4555,7 @@ def warm_start_from_v265_checkpoint(
             and tuple(v.shape[1:]) == tuple(dst.shape[1:])
             and any(marker in k for marker in vocab_key_markers)
             and ("lm_head_text" not in k)
+            and ("tok_emb_text" not in k)
         ):
             out = torch.empty_like(dst)
             if out.ndim >= 2:
@@ -4275,12 +4582,22 @@ def warm_start_from_v265_checkpoint(
                 out[:, :copy_r, :] = v[:, :copy_r, :].to(dtype=out.dtype)
             filtered_sd[k] = out
             register_expanded.append(f"{k}:{v.shape[1]}->{dst.shape[1]}")
+            model._warm_start_old_registers = copy_r
             continue
 
         # 3. Any other shape mismatch (e.g. Iter 15 lm_head_text 129 -> Iter 16 259): leave freshly initialized
         shape_skipped.append(f"{k}:{tuple(v.shape)}!={tuple(dst.shape)}")
 
+    if len(filtered_sd) == 0:
+        raise RuntimeError(
+            f"warm_start_from_v265_checkpoint loaded 0 matching parameters "
+            f"(unexpected={len(unexpected_keys)}, shape_skipped={len(shape_skipped)})"
+        )
+
     inc = model.load_state_dict(filtered_sd, strict=False)
+    all_unexpected = list(unexpected_keys) + [
+        uk for uk in inc.unexpected_keys if uk not in unexpected_keys
+    ]
     return {
         "loaded_count": len(filtered_sd),
         "old_vocab_size": old_v,
@@ -4288,7 +4605,7 @@ def warm_start_from_v265_checkpoint(
         "vocab_expanded": vocab_expanded,
         "register_expanded": register_expanded,
         "missing_keys": list(inc.missing_keys),
-        "unexpected_keys": list(inc.unexpected_keys),
+        "unexpected_keys": all_unexpected,
         "shape_skipped": shape_skipped,
     }
 
@@ -4299,7 +4616,7 @@ def _is_bekern_stage1_trainable_name(name: str) -> bool:
         return True
     if name.endswith("register_tokens"):
         return True
-    if name.startswith("lm_head_text.") or name.startswith("text_mode_gate."):
+    if name.startswith("lm_head_text.") or name.startswith("tok_emb_text.") or name.startswith("text_mode_gate."):
         return True
     if (
         ".mode_gate." in name
@@ -4312,27 +4629,55 @@ def _is_bekern_stage1_trainable_name(name: str) -> bool:
     return False
 
 
+def restore_bekern_full_stage1_frozen_slices(model: UniOMRv2Net) -> int:
+    """Restore frozen Stage-1 parameter slices after ``opt.step()`` (protects against AdamW weight decay).
+
+    Keeps legacy ``tok_emb.weight[:265]``, ``lm_head.weight[:265]``, and any copied
+    ``register_tokens[:, :old_r, :]`` bit-exact invariant even under ``AdamW(weight_decay > 0)``.
+    """
+    frozen_slices: Dict[str, Tuple[int, int, torch.Tensor]] = getattr(model, "_stage1_frozen_slices", {})
+    if not frozen_slices:
+        return 0
+    param_map = dict(model.named_parameters())
+    restored = 0
+    with torch.no_grad():
+        for name, (dim, end_idx, snap) in frozen_slices.items():
+            p = param_map.get(name)
+            if p is None:
+                continue
+            snap_dev = snap.to(device=p.device, dtype=p.dtype)
+            if dim == 0:
+                p[:end_idx].copy_(snap_dev)
+            elif dim == 1:
+                p[:, :end_idx, ...].copy_(snap_dev)
+            restored += 1
+    return restored
+
+
 def set_bekern_full_stage(
     model: UniOMRv2Net,
     stage: int,
     legacy_vocab_size: int = bekern_full.LEGACY_VOCAB_SIZE,
+    legacy_register_tokens: Optional[int] = None,
 ) -> Dict[str, Any]:
     """Configure Iter 16 2-stage freeze/unfreeze schedule (Mitigation #10).
 
     - ``stage == 1``: freezes encoder + core decoder layers, keeping ONLY:
         * new token rows ``[legacy_vocab_size:]`` in ``tok_emb`` & ``lm_head``
-          (enforced via backward gradient hooks zeroing ``grad[:legacy_vocab_size]``),
-        * ``encoder.register_tokens``,
+          (enforced via backward gradient hooks zeroing ``grad[:legacy_vocab_size]``
+          PLUS frozen snapshots restored by ``restore_bekern_full_stage1_frozen_slices``
+          after ``opt.step()`` so AdamW decoupled weight decay never drifts ``[:265]``),
+        * ``encoder.register_tokens`` (preserving ``[:, :old_r, :]`` if warm-started),
         * ``ModeGate`` parameters (``mode_gate``, ``film_gamma/beta``, ``q_down/q_up``, ``text_mode_gate``),
-        * Layer 3 ``lm_head_text``.
+        * Layer 3 ``tok_emb_text`` & ``lm_head_text``.
     - ``stage == 2`` (or ``stage == 0``): removes all Stage-1 gradient hooks and
-      unfreezes every parameter in ``model`` for joint fine-tuning.
+      frozen snapshots, and unfreezes every parameter in ``model`` for joint fine-tuning.
     """
     st = int(stage)
     if st not in (0, 1, 2):
         raise ValueError(f"stage must be 0, 1, or 2, got {stage!r}")
 
-    # Always clear any prior Stage-1 hooks first so repeated calls stay idempotent.
+    # Always clear any prior Stage-1 hooks & frozen snapshots first so repeated calls stay idempotent.
     old_hooks = getattr(model, "_bekern_stage1_hooks", None)
     if old_hooks:
         for h in old_hooks:
@@ -4341,6 +4686,7 @@ def set_bekern_full_stage(
             except Exception:
                 pass
     model._bekern_stage1_hooks = []
+    model._stage1_frozen_slices = {}
 
     if st in (0, 2):
         for p in model.parameters():
@@ -4355,11 +4701,19 @@ def set_bekern_full_stage(
 
     # Stage 1: freeze core; train only new vocab rows, register_tokens, ModeGate, and text head.
     cut = int(legacy_vocab_size)
+    old_r = (
+        int(legacy_register_tokens)
+        if legacy_register_tokens is not None
+        else int(getattr(model, "_warm_start_old_registers", 0))
+    )
     hooks: List[Any] = []
+    frozen_slices: Dict[str, Tuple[int, int, torch.Tensor]] = {}
     for name, p in model.named_parameters():
         if _is_bekern_stage1_trainable_name(name):
             p.requires_grad_(True)
             if name in ("tok_emb.weight", "lm_head.weight", "lm_head.bias") and p.shape[0] > cut:
+                frozen_slices[name] = (0, cut, p[:cut].detach().clone())
+
                 def _make_zero_prefix_hook(prefix_len: int):
                     def _hook(grad: torch.Tensor) -> torch.Tensor:
                         if grad is None:
@@ -4368,11 +4722,26 @@ def set_bekern_full_stage(
                         out[:prefix_len].zero_()
                         return out
                     return _hook
+
                 hooks.append(p.register_hook(_make_zero_prefix_hook(cut)))
+            elif name.endswith("register_tokens") and old_r > 0 and p.ndim == 3 and p.shape[1] > old_r:
+                frozen_slices[name] = (1, old_r, p[:, :old_r, :].detach().clone())
+
+                def _make_zero_reg_hook(prefix_r: int):
+                    def _hook(grad: torch.Tensor) -> torch.Tensor:
+                        if grad is None:
+                            return grad
+                        out = grad.clone()
+                        out[:, :prefix_r, :].zero_()
+                        return out
+                    return _hook
+
+                hooks.append(p.register_hook(_make_zero_reg_hook(old_r)))
         else:
             p.requires_grad_(False)
 
     model._bekern_stage1_hooks = hooks
+    model._stage1_frozen_slices = frozen_slices
     trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
     frozen = sum(p.numel() for p in model.parameters() if not p.requires_grad)
     return {
@@ -4380,4 +4749,5 @@ def set_bekern_full_stage(
         "trainable_params": trainable,
         "frozen_params": frozen,
         "n_hooks": len(hooks),
+        "n_frozen_slices": len(frozen_slices),
     }
