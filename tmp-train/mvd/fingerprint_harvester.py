@@ -58,6 +58,28 @@ DEFAULT_GATE20_EXCLUSION = (
     REPO_ROOT / "data-gen" / "score-corpus" / "gate20" / "exclusion.json"
 )
 DEFAULT_NORTHSTAR_MANIFEST = Path(r"D:\tmp\northstar-eval-pack-v0.2\manifest.json")
+DEFAULT_SYNTHETIC_PREFIXES: Tuple[str, ...] = ("hwsim_", "hw_sim_", "synth_")
+
+
+def _matches_exclude_prefix(
+    work_id: str,
+    source_path: str = "",
+    exclude_prefixes: Sequence[str] = (),
+) -> bool:
+    """Return True if work_id or source_path stem starts with any excluded prefix (case-insensitive)."""
+    if not exclude_prefixes:
+        return False
+    pfxs = tuple(p.lower() for p in exclude_prefixes if p)
+    if not pfxs:
+        return False
+    wid = (work_id or "").strip().lower()
+    if wid and wid.startswith(pfxs):
+        return True
+    if source_path:
+        stem = Path(source_path).stem.strip().lower()
+        if stem and stem.startswith(pfxs):
+            return True
+    return False
 
 SYS_TOKEN = "<sys>"
 
@@ -253,6 +275,43 @@ def _compute_content_hash(n_staves: int, measures: Sequence[MeasureSummary]) -> 
             h.update(f"{st}:".encode("ascii"))
             for n in m.staff_notes[st]:
                 h.update(f"{n.midi},{quantize_dur(n.dur_q)};".encode("ascii"))
+    return h.hexdigest()[:16]
+
+
+def compute_decode_hash(query: ParsedScore | Sequence[str] | str) -> str:
+    """Compute a deterministic normalized pitch-interval + rhythm hash of a decoded query.
+
+    Used by the batch-level Hallucination Attractor Guard to detect identical
+    hallucinated decodes emitted across multiple distinct manuscript images.
+    Returns empty string if the decoded sequence has no notes.
+    """
+    if isinstance(query, ParsedScore):
+        score = query
+    elif isinstance(query, str):
+        score = parse_bekern_tokens(query.split(), work_id="query")
+    else:
+        score = parse_bekern_tokens(query, work_id="query")
+
+    if score.n_measures == 0 or score.n_notes == 0:
+        return ""
+
+    h = hashlib.sha1()
+    h.update(f"s={score.n_staves}|m={score.n_measures}|".encode("ascii"))
+    prev_last_midi: Dict[int, int] = {}
+    for m in score.measures:
+        h.update(b"|")
+        for st in sorted(m.staff_notes.keys()):
+            notes = m.staff_notes[st]
+            if not notes:
+                continue
+            h.update(f"{st}:".encode("ascii"))
+            for k, n in enumerate(notes):
+                if k == 0:
+                    iv = (n.midi - prev_last_midi[st]) if st in prev_last_midi else 0
+                else:
+                    iv = n.midi - notes[k - 1].midi
+                h.update(f"{_clamp(iv, -24, 24)},{quantize_dur(n.dur_q)};".encode("ascii"))
+            prev_last_midi[st] = notes[-1].midi
     return h.hexdigest()[:16]
 
 
@@ -985,6 +1044,7 @@ class SymbolicIndex:
         self.skipped_duplicates: int = 0
         self.skipped_empty: int = 0
         self.skipped_eval_excluded: int = 0
+        self.skipped_synthetic: int = 0
 
     @property
     def n_works(self) -> int:
@@ -1000,8 +1060,13 @@ class SymbolicIndex:
         *,
         deduplicate: bool = True,
         leakage_guard: Optional[EvalLeakageGuard] = None,
+        exclude_prefixes: Sequence[str] = (),
     ) -> Optional[int]:
         """Add a ParsedScore to the inverted index. Returns work_idx or None if skipped."""
+        if _matches_exclude_prefix(score.work_id, score.source_path, exclude_prefixes):
+            self.skipped_synthetic = getattr(self, "skipped_synthetic", 0) + 1
+            return None
+
         if score.n_measures == 0 or score.n_notes < 5:
             self.skipped_empty += 1
             return None
@@ -1059,6 +1124,7 @@ class SymbolicIndex:
         deduplicate: bool = True,
         leakage_guard: Optional[EvalLeakageGuard] = None,
         work_id_prefix: str = "",
+        exclude_prefixes: Sequence[str] = DEFAULT_SYNTHETIC_PREFIXES,
     ) -> int:
         added = 0
         for raw_p in paths:
@@ -1066,6 +1132,9 @@ class SymbolicIndex:
             if not p.is_file():
                 continue
             wid = f"{work_id_prefix}{p.stem}" if work_id_prefix else p.stem
+            if _matches_exclude_prefix(wid, str(p), exclude_prefixes):
+                self.skipped_synthetic = getattr(self, "skipped_synthetic", 0) + 1
+                continue
             if leakage_guard is not None:
                 leaked, _ = leakage_guard.check(wid, str(p))
                 if leaked:
@@ -1087,6 +1156,7 @@ class SymbolicIndex:
         deduplicate: bool = True,
         leakage_guard: Optional[EvalLeakageGuard] = None,
         max_rows: Optional[int] = None,
+        exclude_prefixes: Sequence[str] = DEFAULT_SYNTHETIC_PREFIXES,
     ) -> int:
         """Index digital bekern pages directly from a UniOMR JSONL training manifest.
 
@@ -1125,6 +1195,9 @@ class SymbolicIndex:
 
                 img_path = str(row.get("image", ""))
                 wid = Path(img_path).stem if img_path else Path(bk_paths[0]).stem
+                if _matches_exclude_prefix(wid, img_path or str(bk_paths[0]), exclude_prefixes):
+                    self.skipped_synthetic = getattr(self, "skipped_synthetic", 0) + 1
+                    continue
                 if leakage_guard is not None:
                     leaked, _ = leakage_guard.check(wid, img_path, str(bk_paths[0]))
                     if leaked:
@@ -1164,7 +1237,7 @@ class SymbolicIndex:
     def load(cls, path: Path | str) -> "SymbolicIndex":
         with gzip.open(Path(path), "rb") as fh:
             obj = pickle.load(fh)
-        if not isinstance(obj, cls):
+        if not isinstance(obj, cls) and type(obj).__name__ != cls.__name__:
             raise TypeError(f"Expected SymbolicIndex, got {type(obj)}")
         return obj
 
@@ -1179,6 +1252,7 @@ def build_index(
     deduplicate: bool = True,
     leakage_guard: Optional[EvalLeakageGuard] = None,
     max_jsonl_rows: Optional[int] = None,
+    exclude_prefixes: Sequence[str] = DEFAULT_SYNTHETIC_PREFIXES,
 ) -> SymbolicIndex:
     """Build a SymbolicIndex from any combination of MusicXML dirs/files, bekern files, and JSONL manifests."""
     index = SymbolicIndex()
@@ -1192,19 +1266,35 @@ def build_index(
             for p in dp.rglob("*")
             if p.is_file() and p.suffix.lower() in (".mxl", ".musicxml", ".xml")
         )
-        index.add_musicxml_paths(found, deduplicate=deduplicate, leakage_guard=leakage_guard)
+        index.add_musicxml_paths(
+            found,
+            deduplicate=deduplicate,
+            leakage_guard=leakage_guard,
+            exclude_prefixes=exclude_prefixes,
+        )
 
     if musicxml_files:
         index.add_musicxml_paths(
-            musicxml_files, deduplicate=deduplicate, leakage_guard=leakage_guard
+            musicxml_files,
+            deduplicate=deduplicate,
+            leakage_guard=leakage_guard,
+            exclude_prefixes=exclude_prefixes,
         )
 
     for bf in bekern_files:
         bp = Path(bf)
         if not bp.is_file():
             continue
+        if _matches_exclude_prefix(bp.stem, str(bp), exclude_prefixes):
+            index.skipped_synthetic += 1
+            continue
         score = parse_bekern_file(bp)
-        index.add_score(score, deduplicate=deduplicate, leakage_guard=leakage_guard)
+        index.add_score(
+            score,
+            deduplicate=deduplicate,
+            leakage_guard=leakage_guard,
+            exclude_prefixes=exclude_prefixes,
+        )
 
     for jp in bekern_jsonls:
         index.add_bekern_jsonl(
@@ -1213,6 +1303,7 @@ def build_index(
             deduplicate=deduplicate,
             leakage_guard=leakage_guard,
             max_rows=max_jsonl_rows,
+            exclude_prefixes=exclude_prefixes,
         )
 
     return index
@@ -1265,6 +1356,29 @@ def _works_window_similarity(
     return 0.6 * _bag_f1(iv1, iv2) + 0.4 * _bag_f1(rh1, rh2)
 
 
+def _get_excluded_work_idxs(
+    index: SymbolicIndex, exclude_prefixes: Sequence[str]
+) -> Set[int]:
+    """Return cached set of work_idx values matching exclude_prefixes for fast retrieval filtering."""
+    if not exclude_prefixes:
+        return set()
+    pfxs = tuple(p.lower() for p in exclude_prefixes if p)
+    if not pfxs:
+        return set()
+    cache = getattr(index, "_excluded_prefix_cache", None)
+    if cache is None:
+        cache = {}
+        setattr(index, "_excluded_prefix_cache", cache)
+    key = (pfxs, len(index.works))
+    if key not in cache:
+        cache[key] = {
+            w.work_idx
+            for w in index.works
+            if _matches_exclude_prefix(w.work_id, w.source_path, pfxs)
+        }
+    return cache[key]
+
+
 def retrieve_best_fit(
     query: ParsedScore | Sequence[str],
     index: SymbolicIndex,
@@ -1274,6 +1388,7 @@ def retrieve_best_fit(
     min_max_df: int = 250,
     offset_jitter: int = 2,
     same_work_dedup_sim: float = 0.85,
+    exclude_prefixes: Sequence[str] = (),
 ) -> RetrievalResult:
     """Shazam-style Hough diagonal voting over 5-note pitch-interval + IOI-ratio n-grams.
 
@@ -1299,6 +1414,7 @@ def retrieve_best_fit(
 
     max_df = max(min_max_df, int(max_df_frac * index.n_works))
     postings = index.postings
+    excluded_idxs = _get_excluded_work_idxs(index, exclude_prefixes)
 
     # Deduplicate query (ngram_hash, q_m) pairs so repeated bars don't over-vote
     unique_q = set(q_ngrams)
@@ -1314,6 +1430,8 @@ def retrieve_best_fit(
             continue
         w = 1.0 / math.log2(2.0 + df)
         for w_idx, ref_m in plist:
+            if excluded_idxs and w_idx in excluded_idxs:
+                continue
             off = ref_m - q_m
             votes[(w_idx, off)] += w
             if offset_jitter >= 1:
@@ -1643,6 +1761,8 @@ class HarvestDecision:
     m_start: int
     m_end: int
     system_breaks: List[Tuple[int, int]]
+    query_source_path: str = ""
+    decode_hash: str = ""
 
 
 def verify_harvest_candidate(
@@ -1667,6 +1787,8 @@ def verify_harvest_candidate(
     """
     reasons: List[str] = []
     top1 = retrieval.top1
+    q_src = query.source_path or query.work_id
+    dhash = compute_decode_hash(query)
 
     if top1 is None or alignment is None:
         return HarvestDecision(
@@ -1685,6 +1807,8 @@ def verify_harvest_candidate(
             m_start=0,
             m_end=0,
             system_breaks=[],
+            query_source_path=q_src,
+            decode_hash=dhash,
         )
 
     # (a) Exact staff-count parity
@@ -1726,6 +1850,8 @@ def verify_harvest_candidate(
         m_start=alignment.m_start,
         m_end=alignment.m_end,
         system_breaks=alignment.system_breaks,
+        query_source_path=q_src,
+        decode_hash=dhash,
     )
 
 
@@ -1738,6 +1864,7 @@ def harvest_page(
     tau_score: float = 3.5,
     leakage_guard: Optional[EvalLeakageGuard] = None,
     check_eval_leakage: bool = True,
+    exclude_prefixes: Sequence[str] = (),
 ) -> Tuple[RetrievalResult, Optional[AlignmentResult], HarvestDecision]:
     """Convenience end-to-end call: retrieve -> banded-DTW align -> verify gate."""
     q_score = (
@@ -1745,7 +1872,7 @@ def harvest_page(
         if isinstance(query, ParsedScore)
         else parse_bekern_tokens(query, work_id="query")
     )
-    ret = retrieve_best_fit(q_score, index)
+    ret = retrieve_best_fit(q_score, index, exclude_prefixes=exclude_prefixes)
     if ret.top1 is None:
         dec = verify_harvest_candidate(
             q_score,
@@ -1775,6 +1902,140 @@ def harvest_page(
 
 
 # ---------------------------------------------------------------------------
+# 8b. Batch-Level Hallucination Attractor Guard (filter_attractors)
+# ---------------------------------------------------------------------------
+
+
+def _item_get(item: Any, key: str, default: Any = None) -> Any:
+    if isinstance(item, dict):
+        return item.get(key, default)
+    return getattr(item, key, default)
+
+
+def _item_reject(item: Any, reason: str) -> None:
+    if isinstance(item, dict):
+        item["accepted"] = False
+        reasons = item.setdefault("reasons", [])
+        if reason not in reasons:
+            reasons.append(reason)
+    else:
+        item.accepted = False
+        if reason not in item.reasons:
+            item.reasons.append(reason)
+
+
+def _spans_overlap(a: Tuple[int, int], b: Tuple[int, int]) -> bool:
+    """Return True if two half-open measure spans [s, e) overlap."""
+    return a[0] < b[1] and b[0] < a[1]
+
+
+def filter_attractors(
+    results: Sequence[Any],
+    max_queries_per_work: int = 2,
+    max_duplicate_decodes: int = 1,
+) -> List[Any]:
+    """Batch-level Hallucination Attractor Guard.
+
+    Mutates each result (``HarvestDecision`` or dict) in-place and returns the list:
+      1. **Duplicate-decode rejection (``HALLUCINATION_DUPLICATE_DECODE``):**
+         Computes/reads the normalized pitch-interval/token ``decode_hash`` of each
+         query's decoded sequence. If the exact same ``decode_hash`` appears across
+         ``> max_duplicate_decodes`` (default ``1``, i.e. ``>= 2``) distinct image
+         paths, marks ALL matching items rejected with
+         ``"HALLUCINATION_DUPLICATE_DECODE"``.
+      2. **Attractor-work rejection (``HALLUCINATION_ATTRACTOR_WORK``):**
+         If the same ``work_id`` is matched (passing per-page gates) by
+         ``> max_queries_per_work`` (default ``2``) distinct query images whose
+         matched measure spans overlap (or total ``> max_queries_per_work`` across
+         the batch), marks all of them rejected with
+         ``"HALLUCINATION_ATTRACTOR_WORK"``.
+    """
+    items = list(results)
+    if not items:
+        return items
+
+    # Snapshot initial acceptance before batch-level rejections so attractor works
+    # remain detectable even when some of their queries also collide on decode_hash.
+    initially_accepted: List[bool] = [bool(_item_get(it, "accepted", False)) for it in items]
+
+    img_keys: List[str] = []
+    hash_to_indices: Dict[str, List[int]] = defaultdict(list)
+    hash_to_images: Dict[str, Set[str]] = defaultdict(set)
+
+    for idx, it in enumerate(items):
+        raw_img = (
+            _item_get(it, "image", "")
+            or _item_get(it, "query_source_path", "")
+            or _item_get(it, "source_path", "")
+            or _item_get(it, "query_id", "")
+        )
+        img_key = str(raw_img).strip().lower() or f"__row_{idx}"
+        img_keys.append(img_key)
+
+        dhash = str(_item_get(it, "decode_hash", "") or "").strip()
+        if not dhash:
+            raw_seq = (
+                _item_get(it, "query", None)
+                or _item_get(it, "tokens", None)
+                or _item_get(it, "bekern", None)
+            )
+            if raw_seq is not None:
+                dhash = compute_decode_hash(raw_seq)
+                if isinstance(it, dict):
+                    it["decode_hash"] = dhash
+                elif hasattr(it, "decode_hash"):
+                    it.decode_hash = dhash
+        if dhash:
+            hash_to_indices[dhash].append(idx)
+            hash_to_images[dhash].add(img_key)
+
+    # 1. Duplicate-decode rejection
+    for dhash, idxs in hash_to_indices.items():
+        if len(hash_to_images[dhash]) > max_duplicate_decodes:
+            for idx in idxs:
+                _item_reject(items[idx], "HALLUCINATION_DUPLICATE_DECODE")
+
+    # 2. Attractor-work rejection
+    work_to_indices: Dict[str, List[int]] = defaultdict(list)
+    work_to_images: Dict[str, Set[str]] = defaultdict(set)
+    for idx, it in enumerate(items):
+        if not initially_accepted[idx]:
+            continue
+        wid = str(_item_get(it, "work_id", "") or "").strip()
+        if not wid:
+            continue
+        work_to_indices[wid].append(idx)
+        work_to_images[wid].add(img_keys[idx])
+
+    for wid, idxs in work_to_indices.items():
+        distinct_imgs = work_to_images[wid]
+        if len(distinct_imgs) > max_queries_per_work:
+            for idx in idxs:
+                _item_reject(items[idx], "HALLUCINATION_ATTRACTOR_WORK")
+            continue
+
+        # Also explicitly check overlapping measure spans per distinct image
+        spans = [
+            (
+                img_keys[idx],
+                (int(_item_get(items[idx], "m_start", 0)), int(_item_get(items[idx], "m_end", 0))),
+            )
+            for idx in idxs
+        ]
+        for idx_pos, (im_a, sp_a) in enumerate(spans):
+            if sp_a[1] <= sp_a[0]:
+                continue
+            overlap_imgs = {im_a}
+            for im_b, sp_b in spans:
+                if sp_b[1] > sp_b[0] and _spans_overlap(sp_a, sp_b):
+                    overlap_imgs.add(im_b)
+            if len(overlap_imgs) > max_queries_per_work:
+                _item_reject(items[idxs[idx_pos]], "HALLUCINATION_ATTRACTOR_WORK")
+
+    return items
+
+
+# ---------------------------------------------------------------------------
 # 9. CLI Entrypoint (build-index, retrieve, sweep-rism)
 # ---------------------------------------------------------------------------
 
@@ -1791,6 +2052,12 @@ def _build_cli() -> argparse.ArgumentParser:
     p_idx.add_argument("--out", required=True, help="Output .pkl.gz index path")
     p_idx.add_argument("--no-leakage-guard", action="store_true", help="Disable eval exclusion")
     p_idx.add_argument("--max-jsonl-rows", type=int, default=None)
+    p_idx.add_argument(
+        "--exclude-synthetic",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Exclude synthetic prefixes (hwsim_, hw_sim_, synth_) from indexing (default: True)",
+    )
 
     p_ret = sub.add_parser("retrieve", help="Retrieve & align a single bekern page.")
     p_ret.add_argument("--index", required=True, help="Path to .pkl.gz index")
@@ -1798,6 +2065,32 @@ def _build_cli() -> argparse.ArgumentParser:
     p_ret.add_argument("--tau-align", type=float, default=0.38)
     p_ret.add_argument("--tau-margin", type=float, default=0.15)
     p_ret.add_argument("--no-leakage-guard", action="store_true")
+    p_ret.add_argument(
+        "--exclude-synthetic",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Exclude synthetic prefixes (hwsim_, hw_sim_, synth_) at retrieval time (default: True)",
+    )
+
+    p_swp = sub.add_parser(
+        "sweep-jsonl",
+        help="Batch-harvest a decoded bekern JSONL with synthetic exclusion & Hallucination Attractor Guard.",
+    )
+    p_swp.add_argument("--index", required=True, help="Path to .pkl.gz index")
+    p_swp.add_argument("--jsonl", required=True, help="Input decoded bekern JSONL")
+    p_swp.add_argument("--out", required=True, help="Output JSONL of clean accepted matches")
+    p_swp.add_argument("--tau-align", type=float, default=0.38)
+    p_swp.add_argument("--tau-margin", type=float, default=0.15)
+    p_swp.add_argument("--tau-score", type=float, default=3.5)
+    p_swp.add_argument("--max-queries-per-work", type=int, default=2)
+    p_swp.add_argument("--max-duplicate-decodes", type=int, default=1)
+    p_swp.add_argument("--no-leakage-guard", action="store_true")
+    p_swp.add_argument(
+        "--exclude-synthetic",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Exclude synthetic prefixes (hwsim_, hw_sim_, synth_) at retrieval time (default: True)",
+    )
 
     return ap
 
@@ -1809,11 +2102,13 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     if args.cmd == "build-index":
         t0 = time.perf_counter()
         guard = None if args.no_leakage_guard else EvalLeakageGuard.from_files()
+        excl = DEFAULT_SYNTHETIC_PREFIXES if args.exclude_synthetic else ()
         idx = build_index(
             musicxml_dirs=args.musicxml_dir,
             bekern_jsonls=args.bekern_jsonl,
             leakage_guard=guard,
             max_jsonl_rows=args.max_jsonl_rows,
+            exclude_prefixes=excl,
         )
         idx.save(args.out)
         dt = time.perf_counter() - t0
@@ -1827,6 +2122,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     "skipped_duplicates": idx.skipped_duplicates,
                     "skipped_empty": idx.skipped_empty,
                     "skipped_eval_excluded": idx.skipped_eval_excluded,
+                    "skipped_synthetic": getattr(idx, "skipped_synthetic", 0),
                     "elapsed_s": round(dt, 2),
                 },
                 indent=2,
@@ -1837,14 +2133,114 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     if args.cmd == "retrieve":
         idx = SymbolicIndex.load(args.index)
         q = parse_bekern_file(args.bekern)
+        excl = DEFAULT_SYNTHETIC_PREFIXES if args.exclude_synthetic else ()
         _, _, dec = harvest_page(
             q,
             idx,
             tau_align=args.tau_align,
             tau_margin=args.tau_margin,
             check_eval_leakage=not args.no_leakage_guard,
+            exclude_prefixes=excl,
         )
         print(json.dumps(dec.__dict__, indent=2))
+        return 0
+
+    if args.cmd == "sweep-jsonl":
+        t0 = time.perf_counter()
+        idx = SymbolicIndex.load(args.index)
+        guard = None if args.no_leakage_guard else EvalLeakageGuard.from_files()
+        excl = DEFAULT_SYNTHETIC_PREFIXES if args.exclude_synthetic else ()
+
+        rows_in: List[Dict[str, Any]] = []
+        with Path(args.jsonl).open("r", encoding="utf-8") as fh:
+            for line in fh:
+                line = line.strip()
+                if line:
+                    rows_in.append(json.loads(line))
+
+        batch_records: List[Dict[str, Any]] = []
+        per_page_accepted = 0
+        for row in rows_in:
+            img_path = str(row.get("image", ""))
+            bk_paths = row.get("bekerns") or []
+            if isinstance(bk_paths, str):
+                bk_paths = [bk_paths]
+            sys_streams: List[List[str]] = []
+            for bp in bk_paths:
+                p = Path(bp)
+                if p.is_file():
+                    toks = p.read_text(encoding="utf-8", errors="ignore").split()
+                    if toks:
+                        sys_streams.append(toks)
+            qid = Path(img_path).stem if img_path else (Path(bk_paths[0]).stem if bk_paths else "query")
+            q_score = parse_bekern_tokens(
+                [],
+                work_id=qid,
+                source_path=img_path,
+                system_streams=sys_streams,
+            )
+            ret, _, dec = harvest_page(
+                q_score,
+                idx,
+                tau_align=args.tau_align,
+                tau_margin=args.tau_margin,
+                tau_score=args.tau_score,
+                leakage_guard=guard,
+                check_eval_leakage=not args.no_leakage_guard,
+                exclude_prefixes=excl,
+            )
+            if dec.accepted:
+                per_page_accepted += 1
+            rec = dict(dec.__dict__)
+            rec["image"] = img_path
+            rec["work_source_path"] = ret.top1.source_path if ret.top1 else ""
+            rec["bekerns"] = bk_paths
+            batch_records.append(rec)
+
+        filter_attractors(
+            batch_records,
+            max_queries_per_work=args.max_queries_per_work,
+            max_duplicate_decodes=args.max_duplicate_decodes,
+        )
+
+        dup_rejected = sum(
+            1 for r in batch_records if "HALLUCINATION_DUPLICATE_DECODE" in r["reasons"]
+        )
+        attr_rejected = sum(
+            1 for r in batch_records if "HALLUCINATION_ATTRACTOR_WORK" in r["reasons"]
+        )
+        clean = [r for r in batch_records if r["accepted"]]
+        clean.sort(key=lambda r: (r["align_score"], r["top1_score"]), reverse=True)
+
+        out_p = Path(args.out)
+        out_p.parent.mkdir(parents=True, exist_ok=True)
+        with out_p.open("w", encoding="utf-8") as fh:
+            for r in clean:
+                fh.write(json.dumps(r) + "\n")
+
+        dt = time.perf_counter() - t0
+        summary = {
+            "total_queries": len(batch_records),
+            "per_page_accepted_before_attractor_guard": per_page_accepted,
+            "rejected_duplicate_decode": dup_rejected,
+            "rejected_attractor_work": attr_rejected,
+            "clean_accepted": len(clean),
+            "out": str(out_p),
+            "elapsed_s": round(dt, 2),
+            "top5": [
+                {
+                    "query_id": r["query_id"],
+                    "work_id": r["work_id"],
+                    "align_score": r["align_score"],
+                    "margin": r["margin"],
+                    "top1_score": r["top1_score"],
+                    "m_start": r["m_start"],
+                    "m_end": r["m_end"],
+                }
+                for r in clean[:5]
+            ],
+        }
+        print(json.dumps(summary, indent=2))
         return 0
 
     return 1

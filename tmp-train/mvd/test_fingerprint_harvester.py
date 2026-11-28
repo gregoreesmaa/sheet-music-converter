@@ -355,6 +355,120 @@ class TestFingerprintHarvester(unittest.TestCase):
             assert aln is not None and aln.align_score >= 0.95
             assert dec.accepted is True
 
+    def test_duplicate_decode_rejection_and_synthetic_prefix_exclusion(self) -> None:
+        """Duplicate decodes across >=2 distinct images must be rejected, and synthetic prefixes excluded by default."""
+        with tempfile.TemporaryDirectory(prefix="fp_harv_synth_") as td:
+            tmp_path = Path(td)
+            bk_real = _make_synthetic_bekern(seed=501, n_staves=2, n_measures=12, notes_per_bar=6)
+            bk_synth1 = _make_synthetic_bekern(seed=502, n_staves=2, n_measures=12, notes_per_bar=6)
+            bk_synth2 = _make_synthetic_bekern(seed=503, n_staves=2, n_measures=12, notes_per_bar=6)
+            bk_synth3 = _make_synthetic_bekern(seed=504, n_staves=2, n_measures=12, notes_per_bar=6)
+
+            f_real = tmp_path / "real_s0.txt"
+            f_s1 = tmp_path / "s1.txt"
+            f_s2 = tmp_path / "s2.txt"
+            f_s3 = tmp_path / "s3.txt"
+            f_real.write_text(" ".join(bk_real), encoding="utf-8")
+            f_s1.write_text(" ".join(bk_synth1), encoding="utf-8")
+            f_s2.write_text(" ".join(bk_synth2), encoding="utf-8")
+            f_s3.write_text(" ".join(bk_synth3), encoding="utf-8")
+
+            jsonl_path = tmp_path / "manifest.jsonl"
+            rows = [
+                {"image": "openscore_bach_bwv1001.png", "bekerns": [str(f_real)], "domain": "printed"},
+                {"image": "hwsim_00123.png", "bekerns": [str(f_s1)], "domain": "hw"},
+                {"image": "hw_sim_00456.png", "bekerns": [str(f_s2)], "domain": "hw"},
+                {"image": "synth_page_007.png", "bekerns": [str(f_s3)], "domain": "printed"},
+            ]
+            jsonl_path.write_text("\n".join(json.dumps(r) for r in rows), encoding="utf-8")
+
+            # Default build_index excludes hwsim_, hw_sim_, synth_
+            idx_clean = fh.build_index(bekern_jsonls=[jsonl_path])
+            assert idx_clean.n_works == 1
+            assert idx_clean.skipped_synthetic == 3
+            assert "openscore_bach_bwv1001" in idx_clean.work_id_to_idx
+
+            # Disabling exclude_prefixes indexes all 4, and retrieval-time exclude_prefixes filters them out
+            idx_all = fh.build_index(bekern_jsonls=[jsonl_path], exclude_prefixes=())
+            assert idx_all.n_works == 4
+            q_synth = fh.parse_bekern_tokens(bk_synth1, work_id="q_synth", source_path="img_synth.jpg")
+            ret_filt = fh.retrieve_best_fit(
+                q_synth, idx_all, exclude_prefixes=fh.DEFAULT_SYNTHETIC_PREFIXES
+            )
+            assert ret_filt.top1 is None or not ret_filt.top1.work_id.startswith("hwsim_")
+
+        # Batch duplicate-decode hallucination guard: 2 distinct images with identical decode -> both rejected
+        idx = fh.SymbolicIndex()
+        t_a = _make_synthetic_bekern(seed=601, n_staves=2, n_measures=16, notes_per_bar=6)
+        t_b = _make_synthetic_bekern(seed=602, n_staves=2, n_measures=16, notes_per_bar=6)
+        idx.add_score(fh.parse_bekern_tokens(t_a, work_id="real_work_a"))
+        idx.add_score(fh.parse_bekern_tokens(t_b, work_id="real_work_b"))
+
+        q1 = fh.parse_bekern_tokens(t_a, work_id="rism_001", source_path="rism_001.jpg")
+        q2 = fh.parse_bekern_tokens(t_a, work_id="rism_002", source_path="rism_002.jpg")
+        q_ok = fh.parse_bekern_tokens(t_b, work_id="rism_003", source_path="rism_003.jpg")
+
+        _, _, d1 = fh.harvest_page(q1, idx, check_eval_leakage=False)
+        _, _, d2 = fh.harvest_page(q2, idx, check_eval_leakage=False)
+        _, _, d3 = fh.harvest_page(q_ok, idx, check_eval_leakage=False)
+        assert d1.accepted and d2.accepted and d3.accepted
+
+        fh.filter_attractors([d1, d2, d3], max_queries_per_work=2, max_duplicate_decodes=1)
+        assert d1.accepted is False
+        assert "HALLUCINATION_DUPLICATE_DECODE" in d1.reasons
+        assert d2.accepted is False
+        assert "HALLUCINATION_DUPLICATE_DECODE" in d2.reasons
+        assert d3.accepted is True
+
+    def test_attractor_work_rejection(self) -> None:
+        """A single work_id matched by >max_queries_per_work distinct images must be rejected."""
+        idx = fh.SymbolicIndex()
+        w_attr = _make_synthetic_bekern(seed=701, n_staves=2, n_measures=24, notes_per_bar=8)
+        w_good = _make_synthetic_bekern(seed=702, n_staves=2, n_measures=24, notes_per_bar=8)
+        idx.add_score(fh.parse_bekern_tokens(w_attr, work_id="attractor_work"))
+        idx.add_score(fh.parse_bekern_tokens(w_good, work_id="genuine_work"))
+
+        # 3 distinct query images with distinct noisy decodes all matching attractor_work
+        decisions = []
+        for k, (ms, me, cseed) in enumerate([(0, 10, 11), (2, 12, 22), (4, 14, 33)]):
+            qt = _make_synthetic_bekern(
+                seed=701,
+                n_staves=2,
+                n_measures=24,
+                notes_per_bar=8,
+                corrupt_frac=0.15,
+                corrupt_seed=cseed,
+                measure_slice=(ms, me),
+            )
+            q = fh.parse_bekern_tokens(qt, work_id=f"rism_attr_{k}", source_path=f"rism_attr_{k}.jpg")
+            _, _, dec = fh.harvest_page(q, idx, tau_align=0.35, tau_margin=0.15, check_eval_leakage=False)
+            assert dec.accepted is True and dec.work_id == "attractor_work"
+            decisions.append(dec)
+
+        # 2 distinct query images matching genuine_work (<= max_queries_per_work=2) stay accepted
+        for k, (ms, me, cseed) in enumerate([(0, 10, 44), (12, 22, 55)]):
+            qt = _make_synthetic_bekern(
+                seed=702,
+                n_staves=2,
+                n_measures=24,
+                notes_per_bar=8,
+                corrupt_frac=0.10,
+                corrupt_seed=cseed,
+                measure_slice=(ms, me),
+            )
+            q = fh.parse_bekern_tokens(qt, work_id=f"rism_good_{k}", source_path=f"rism_good_{k}.jpg")
+            _, _, dec = fh.harvest_page(q, idx, tau_align=0.35, tau_margin=0.15, check_eval_leakage=False)
+            assert dec.accepted is True and dec.work_id == "genuine_work"
+            decisions.append(dec)
+
+        fh.filter_attractors(decisions, max_queries_per_work=2, max_duplicate_decodes=1)
+
+        for d in decisions[:3]:
+            assert d.accepted is False
+            assert "HALLUCINATION_ATTRACTOR_WORK" in d.reasons
+        for d in decisions[3:]:
+            assert d.accepted is True
+
 
 if __name__ == "__main__":
     unittest.main()
