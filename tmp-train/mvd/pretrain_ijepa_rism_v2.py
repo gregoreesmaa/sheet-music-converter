@@ -16,7 +16,7 @@ Key Frontier Components:
        (``masked_weight=3.0``) AND visible context ink tokens
        (``visible_weight=0.5``) with Smooth-L1 + Cosine loss across all 3 levels
        (default weights ``0.25 / 0.35 / 1.0``).
-  2. **DINOv3 Ink-Token Gram Anchoring** (``--gram-weight 1.0``, ``--gram-max-tokens 512``):
+  2. **DINOv3 Ink-Token Gram Anchoring** (``--gram-weight 0.5``, ``--gram-max-tokens 512``):
      - Frozen ``gram_teacher`` snapshot (from ``--init-from`` or step-0 encoder)
        anchors pairwise L2-normalized ink-token Gram matrices
        ``G_s = F_s @ F_s.T`` vs ``G_t = F_t @ F_t.T`` (deterministic stride
@@ -1623,7 +1623,7 @@ def build_argparser() -> argparse.ArgumentParser:
     p.add_argument("--level-weights", type=str, default="0.25,0.35,1.0", help="DeepStack level weights (post_merger,global_mid,final)")
     p.add_argument("--masked-weight", type=float, default=3.0, help="Weight on masked ink token prediction (default: 3.0)")
     p.add_argument("--visible-weight", type=float, default=0.5, help="Weight on visible context ink token prediction (default: 0.5)")
-    p.add_argument("--gram-weight", type=float, default=1.0, help="DINOv3 Gram anchoring loss weight (default: 1.0)")
+    p.add_argument("--gram-weight", type=float, default=0.5, help="DINOv3 Gram anchoring loss weight (default: 0.5, promoted by ov-32b)")
     p.add_argument("--gram-max-tokens", type=int, default=512, help="Max subsampled ink tokens for Gram matrix (default: 512)")
     p.add_argument("--stroke-hog-weight", type=float, default=0.25, help="Sobel-HOG stroke reconstruction weight (default: 0.25)")
     p.add_argument("--router-cons-weight", type=float, default=0.2, help="Unmasked paper router saliency consistency weight (default: 0.2)")

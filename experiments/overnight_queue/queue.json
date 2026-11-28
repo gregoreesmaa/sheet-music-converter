@@ -481,15 +481,9 @@
     "est_cu": 3.4,
     "script": "experiments/2026-11-26T01-38-ov-17-irope-registers-jitter-sweep/run_colab.py",
     "hf_eval_target": "evals/2026-11-26T01-38-ov-17-irope-registers-jitter-sweep.json",
-    "status": "FAILED",
+    "status": "QUEUED",
     "depends_on": [],
-    "note": "re-queued after triage fix 2026-11-26 (round 2)",
-    "session": "ov-17",
-    "started_at": "2026-11-28T02:35:36Z",
-    "log_path": "D:\\tmp\\overnight-queue-logs\\2026-11-26T01-38-ov-17-irope-registers-jitter-sweep.log",
-    "completed_at": "2026-11-28T02:52:47Z",
-    "elapsed_sec": 1030.27,
-    "returncode": 1
+    "note": "re-queued after triage fix 2026-11-26 (round 2)"
   },
   {
     "id": "2026-11-26T01-38-ov-21-paper-gate-border-threshold",
@@ -1944,7 +1938,9 @@
     "log_path": "D:\\tmp\\overnight-queue-logs\\2026-11-26T16-20-ov-32b-gram-weight-high-vicreg.log",
     "completed_at": "2026-11-28T02:51:32Z",
     "elapsed_sec": 1401.44,
-    "returncode": 0
+    "returncode": 0,
+    "verdict": "PROMOTE",
+    "summary": "A100 3/3 arms (500 steps, small_45m, VICReg 1.0/0.04, muon+adamw, 955.3s compute / 1401.4s wall): gram_0p5 ONLY arm passing all 3 gates: dense_erank_mean 182.025 (>=70, 2.72x ov-32), dense_offdiag_cosine 0.78753 (<=0.85 PASS), global_page_erank 55.114 (>=15, 8.23x ov-32), top1_var 0.11387, probe_r2 0.12223. Higher gram_1p0 (erank 166.91, cos 0.8551 FAIL) & gram_2p0 (erank 154.43, cos 0.9019 FAIL) pull toward frozen step-0 random init; DISCARDED. Locked default --gram-weight 0.5 in pretrain_ijepa_rism_v2.py."
   },
   {
     "id": "2026-11-26T19-35-i13-26b-asymmetric-gqa-cross-mha",
@@ -2272,12 +2268,9 @@
     "est_cu": 3.5,
     "script": "experiments/2026-11-26T22-18-i14-08-verifier-gated-rism-selftrain-flywheel/run_colab.py",
     "hf_eval_target": "evals/2026-11-26T22-18-i14-08-verifier-gated-rism-selftrain-flywheel.json",
-    "status": "RUNNING",
+    "status": "QUEUED",
     "depends_on": [],
-    "note": "Wave 11 Safe/Medium (Theorist 8 Flywheel): builds on ov-39 with pHash/8-gram decontamination, multi-scale MBR, zero-dropped-system check, w_t=p_t^2, and 30% GT anchor.",
-    "session": "2026-11-26t22-18-i14-08-",
-    "started_at": "2026-11-28T02:51:32Z",
-    "log_path": "D:\\tmp\\overnight-queue-logs\\2026-11-26T22-18-i14-08-verifier-gated-rism-selftrain-flywheel.log"
+    "note": "Wave 11 Safe/Medium (Theorist 8 Flywheel): builds on ov-39 with pHash/8-gram decontamination, multi-scale MBR, zero-dropped-system check, w_t=p_t^2, and 30% GT anchor."
   },
   {
     "id": "2026-11-26T22-18-i14-09-ink-aware-vjepa-dino-archival-pretrain",
@@ -2291,12 +2284,9 @@
     "est_cu": 3.9,
     "script": "experiments/2026-11-26T22-18-i14-09-ink-aware-vjepa-dino-archival-pretrain/run_colab.py",
     "hf_eval_target": "evals/2026-11-26T22-18-i14-09-ink-aware-vjepa-dino-archival-pretrain.json",
-    "status": "RUNNING",
+    "status": "QUEUED",
     "depends_on": [],
-    "note": "Wave 11 Medium/Wild (Theorist 8 SSL): builds on ov-31b/ov-33b/i13-04 with ink-only structured measure-span & chord-column masking + DINOv2 view invariance.",
-    "session": "2026-11-26t22-18-i14-09-",
-    "started_at": "2026-11-28T02:52:47Z",
-    "log_path": "D:\\tmp\\overnight-queue-logs\\2026-11-26T22-18-i14-09-ink-aware-vjepa-dino-archival-pretrain.log"
+    "note": "Wave 11 Medium/Wild (Theorist 8 SSL): builds on ov-31b/ov-33b/i13-04 with ink-only structured measure-span & chord-column masking + DINOv2 view invariance."
   },
   {
     "id": "2026-11-26T22-18-i14-10-hw-crossout-nib-physics-and-scribe-adapt",
@@ -2305,7 +2295,7 @@
     "wave": 11,
     "priority": 10,
     "provider": "colab_l4",
-    "gpu": "L4",
+    "gpu": "A100",
     "est_minutes": 46,
     "est_cu": 3.8,
     "script": "experiments/2026-11-26T22-18-i14-10-hw-crossout-nib-physics-and-scribe-adapt/run_colab.py",
@@ -2321,7 +2311,7 @@
     "wave": 11,
     "priority": 11,
     "provider": "colab_l4",
-    "gpu": "L4",
+    "gpu": "A100",
     "est_minutes": 42,
     "est_cu": 3.4,
     "script": "experiments/2026-11-26T22-18-i14-11-1d-sysband-anchor-and-eos-lock/run_colab.py",

@@ -1,0 +1,43 @@
+{
+  "exp_id": "2026-11-26T16-20-ov-32b-gram-weight-high-vicreg",
+  "status": "completed",
+  "platform": "colab-NVIDIA A100-SXM4-40GB",
+  "started_utc": "2026-11-28T02:35:28.813969+00:00",
+  "completed_utc": "2026-11-28T02:51:24.101103+00:00",
+  "elapsed_secs": 955.29,
+  "eval_path": "evals/2026-11-26T16-20-ov-32b-gram-weight-high-vicreg.json",
+  "summary": {
+    "best_erank_arm": "gram_0p5",
+    "best_gram_weight": 0.5,
+    "best_dense_erank_mean": 182.025,
+    "per_arm_summary": {
+      "gram_0p5": {
+        "gram_weight": 0.5,
+        "final_jepa_masked": 0.20176,
+        "dense_erank_mean": 182.025,
+        "dense_norm_spectral_entropy": 0.87381,
+        "dense_offdiag_cosine_mean": 0.78753,
+        "gram_drift_vs_step0_mse": 0.040337,
+        "ridge_ink_probe_r2": 0.12223
+      },
+      "gram_1p0": {
+        "gram_weight": 1.0,
+        "final_jepa_masked": 0.14807,
+        "dense_erank_mean": 166.91,
+        "dense_norm_spectral_entropy": 0.85914,
+        "dense_offdiag_cosine_mean": 0.85506,
+        "gram_drift_vs_step0_mse": 0.017572,
+        "ridge_ink_probe_r2": 0.12791
+      },
+      "gram_2p0": {
+        "gram_weight": 2.0,
+        "final_jepa_masked": 0.10958,
+        "dense_erank_mean": 154.432,
+        "dense_norm_spectral_entropy": 0.84589,
+        "dense_offdiag_cosine_mean": 0.90187,
+        "gram_drift_vs_step0_mse": 0.007404,
+        "ridge_ink_probe_r2": 0.12147
+      }
+    }
+  }
+}
