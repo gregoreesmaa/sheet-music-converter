@@ -1,7 +1,7 @@
 # `2026-11-26T01-38-ov-16-resolution-multiscale-sweep`
 
 **Title:** Overnight Exp 16 — Full-Page Resolution & Multi-Scale Sweep (`1024px` vs `1280px` vs `1536px` Multi-Scale) on `UniOMR v2 small_45m`
-**Status:** `QUEUED` (Overnight Batch 02, Wave 4)
+**Status:** `COMPLETED` — Verdict: **`DISCARD`** (see [OUTCOME.md](./OUTCOME.md))
 **Baseline Commit SHA:** `164852f`
 **Target Platform:** Google Colab `L4` (24 GB VRAM, BF16 native, ~35–40 min total, ~3.2 CU)
 
@@ -23,7 +23,7 @@
 
 - **Plan & Runbook:** [PLAN.md](./PLAN.md)
 - **Standalone Colab Runner:** [run_colab.py](./run_colab.py)
-- **Outcome:** `OUTCOME.md` *(written after Colab run completes)*
+- **Outcome:** [OUTCOME.md](./OUTCOME.md) (`DISCARD` — `1024px_fixed` `0.2305` / `1280px_fixed` `0.2301` / `1536px_multiscale` `0.2291` EMA F1; saturated at `eval_max_len=512` + `450`-step floor)
 - **HF Private Hub Artifacts (`gregoreesmaa/sheet-music-converter-omr`):**
   - Eval JSON: `evals/2026-11-26T01-38-ov-16-resolution-multiscale-sweep.json`
   - Run Ledger: `runs/2026-11-26T01-38-ov-16-resolution-multiscale-sweep.json`
