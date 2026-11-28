@@ -1128,9 +1128,25 @@ class InkTokenRouterV2(nn.Module):
         else:
             luma = images.to(torch.float32).mean(dim=1, keepdim=True)
 
+        # Per-image adaptive dark-border thresholds from 90th-percentile luma (downsampled 4x for ~0 overhead).
+        # Handles underexposed/dim aged paper (luma < 0.35) while floor >= 0.05 keeps all-black images dark.
+        _, _, _lh, _lw = luma.shape
+        luma_ds = F.avg_pool2d(luma, kernel_size=4, stride=4) if (_lh >= 4 and _lw >= 4) else luma
+        luma_flat = luma_ds.flatten(1)
+        n_ds = luma_flat.shape[1]
+        if torch.onnx.is_in_onnx_export():
+            k90_top = max(1, min(n_ds, n_ds - int(round(0.90 * max(0, n_ds - 1)))))
+            p90_luma = torch.topk(luma_flat, k=k90_top, dim=1, largest=True, sorted=True).values[:, -1:].view(-1, 1, 1, 1)
+        else:
+            k90 = max(1, min(n_ds, int(round(0.90 * max(0, n_ds - 1))) + 1))
+            p90_luma = torch.kthvalue(luma_flat, k=k90, dim=1).values.view(-1, 1, 1, 1)
+        bright_thr = torch.clamp(0.85 * p90_luma, min=0.05, max=0.35)
+        dark_thr = torch.clamp(0.65 * p90_luma, min=0.05, max=0.22)
+
         # Edge-connected dark-border mask: 2 cumsums (0 flips) — bit-identical to 4-edge scan.
-        # Since (luma < 0.22) implies bright_i == 0, cs_y == cs_y[:, :, -1:, :] iff no bright pixel at y..H-1.
-        bright_i = (luma >= 0.35).to(torch.int32)
+        # Since (luma < dark_thr) implies bright_i == 0 (dark_thr <= bright_thr),
+        # cs_y == cs_y[:, :, -1:, :] iff no bright pixel at y..H-1.
+        bright_i = (luma >= bright_thr).to(torch.int32)
         cs_y = bright_i.cumsum(dim=2)
         cs_x = bright_i.cumsum(dim=3)
         edge_dark = (
@@ -1139,7 +1155,7 @@ class InkTokenRouterV2(nn.Module):
             | (cs_x == 0)
             | (cs_x == cs_x[:, :, :, -1:])
         )
-        border_px = (edge_dark & (luma < 0.22)).to(luma.dtype)
+        border_px = (edge_dark & (luma < dark_thr)).to(luma.dtype)
 
         # Dilate ONLY the outer border mask by 6px in pixel space (separable 1x13 + 13x1)
         border_dilated_px = F.max_pool2d(
@@ -1159,10 +1175,19 @@ class InkTokenRouterV2(nn.Module):
         )
         local_ink = local_bg.sub(luma).div_(local_bg.clamp(min=0.15)).clamp_(0.0, 1.0).mul_(paper_px)
         _, _, H, W = local_ink.shape
-        if H == 16 * h_p and W == 16 * w_p:
+        target_h, target_w = 16 * h_p, 16 * w_p
+        if H == target_h and W == target_w:
             ink_max = F.max_pool2d(local_ink, kernel_size=16, stride=16)
             ink_avg = F.avg_pool2d(local_ink, kernel_size=16, stride=16)
             paper_grid_f = F.avg_pool2d(paper_px, kernel_size=16, stride=16)
+        elif H <= target_h and W <= target_w:
+            pad_b = target_h - H
+            pad_r = target_w - W
+            local_ink_pad = F.pad(local_ink, (0, pad_r, 0, pad_b), mode="constant", value=0.0)
+            paper_px_pad = F.pad(paper_px, (0, pad_r, 0, pad_b), mode="constant", value=0.0)
+            ink_max = F.max_pool2d(local_ink_pad, kernel_size=16, stride=16)
+            ink_avg = F.avg_pool2d(local_ink_pad, kernel_size=16, stride=16)
+            paper_grid_f = F.avg_pool2d(paper_px_pad, kernel_size=16, stride=16)
         else:
             ink_max = F.adaptive_max_pool2d(local_ink, (h_p, w_p))
             ink_avg = F.adaptive_avg_pool2d(local_ink, (h_p, w_p))
@@ -1202,6 +1227,7 @@ class InkTokenRouterV2(nn.Module):
         saliency_prob = torch.sigmoid(saliency_logits)
 
         ink_target: Optional[torch.Tensor] = None
+        paper_mask_grid: Optional[torch.Tensor] = None
         if images is not None:
             local_ink_grid, paper_gate, paper_mask_grid = self._compute_ink_and_paper_gate(
                 images, H_p, W_p
@@ -1285,6 +1311,22 @@ class InkTokenRouterV2(nn.Module):
                     if torch.onnx.is_in_onnx_export():
                         k10 = max(1, min(N, int(round(0.10 * max(0, N - 1))) + 1))
                         p10 = torch.topk(score_flat, k=k10, dim=1, largest=False, sorted=True).values[:, -1:]
+                    elif paper_mask_grid is not None:
+                        # Sync-free exact 10th percentile over valid paper tokens only so dark
+                        # exterior borders cannot collapse p10 and bloat k_dyn.
+                        sf = score_flat.float()
+                        flat_paper_p10 = paper_mask_grid.flatten(1)
+                        sorted_sc, _ = sf.masked_fill(~flat_paper_p10, float("inf")).sort(dim=1)
+                        n_valid_p10 = flat_paper_p10.sum(dim=1)
+                        pos10 = (n_valid_p10 - 1).clamp(min=0).to(torch.float64) * 0.10
+                        lo10 = pos10.floor().to(torch.long)
+                        hi10 = pos10.ceil().to(torch.long)
+                        frac10 = (pos10 - lo10.to(torch.float64)).to(sf.dtype).unsqueeze(1)
+                        v_lo10 = sorted_sc.gather(1, lo10.unsqueeze(1))
+                        v_hi10 = sorted_sc.gather(1, hi10.unsqueeze(1))
+                        q10_masked = v_lo10 + frac10 * (v_hi10 - v_lo10)
+                        q10_fallback = torch.quantile(sf, 0.10, dim=1, keepdim=True)
+                        p10 = torch.where(n_valid_p10.unsqueeze(1) > 0, q10_masked, q10_fallback).to(score_flat.dtype)
                     else:
                         p10 = torch.quantile(score_flat.float(), 0.10, dim=1, keepdim=True).to(score_flat.dtype)
                     thr = max(self.saliency_thr, 0.15)

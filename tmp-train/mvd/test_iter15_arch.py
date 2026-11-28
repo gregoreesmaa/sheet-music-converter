@@ -559,3 +559,73 @@ def test_10_tok_dropout_preserves_sys_and_guards() -> None:
     _, _, rinfo = model.encoder.router(feat_2d, images=dark_img)
     assert torch.isfinite(rinfo["ink_target"]).all()
 
+
+def test_11_router_dark_border_p10_dim_paper_and_non_mult16_alignment() -> None:
+    """Verify 3 router/bucket edge-case fixes: dark-border p10, dim aged paper, non-mult-16 alignment."""
+    import uni_omr as uo
+
+    # 1. Dark-border p10: exterior dark desk (>40% of tokens) must not collapse p10 and bloat blank-paper k_dyn.
+    router = v2.InkTokenRouterV2(
+        d_model=32,
+        router_hidden=32,
+        dynamic_routing=True,
+        min_keep_ratio=0.10,
+        max_keep_ratio=0.80,
+        saliency_thr=0.15,
+        max_mem_tokens=512,
+        adaptive_ink_target=True,
+    ).eval()
+    with torch.no_grad():
+        for p in router.saliency_net.parameters():
+            p.zero_()
+
+    img_border = torch.zeros(1, 3, 256, 256)
+    img_border[:, :, 32:224, 32:224] = 0.95  # 192x192 white paper inside 32px dark desk border
+    # Single small 2px-thick ink stroke in center cell (8, 8)
+    img_border[:, :, 134:136, 128:144] = 0.10
+    feat_border = torch.zeros(1, 32, 16, 16)
+    with torch.no_grad():
+        _, _, rinfo_border = router(feat_border, images=img_border)
+    # Without masked p10, all 144 interior paper tokens exceed p10+0.15; with masked p10, k_kept stays near k_min=26.
+    assert rinfo_border["k_kept"] <= 40, f"Dark border bloated k_kept={rinfo_border['k_kept']} (expected <= 40)"
+    assert rinfo_border["ink_recall"] >= 0.99
+
+    # Fallback when n_valid == 0 (all-black image in eval dynamic_routing) must remain finite with no NaN.
+    with torch.no_grad():
+        _, _, rinfo_dark = router(feat_border, images=torch.zeros(1, 3, 256, 256))
+    assert torch.isfinite(rinfo_dark["saliency_map"]).all()
+    assert rinfo_dark["k_kept"] >= 1
+
+    # 2. Underexposed/dim aged paper (luma=0.30, ink contrast=0.08 -> ink luma=0.22) keeps paper valid & ink_target > 0.
+    img_dim = torch.full((1, 3, 128, 128), 0.30)
+    img_dim[:, :, 60:62, 32:96] = 0.22  # ink contrast = 0.08 on dim paper
+    feat_dim = torch.zeros(1, 32, 8, 8)
+    with torch.no_grad():
+        _, _, eff_paper_dim = router._compute_ink_and_paper_gate(img_dim, 8, 8)
+        _, _, rinfo_dim = router(feat_dim, images=img_dim)
+        _, _, eff_paper_black = router._compute_ink_and_paper_gate(torch.zeros(1, 3, 128, 128), 8, 8)
+    assert eff_paper_dim.float().mean().item() > 0.90, "Dim aged paper (luma=0.30) was wrongly masked as dark border"
+    assert rinfo_dim["ink_target"].sum().item() > 0, "Dim aged paper (luma=0.30, ink=0.08) lost ink_target"
+    assert not eff_paper_black.any(), "All-black image must stay masked as dark border (floor >= 0.05)"
+
+    # 3. Non-mult-16 direct input (240x180 -> PatchMerger2x2 grid 15x12): exact 1:1 stride-16 alignment, no adaptive drift.
+    cfg = _make_tiny_iter15_cfg(grad_checkpoint=False)
+    model = v2.UniOMRv2Net(cfg).eval()
+    img_nm16 = torch.full((1, 3, 240, 180), 0.95)
+    # Place 2px dark ink strictly inside stride-16 cell (row=1, col=10): y in [22, 24), x in [164, 172)
+    img_nm16[:, :, 22:24, 164:172] = 0.10
+    with torch.no_grad():
+        _, _, enc_info = model.encode_image(img_nm16, return_aux=False)
+        assert enc_info["grid_hw"] == (15, 12)
+        ink_grid, _, _ = router._compute_ink_and_paper_gate(img_nm16, 15, 12)
+    assert ink_grid.shape == (1, 1, 15, 12)
+    assert ink_grid[0, 0, 1, 10].item() > 0.15, "Expected ink in exact stride-16 cell (1, 10)"
+    assert ink_grid[0, 0, 1, 11].item() == pytest.approx(0.0, abs=1e-6), "Ink drifted into col 11 (adaptive pool bug)"
+
+    # Narrow HW buckets in FIXED_HW_BUCKETS
+    assert (1536, 896) in uo.FIXED_HW_BUCKETS
+    assert (896, 1536) in uo.FIXED_HW_BUCKETS
+    assert uo._snap_to_fixed_hw_bucket(1500, 880) == (1536, 896)
+    assert uo._snap_to_fixed_hw_bucket(880, 1500) == (896, 1536)
+
+

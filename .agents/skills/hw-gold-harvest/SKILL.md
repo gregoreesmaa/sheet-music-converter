@@ -36,15 +36,14 @@ PAE/catalog matching identifies the *work*, **not** the downloaded canvas (a can
 
 ---
 
-## Stage 3 — Exact Single-Page `[m_start, m_end)` & `<sys>` Forced Alignment (Never Multi-Page!)
+## Stage 3 — 100% Model-Free Single-Page `[m_start, m_end)` & `<sys>` Slicing (Never Multi-Page, Never Prior OMR Models!)
 
-Every genuine opening manuscript page typically fits **fewer measures and different system breaks** than the digital score's page 1 (e.g., `13` bars `2+3+2+2+2+2` vs digital's `22` bars). **NEVER pair a multi-page digital label with a single manuscript page.**
+Every genuine opening manuscript page typically fits **fewer measures and different system breaks** than the digital score's page 1 (e.g., `13` bars `2+3+2+2+2+2` vs digital's `22` bars). **NEVER pair a multi-page digital label with a single manuscript page, and NEVER use an earlier neural OMR model to set measure/system boundaries** (avoids propagating earlier model drops/mistakes into ground truth).
 
-1. **Forced Alignment:** Decode each Stage-2 survivor canvas with our best UniOMR checkpoint (`--no-cudnn` on Windows, `use_grammar=True`) and run `fingerprint_harvester.align_page_to_work()` against **only** its verified GOLD `work_id` to find exact single-page `[m_start, m_end)` and per-system measure breaks `[(s0, e0), (s1, e1), ...]`.
-2. **Single-Page Boundary Gate:**
-   - Require `len(system_breaks) == visual_n_systems` (exact system-count match),
-   - Contiguous non-overlapping spans (`e_i == s_{i+1}`, each `>= 1` measure, `m_end > m_start`),
-   - `align_score >= 0.45` (and optionally Teacher-Forced `PMI_pitch > 0`, `Δ_transp > 0`, and 2D cross-attention reading-order monotonicity `M_attn` when verifying interior/non-opening canvases).
+1. **Inter-Staff Barline Hinting (CPU):** On each detected physical system `s = 1..S`, scan vertical ink runs across the inter-staff gaps (with slight horizontal dilation for ±5° slant) to estimate approximate measure count `M_est(s)`.
+2. **Whole-System Verovio Render-Compare & Margin Abstention (CPU):**
+   - For each system `s`, test candidate end-bars `k ∈ [M_est(s) - 2 .. M_est(s) + 2]` by rendering `(m_start, k)` in-process with `verovio` + `resvg_py`, piecewise-linearly aligning to manuscript barlines/horizontal extent, and scoring **notehead density + stem/beam rhythm + staff-locked pitch height** against the manuscript pixels.
+   - **Abstain on ambiguity:** Require the winning end-bar `k*` to clear `k* ± 1` by a strict margin (rejecting ambiguous 1-staff or low-margin systems rather than guessing).
 3. **Exact Single-Page Label Export:**
    - Slice the digital work's MusicXML per system via `assembly-serialize.exe bekern --v2 --measures S..E` (`bekern_version="v2a"`) or per-measure bekern/kern slice (`bekern_version="v1"`).
    - Validate `0` OOV tokens against `data.VOCAB`, `PrefixState(strict=False)` grammar sanity, and `0` eval overlap.

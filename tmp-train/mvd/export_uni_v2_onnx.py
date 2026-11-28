@@ -385,7 +385,7 @@ class UniOMRv2EncoderONNX(nn.Module):
 
     def _compute_ink_and_paper_gate_f32(
         self, images: torch.Tensor
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Pure float32 InkTokenRouterV2 edge-connected dark-border ink map + paper_gate.
 
         Exact parity with ``InkTokenRouterV2._compute_ink_and_paper_gate`` using
@@ -397,8 +397,18 @@ class UniOMRv2EncoderONNX(nn.Module):
             + 0.114 * images[:, 2:3]
         )
 
+        # Per-image adaptive dark-border thresholds from 90th-percentile luma (4x downsampled).
+        luma_ds = F.avg_pool2d(luma, kernel_size=4, stride=4)
+        luma_flat = luma_ds.flatten(1)
+        luma_sorted, _ = torch.sort(luma_flat, dim=1)
+        n_ds = torch.ones_like(luma_flat, dtype=torch.float32).sum(dim=1)
+        k90_idx = torch.round((n_ds - 1.0).clamp(min=0.0) * 0.90).to(torch.long).view(-1, 1)
+        p90_luma = torch.gather(luma_sorted, 1, k90_idx).view(-1, 1, 1, 1)
+        bright_thr = (0.85 * p90_luma).clamp(min=0.05, max=0.35)
+        dark_thr = (0.65 * p90_luma).clamp(min=0.05, max=0.22)
+
         # Edge-connected dark-border mask via float32 cumsums (exact for H, W <= 2^24).
-        bright_f = (luma >= 0.35).to(torch.float32)
+        bright_f = (luma >= bright_thr).to(torch.float32)
         cs_y = bright_f.cumsum(dim=2)
         cs_x = bright_f.cumsum(dim=3)
         top_dark = (cs_y < 0.5).to(torch.float32)
@@ -406,7 +416,7 @@ class UniOMRv2EncoderONNX(nn.Module):
         left_dark = (cs_x < 0.5).to(torch.float32)
         right_dark = ((cs_x[:, :, :, -1:] - cs_x) < 0.5).to(torch.float32)
         edge_dark_f = (top_dark + bot_dark + left_dark + right_dark).clamp(0.0, 1.0)
-        border_px = edge_dark_f * (luma < 0.22).to(torch.float32)
+        border_px = edge_dark_f * (luma < dark_thr).to(torch.float32)
 
         border_dilated_px = F.max_pool2d(
             F.max_pool2d(border_px, kernel_size=(1, 13), stride=1, padding=(0, 6)),
@@ -442,7 +452,7 @@ class UniOMRv2EncoderONNX(nn.Module):
 
         local_ink_grid = local_ink_grid * effective_paper_f
         paper_gate = 0.05 + 0.95 * effective_paper_f
-        return local_ink_grid, paper_gate
+        return local_ink_grid, paper_gate, effective_paper_f
 
     def _route_v2_onnx(
         self,
@@ -466,7 +476,7 @@ class UniOMRv2EncoderONNX(nn.Module):
             saliency_logits = saliency_logits + r.vrfm_band_alpha * row_smooth
         saliency_prob = torch.sigmoid(saliency_logits)
 
-        local_ink_grid, paper_gate = self._compute_ink_and_paper_gate_f32(images)
+        local_ink_grid, paper_gate, effective_paper_f = self._compute_ink_and_paper_gate_f32(images)
         saliency_prob = saliency_prob * paper_gate
 
         if r.use_ink_prior:
@@ -510,6 +520,18 @@ class UniOMRv2EncoderONNX(nn.Module):
             grid_coords = torch.stack([grid_y.reshape(-1), grid_x.reshape(-1)], dim=-1).unsqueeze(0)
 
             if r.dynamic_routing:
+                flat_paper_f = effective_paper_f.flatten(1)
+                n_valid_f = flat_paper_f.sum(dim=1)
+                has_valid_f = (n_valid_f > 0.5).to(torch.float32).view(1, 1)
+                score_masked_sorted, _ = torch.sort(score_flat + (1.0 - flat_paper_f) * 1e6, dim=1)
+                pos_m = (n_valid_f - 1.0).clamp(min=0.0) * 0.10
+                lo_m = torch.floor(pos_m)
+                hi_m = torch.ceil(pos_m)
+                frac_m = (pos_m - lo_m).view(1, 1)
+                v_lo_m = torch.gather(score_masked_sorted, 1, lo_m.to(torch.long).view(1, 1))
+                v_hi_m = torch.gather(score_masked_sorted, 1, hi_m.to(torch.long).view(1, 1))
+                p10_masked = v_lo_m + frac_m * (v_hi_m - v_lo_m)
+
                 score_sorted, _ = torch.sort(score_flat, dim=1)
                 pos = (n_t - 1).clamp(min=0).to(torch.float32) * 0.10
                 lo_f = torch.floor(pos)
@@ -517,7 +539,9 @@ class UniOMRv2EncoderONNX(nn.Module):
                 frac = (pos - lo_f).view(1, 1)
                 v_lo = torch.gather(score_sorted, 1, lo_f.to(torch.long).view(1, 1))
                 v_hi = torch.gather(score_sorted, 1, hi_f.to(torch.long).view(1, 1))
-                p10 = v_lo + frac * (v_hi - v_lo)
+                p10_fallback = v_lo + frac * (v_hi - v_lo)
+
+                p10 = has_valid_f * p10_masked + (1.0 - has_valid_f) * p10_fallback
                 thr = max(float(r.saliency_thr), 0.15)
                 above = (score_flat > (p10 + thr)).to(torch.long).sum(dim=1)
                 k_min = torch.clamp(torch.ceil(n_t.to(torch.float32) * r.min_keep_ratio).to(torch.long), min=1)
