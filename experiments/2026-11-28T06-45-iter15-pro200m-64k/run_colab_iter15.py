@@ -43,7 +43,9 @@ import time
 import traceback
 from typing import Any, Callable, Dict, List, Optional, Sequence, Set, Tuple
 
-os.environ.setdefault("HF_HUB_ENABLE_HF_TRANSFER", "1")
+os.environ["HF_HUB_ENABLE_HF_TRANSFER"] = (
+    os.environ.get("HF_HUB_ENABLE_HF_TRANSFER") or "1"
+)
 
 EXP_ID = "2026-11-28T06-45-iter15-pro200m-64k"
 RUN_TAG = "iter15_pro200m_64k"
@@ -53,6 +55,13 @@ HF_LATEST_PREFIX = f"{HF_CKPT_ROOT}/latest"
 HF_MILESTONES_PREFIX = f"{HF_CKPT_ROOT}/milestones"
 HF_RUN_LEDGER_PATH = f"runs/{EXP_ID}.json"
 HF_ITER15_DATA_PREFIX = "datasets/iter15_v2a/"
+HF_ITER15_SHARDS_PREFIX = "datasets/iter15_v2a/shards/"
+HF_ITER15_MANIFEST_PATH = f"{HF_ITER15_SHARDS_PREFIX}uni_fullpage_iter15_v2a.jsonl"
+HF_ITER15_NUM_SHARDS = 14
+HF_ITER15_SHARD_FILES: Tuple[str, ...] = tuple(
+    f"{HF_ITER15_SHARDS_PREFIX}iter15_shard_{i:02d}.tar"
+    for i in range(HF_ITER15_NUM_SHARDS)
+)
 HF_TEACHER_CKPT_PATH = "checkpoints/iter14_v2a_stage2_16k/uni_omr_v2_ema_latest.pt"
 HF_DL_CACHE_DIR = Path("/tmp/hf_dl_cache")
 
@@ -189,8 +198,8 @@ def select_gpu_profile(
             tier="H100-80GB",
             device_name=dev_name,
             vram_gb=round(vram_gb, 2),
-            batch_size=4,
-            grad_accum=4,
+            batch_size=8,
+            grad_accum=2,
             use_grad_checkpoint=True,
             use_bf16=True,
             use_no_cudnn=False,
@@ -286,7 +295,7 @@ def remap_jsonl_manifest(
         total += 1
         rec = json.loads(line)
 
-        for key in ("image", "img", "image_path", "musicxml", "src_path"):
+        for key in ("image", "img", "image_path", "bekern", "bekern_path", "musicxml", "src_path"):
             if key in rec and isinstance(rec[key], str) and rec[key]:
                 new_val = remap_windows_path(
                     rec[key], data_root=data_root, repo_root=repo_root
@@ -852,6 +861,21 @@ def _ensure_python_deps() -> None:
 
 def _extract_tar_to(tar_path: Path, dst_dir: Path) -> None:
     dst_dir.mkdir(parents=True, exist_ok=True)
+    tar_bin = shutil.which("tar")
+    if tar_bin:
+        try:
+            subprocess.run(
+                [tar_bin, "-xf", str(tar_path), "-C", str(dst_dir)],
+                check=True,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
+            )
+            return
+        except Exception as exc:
+            _log(
+                f"[WARN] system tar -xf failed for {tar_path.name} ({exc}); "
+                "falling back to Python tarfile."
+            )
     with tarfile.open(tar_path, "r:*") as tf:
         tf.extractall(path=dst_dir)
 
@@ -875,86 +899,114 @@ def _download_hf_file(hf_token: str, repo_filename: str, dst_path: Path) -> Path
     return dst_path
 
 
-def pull_hf_datasets(
+def prepare_dataset(
     *,
     hf_token: str,
     data_root: Path,
     repo_root: Path,
     manifest_name: str = "uni_fullpage_iter15_v2a.jsonl",
+    smoke_mode: bool = False,
 ) -> Dict[str, Any]:
-    """Stream HF dataset shards (`datasets/iter15_v2a/*` + RISM style pool) onto Colab NVMe."""
-    from huggingface_hub import HfApi
+    """Stream HF 1536px JPEG Q95 shards (`datasets/iter15_v2a/shards/*` + RISM) onto Colab NVMe.
 
+    - Full mode: downloads `uni_fullpage_iter15_v2a.jsonl`, all 14 shards
+      (`iter15_shard_00.tar` .. `iter15_shard_13.tar`, 55,015 pages, 17.83 GB),
+      and `datasets/rism_hw_5707.tar`.
+    - Smoke mode: downloads `uni_fullpage_iter15_v2a.jsonl` and ONLY
+      `iter15_shard_00.tar` (3,930 rows) so smoke staging completes in <30s.
+    - Deletes each `.tar` immediately after `tar -xf` extraction to keep peak
+      Colab disk around ~20 GB.
+    - Rewrites relative `pages/shard_XX/...` and `bekerns/shard_XX/...` paths
+      to absolute `f"{data_root}/..."` paths, keeping only rows whose extracted
+      image exists on disk.
+    """
     data_root.mkdir(parents=True, exist_ok=True)
-    api = HfApi(token=hf_token)
-    all_files = set(api.list_repo_files(repo_id=HF_REPO_ID, repo_type="dataset"))
 
-    iter15_files = sorted(f for f in all_files if f.startswith(HF_ITER15_DATA_PREFIX))
-    _log(f"Found {len(iter15_files)} file(s) under HF {HF_ITER15_DATA_PREFIX}")
-    for rf in iter15_files:
-        rel_name = rf[len(HF_ITER15_DATA_PREFIX) :]
-        marker = data_root / ".unpacked" / f"iter15_v2a__{rel_name.replace('/', '__')}.done"
+    # 1. Download manifest JSONL
+    manifest_repo_path = f"{HF_ITER15_SHARDS_PREFIX}{manifest_name}"
+    src_manifest = data_root / manifest_name
+    if not (src_manifest.is_file() and src_manifest.stat().st_size > 0):
+        _log(f"Downloading manifest {manifest_repo_path} -> {src_manifest}...")
+        _download_hf_file(hf_token, manifest_repo_path, src_manifest)
+
+    # 2. Stream & extract iter15 shards one-by-one, deleting each .tar immediately
+    shard_files = HF_ITER15_SHARD_FILES[:1] if smoke_mode else HF_ITER15_SHARD_FILES
+    _log(
+        f"Staging {len(shard_files)}/{HF_ITER15_NUM_SHARDS} iter15_v2a shard(s) "
+        f"(smoke_mode={smoke_mode}) -> {data_root}..."
+    )
+    for rf in shard_files:
+        shard_name = Path(rf).name
+        marker = data_root / ".unpacked" / f"iter15_v2a_shards__{shard_name}.done"
         if marker.is_file():
             continue
-        tmp_dst = data_root / ".downloads" / rel_name
+        tmp_dst = data_root / ".downloads" / shard_name
         _log(f"Downloading {rf}...")
         _download_hf_file(hf_token, rf, tmp_dst)
-        if rel_name.endswith((".tar", ".tar.gz", ".tgz")):
-            _log(f"Extracting {rel_name} -> {data_root}...")
+        try:
+            _log(f"Extracting {shard_name} -> {data_root}...")
             _extract_tar_to(tmp_dst, data_root)
+        finally:
             try:
-                tmp_dst.unlink()
+                if tmp_dst.exists():
+                    tmp_dst.unlink()
             except OSError:
                 pass
-        else:
-            target = data_root / Path(rel_name).name
-            target.parent.mkdir(parents=True, exist_ok=True)
-            shutil.move(str(tmp_dst), str(target))
         marker.parent.mkdir(parents=True, exist_ok=True)
         marker.write_text(_utc_now() + "\n", encoding="utf-8")
 
-    for rf, target_subdir in HF_CORE_DATASET_SHARDS:
-        if rf not in all_files:
-            continue
-        marker = data_root / ".unpacked" / f"{Path(rf).name}.done"
-        if marker.is_file():
-            continue
-        dst_dir = data_root / target_subdir
-        tmp_dst = data_root / ".downloads" / Path(rf).name
-        _log(f"Downloading core shard {rf} -> {dst_dir}...")
-        _download_hf_file(hf_token, rf, tmp_dst)
-        _extract_tar_to(tmp_dst, dst_dir)
-        try:
-            tmp_dst.unlink()
-        except OSError:
-            pass
-        marker.parent.mkdir(parents=True, exist_ok=True)
-        marker.write_text(_utc_now() + "\n", encoding="utf-8")
+    # 3. Download & extract RISM style pool (full mode only)
+    if not smoke_mode:
+        for rf, target_subdir in HF_CORE_DATASET_SHARDS:
+            marker = data_root / ".unpacked" / f"{Path(rf).name}.done"
+            if marker.is_file():
+                continue
+            dst_dir = data_root / target_subdir
+            tmp_dst = data_root / ".downloads" / Path(rf).name
+            _log(f"Downloading core shard {rf} -> {dst_dir}...")
+            _download_hf_file(hf_token, rf, tmp_dst)
+            try:
+                _log(f"Extracting {Path(rf).name} -> {dst_dir}...")
+                _extract_tar_to(tmp_dst, dst_dir)
+            finally:
+                try:
+                    if tmp_dst.exists():
+                        tmp_dst.unlink()
+                except OSError:
+                    pass
+            marker.parent.mkdir(parents=True, exist_ok=True)
+            marker.write_text(_utc_now() + "\n", encoding="utf-8")
 
-    # Remap full-page JSONL manifest
-    src_manifest: Optional[Path] = None
-    for cand in (manifest_name, "uni_fullpage_iter15_v2a.jsonl", "uni_fullpage_iter14_v2a_rism.jsonl"):
-        p = data_root / cand
-        if p.is_file():
-            src_manifest = p
-            break
-    if src_manifest is None:
-        raise FileNotFoundError(
-            f"Could not locate full-page JSONL manifest under {data_root} after HF pull."
-        )
-
-    dst_manifest = data_root / f"{src_manifest.stem}_colab.jsonl"
+    # 4. Rewrite relative shard paths -> absolute data_root paths (drop missing images)
+    dst_manifest = data_root / (
+        f"{src_manifest.stem}_colab_smoke.jsonl"
+        if smoke_mode
+        else f"{src_manifest.stem}_colab.jsonl"
+    )
     stats = remap_jsonl_manifest(
-        src_manifest, dst_manifest, data_root=data_root, repo_root=repo_root, drop_missing=False
+        src_manifest,
+        dst_manifest,
+        data_root=data_root,
+        repo_root=repo_root,
+        drop_missing=True,
     )
     _log(f"Remapped manifest {src_manifest.name} -> {dst_manifest.name}: {stats}")
+    if stats["kept_rows"] == 0:
+        raise RuntimeError(
+            f"Manifest remapping kept 0/{stats['total_rows']} rows under {data_root}."
+        )
 
-    rism_style_dir = data_root / "unlabeled-10k-real" / "rism_hw"
+    rism_style_dir: Optional[Path] = (
+        None if smoke_mode else (data_root / "unlabeled-10k-real" / "rism_hw")
+    )
     return {
         "fullpage_manifest": dst_manifest,
         "rism_style_dir": rism_style_dir,
         "manifest_stats": stats,
     }
+
+
+pull_hf_datasets = prepare_dataset
 
 
 def restore_latest_from_hf(
@@ -1242,6 +1294,7 @@ def run_dry_run_self_test(repo_root: Path) -> None:
     p_h100 = select_gpu_profile(vram_gb=80.0, device_name="NVIDIA H100 80GB")
     p_a100 = select_gpu_profile(vram_gb=40.0, device_name="NVIDIA A100-SXM4-40GB")
     p_l4 = select_gpu_profile(vram_gb=22.5, device_name="NVIDIA L4")
+    assert p_h100.batch_size == 8 and p_h100.grad_accum == 2 and p_h100.num_workers == 8
     assert p_h100.batch_size * p_h100.grad_accum == 16
     assert p_a100.batch_size == 4 and p_a100.grad_accum == 4 and p_a100.num_workers == 6
     assert p_a100.batch_size * p_a100.grad_accum == 16
@@ -1251,6 +1304,10 @@ def run_dry_run_self_test(repo_root: Path) -> None:
     assert p_a100.use_channels_last is is_linux
     assert p_l4.use_channels_last is False
     assert os.environ.get("HF_HUB_ENABLE_HF_TRANSFER") == "1"
+    assert len(HF_ITER15_SHARD_FILES) == 14
+    assert HF_ITER15_SHARD_FILES[0] == "datasets/iter15_v2a/shards/iter15_shard_00.tar"
+    assert HF_ITER15_SHARD_FILES[-1] == "datasets/iter15_v2a/shards/iter15_shard_13.tar"
+    assert HF_ITER15_MANIFEST_PATH == "datasets/iter15_v2a/shards/uni_fullpage_iter15_v2a.jsonl"
 
     with tempfile.TemporaryDirectory(prefix="iter15_pro200m_dryrun_") as td:
         tmp_root = Path(td)
@@ -1260,22 +1317,48 @@ def run_dry_run_self_test(repo_root: Path) -> None:
         fake_rism.mkdir(parents=True, exist_ok=True)
         fake_out.mkdir(parents=True, exist_ok=True)
 
-        # Verify manifest path remapping
-        src_jsonl = fake_data / "manifest.jsonl"
-        dst_jsonl = fake_data / "manifest_colab.jsonl"
+        # Verify tar extraction helper + relative shard manifest remapping with drop_missing=True
+        shard0_src = tmp_root / "shard0_src"
+        (shard0_src / "pages" / "shard_00").mkdir(parents=True, exist_ok=True)
+        (shard0_src / "bekerns" / "shard_00").mkdir(parents=True, exist_ok=True)
+        (shard0_src / "pages" / "shard_00" / "p0.jpg").write_bytes(b"\xff\xd8\xff\xd9")
+        (shard0_src / "bekerns" / "shard_00" / "p0_s0.bekern").write_text("**kern\n", encoding="utf-8")
+        tar_path = tmp_root / "iter15_shard_00.tar"
+        with tarfile.open(tar_path, "w") as tf:
+            tf.add(shard0_src / "pages", arcname="pages")
+            tf.add(shard0_src / "bekerns", arcname="bekerns")
+        _extract_tar_to(tar_path, fake_data)
+        assert (fake_data / "pages" / "shard_00" / "p0.jpg").is_file()
+
+        src_jsonl = fake_data / "uni_fullpage_iter15_v2a.jsonl"
+        dst_jsonl = fake_data / "uni_fullpage_iter15_v2a_colab.jsonl"
         src_jsonl.write_text(
-            json.dumps(
-                {
-                    "image": r"D:\tmp\unlabeled-10k-real\rism_hw\p0.png",
-                    "bekerns": [r"D:\tmp\iter15_v2a\bekerns\p0_s0.bekern"],
-                    "domain": "real_hw",
-                }
+            "\n".join(
+                [
+                    json.dumps(
+                        {
+                            "image": "pages/shard_00/p0.jpg",
+                            "bekerns": ["bekerns/shard_00/p0_s0.bekern"],
+                            "domain": "real_hw",
+                        }
+                    ),
+                    json.dumps(
+                        {
+                            "image": "pages/shard_01/p1_missing.jpg",
+                            "bekerns": ["bekerns/shard_01/p1_s0.bekern"],
+                            "domain": "printed",
+                        }
+                    ),
+                ]
             )
             + "\n",
             encoding="utf-8",
         )
-        stats = remap_jsonl_manifest(src_jsonl, dst_jsonl, data_root=Path("/content/data"))
-        assert stats["total_rows"] == 1 and stats["remapped_fields"] == 2
+        stats = remap_jsonl_manifest(src_jsonl, dst_jsonl, data_root=fake_data, drop_missing=True)
+        assert stats["total_rows"] == 2 and stats["kept_rows"] == 1 and stats["missing_images"] == 1
+        kept_rec = json.loads(dst_jsonl.read_text(encoding="utf-8").strip())
+        assert kept_rec["image"] == (fake_data / "pages" / "shard_00" / "p0.jpg").as_posix()
+        assert kept_rec["bekerns"] == [(fake_data / "bekerns" / "shard_00" / "p0_s0.bekern").as_posix()]
 
         # Verify full 64k CLI command (fresh & true --resume)
         fake_teacher = fake_data / "teacher_ema.pt"
@@ -1420,7 +1503,9 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
     args = parse_args(argv)
-    os.environ.setdefault("HF_HUB_ENABLE_HF_TRANSFER", "1")
+    os.environ["HF_HUB_ENABLE_HF_TRANSFER"] = (
+        os.environ.get("HF_HUB_ENABLE_HF_TRANSFER") or "1"
+    )
     os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
     repo_root = _resolve_repo_root()
@@ -1444,11 +1529,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     out_dir = (args.run_root / "smoke") if smoke_mode else args.run_root
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    assets = pull_hf_datasets(
+    assets = prepare_dataset(
         hf_token=hf_token,
         data_root=args.data_root,
         repo_root=repo_root,
         manifest_name=args.manifest_name,
+        smoke_mode=smoke_mode,
     )
 
     teacher_ckpt: Optional[Path] = args.teacher_ckpt

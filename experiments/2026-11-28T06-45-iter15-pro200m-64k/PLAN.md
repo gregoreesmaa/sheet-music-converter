@@ -13,7 +13,7 @@
 - **Local Evaluation Watcher:** Local `RTX 4080 SUPER` (`16 GB` VRAM, Ada `cc=8.9`, `BF16`, `assembly-serialize.exe`) running [watch_milestones_local.py](./watch_milestones_local.py) asynchronously against HF `checkpoints/iter15_pro200m_64k/milestones/` so milestone scoring never pauses or consumes Colab GPU time.
 - **Rationale:** `iter15_pro200m` (`194.14M` infer params) at `1536px` multi-scale + `max_seq_len=3840` + `bd3_repair_head` benefits strongly from H100/A100 VRAM & tensor-core throughput, while 5-minute rolling HF sync + auto-resume makes the 64k run completely resilient to Colab session limits or preemptions.
 - **Auto-Tuned GPU Profiles (`run_colab_iter15.py`):**
-  - **H100-80GB (`>= 70 GB`):** `bs=4, ga=4` (effective batch `16`), `--grad-checkpoint`, `--channels-last` (Linux NHWC), `num_workers=8`, `prefetch_threads=8`
+  - **H100-80GB (`>= 70 GB`):** `bs=8, ga=2` (effective batch `16`, verified ~41–50 GB / 80 GB VRAM), `--grad-checkpoint`, `--channels-last` (Linux NHWC), `num_workers=8`, `prefetch_threads=8`
   - **A100-40GB (`>= 36 GB`):** `bs=4, ga=4` (effective batch `16`), `--grad-checkpoint`, `--channels-last` (Linux NHWC), `num_workers=6`, `prefetch_threads=6`
   - **L4-24GB (`< 36 GB`):** `bs=1, ga=16` (effective batch `16`), `--grad-checkpoint`, `num_workers=2`, `prefetch_threads=4`
 
@@ -74,8 +74,8 @@ Verified on disk (`UniOMRv2Config.iter15_pro200m()`, commit `15fc120` / `be914c6
 
 ## 4. Required Training & Eval Data (100% Permissive, Zero Eval Overlap)
 
-- **HF Dataset Prefix:** `datasets/iter15_v2a/` (full-page shards + `uni_fullpage_iter15_v2a.jsonl`, remapped cleanly from `D:\tmp\...` -> `/content/data/...`)
-- **Core HF Shards:** `datasets/rism_hw_5707.tar` (unpaired RISM style pool for FDA/AdaIN)
+- **HF Dataset Shards:** `datasets/iter15_v2a/shards/` — **`55,015` pages** (`1536px` JPEG Q95, `14` shards `iter15_shard_00.tar`..`iter15_shard_13.tar`, `17.83 GB` total) + `uni_fullpage_iter15_v2a.jsonl` (relative `pages/shard_XX/...` and `bekerns/shard_XX/...` remapped to `/content/data/...`, deleting each `.tar` immediately after `tar -xf` extraction so peak Colab disk stays ~20 GB; `--smoke-steps` downloads only `iter15_shard_00.tar` = `3,930` rows)
+- **Core HF Shards:** `datasets/rism_hw_5707.tar` (unpaired RISM style pool for FDA/AdaIN, downloaded in full mode)
 - **Stratified Weights (`v4_hw70`):**
   - Printed (`30.0%`): `legacy_printed 13.2%`, `multi_renderer_printed 13.2%`, `rare_printed 3.6%`
   - Handwritten (`69.5%`): `synth_hw 25.0%`, `real_hw_archival 18.0%`, `real_hw_pseudo 20.0%`, `real_hw_stitched 6.5%`
