@@ -3155,7 +3155,10 @@ def _build_datasets_and_iters(
                     domain = str(rec.get("domain", "")).strip().lower()
                     bekern_version = str(rec.get("bekern_version", "v2a")).strip().lower()
                     if img_p.is_file() and (beks or _is_neg_control_row(img_p, domain)):
-                        fp_pairs.append((img_p, beks, domain, bekern_version))
+                        if rec.get("layer_mask") is not None:
+                            fp_pairs.append((img_p, beks, domain, bekern_version, int(rec["layer_mask"])))
+                        else:
+                            fp_pairs.append((img_p, beks, domain, bekern_version))
         max_sys_cap = int(getattr(args, "max_systems_per_page", 16))
         if fp_pairs and max_sys_cap > 0:
             fp_pairs, n_dropped_sys = filter_fullpage_pairs_by_systems(
@@ -3380,6 +3383,7 @@ def _build_datasets_and_iters(
                     )
         else:
             fp_strat_sampler = None
+        use_bekern_full_ds = bool(getattr(cfg, "bekern_full", False))
         fp_train_ds = UniFullPageDataset(
             fp_tr,
             fullpage_max_dim=init_fp_max_dim,
@@ -3392,6 +3396,7 @@ def _build_datasets_and_iters(
             rism_fda_prob=rism_fda_prob,
             rism_adain_prob=rism_adain_prob,
             rism_fda_beta=rism_fda_beta,
+            bekern_full=use_bekern_full_ds,
         )
         if fp_tr:
             clean_datasets_for_cache.append((
@@ -3402,6 +3407,7 @@ def _build_datasets_and_iters(
                     max_seq_len=args.max_seq_len,
                     augment=False,
                     return_uint8=True,
+                    bekern_full=use_bekern_full_ds,
                 ),
             ))
         fullpage_val_ds = UniFullPageDataset(
@@ -3410,6 +3416,7 @@ def _build_datasets_and_iters(
             max_seq_len=args.max_seq_len,
             augment=False,
             return_uint8=True,
+            bekern_full=use_bekern_full_ds,
         ) if fp_va else None
         fullpage_hw_val_ds = UniFullPageDataset(
             fp_hw_va,
@@ -3417,6 +3424,7 @@ def _build_datasets_and_iters(
             max_seq_len=args.max_seq_len,
             augment=False,
             return_uint8=True,
+            bekern_full=use_bekern_full_ds,
         ) if fp_hw_va else None
         fixed_hw_buckets = bool(getattr(args, "fixed_hw_buckets", False))
         fp_collate_fn: Any = (

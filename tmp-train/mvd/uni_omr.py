@@ -4183,6 +4183,7 @@ class UniFullPageDataset(Dataset):
         rism_adain_prob: float = 0.0,
         rism_fda_beta: float = 0.02,
         canonicalize_voices: bool = True,
+        bekern_full: bool = False,
     ) -> None:
         self.pairs = list(pairs)
         self.fullpage_max_dim = int(fullpage_max_dim)
@@ -4197,8 +4198,10 @@ class UniFullPageDataset(Dataset):
         self.rism_adain_prob = float(max(0.0, min(1.0, rism_adain_prob)))
         self.rism_fda_beta = float(rism_fda_beta)
         self.canonicalize_voices = bool(canonicalize_voices)
+        self.bekern_full = bool(bekern_full)
         self._batch_target_dim: Optional[int] = None
         self._seq_cache: Dict[int, np.ndarray] = {}
+        self._bf_extra_cache: Dict[int, Tuple[int, np.ndarray, np.ndarray]] = {}
 
     def set_target_dim(self, dim: Optional[int]) -> None:
         """Set a shared per-batch target max_dim (pass None to clear)."""
@@ -4220,14 +4223,30 @@ class UniFullPageDataset(Dataset):
                 target_dim = self.fullpage_max_dim
 
         entry = self.pairs[sample_idx]
-        img_path, bekern_paths = entry[0], entry[1]
-        if len(entry) > 2:
-            domain = str(entry[2]).strip().lower()
-        elif self.domains is not None:
-            domain = self.domains[sample_idx]
+        row_layer_mask: Optional[int] = None
+        if isinstance(entry, dict):
+            img_path = entry["image"]
+            bekern_paths = entry.get("bekerns", ())
+            if "domain" in entry and entry["domain"] is not None:
+                domain = str(entry["domain"]).strip().lower()
+            elif self.domains is not None:
+                domain = self.domains[sample_idx]
+            else:
+                domain = ""
+            bekern_version = str(entry.get("bekern_version", "v2a")).strip().lower()
+            if entry.get("layer_mask") is not None:
+                row_layer_mask = int(entry["layer_mask"])
         else:
-            domain = ""
-        bekern_version = str(entry[3]).strip().lower() if len(entry) > 3 else "v2a"
+            img_path, bekern_paths = entry[0], entry[1]
+            if len(entry) > 2:
+                domain = str(entry[2]).strip().lower()
+            elif self.domains is not None:
+                domain = self.domains[sample_idx]
+            else:
+                domain = ""
+            bekern_version = str(entry[3]).strip().lower() if len(entry) > 3 else "v2a"
+            if len(entry) > 4 and entry[4] is not None:
+                row_layer_mask = int(entry[4])
         is_hw = domain in (
             "hw",
             "real_hw",
@@ -4272,6 +4291,76 @@ class UniFullPageDataset(Dataset):
                 img_t = _hwc_u8_to_chw_tensor(arr, self.return_uint8)
         else:
             img_t = _hwc_u8_to_chw_tensor(arr, self.return_uint8)
+
+        if self.bekern_full:
+            import bekern_full as _bf
+
+            cached_seq = self._seq_cache.get(sample_idx)
+            cached_extra = self._bf_extra_cache.get(sample_idx)
+            if cached_seq is None or cached_extra is None:
+                raw_parts: List[str] = []
+                for b_path in bekern_paths:
+                    p_txt = Path(b_path).read_text(encoding="utf-8").strip()
+                    if p_txt:
+                        raw_parts.append(p_txt)
+                full_text = f" {SYS_TOKEN} ".join(raw_parts)
+                first_tok = full_text.split(None, 1)[0] if full_text else ""
+
+                if row_layer_mask is not None:
+                    layer_mask = int(row_layer_mask) & 0b1111
+                elif first_tok in _bf.SCHEMA_TOKEN_TO_BITS:
+                    layer_mask = int(_bf.SCHEMA_TOKEN_TO_BITS[first_tok])
+                elif bekern_version == "v1":
+                    layer_mask = int(_bf.SCHEMA_LAYER_BITS["v1"])
+                elif bekern_version in ("full", "bekern-full"):
+                    layer_mask = int(_bf.SCHEMA_LAYER_BITS["full"])
+                else:
+                    layer_mask = int(_bf.SCHEMA_LAYER_BITS["v2a"])
+
+                if first_tok not in _bf.SCHEMA_TOKEN_TO_BITS:
+                    if bekern_version == "v1" or layer_mask == _bf.SCHEMA_LAYER_BITS["v1"]:
+                        schema_tok = "<schema:v1>"
+                    elif bekern_version in ("full", "bekern-full") or layer_mask == _bf.SCHEMA_LAYER_BITS["full"]:
+                        schema_tok = "<schema:full>"
+                    else:
+                        schema_tok = "<schema:v2a>"
+                    text_to_enc = f"{schema_tok} {full_text}".strip()
+                else:
+                    text_to_enc = full_text
+
+                enc = _bf.encode_bekern_full_sequence(text_to_enc, add_bos_eos=True)
+                ids = _cap_token_ids(enc["music_ids"], self.max_seq_len)
+                tb_in_list: List[int] = []
+                tb_tgt_list: List[int] = []
+                for span in enc["text_spans"]:
+                    if len(span) >= 2:
+                        tb_in_list.extend(span[:-1])
+                        tb_tgt_list.extend(span[1:])
+                if len(tb_in_list) > self.max_seq_len:
+                    tb_in_list = tb_in_list[: self.max_seq_len]
+                    tb_tgt_list = tb_tgt_list[: self.max_seq_len]
+
+                cached_seq = np.asarray(ids, dtype=_SEQ_CACHE_DTYPE)
+                cached_extra = (
+                    layer_mask,
+                    np.asarray(tb_in_list, dtype=_SEQ_CACHE_DTYPE),
+                    np.asarray(tb_tgt_list, dtype=_SEQ_CACHE_DTYPE),
+                )
+                self._seq_cache[sample_idx] = cached_seq
+                self._bf_extra_cache[sample_idx] = cached_extra
+
+            cached_lm, cached_tbi, cached_tbt = cached_extra
+            return {
+                "image": img_t,
+                "seq": torch.from_numpy(cached_seq).to(torch.long),
+                "sample_id": make_sample_id(img_path),
+                "kind": "fullpage",
+                "domain": domain,
+                "bekern_version": bekern_version,
+                "layer_mask": int(cached_lm),
+                "text_byte_in": torch.from_numpy(cached_tbi).to(torch.long),
+                "text_byte_tgt": torch.from_numpy(cached_tbt).to(torch.long),
+            }
 
         cached_seq = self._seq_cache.get(sample_idx)
         if cached_seq is None:
@@ -4741,7 +4830,13 @@ def collate_uni_batch(
         images = torch.full((B, 3, max_h, max_w), 255, dtype=torch.uint8)
     else:
         images = torch.ones((B, 3, max_h, max_w), dtype=torch.float32)
-    seqs = torch.full((B, max_t), PAD_ID, dtype=torch.long)
+    has_bekern_full = any("layer_mask" in s for s in samples)
+    seq_pad_id = PAD_ID
+    if has_bekern_full:
+        import bekern_full as _bf
+
+        seq_pad_id = _bf.PAD_ID
+    seqs = torch.full((B, max_t), seq_pad_id, dtype=torch.long)
     sample_ids: List[str] = []
     domains: List[str] = []
     bekern_versions: List[str] = []
@@ -4761,7 +4856,7 @@ def collate_uni_batch(
         bekern_versions.append(str(s.get("bekern_version", "v2a")).strip().lower())
 
     is_v1_schema = torch.tensor([bv == "v1" for bv in bekern_versions], dtype=torch.bool)
-    return {
+    out_batch: Dict[str, Any] = {
         "images": images,
         "seq": seqs,
         "sample_ids": sample_ids,
@@ -4772,6 +4867,41 @@ def collate_uni_batch(
         "orig_seq_len": orig_seq_len,
         "kind": samples[0].get("kind", "unknown") if B > 0 else "empty",
     }
+    if has_bekern_full:
+        lm_vals: List[int] = []
+        for i, s in enumerate(samples):
+            if "layer_mask" in s and s["layer_mask"] is not None:
+                lm_vals.append(int(s["layer_mask"]))
+            else:
+                bv = bekern_versions[i]
+                lm_vals.append(
+                    int(_bf.SCHEMA_LAYER_BITS.get(bv, _bf.SCHEMA_LAYER_BITS["v2a"]))
+                )
+        out_batch["layer_masks"] = torch.tensor(lm_vals, dtype=torch.long)
+
+        max_txt = 0
+        for s in samples:
+            tbi = s.get("text_byte_in")
+            if tbi is not None:
+                max_txt = max(max_txt, int(len(tbi)))
+        if max_txt > 0:
+            tb_inputs = torch.full((B, max_txt), _bf.TEXT_PAD_ID, dtype=torch.long)
+            tb_targets = torch.full((B, max_txt), _bf.TEXT_PAD_ID, dtype=torch.long)
+            for i, s in enumerate(samples):
+                tbi = s.get("text_byte_in")
+                tbt = s.get("text_byte_tgt")
+                if tbi is not None and len(tbi) > 0:
+                    t_in = tbi if isinstance(tbi, torch.Tensor) else torch.as_tensor(tbi, dtype=torch.long)
+                    tb_inputs[i, : int(t_in.shape[0])] = t_in
+                if tbt is not None and len(tbt) > 0:
+                    t_tg = tbt if isinstance(tbt, torch.Tensor) else torch.as_tensor(tbt, dtype=torch.long)
+                    tb_targets[i, : int(t_tg.shape[0])] = t_tg
+            out_batch["text_byte_inputs"] = tb_inputs
+            out_batch["text_byte_targets"] = tb_targets
+        else:
+            out_batch["text_byte_inputs"] = None
+            out_batch["text_byte_targets"] = None
+    return out_batch
 
 
 def unpack_collated_batch(batch: Dict[str, Any], fallback_kind: str) -> List[Dict[str, Any]]:
@@ -4781,6 +4911,9 @@ def unpack_collated_batch(batch: Dict[str, Any], fallback_kind: str) -> List[Dic
     orig_seq_len = batch.get("orig_seq_len")
     domains = batch.get("domains")
     bekern_versions = batch.get("bekern_versions")
+    layer_masks = batch.get("layer_masks")
+    tb_inputs = batch.get("text_byte_inputs")
+    tb_targets = batch.get("text_byte_targets")
     out: List[Dict[str, Any]] = []
     for i in range(B_loc):
         im = batch["images"][i]
@@ -4794,14 +4927,29 @@ def unpack_collated_batch(batch: Dict[str, Any], fallback_kind: str) -> List[Dic
             non_pad = (sq != PAD_ID).nonzero(as_tuple=False)
             if non_pad.numel() > 0:
                 sq = sq[: int(non_pad[-1].item()) + 1]
-        out.append({
+        item: Dict[str, Any] = {
             "image": im,
             "seq": sq,
             "sample_id": batch["sample_ids"][i],
             "kind": fallback_kind,
             "domain": domains[i] if (domains is not None and i < len(domains)) else ("hw" if fallback_kind == "hw_strip" else "printed"),
             "bekern_version": bekern_versions[i] if (bekern_versions is not None and i < len(bekern_versions)) else "v2a",
-        })
+        }
+        if layer_masks is not None and i < int(layer_masks.shape[0]):
+            import bekern_full as _bf
+
+            item["layer_mask"] = int(layer_masks[i].item())
+            if isinstance(tb_inputs, torch.Tensor) and isinstance(tb_targets, torch.Tensor):
+                tbi_row = tb_inputs[i]
+                tbt_row = tb_targets[i]
+                non_tpad = (tbi_row != _bf.TEXT_PAD_ID).nonzero(as_tuple=False)
+                t_end = int(non_tpad[-1].item()) + 1 if non_tpad.numel() > 0 else 0
+                item["text_byte_in"] = tbi_row[:t_end]
+                item["text_byte_tgt"] = tbt_row[:t_end]
+            else:
+                item["text_byte_in"] = torch.empty(0, dtype=torch.long)
+                item["text_byte_tgt"] = torch.empty(0, dtype=torch.long)
+        out.append(item)
     return out
 
 

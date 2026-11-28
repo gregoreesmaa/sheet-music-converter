@@ -24,6 +24,7 @@ import argparse
 import contextlib
 from dataclasses import asdict, fields
 import difflib
+import heapq
 import json
 import math
 import statistics
@@ -58,6 +59,12 @@ DEFAULT_MANIFEST = REPO_ROOT / "data-gen" / "score-corpus" / "suite31" / "suite3
 # Helpers: Backward-Compat Vocab IDs, Grammar Masking, Truncation & KV Slicing
 # ---------------------------------------------------------------------------
 
+_VOCAB_SPEC_CACHE: Dict[
+    int, Tuple[int, int, int, int, Dict[str, int], Dict[int, str]]
+] = {}
+_FAIL_OPEN_IDS_CACHE: Dict[int, List[int]] = {}
+
+
 def _vocab_spec(
     vocab_size: int,
 ) -> Tuple[int, int, int, int, Dict[str, int], Dict[int, str]]:
@@ -68,8 +75,11 @@ def _vocab_spec(
     and Iter 16 ``bekern-full`` (``FULL_VOCAB_SIZE`` with specials fixed at 261..264).
     """
     vsz = int(vocab_size)
+    cached = _VOCAB_SPEC_CACHE.get(vsz)
+    if cached is not None:
+        return cached
     if vsz == bekern_full.FULL_VOCAB_SIZE:
-        return (
+        spec = (
             bekern_full.PAD_ID,
             bekern_full.BOS_ID,
             bekern_full.EOS_ID,
@@ -77,6 +87,8 @@ def _vocab_spec(
             dict(bekern_full.FULL_TOKEN_TO_ID),
             dict(bekern_full.FULL_ID_TO_TOKEN),
         )
+        _VOCAB_SPEC_CACHE[vsz] = spec
+        return spec
     n_base = vsz - 4
     if n_base < 0 or n_base > len(data.VOCAB):
         raise ValueError(
@@ -93,7 +105,9 @@ def _vocab_spec(
     id_to_tok[bos_id] = "<bos>"
     id_to_tok[eos_id] = "<eos>"
     id_to_tok[sys_id] = uni_omr.SYS_TOKEN
-    return pad_id, bos_id, eos_id, sys_id, tok_to_id, id_to_tok
+    spec = (pad_id, bos_id, eos_id, sys_id, tok_to_id, id_to_tok)
+    _VOCAB_SPEC_CACHE[vsz] = spec
+    return spec
 
 
 def decode_uni_compat(
@@ -162,13 +176,14 @@ def _allowed_ids_for_state(state: grammar.PrefixState, vocab_size: int) -> List[
     pad_id, bos_id, eos_id, sys_id, tok_to_id, _ = _vocab_spec(vocab_size)
     if state.broken:
         # Fail open over all non-PAD/non-BOS tokens.
-        return [
-            i for i in range(vocab_size)
-            if i not in (pad_id, bos_id)
-        ]
+        fail_open = _FAIL_OPEN_IDS_CACHE.get(vocab_size)
+        if fail_open is None:
+            fail_open = [i for i in range(vocab_size) if i != pad_id and i != bos_id]
+            _FAIL_OPEN_IDS_CACHE[vocab_size] = fail_open
+        return fail_open
 
     allow_set, eos_ok = state.allowed()
-    allow_ids = {i for i in allow_set if 0 <= i < vocab_size and i not in (pad_id, bos_id)}
+    allow_ids = {i for i in allow_set if 0 <= i < vocab_size and i != pad_id and i != bos_id}
 
     # Suppress tight-loop cycle extension in BOTH strict=False and strict=True
     # modes whenever alternatives exist.
@@ -192,7 +207,7 @@ def _allowed_ids_for_state(state: grammar.PrefixState, vocab_size: int) -> List[
     # Never emit PAD or BOS as generated tokens.
     allow_ids.discard(pad_id)
     allow_ids.discard(bos_id)
-    return sorted(i for i in allow_ids if 0 <= i < vocab_size)
+    return sorted(allow_ids)
 
 
 def _select_constrained_token(
@@ -205,6 +220,15 @@ def _select_constrained_token(
     if not allowed:
         return int(step_logits_1d.argmax(dim=-1).item())
 
+    # Fast CPU path: avoid per-step torch.tensor(allowed) + index_select allocation.
+    # Because `allowed` is sorted ascending, `max(..., key=vals.__getitem__)` breaks
+    # ties by lowest token ID (100% bit-identical to `index_select` + `argmax`).
+    if step_logits_1d.device.type == "cpu":
+        vals = step_logits_1d.tolist()
+        best_id = max(allowed, key=vals.__getitem__)
+        if math.isfinite(vals[best_id]):
+            return int(best_id)
+
     idx_t = torch.tensor(allowed, dtype=torch.long, device=step_logits_1d.device)
     sub_logits = step_logits_1d.index_select(0, idx_t)
     if not bool(torch.isfinite(sub_logits).any()):
@@ -212,6 +236,37 @@ def _select_constrained_token(
 
     best_pos = int(sub_logits.argmax(dim=-1).item())
     return int(allowed[best_pos])
+
+
+def _topk_allowed_log_probs(
+    row_logits: torch.Tensor,
+    row_lp: torch.Tensor,
+    allowed: List[int],
+    k_per_beam: int,
+) -> Optional[List[Tuple[float, int]]]:
+    """Return top-k ``(log_prob, tok_id)`` over ``allowed``, or None if all non-finite.
+
+    Uses a zero-allocation CPU ``heapq.nlargest`` fast path (100% bit-identical
+    tie-breaking for sorted ``allowed``) and falls back to exact tensor ops on
+    GPU or non-finite logits.
+    """
+    k_take = min(k_per_beam, len(allowed))
+    if row_lp.device.type == "cpu":
+        lp_vals = row_lp.tolist()
+        top_ids = heapq.nlargest(k_take, allowed, key=lp_vals.__getitem__)
+        if top_ids and all(math.isfinite(lp_vals[tid]) for tid in top_ids):
+            return [(float(lp_vals[tid]), int(tid)) for tid in top_ids]
+
+    idx_t = torch.tensor(allowed, dtype=torch.long, device=row_logits.device)
+    sub_logits = row_logits.index_select(0, idx_t)
+    if not bool(torch.isfinite(sub_logits).any()):
+        return None
+    sub_lp = row_lp.index_select(0, idx_t)
+    top_vals, top_pos = torch.topk(sub_lp, k=k_take, dim=-1)
+    return [
+        (float(val_t), int(allowed[int(pos_t)]))
+        for val_t, pos_t in zip(top_vals.tolist(), top_pos.tolist())
+    ]
 
 
 def _advance_grammar_state(
@@ -514,15 +569,10 @@ def _beam_repair_measure(
                     if tid != eos_id and tid != sys_id
                 ]
                 if allowed:
-                    idx_t = torch.tensor(allowed, dtype=torch.long, device=device)
-                    sub_logits = row_logits.index_select(0, idx_t)
-                    if bool(torch.isfinite(sub_logits).any()):
-                        sub_lp = row_lp.index_select(0, idx_t)
-                        k_take = min(k_per_beam, len(allowed))
-                        top_vals, top_pos = torch.topk(sub_lp, k=k_take, dim=-1)
-                        for val_t, pos_t in zip(top_vals.tolist(), top_pos.tolist()):
-                            tok_id = int(allowed[int(pos_t)])
-                            candidates.append((beam_lp + float(val_t), i, tok_id))
+                    top_pairs = _topk_allowed_log_probs(row_logits, row_lp, allowed, k_per_beam)
+                    if top_pairs is not None:
+                        for val_f, tok_id in top_pairs:
+                            candidates.append((beam_lp + val_f, i, tok_id))
                         used_mask = True
             if not used_mask:
                 masked_lp = row_lp.clone()
@@ -861,6 +911,11 @@ def generate_conf_gated_ilms(
     n_changed = 0
     n_ref_calls = 0
     cur_id = bos_id
+    fsa_mask_buf: Optional[torch.Tensor] = (
+        torch.empty(vocab_size, dtype=torch.float32, device=device)
+        if use_grammar and state is not None
+        else None
+    )
 
     for _ in range(int(max_len)):
         cur_t = torch.tensor([[cur_id]], dtype=torch.long, device=device)
@@ -879,8 +934,10 @@ def generate_conf_gated_ilms(
         if use_grammar and state is not None:
             allowed = _allowed_ids_for_state(state, vocab_size)
             if allowed:
-                fsa_mask = torch.full_like(lo, -1e9)
-                fsa_mask[allowed] = 0.0
+                assert fsa_mask_buf is not None
+                fsa_mask_buf.fill_(-1e9)
+                fsa_mask_buf[allowed] = 0.0
+                fsa_mask = fsa_mask_buf
                 lo_masked = lo + fsa_mask
             else:
                 lo_masked = lo
@@ -1545,15 +1602,10 @@ def generate_beam(
                 if use_grammar and beam_state is not None:
                     allowed = _allowed_ids_for_state(beam_state, vocab_size)
                     if allowed:
-                        idx_t = torch.tensor(allowed, dtype=torch.long, device=device)
-                        sub_logits = row_logits.index_select(0, idx_t)
-                        if bool(torch.isfinite(sub_logits).any()):
-                            sub_lp = row_lp.index_select(0, idx_t)
-                            k_take = min(k_per_beam, len(allowed))
-                            top_vals, top_pos = torch.topk(sub_lp, k=k_take, dim=-1)
-                            for val_t, pos_t in zip(top_vals.tolist(), top_pos.tolist()):
-                                tok_id = int(allowed[int(pos_t)])
-                                raw_s = beam_score + float(val_t)
+                        top_pairs = _topk_allowed_log_probs(row_logits, row_lp, allowed, k_per_beam)
+                        if top_pairs is not None:
+                            for val_f, tok_id in top_pairs:
+                                raw_s = beam_score + val_f
                                 norm_s = _beam_norm_score(raw_s, next_len, lp_exp)
                                 candidates.append((norm_s, raw_s, i, tok_id))
                             used_mask = True

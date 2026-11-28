@@ -674,12 +674,13 @@ def test_iter12_kernel_speedups() -> None:
         torch.onnx.is_in_onnx_export = orig_onnx_fn  # type: ignore[assignment]
 
     # 2. InkTokenRouterV2._compute_ink_and_paper_gate 2-cumsum/0-flip exact parity vs 4-edge flip scan
-    img = torch.full((2, 3, 96, 80), 0.9, dtype=torch.float32)
+    #    Use stride-16 aligned dims (192x160 -> 12x10 grid) matching the backbone's /16 patch grid.
+    img = torch.full((2, 3, 192, 160), 0.9, dtype=torch.float32)
     img[:, :, :12, :] = 0.05   # dark top desk border
     img[:, :, -10:, :] = 0.10  # dark bottom desk border
     img[:, :, :, :8] = 0.08    # dark left border
     img[:, :, :, -6:] = 0.12   # dark right border
-    img[:, :, 40:52, 30:48] = 0.15  # dark interior music ink/shadow (must NOT be masked)
+    img[:, :, 80:104, 60:96] = 0.15  # dark interior music ink/shadow (must NOT be masked)
     ink_fast, gate_fast, eff_fast = InkTokenRouterV2._compute_ink_and_paper_gate(img, 12, 10)
     # Reference 4-edge flip scan
     luma_ref = 0.299 * img[:, 0:1] + 0.587 * img[:, 1:2] + 0.114 * img[:, 2:3]
