@@ -536,8 +536,8 @@ def _compute_attn_ink_cov_and_norm_lp(
     attn_ink_cov = 0.85  # neutral fallback if hook unavailable
     if "q_in" in captured and "kv_in" in captured:
         with torch.no_grad():
-            q_in = captured["q_in"]
-            kv_in = captured["kv_in"]
+            q_in = captured["q_in"].to(dtype=ca.q_proj.weight.dtype)
+            kv_in = captured["kv_in"].to(dtype=ca.k_proj.weight.dtype)
             B, Lq, _ = q_in.shape
             Lk = kv_in.shape[1]
             n_heads = int(getattr(ca, "n_heads", 8))
@@ -1008,6 +1008,7 @@ def _run_part_a_northstar_ttc(
                     flush=True,
                 )
         except Exception as exc:
+            print(f"[Part A][ERROR][{idx:03d}/{len(pages):03d}] {pid}: {type(exc).__name__}: {exc}", flush=True)
             _atomic_write_text(p0_xml, "")
             _atomic_write_text(p1_xml, "")
             dt = round(time.perf_counter() - t_page0, 4)
@@ -1166,7 +1167,28 @@ def _load_manifest_pairs(manifest_path: Path) -> List[Tuple[Path, List[Path], st
     return pairs
 
 
-def _encode_bekerns_systems(beks: List[Path], uni_omr: Any) -> Tuple[List[int], List[List[str]]]:
+def _encode_tokens_compat(toks: Sequence[str], vocab_size: int, eus: Any, uni_omr: Any) -> List[int]:
+    """Encode bekern/system tokens strictly within the checkpoint's vocab_size."""
+    _, bos_id, eos_id, sys_id, tok_to_id, _ = eus._vocab_spec(int(vocab_size))
+    ids: List[int] = [bos_id]
+    for tok in toks:
+        if tok == uni_omr.SYS_TOKEN:
+            ids.append(sys_id)
+        else:
+            tid = tok_to_id.get(tok)
+            if tid is not None:
+                ids.append(int(tid))
+    ids.append(eos_id)
+    return ids
+
+
+def _encode_bekerns_systems(
+    beks: List[Path],
+    uni_omr: Any,
+    *,
+    vocab_size: int,
+    eus: Any,
+) -> Tuple[List[int], List[List[str]]]:
     sys_toks: List[List[str]] = []
     flat: List[str] = []
     for idx, bp in enumerate(beks):
@@ -1176,7 +1198,7 @@ def _encode_bekerns_systems(beks: List[Path], uni_omr: Any) -> Tuple[List[int], 
         if idx > 0:
             flat.append(uni_omr.SYS_TOKEN)
         flat.extend(toks)
-    return uni_omr.encode_uni(flat), sys_toks
+    return _encode_tokens_compat(flat, vocab_size, eus, uni_omr), sys_toks
 
 
 def _pil_to_tensor(img_pil: Any, max_dim: int) -> "torch.Tensor":
@@ -1192,8 +1214,7 @@ def _pil_to_tensor(img_pil: Any, max_dim: int) -> "torch.Tensor":
     if (nw, nh) != (w, h):
         rgb = rgb.resize((nw, nh), Image.BICUBIC)
     arr = np.asarray(rgb, dtype=np.float32) / 255.0
-    t = torch.from_numpy(arr).permute(2, 0, 1).contiguous()
-    return (t - 0.5) / 0.5
+    return torch.from_numpy(arr).permute(2, 0, 1).contiguous()
 
 
 def _is_header_token(tok: str, sys_token: str) -> bool:
@@ -1235,8 +1256,8 @@ def _build_sys_dagger_example(
             suffix_toks.append(uni_omr.SYS_TOKEN)
         suffix_toks.extend(sys_toks[s_idx])
 
-    suffix_ids_full = uni_omr.encode_uni(suffix_toks)
-    # encode_uni returns [BOS, ..., EOS]; drop BOS for spliced suffix
+    suffix_ids_full = _encode_tokens_compat(suffix_toks, vocab_size, eus, uni_omr)
+    # _encode_tokens_compat returns [BOS, ..., EOS]; drop BOS for spliced suffix
     suffix_ids = suffix_ids_full[1:] if len(suffix_ids_full) >= 2 else suffix_ids_full
     if len(suffix_ids) < 2:
         return None
@@ -1300,6 +1321,8 @@ def _build_antiprior_example(
     rng: random.Random,
     device: "torch.device",
     uni_omr: Any,
+    vocab_size: int,
+    eus: Any,
 ) -> Optional[Tuple["torch.Tensor", "torch.Tensor", "torch.Tensor", "torch.Tensor"]]:
     """Build a Counterfactual Anti-Prior pair:
     - Applies mild photometric contrast/gamma + vertical-crop jitter on the image
@@ -1323,7 +1346,7 @@ def _build_antiprior_example(
         if idx > 0:
             flat_toks.append(uni_omr.SYS_TOKEN)
         flat_toks.extend(st)
-    ids = uni_omr.encode_uni(flat_toks)
+    ids = _encode_tokens_compat(flat_toks, vocab_size, eus, uni_omr)
     if len(ids) < 4:
         return None
     ids = ids[:MAX_SEQ_LEN]
@@ -1335,10 +1358,11 @@ def _build_antiprior_example(
 
     # Anti-prior input perturbation: corrupt 15% of non-special decoder input tokens
     # so the decoder MUST read visual memory rather than autoregressing LM priors.
+    pad_id, _, _, _, _, _ = eus._vocab_spec(int(vocab_size))
     if dec_in.shape[1] > 4:
         corrupt_mask = torch.rand_like(dec_in, dtype=torch.float32) < 0.15
         corrupt_mask[:, 0] = False  # keep BOS
-        rand_toks = torch.randint(4, uni_omr.VOCAB_SIZE, dec_in.shape, device=device, dtype=dec_in.dtype)
+        rand_toks = torch.randint(0, pad_id, dec_in.shape, device=device, dtype=dec_in.dtype)
         dec_in = torch.where(corrupt_mask, rand_toks, dec_in)
 
     # Upweight state-header tokens (`<sys>`, `clef-*`, `key*`, `time-*`)
@@ -1513,7 +1537,7 @@ def _train_part_b_arm(
         step_loss = 0.0
         for _ in range(GRAD_ACCUM):
             img_p, beks, _, _ = rng.choices(train_pairs, weights=weights, k=1)[0]
-            ids, sys_toks = _encode_bekerns_systems(beks, uni_omr)
+            ids, sys_toks = _encode_bekerns_systems(beks, uni_omr, vocab_size=int(cfg.vocab_size), eus=eus)
             if len(ids) < 4:
                 continue
             img = Image.open(img_p).convert("RGB")
@@ -1555,7 +1579,15 @@ def _train_part_b_arm(
                     mode = "sft"
 
             if mode == "antiprior":
-                ap = _build_antiprior_example(img, sys_toks, rng=rng, device=device, uni_omr=uni_omr)
+                ap = _build_antiprior_example(
+                    img,
+                    sys_toks,
+                    rng=rng,
+                    device=device,
+                    uni_omr=uni_omr,
+                    vocab_size=int(cfg.vocab_size),
+                    eus=eus,
+                )
                 if ap is not None:
                     inp, dec_in, labels, tok_w = ap
                     with torch.amp.autocast("cuda", dtype=torch.bfloat16, enabled=use_bf16):

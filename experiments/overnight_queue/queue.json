@@ -1944,7 +1944,7 @@
     "est_cu": 3.8,
     "script": "experiments/2026-11-26T19-35-i13-26b-asymmetric-gqa-cross-mha/run_colab.py",
     "hf_eval_target": "evals/2026-11-26T19-35-i13-26b-asymmetric-gqa-cross-mha.json",
-    "status": "QUEUED",
+    "status": "RUNNING",
     "depends_on": [
       "2026-11-26T07-40-i13-26-gqa-kv-heads-sweep"
     ]
@@ -2062,7 +2062,7 @@
   {
     "id": "2026-11-26T21-56-eval-northstar-iter10_5-v1",
     "short_id": "ns-i10_5-v1",
-    "title": "OMR-NorthStar v0.1 125p Eval \u2014 UniOMR Iter 10.5 (v1, 4x8, 8k EMA)",
+    "title": "OMR-NorthStar v0.1 125p Eval — UniOMR Iter 10.5 (v1, 4x8, 8k EMA)",
     "wave": 10,
     "priority": 1,
     "provider": "colab_l4",
@@ -2361,7 +2361,7 @@
   {
     "id": "2026-11-26T22-41-eval-northstar-iter13-mid",
     "short_id": "ns-i13-mid",
-    "title": "OMR-NorthStar v0.1 125p Eval \u2014 UniOMR Iter 13 Stage 2 Mid (v2, step 744 EMA, max_mem=3072)",
+    "title": "OMR-NorthStar v0.1 125p Eval — UniOMR Iter 13 Stage 2 Mid (v2, step 744 EMA, max_mem=3072)",
     "wave": 10,
     "priority": 1,
     "provider": "colab_l4",
@@ -2387,7 +2387,7 @@
   {
     "id": "2026-11-26T22-47-eval-northstar-iter10_5-v1-msczrs",
     "short_id": "ns-i10_5-rs",
-    "title": "OMR-NorthStar v0.1 125p Eval \u2014 UniOMR Iter 10.5 (v1, 8k EMA) with Rust mscz-rs Exporter",
+    "title": "OMR-NorthStar v0.1 125p Eval — UniOMR Iter 10.5 (v1, 8k EMA) with Rust mscz-rs Exporter",
     "wave": 10,
     "priority": 1,
     "provider": "colab_l4",
@@ -2636,7 +2636,7 @@
       "datasets/iter10_5_proxy_2k.tar",
       "datasets/suite31_hw_eval.tar"
     ],
-    "note": "Wave 13 Pivot Strategist 3: 2-arm 1,500-step bake-off on edge85m (<55MB INT4) breaking the -13.5pp S_expr text=0.000 ceiling \u2014 arm_a_textspotter_head (~1.8M parallel 2L d=256 cross-attending to mem_post_merger + unfrozen router) vs arm_b_deferred_sys_lyr_bpe (end-of-system <sys_lyr> + 256-token syllable BPE). Promote gate: held-out text F1 >= 0.70, vocal S_note delta >= -0.5pp, packed INT4 < 55.0 MB.",
+    "note": "Wave 13 Pivot Strategist 3: 2-arm 1,500-step bake-off on edge85m (<55MB INT4) breaking the -13.5pp S_expr text=0.000 ceiling — arm_a_textspotter_head (~1.8M parallel 2L d=256 cross-attending to mem_post_merger + unfrozen router) vs arm_b_deferred_sys_lyr_bpe (end-of-system <sys_lyr> + 256-token syllable BPE). Promote gate: held-out text F1 >= 0.70, vocal S_note delta >= -0.5pp, packed INT4 < 55.0 MB.",
     "session": "2026-11-27t07-46-i15-03-",
     "started_at": "2026-11-27T20:08:58Z",
     "log_path": "D:\\tmp\\overnight-queue-logs\\2026-11-27T07-46-i15-03-lyrics-textspotter-vs-deferred-bpe.log"
@@ -2656,7 +2656,7 @@
     "plan": "experiments/2026-11-27T07-46-i15-04-risk-gated-visual-ttc-and-sys-dagger/PLAN.md",
     "hf_eval_target": "evals/2026-11-27T07-46-i15-04-risk-gated-visual-ttc-and-sys-dagger.json",
     "hf_run_target": "runs/2026-11-27T07-46-i15-04-risk-gated-visual-ttc-and-sys-dagger.json",
-    "status": "RUNNING",
+    "status": "QUEUED",
     "depends_on": [],
     "datasets": [
       "datasets/northstar_eval_pack_125p.tar.gz",
@@ -2666,7 +2666,8 @@
     "note": "Wave 13 Strategist 4 (Pivots 3 & 2): Part A zero-train Risk-Gated Visual-Coverage TTC on NorthStar 125p (fixes all 5 i14-14 defects + bsvr=0.997 blind spot; gates: CDR esc<=15%, lat<=1.45x, 0.0pp printed reg, NS>=+3.0); Part B 1,200-step <sys>-aligned On-Policy DAgger + Counterfactual Anti-Prior (75% SFT + 25% DAgger/Anti-Prior, ignore_index=-100 on prefix, 3x <sys> header weight) vs SFT control on suite31_hw (gates: HWM Note F1>=+3.0pp, printed>=-0.3pp).",
     "session": "2026-11-27t07-46-i15-04-",
     "started_at": "2026-11-28T00:52:32Z",
-    "log_path": "D:\\tmp\\overnight-queue-logs\\2026-11-27T07-46-i15-04-risk-gated-visual-ttc-and-sys-dagger.log"
+    "log_path": "D:\\tmp\\overnight-queue-logs\\2026-11-27T07-46-i15-04-risk-gated-visual-ttc-and-sys-dagger.log",
+    "requeue_note": "Fixed 3 bugs 2026-11-28: Part B vocab_size=237 compat encoding (was 265->CUDA assert), Part A bf16 q_proj/k_proj dtype mismatch (was silently swallowing RuntimeError), Part B _pil_to_tensor [0,1] norm."
   },
   {
     "id": "2026-11-27T07-46-i15-05-spx13-band-tiling-and-hw-lora",
@@ -2675,7 +2676,7 @@
     "wave": 13,
     "priority": 5,
     "provider": "colab_l4",
-    "gpu": "L4",
+    "gpu": "A100",
     "est_minutes": 75,
     "est_cu": 5.5,
     "script": "experiments/2026-11-27T07-46-i15-05-spx13-band-tiling-and-hw-lora/run_colab.py",
@@ -2683,13 +2684,16 @@
     "plan": "experiments/2026-11-27T07-46-i15-05-spx13-band-tiling-and-hw-lora/PLAN.md",
     "hf_eval_target": "evals/2026-11-27T07-46-i15-05-spx13-band-tiling-and-hw-lora.json",
     "hf_run_target": "runs/2026-11-27T07-46-i15-05-spx13-band-tiling-and-hw-lora.json",
-    "status": "QUEUED",
+    "status": "RUNNING",
     "depends_on": [],
     "datasets": [
       "datasets/suite31_hw_eval.tar",
       "datasets/iter10_5_proxy_2k.tar"
     ],
-    "note": "Wave 13 Pivot Strategist 5: Arm A tests zero-train dark-border crop + canonical s_px=13 px 1-2 system band tiling (n_bands=1 bit-identical passthrough when s_px>=10 px; gate hw_landscape >= +5.0 pp, 0.00 pp printed); Arm B freezes base and trains 1,500-step rank-16 HW-only LoRA (1.29 MB INT4 on edge85m, <55 MB total) strictly on HW s_px=13 bands (gate hw_clean/hw_photo >= +4.0 pp over Arm A, domain-gated 0.00 pp printed)."
+    "note": "Wave 13 Pivot Strategist 5: Arm A tests zero-train dark-border crop + canonical s_px=13 px 1-2 system band tiling (n_bands=1 bit-identical passthrough when s_px>=10 px; gate hw_landscape >= +5.0 pp, 0.00 pp printed); Arm B freezes base and trains 1,500-step rank-16 HW-only LoRA (1.29 MB INT4 on edge85m, <55 MB total) strictly on HW s_px=13 bands (gate hw_clean/hw_photo >= +4.0 pp over Arm A, domain-gated 0.00 pp printed).",
+    "session": "2026-11-27t07-46-i15-05-",
+    "started_at": "2026-11-28T01:16:23Z",
+    "log_path": "D:\\tmp\\overnight-queue-logs\\2026-11-27T07-46-i15-05-spx13-band-tiling-and-hw-lora.log"
   },
   {
     "id": "2026-11-27T07-52-i15-07-bekern3-2d-cursor-and-bar-rewind",
@@ -2706,7 +2710,7 @@
     "plan": "experiments/2026-11-27T07-52-i15-07-bekern3-2d-cursor-and-bar-rewind/PLAN.md",
     "hf_eval_target": "evals/2026-11-27T07-52-i15-07-bekern3-2d-cursor-and-bar-rewind.json",
     "hf_run_target": "runs/2026-11-27T07-52-i15-07-bekern3-2d-cursor-and-bar-rewind.json",
-    "status": "QUEUED",
+    "status": "FAILED",
     "depends_on": [],
     "datasets": [
       "datasets/iter10_5_proxy_2k.tar",
@@ -2729,7 +2733,7 @@
     "plan": "experiments/2026-11-27T07-52-i15-06-bekern3-visual-sp-chord-polyphony/PLAN.md",
     "hf_eval_target": "evals/2026-11-27T07-52-i15-06-bekern3-visual-sp-chord-polyphony.json",
     "hf_run_target": "runs/2026-11-27T07-52-i15-06-bekern3-visual-sp-chord-polyphony.json",
-    "status": "QUEUED",
+    "status": "FAILED",
     "depends_on": [],
     "datasets": [
       "datasets/iter10_5_proxy_2k.tar",
@@ -2781,13 +2785,14 @@
     "plan": "experiments/2026-11-27T08-19-i15-09-data-mix-ratio-and-rep-cap-sweep/PLAN.md",
     "hf_eval_target": "evals/2026-11-27T08-19-i15-09-data-mix-ratio-and-rep-cap-sweep.json",
     "hf_run_target": "runs/2026-11-27T08-19-i15-09-data-mix-ratio-and-rep-cap-sweep.json",
-    "status": "RUNNING",
+    "status": "COMPLETED",
     "depends_on": [],
     "datasets": [
       "datasets/iter10_5_proxy_2k.tar",
       "datasets/suite31_hw_eval.tar"
     ],
-    "note": "Wave 13 Data-Mix & Repetition-Cap Sweep: 3-arm 800-step warm-start ablation on frozen UniOMRv2 EMA (arm0_v3_50_50 vs arm1_hw_heavy_30_70 vs arm2_rep_cap_10x_hard_upsample with <=10x real_hw_archival cap spilling to rism_pseudo+synth_hw + 2x hard-layout upsample), RAW+EMA eval on all 90 suite31_hw pages. Promote gate: >= +2.0 pp HW Note F1 with <= 0.5 pp Printed drop."
+    "note": "Wave 13 Data-Mix & Repetition-Cap Sweep: 3-arm 800-step warm-start ablation on frozen UniOMRv2 EMA (arm0_v3_50_50 vs arm1_hw_heavy_30_70 vs arm2_rep_cap_10x_hard_upsample with <=10x real_hw_archival cap spilling to rism_pseudo+synth_hw + 2x hard-layout upsample), RAW+EMA eval on all 90 suite31_hw pages. Promote gate: >= +2.0 pp HW Note F1 with <= 0.5 pp Printed drop.",
+    "verdict": "PROMOTE"
   },
   {
     "id": "2026-11-27T08-47-eval-iter14-mid-suite31-and-northstar",
