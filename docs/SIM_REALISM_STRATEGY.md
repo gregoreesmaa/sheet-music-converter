@@ -61,3 +61,20 @@ Every classifier tier MUST pass the **5-repeat Real-vs-Real Null Control** (`|me
 | :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
 | **`v0.7` baseline** (`5e7e4fe`) | T1 | `0.535` (PASS) | `0.9940` | `0.9869` | `0.9722` | `0.9987` | `69.69` (`5.63`) | `0.165` (`0.966`) | `7.0` / `11.5` (`1.64×`) | `19.3%` / `10.9%` |
 | **`v0.8`** *(running)* | T1 | *pending* | *pending* | *pending* | *pending* | *pending* | *pending* | *pending* | *pending* | *pending* |
+
+## v0.8 benchmark result (measured 2026-11-28, same protocol as v0.7; report D:\tmp\hwsim-realism-bench-v08\report.json)
+
+| Metric | v0.7 | v0.8 |
+|---|---:|---:|
+| Probe C AUC | 0.9967 | 0.9922 |
+| Probe C stdFD | 69.7 | 62.2 |
+| recall / coverage | 0.185 / 0.165 | 0.260 / 0.180 |
+| variance_ratio | 0.354 | 0.432 |
+| patch_binary AUC | 0.972 | 0.981 (worse) |
+| patch_highfreq AUC | 0.987 | 0.998 (worse) |
+| fullpage AUC | 0.9987 | 0.9993 |
+| staff spacing p50 (real 7.0) | 11.5 | 12.0 (worse) |
+| ink fraction (real 19.3%) | 10.9% | 13.3% |
+| patch fallback (real 4.1%) | 46.3% | 36.0% |
+
+Remaining gaps: staff-scale mismatch 1.71x (pack 8-14 staves per page), high-frequency/edge energy too low vs real, coverage/diversity still low, full-page framing. PARKED until agent credits return.

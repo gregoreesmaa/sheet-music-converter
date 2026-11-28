@@ -203,7 +203,7 @@ def select_gpu_profile(
             use_grad_checkpoint=True,
             use_bf16=True,
             use_no_cudnn=False,
-            use_channels_last=is_linux,
+            use_channels_last=False,  # fused-Adam resume crash on Colab w/ channels_last
             prefetch_threads=8,
             num_workers=8,
         )
@@ -217,7 +217,7 @@ def select_gpu_profile(
             use_grad_checkpoint=True,
             use_bf16=True,
             use_no_cudnn=False,
-            use_channels_last=is_linux,
+            use_channels_last=False,  # fused-Adam resume crash on Colab w/ channels_last
             prefetch_threads=6,
             num_workers=6,
         )
@@ -1300,8 +1300,8 @@ def run_dry_run_self_test(repo_root: Path) -> None:
     assert p_a100.batch_size * p_a100.grad_accum == 16
     assert p_l4.batch_size * p_l4.grad_accum == 16
     is_linux = sys.platform.startswith("linux")
-    assert p_h100.use_channels_last is is_linux
-    assert p_a100.use_channels_last is is_linux
+    assert p_h100.use_channels_last is False
+    assert p_a100.use_channels_last is False
     assert p_l4.use_channels_last is False
     assert os.environ.get("HF_HUB_ENABLE_HF_TRANSFER") == "1"
     assert len(HF_ITER15_SHARD_FILES) == 14
