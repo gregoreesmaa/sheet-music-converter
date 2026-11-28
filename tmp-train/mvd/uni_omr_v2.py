@@ -118,6 +118,9 @@ __all__ = [
     "SysCountHead",
     "StaffSegHead",
     "StrokeHogHead",
+    "FourierCoordMLP",
+    "ChainedMTPHead",
+    "BD3ReMDMRepairHead",
     "GroupedQueryAttention",
     "DeepStackFusion",
     "GQADecoderLayer",
@@ -128,6 +131,9 @@ __all__ = [
     "compute_staff_seg_loss",
     "compute_stroke_hog_target",
     "compute_stroke_hog_loss",
+    "build_text_aux_targets",
+    "sample_bd3_complementary_views",
+    "compute_bd3_repair_loss",
     "fake_quant_int4_ste",
     "QATInt4Controller",
 ]
@@ -316,6 +322,31 @@ class UniOMRv2Config:
     rope_coord_scale: float = 128.0
     grad_checkpoint: bool = False
 
+    # Iter 15 promoted upgrades (ALL default False/None/0 for 100% backward compatibility)
+    dec_ffn_mult: Optional[float] = None
+    use_yoco_cla: bool = False
+    yoco_cross_banks: Tuple[int, ...] = (0, 3, 7)
+    yoco_cross_kv_heads: Optional[int] = None
+    yoco_self_kv_heads: Optional[int] = None
+    use_resformer_v_res: bool = False
+    use_diff_cross_attn: bool = False
+    use_coordkey_ca: bool = False
+    coord_dim: int = 16
+    coord_mlp_hidden: int = 128
+    coord_n_freqs: int = 16
+    mode_gate_layers: int = 0
+    mode_gate_rank: int = 32
+    use_chained_mtp: bool = False
+    text_aux_vocab_size: int = 0
+    text_aux_loss_weight: float = 0.0
+    use_quantvla_head_temp: bool = False
+    use_bd3_repair_head: bool = False
+    bd3_d_rep: int = 256
+    bd3_n_heads: int = 4
+    bd3_d_ff: int = 512
+    bd3_n_layers: int = 2
+    bd3_block_size: int = 32
+
     def __post_init__(self) -> None:
         if self.d_model % self.n_heads != 0:
             raise ValueError(f"d_model ({self.d_model}) must be divisible by n_heads ({self.n_heads})")
@@ -333,6 +364,31 @@ class UniOMRv2Config:
         self.rope_jitter = float(max(0.0, self.rope_jitter))
         self.mixstyle_prob = float(max(0.0, min(1.0, self.mixstyle_prob)))
         self.vrfm_band_alpha = float(max(0.0, self.vrfm_band_alpha))
+        if self.yoco_cross_kv_heads is not None:
+            if self.n_heads % int(self.yoco_cross_kv_heads) != 0:
+                raise ValueError(
+                    f"n_heads ({self.n_heads}) must be divisible by yoco_cross_kv_heads ({self.yoco_cross_kv_heads})"
+                )
+            self.yoco_cross_kv_heads = int(self.yoco_cross_kv_heads)
+        if self.yoco_self_kv_heads is not None:
+            if self.n_heads % int(self.yoco_self_kv_heads) != 0:
+                raise ValueError(
+                    f"n_heads ({self.n_heads}) must be divisible by yoco_self_kv_heads ({self.yoco_self_kv_heads})"
+                )
+            self.yoco_self_kv_heads = int(self.yoco_self_kv_heads)
+        if self.use_yoco_cla:
+            banks = tuple(sorted(set(int(b) for b in self.yoco_cross_banks if 0 <= int(b) < self.n_dec_layers)))
+            if not banks or banks[0] != 0:
+                banks = (0,) + tuple(b for b in banks if b != 0)
+            self.yoco_cross_banks = banks
+        if self.use_diff_cross_attn and (head_dim % 2 != 0):
+            raise ValueError(f"head_dim ({head_dim}) must be even when use_diff_cross_attn=True")
+        if self.use_diff_cross_attn and self.use_coordkey_ca and (int(self.coord_dim) % 2 != 0):
+            raise ValueError(f"coord_dim ({self.coord_dim}) must be even when combining Diff + CoordKey")
+        if self.use_bd3_repair_head and (int(self.bd3_d_rep) % int(self.bd3_n_heads) != 0):
+            raise ValueError(
+                f"bd3_d_rep ({self.bd3_d_rep}) must be divisible by bd3_n_heads ({self.bd3_n_heads})"
+            )
         for _name in ("pad_id", "bos_id", "eos_id", "sys_id"):
             _val = getattr(self, _name)
             if _val is not None:
@@ -430,6 +486,74 @@ class UniOMRv2Config:
             router_hidden=64,
             max_mem_tokens=3072,
             mtp_k=4,
+        )
+        params.update(overrides)
+        return cls(**params)
+
+    @classmethod
+    def pro200m(cls, **overrides: Any) -> "UniOMRv2Config":
+        """d_model=768, ~195M infer params, ~120 MB Hybrid FP16/INT4-QAT (< 135 MB w/ scales)."""
+        params: Dict[str, Any] = dict(
+            d_model=768,
+            n_heads=12,
+            n_kv_heads=4,
+            n_axial_layers=0,
+            n_global_layers=8,
+            n_dec_layers=12,
+            ffn_mult=3.5,
+            axial_ffn_mult=2.0,
+            backbone_channels=(64, 128, 240, 448),
+            backbone_blocks=(1, 2, 3, 3),
+            backbone_expand=2.0,
+            router_hidden=64,
+            max_mem_tokens=3072,
+            mtp_k=4,
+        )
+        params.update(overrides)
+        return cls(**params)
+
+    @classmethod
+    def iter15_pro200m(cls, **overrides: Any) -> "UniOMRv2Config":
+        """Iter 15 flagship pro200m (d=768) with all 7+1 promoted upgrades enabled (< 135 MB INT4)."""
+        params: Dict[str, Any] = dict(
+            d_model=768,
+            n_heads=12,
+            n_kv_heads=6,
+            n_axial_layers=0,
+            n_global_layers=8,
+            n_dec_layers=12,
+            ffn_mult=3.5,
+            dec_ffn_mult=3.5,
+            axial_ffn_mult=2.0,
+            backbone_channels=(64, 128, 240, 448),
+            backbone_blocks=(1, 2, 3, 3),
+            backbone_expand=2.0,
+            router_hidden=64,
+            max_mem_tokens=3072,
+            mtp_k=4,
+            # Promoted Iter 15 winners:
+            use_yoco_cla=True,
+            yoco_cross_banks=(0, 3, 7),
+            yoco_cross_kv_heads=12,
+            yoco_self_kv_heads=6,
+            use_resformer_v_res=True,
+            use_diff_cross_attn=True,
+            use_coordkey_ca=True,
+            coord_dim=16,
+            coord_mlp_hidden=128,
+            coord_n_freqs=16,
+            mode_gate_layers=4,
+            mode_gate_rank=32,
+            use_chained_mtp=True,
+            text_aux_vocab_size=129,
+            text_aux_loss_weight=0.02,
+            use_quantvla_head_temp=True,
+            use_bd3_repair_head=True,
+            bd3_d_rep=256,
+            bd3_n_heads=4,
+            bd3_d_ff=512,
+            bd3_n_layers=2,
+            bd3_block_size=32,
         )
         params.update(overrides)
         return cls(**params)
@@ -1644,14 +1768,340 @@ def compute_staff_seg_loss(
 
 
 # ---------------------------------------------------------------------------
+# 3b. Iter 15 Modules: FourierCoordMLP, ChainedMTPHead, BD3ReMDMRepairHead
+# ---------------------------------------------------------------------------
+
+class FourierCoordMLP(nn.Module):
+    """Shared 2D Fourier coordinate encoder: (y_norm, x_norm) -> (2 + 4*n_freqs) -> hidden -> out."""
+
+    def __init__(self, n_freqs: int = 16, hidden_dim: int = 128, out_dim: int = 128) -> None:
+        super().__init__()
+        self.n_freqs = int(n_freqs)
+        in_dim = 2 + 4 * self.n_freqs
+        freqs = (2.0 ** torch.linspace(0.0, 6.0, self.n_freqs, dtype=torch.float32)) * math.pi
+        self.register_buffer("freqs", freqs, persistent=False)
+        self.fc1 = nn.Linear(in_dim, hidden_dim, bias=True)
+        self.fc2 = nn.Linear(hidden_dim, out_dim, bias=True)
+
+    def forward(
+        self,
+        kept_idx: torch.Tensor,
+        grid_hw: Tuple[int, int],
+        n_bg_summary: int,
+        dtype: torch.dtype,
+        is_full_grid: bool = False,
+    ) -> torch.Tensor:
+        """Return shared spatial coordinate features ``(B, Lk, out_dim)``."""
+        h_p, w_p = int(grid_hw[0]), int(grid_hw[1])
+        device = kept_idx.device
+        B = kept_idx.shape[0]
+
+        if is_full_grid and n_bg_summary == 0:
+            ys = torch.arange(h_p, device=device, dtype=torch.float32) / float(max(1, h_p - 1))
+            xs = torch.arange(w_p, device=device, dtype=torch.float32) / float(max(1, w_p - 1))
+            gy, gx = torch.meshgrid(ys, xs, indexing="ij")
+            y_norm = gy.reshape(1, -1).expand(B, -1)
+            x_norm = gx.reshape(1, -1).expand(B, -1)
+        else:
+            y_idx = torch.div(kept_idx, w_p, rounding_mode="floor").to(torch.float32)
+            x_idx = (kept_idx % w_p).to(torch.float32)
+            y_norm = y_idx / float(max(1, h_p - 1))
+            x_norm = x_idx / float(max(1, w_p - 1))
+            if n_bg_summary > 0:
+                cy = torch.full((B, n_bg_summary), 0.5, device=device, dtype=torch.float32)
+                cx = torch.full((B, n_bg_summary), 0.5, device=device, dtype=torch.float32)
+                y_norm = torch.cat([y_norm, cy], dim=1)
+                x_norm = torch.cat([x_norm, cx], dim=1)
+
+        f = self.freqs if self.freqs.device == device else self.freqs.to(device)
+        fy = y_norm.unsqueeze(-1) * f
+        fx = x_norm.unsqueeze(-1) * f
+        feats = torch.cat(
+            [y_norm.unsqueeze(-1), x_norm.unsqueeze(-1), fy.sin(), fy.cos(), fx.sin(), fx.cos()],
+            dim=-1,
+        ).to(dtype)
+        return self.fc2(F.silu(self.fc1(feats)))
+
+
+class ChainedMTPHead(nn.Module):
+    """DeepSeek-V3 sequential Chained MTP projection:
+    ``h_k = h_{k-1} + SiLU(W_k([RMSNorm(h_{k-1}); RMSNorm(tok_emb(y_{t+k}))]))``.
+    """
+
+    def __init__(self, d_model: int) -> None:
+        super().__init__()
+        self.norm_h = RMSNorm(d_model)
+        self.norm_e = RMSNorm(d_model)
+        self.proj = nn.Linear(2 * d_model, d_model, bias=False)
+
+    def forward(self, h_prev: torch.Tensor, next_tok_emb: torch.Tensor) -> torch.Tensor:
+        fused = torch.cat([self.norm_h(h_prev), self.norm_e(next_tok_emb)], dim=-1)
+        return h_prev + F.silu(self.proj(fused))
+
+
+_TEXT_AUX_PREFIXES: Tuple[str, ...] = (
+    "dyn-",
+    "hairpin-",
+    "art-",
+    "clef-",
+    "time-",
+    "key",
+    "ottava-",
+    "volta-",
+)
+
+
+def build_text_aux_targets(
+    targets: torch.Tensor,
+    vocab_size: int,
+    pad_id: int = PAD_ID,
+    text_vocab_size: int = 129,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Map structural/expressive text-like tokens into ``0..text_vocab_size-2`` and others to ``text_vocab_size-1``."""
+    device = targets.device
+    other_id = max(1, int(text_vocab_size) - 1)
+    lut = torch.full((vocab_size,), other_id, dtype=torch.long)
+    for tid, tok in UNI_ID_TO_TOKEN.items():
+        if 0 <= tid < vocab_size and any(tok.startswith(p) for p in _TEXT_AUX_PREFIXES):
+            lut[tid] = tid % other_id
+    lut = lut.to(device)
+    safe_t = targets.clamp(0, vocab_size - 1)
+    text_tgt = lut[safe_t]
+    valid = targets != pad_id
+    text_tgt = torch.where(valid, text_tgt, torch.full_like(text_tgt, -100))
+    is_text = (text_tgt >= 0) & (text_tgt < other_id)
+    return text_tgt, is_text
+
+
+class _BD3RepairLayer(nn.Module):
+    """Lightweight bidirectional intra-cell self-attn + visual cross-attn + SwiGLU."""
+
+    def __init__(self, d_rep: int, n_heads: int, d_ff: int, dropout: float = 0.1) -> None:
+        super().__init__()
+        self.d_rep = int(d_rep)
+        self.n_heads = int(n_heads)
+        self.head_dim = self.d_rep // self.n_heads
+
+        self.norm1 = RMSNorm(d_rep)
+        self.qkv_proj = nn.Linear(d_rep, 3 * d_rep, bias=False)
+        self.sa_o_proj = nn.Linear(d_rep, d_rep, bias=False)
+        self.sa_q_norm = RMSNorm(self.head_dim)
+        self.sa_k_norm = RMSNorm(self.head_dim)
+
+        self.norm2 = RMSNorm(d_rep)
+        self.ca_q_proj = nn.Linear(d_rep, d_rep, bias=False)
+        self.ca_kv_proj = nn.Linear(d_rep, 2 * d_rep, bias=False)
+        self.ca_o_proj = nn.Linear(d_rep, d_rep, bias=False)
+        self.ca_q_norm = RMSNorm(self.head_dim)
+        self.ca_k_norm = RMSNorm(self.head_dim)
+
+        self.norm3 = RMSNorm(d_rep)
+        self.ffn = SwiGLU(d_rep, d_ff, dropout=dropout)
+        self.drop = nn.Dropout(dropout)
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        mem_rep: torch.Tensor,
+        rope_cos: torch.Tensor,
+        rope_sin: torch.Tensor,
+        block_size: int = 32,
+    ) -> torch.Tensor:
+        B, T, D = x.shape
+
+        # 1. Bidirectional intra-cell (block-local) self-attention (BD3-LM style)
+        h = self.norm1(x)
+        pad_t = (block_size - (T % block_size)) % block_size
+        if pad_t > 0:
+            h_pad = F.pad(h, (0, 0, 0, pad_t))
+            cos_pad = F.pad(rope_cos, (0, 0, 0, pad_t))
+            sin_pad = F.pad(rope_sin, (0, 0, 0, pad_t))
+        else:
+            h_pad = h
+            cos_pad = rope_cos
+            sin_pad = rope_sin
+
+        T_pad = h_pad.shape[1]
+        n_blk = T_pad // block_size
+        h_blk = h_pad.view(B * n_blk, block_size, D)
+        q, k, v = self.qkv_proj(h_blk).chunk(3, dim=-1)
+        q = self.sa_q_norm(q.view(B * n_blk, block_size, self.n_heads, self.head_dim)).transpose(1, 2)
+        k = self.sa_k_norm(k.view(B * n_blk, block_size, self.n_heads, self.head_dim)).transpose(1, 2)
+        v = v.view(B * n_blk, block_size, self.n_heads, self.head_dim).transpose(1, 2)
+
+        c_blk = cos_pad[:, :, :block_size, :]
+        s_blk = sin_pad[:, :, :block_size, :]
+        q, k = apply_rope(q, k, c_blk, s_blk)
+
+        sa_out = _sdpa(q, k, v, attn_mask=None, is_causal=False, enable_gqa=False)
+        sa_out = sa_out.transpose(1, 2).reshape(B, T_pad, D)[:, :T, :]
+        x = x + self.drop(self.sa_o_proj(sa_out))
+
+        # 2. Visual cross-attention to projected encoder memory
+        h2 = self.norm2(x)
+        Lk = mem_rep.shape[1]
+        cq = self.ca_q_norm(self.ca_q_proj(h2).view(B, T, self.n_heads, self.head_dim)).transpose(1, 2)
+        ck, cv = self.ca_kv_proj(mem_rep).chunk(2, dim=-1)
+        ck = self.ca_k_norm(ck.view(B, Lk, self.n_heads, self.head_dim)).transpose(1, 2)
+        cv = cv.view(B, Lk, self.n_heads, self.head_dim).transpose(1, 2)
+        ca_out = _sdpa(cq, ck, cv, attn_mask=None, is_causal=False, enable_gqa=False)
+        ca_out = ca_out.transpose(1, 2).reshape(B, T, D)
+        x = x + self.drop(self.ca_o_proj(ca_out))
+
+        # 3. SwiGLU FFN
+        x = x + self.drop(self.ffn(self.norm3(x)))
+        return x
+
+
+class BD3ReMDMRepairHead(nn.Module):
+    """Lightweight 2-layer bidirectional intra-cell masked-diffusion / remasking repair head.
+
+    Shares ``model.tok_emb`` and ``model.lm_head`` (zero extra vocab table params).
+    """
+
+    def __init__(
+        self,
+        d_model: int,
+        d_rep: int = 256,
+        n_heads: int = 4,
+        d_ff: int = 512,
+        n_layers: int = 2,
+        block_size: int = 32,
+        dropout: float = 0.1,
+    ) -> None:
+        super().__init__()
+        self.d_model = int(d_model)
+        self.d_rep = int(d_rep)
+        self.block_size = int(block_size)
+        head_dim = self.d_rep // int(n_heads)
+
+        self.in_proj = nn.Linear(self.d_model, self.d_rep, bias=False)
+        self.mem_proj = nn.Linear(self.d_model, self.d_rep, bias=False)
+        self.mask_emb = nn.Parameter(torch.randn(1, 1, self.d_rep) * 0.02)
+        self.rope1d = _CachedRoPE1D(head_dim=head_dim, base=10000.0)
+        self.layers = nn.ModuleList([
+            _BD3RepairLayer(self.d_rep, n_heads=n_heads, d_ff=d_ff, dropout=dropout)
+            for _ in range(n_layers)
+        ])
+        self.out_norm = RMSNorm(self.d_rep)
+        self.out_proj = nn.Linear(self.d_rep, self.d_model, bias=False)
+
+    def forward(
+        self,
+        tok_embeds: torch.Tensor,
+        mask_flags: torch.Tensor,
+        mem_final: torch.Tensor,
+        lm_head: nn.Linear,
+    ) -> torch.Tensor:
+        compute_dtype = _active_compute_dtype(tok_embeds)
+        x = self.in_proj(tok_embeds.to(compute_dtype))
+        m_emb = self.mask_emb.to(dtype=x.dtype).expand_as(x)
+        x = torch.where(mask_flags.unsqueeze(-1), m_emb, x)
+
+        mem_rep = self.mem_proj(mem_final.to(compute_dtype))
+        T = x.shape[1]
+        cos1d, sin1d = self.rope1d(max(T, self.block_size), device=x.device, dtype=x.dtype)
+        cos1d = cos1d[:, :, :T, :]
+        sin1d = sin1d[:, :, :T, :]
+
+        for layer in self.layers:
+            x = layer(x, mem_rep, cos1d, sin1d, block_size=self.block_size)
+
+        h_out = self.out_proj(self.out_norm(x))
+        return lm_head(h_out)
+
+
+def sample_bd3_complementary_views(
+    tgt_y: torch.Tensor,
+    vocab_size: int,
+    pad_id: int = PAD_ID,
+    bos_id: int = BOS_ID,
+    eos_id: int = EOS_ID,
+    n_views: int = 2,
+    music_vocab_end: Optional[int] = None,
+) -> List[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
+    """Build complementary masked/corrupted views (15-40% mask + 10% single-token corruption)."""
+    valid = (tgt_y != pad_id) & (tgt_y != bos_id) & (tgt_y != eos_id)
+    p_mask = float(0.15 + 0.25 * torch.rand((), device=tgt_y.device).item())
+    u = torch.rand(tgt_y.shape, device=tgt_y.device)
+    hi_vocab = int(music_vocab_end) if (music_vocab_end is not None and music_vocab_end > 4) else int(vocab_size)
+    lo_vocab = 0 if hi_vocab <= 4 else min(4, hi_vocab - 1)
+
+    n_v = max(1, int(n_views))
+    masks: List[torch.Tensor] = [(u < p_mask) & valid]
+    if n_v >= 2:
+        masks.append(((1.0 - u) < p_mask) & valid)
+    for _ in range(2, n_v):
+        masks.append((torch.rand(tgt_y.shape, device=tgt_y.device) < p_mask) & valid)
+
+    views: List[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = []
+    for m in masks:
+        corrupt_unmasked = (torch.rand(tgt_y.shape, device=tgt_y.device) < 0.10) & valid & (~m)
+        rand_toks = torch.randint(lo_vocab, hi_vocab, tgt_y.shape, device=tgt_y.device, dtype=tgt_y.dtype)
+        corrupt_ids = torch.where(corrupt_unmasked, rand_toks, tgt_y)
+        supervise = m | corrupt_unmasked
+        if not bool(supervise.any()):
+            supervise = valid
+            m = valid
+        views.append((corrupt_ids, m, supervise))
+    return views
+
+
+def compute_bd3_repair_loss(
+    model: "UniOMRv2Net",
+    mem_final: torch.Tensor,
+    tgt_y: torch.Tensor,
+    n_views: int = 2,
+) -> torch.Tensor:
+    """Complementary masked-diffusion + single-token corruption repair loss."""
+    if model.bd3_repair_head is None:
+        return mem_final.new_zeros(())
+    pad_id = model.cfg.resolved_pad_id()
+    bos_id = model.cfg.resolved_bos_id()
+    eos_id = model.cfg.resolved_eos_id()
+    views = sample_bd3_complementary_views(
+        tgt_y,
+        vocab_size=int(model.cfg.vocab_size),
+        pad_id=pad_id,
+        bos_id=bos_id,
+        eos_id=eos_id,
+        n_views=n_views,
+        music_vocab_end=model.cfg.resolved_music_vocab_end(),
+    )
+    total_loss = torch.zeros((), device=tgt_y.device, dtype=torch.float32)
+    for corrupt_ids, mask_flags, supervise in views:
+        tok_emb = model.tok_emb(corrupt_ids)
+        logits = model.bd3_repair_head(tok_emb, mask_flags, mem_final, model.lm_head)
+        targets = torch.where(supervise, tgt_y, torch.full_like(tgt_y, pad_id))
+        loss_v = F.cross_entropy(
+            logits.float().reshape(-1, logits.size(-1)),
+            targets.reshape(-1),
+            ignore_index=pad_id,
+        )
+        total_loss = total_loss + loss_v
+    return (total_loss / float(len(views))).to(mem_final.dtype)
+
+
+# ---------------------------------------------------------------------------
 # 4. Grouped-Query Attention (GQA) Decoder (8 Q-heads / 2 KV-heads -> 4x smaller KV cache)
 # ---------------------------------------------------------------------------
+
+def _diff_lambda_init(layer_idx: int) -> float:
+    return 0.8 - 0.6 * math.exp(-0.3 * float(layer_idx))
+
 
 class GroupedQueryAttention(nn.Module):
     """Grouped-Query Attention for decoder self-attention & cross-attention.
 
-    Caches compact ``(B, n_kv_heads, L_k, head_dim)`` tensors so WebGPU
-    KV-cache RAM and memory bandwidth drop by ``n_heads / n_kv_heads`` (4x).
+    Supports legacy stock GQA (default, zero extra params/buffers) as well as
+    Iter 15 native upgrades with zero wrapper indirection:
+      - ``owns_kv=False`` (YOCO / CLA consumer reusing shared K/V bank)
+      - ``use_v_res=True`` (ResFormer value residual on KV producers)
+      - ``use_diff_attn=True`` (Differential Attention, Ye et al. 2024)
+      - ``use_coordkey=True`` (Decoupled 2D Fourier spatial Q/K subspace;
+        combines with ``use_diff_attn`` via Split-Spatial Geometry ``32+8=40``)
+      - ``use_mode_gate=True`` (Modality-Gated FiLM + low-rank Q modulation)
+      - ``use_head_temp=True`` (QuantVLA per-head temperature buffer ``(1, H, 1, 1)``)
     """
 
     def __init__(
@@ -1661,6 +2111,18 @@ class GroupedQueryAttention(nn.Module):
         n_kv_heads: int = 2,
         use_native_gqa: bool = True,
         use_rope: bool = True,
+        *,
+        owns_kv: bool = True,
+        use_v_res: bool = False,
+        v_res_init: float = -2.0,
+        use_diff_attn: bool = False,
+        layer_idx: int = 0,
+        use_coordkey: bool = False,
+        coord_in_dim: int = 128,
+        coord_dim: int = 16,
+        use_mode_gate: bool = False,
+        mode_gate_rank: int = 32,
+        use_head_temp: bool = False,
     ) -> None:
         super().__init__()
         if d_model % n_heads != 0:
@@ -1675,19 +2137,160 @@ class GroupedQueryAttention(nn.Module):
         self.kv_dim = n_kv_heads * self.head_dim
         self.use_native_gqa = bool(use_native_gqa)
         self.use_rope = bool(use_rope)
+        self.owns_kv = bool(owns_kv)
+        self.use_v_res = bool(use_v_res and owns_kv)
+        self.use_diff_attn = bool(use_diff_attn)
+        self.layer_idx = int(layer_idx)
+        self.use_coordkey = bool(use_coordkey)
+        self.coord_dim = int(coord_dim) if self.use_coordkey else 0
+        self.use_mode_gate = bool(use_mode_gate)
+        self.use_head_temp = bool(use_head_temp)
 
+        if self.use_diff_attn:
+            if self.head_dim % 2 != 0:
+                raise ValueError(f"head_dim ({self.head_dim}) must be even for DiffAttention")
+            self.half_dim = self.head_dim // 2
+            self.lambda_init = float(_diff_lambda_init(self.layer_idx))
+            if self.use_coordkey and (self.coord_dim % 2 != 0):
+                raise ValueError(f"coord_dim ({self.coord_dim}) must be even for Diff+CoordKey")
+            self.half_coord_dim = self.coord_dim // 2 if self.use_coordkey else 0
+        else:
+            self.half_dim = 0
+            self.lambda_init = 0.0
+            self.half_coord_dim = 0
+
+        # Core projections
         self.q_proj = nn.Linear(d_model, d_model, bias=False)
-        self.k_proj = nn.Linear(d_model, self.kv_dim, bias=False)
-        self.v_proj = nn.Linear(d_model, self.kv_dim, bias=False)
+        if self.owns_kv:
+            self.k_proj: Optional[nn.Linear] = nn.Linear(d_model, self.kv_dim, bias=False)
+            self.v_proj: Optional[nn.Linear] = nn.Linear(d_model, self.kv_dim, bias=False)
+        else:
+            self.k_proj = None
+            self.v_proj = None
         self.o_proj = nn.Linear(d_model, d_model, bias=False)
-        self.q_norm = RMSNorm(self.head_dim)
-        self.k_norm = RMSNorm(self.head_dim)
+
+        # Q/K content norms (legacy path creates exact q_norm/k_norm)
+        if self.use_diff_attn:
+            self.q_norm: Optional[RMSNorm] = None
+            self.k_norm: Optional[RMSNorm] = None
+            self.q1_norm: Optional[RMSNorm] = RMSNorm(self.half_dim)
+            self.q2_norm: Optional[RMSNorm] = RMSNorm(self.half_dim)
+            if self.owns_kv:
+                self.k1_norm: Optional[RMSNorm] = RMSNorm(self.half_dim)
+                self.k2_norm: Optional[RMSNorm] = RMSNorm(self.half_dim)
+            else:
+                self.k1_norm = None
+                self.k2_norm = None
+            self.lambda_q1 = nn.Parameter(torch.zeros(self.half_dim, dtype=torch.float32).normal_(mean=0.0, std=0.1))
+            self.lambda_k1 = nn.Parameter(torch.zeros(self.half_dim, dtype=torch.float32).normal_(mean=0.0, std=0.1))
+            self.lambda_q2 = nn.Parameter(torch.zeros(self.half_dim, dtype=torch.float32).normal_(mean=0.0, std=0.1))
+            self.lambda_k2 = nn.Parameter(torch.zeros(self.half_dim, dtype=torch.float32).normal_(mean=0.0, std=0.1))
+            self.subln: Optional[RMSNorm] = RMSNorm(self.head_dim)
+        else:
+            self.q_norm = RMSNorm(self.head_dim)
+            self.k_norm = RMSNorm(self.head_dim) if self.owns_kv else None
+
+        # ResFormer value residual
+        if self.use_v_res:
+            self.v_res_alpha: Optional[nn.Parameter] = nn.Parameter(
+                torch.full((1, n_kv_heads, 1, 1), float(v_res_init))
+            )
+        else:
+            self.v_res_alpha = None
+
+        # CoordKey-CA spatial projections & norms
+        if self.use_coordkey:
+            self.q_coord_proj: Optional[nn.Linear] = nn.Linear(d_model, n_heads * self.coord_dim, bias=False)
+            self.k_coord_proj: Optional[nn.Linear] = (
+                nn.Linear(coord_in_dim, n_kv_heads * self.coord_dim, bias=False) if self.owns_kv else None
+            )
+            if self.use_diff_attn:
+                self.q_s1_norm: Optional[RMSNorm] = RMSNorm(self.half_coord_dim)
+                self.q_s2_norm: Optional[RMSNorm] = RMSNorm(self.half_coord_dim)
+                if self.owns_kv:
+                    self.k_s1_norm: Optional[RMSNorm] = RMSNorm(self.half_coord_dim)
+                    self.k_s2_norm: Optional[RMSNorm] = RMSNorm(self.half_coord_dim)
+                else:
+                    self.k_s1_norm = None
+                    self.k_s2_norm = None
+            else:
+                self.q_coord_norm: Optional[RMSNorm] = RMSNorm(self.coord_dim)
+                self.k_coord_norm: Optional[RMSNorm] = RMSNorm(self.coord_dim) if self.owns_kv else None
+
+        # ModeGate (FiLM + low-rank Q modulation BEFORE q_proj and q_coord_proj)
+        if self.use_mode_gate:
+            self.mode_gate = nn.Linear(d_model, 1, bias=True)
+            nn.init.zeros_(self.mode_gate.weight)
+            nn.init.constant_(self.mode_gate.bias, -2.0)
+            self.film_gamma = nn.Parameter(torch.zeros(1, 1, d_model))
+            self.film_beta = nn.Parameter(torch.zeros(1, 1, d_model))
+            self.q_down = nn.Linear(d_model, int(mode_gate_rank), bias=False)
+            self.q_up = nn.Linear(int(mode_gate_rank), d_model, bias=False)
+            nn.init.zeros_(self.q_up.weight)
+
+        # QuantVLA per-head attention temperature buffer (registered ONLY when enabled)
+        if self.use_head_temp:
+            self.register_buffer("head_temp", torch.ones(1, n_heads, 1, 1))
+        else:
+            self.head_temp: Optional[torch.Tensor] = None
 
     def _expand_kv(self, x: torch.Tensor) -> torch.Tensor:
         if self.n_rep == 1:
             return x
         B, n_kv, L, hd = x.shape
         return x.unsqueeze(2).expand(B, n_kv, self.n_rep, L, hd).reshape(B, self.n_heads, L, hd)
+
+    def _compute_lambda(self, dtype: torch.dtype) -> torch.Tensor:
+        lam_1 = torch.exp(torch.sum(self.lambda_q1.float() * self.lambda_k1.float()))
+        lam_2 = torch.exp(torch.sum(self.lambda_q2.float() * self.lambda_k2.float()))
+        return (lam_1 - lam_2 + self.lambda_init).to(dtype)
+
+    def compute_kv(
+        self,
+        kv_in: torch.Tensor,
+        *,
+        coord_feat: Optional[torch.Tensor] = None,
+        v0: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Project K (packed if Diff/CoordKey) and V (with optional ResFormer v_res)."""
+        assert self.owns_kv and self.k_proj is not None and self.v_proj is not None
+        B, Lk, _ = kv_in.shape
+        v = self.v_proj(kv_in).view(B, Lk, self.n_kv_heads, self.head_dim).transpose(1, 2)
+        if self.use_v_res and v0 is not None and self.v_res_alpha is not None:
+            g = torch.sigmoid(self.v_res_alpha).to(v.dtype)
+            v = (1.0 - g) * v + g * v0
+
+        if self.use_diff_attn:
+            assert self.k1_norm is not None and self.k2_norm is not None
+            k_c_raw = self.k_proj(kv_in).view(B, Lk, self.n_kv_heads, 2, self.half_dim)
+            k1 = self.k1_norm(k_c_raw[:, :, :, 0, :]).transpose(1, 2)
+            k2 = self.k2_norm(k_c_raw[:, :, :, 1, :]).transpose(1, 2)
+            if self.use_coordkey:
+                if coord_feat is None:
+                    raise RuntimeError("coord_feat must be provided for CoordKey cross-attention")
+                assert self.k_coord_proj is not None and self.k_s1_norm is not None and self.k_s2_norm is not None
+                k_s_raw = self.k_coord_proj(coord_feat.to(kv_in.dtype)).view(
+                    B, Lk, self.n_kv_heads, 2, self.half_coord_dim
+                )
+                k_s1 = self.k_s1_norm(k_s_raw[:, :, :, 0, :]).transpose(1, 2)
+                k_s2 = self.k_s2_norm(k_s_raw[:, :, :, 1, :]).transpose(1, 2)
+                k1 = torch.cat([k1, k_s1], dim=-1)  # (B, n_kv, Lk, half_dim + half_coord_dim = 40)
+                k2 = torch.cat([k2, k_s2], dim=-1)  # (B, n_kv, Lk, 40)
+            k_out = torch.cat([k1, k2], dim=-1)     # (B, n_kv, Lk, 80 or 64)
+        else:
+            assert self.k_norm is not None
+            k_c = self.k_norm(self.k_proj(kv_in).view(B, Lk, self.n_kv_heads, self.head_dim)).transpose(1, 2)
+            if self.use_coordkey:
+                if coord_feat is None:
+                    raise RuntimeError("coord_feat must be provided for CoordKey cross-attention")
+                assert self.k_coord_proj is not None and self.k_coord_norm is not None
+                k_s = self.k_coord_norm(
+                    self.k_coord_proj(coord_feat.to(kv_in.dtype)).view(B, Lk, self.n_kv_heads, self.coord_dim)
+                ).transpose(1, 2)
+                k_out = torch.cat([k_c, k_s], dim=-1)
+            else:
+                k_out = k_c
+        return k_out, v
 
     def forward(
         self,
@@ -1700,21 +2303,95 @@ class GroupedQueryAttention(nn.Module):
         past_kv: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
         use_cache: bool = False,
         is_cross: bool = False,
+        *,
+        coord_feat: Optional[torch.Tensor] = None,
+        shared_kv: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+        v0: Optional[torch.Tensor] = None,
+        return_v_cur: bool = False,
     ) -> Any:
         B, Lq, _ = q_in.shape
+
+        # ModeGate modulates q_in -> q_mod BEFORE both q_proj and q_coord_proj
+        if self.use_mode_gate:
+            alpha = torch.sigmoid(self.mode_gate(q_in)).to(q_in.dtype)
+            gamma = self.film_gamma.to(q_in.dtype)
+            beta = self.film_beta.to(q_in.dtype)
+            q_delta = self.q_up(F.silu(self.q_down(q_in)))
+            q_mod = q_in * (1.0 + alpha * gamma) + alpha * (beta + q_delta)
+        else:
+            q_mod = q_in
+
+        v_raw_cur: Optional[torch.Tensor] = None
+
+        # --- Special path: Differential Attention (with or without CoordKey / YOCO) ---
+        if self.use_diff_attn:
+            assert self.q1_norm is not None and self.q2_norm is not None and self.subln is not None
+            q_c_raw = self.q_proj(q_mod).view(B, Lq, self.n_heads, 2, self.half_dim)
+            q1 = self.q1_norm(q_c_raw[:, :, :, 0, :]).transpose(1, 2)
+            q2 = self.q2_norm(q_c_raw[:, :, :, 1, :]).transpose(1, 2)
+            if self.use_coordkey:
+                assert self.q_coord_proj is not None and self.q_s1_norm is not None and self.q_s2_norm is not None
+                q_s_raw = self.q_coord_proj(q_mod).view(B, Lq, self.n_heads, 2, self.half_coord_dim)
+                q_s1 = self.q_s1_norm(q_s_raw[:, :, :, 0, :]).transpose(1, 2)
+                q_s2 = self.q_s2_norm(q_s_raw[:, :, :, 1, :]).transpose(1, 2)
+                q1 = torch.cat([q1, q_s1], dim=-1)  # (B, H, Lq, 40)
+                q2 = torch.cat([q2, q_s2], dim=-1)  # (B, H, Lq, 40)
+
+            if self.head_temp is not None:
+                ht = self.head_temp.to(q1.dtype)
+                q1 = q1 * ht
+                q2 = q2 * ht
+
+            if shared_kv is not None:
+                k_packed, v = shared_kv
+            elif is_cross and past_kv is not None:
+                k_packed, v = past_kv
+            else:
+                if kv_in is None:
+                    raise ValueError("kv_in must be provided when past_kv and shared_kv are None")
+                k_packed, v = self.compute_kv(kv_in, coord_feat=coord_feat, v0=v0)
+                v_raw_cur = v
+
+            present_kv = (k_packed, v)
+            k1, k2 = k_packed.chunk(2, dim=-1)
+            # Explicit _expand_kv (enable_gqa=False) for CUTLASS asymmetric d_qk=40, d_v=64
+            k1_exp = self._expand_kv(k1)
+            k2_exp = self._expand_kv(k2)
+            v_exp = self._expand_kv(v)
+
+            attn1 = _sdpa(q1, k1_exp, v_exp, attn_mask=attn_mask, is_causal=False, enable_gqa=False)
+            attn2 = _sdpa(q2, k2_exp, v_exp, attn_mask=attn_mask, is_causal=False, enable_gqa=False)
+            lam = self._compute_lambda(q1.dtype)
+            out = self.subln(attn1 - lam * attn2) * (1.0 - self.lambda_init)
+            out = self.o_proj(out.transpose(1, 2).reshape(B, Lq, self.d_model))
+            if return_v_cur:
+                return out, present_kv, v_raw_cur
+            if use_cache:
+                return out, present_kv
+            return out
+
+        # --- Standard GQA path (supports legacy, CoordKey-only, YOCO/CLA, ResFormer, ModeGate, QuantVLA) ---
         in_onnx = torch.onnx.is_in_onnx_export()
         can_fuse_qkv = (
-            (not is_cross)
-            and (kv_in is q_in)
+            self.owns_kv
+            and (shared_kv is None)
+            and (not is_cross)
+            and (kv_in is q_mod)
+            and (not self.use_coordkey)
+            and (not self.use_v_res)
+            and (not return_v_cur)
             and (not in_onnx)
+            and self.k_proj is not None
+            and self.v_proj is not None
             and (self.q_proj.bias is None and self.k_proj.bias is None and self.v_proj.bias is None)
             and (not _is_qat_linear_active(self.q_proj))
             and (not _is_qat_linear_active(self.k_proj))
             and (not _is_qat_linear_active(self.v_proj))
         )
         if can_fuse_qkv:
+            assert self.q_norm is not None and self.k_norm is not None
             w_qkv = torch.cat((self.q_proj.weight, self.k_proj.weight, self.v_proj.weight), dim=0)
-            qkv = F.linear(q_in, w_qkv)
+            qkv = F.linear(q_mod, w_qkv)
             d_q = self.n_heads * self.head_dim
             d_kv = self.n_kv_heads * self.head_dim
             q_raw, k_raw, v_raw = qkv.split((d_q, d_kv, d_kv), dim=-1)
@@ -1727,49 +2404,68 @@ class GroupedQueryAttention(nn.Module):
                 k = torch.cat([past_kv[0], k], dim=2)
                 v = torch.cat([past_kv[1], v], dim=2)
         else:
-            q = self.q_norm(self.q_proj(q_in).view(B, Lq, self.n_heads, self.head_dim)).transpose(1, 2)
+            assert self.q_norm is not None
+            q = self.q_norm(self.q_proj(q_mod).view(B, Lq, self.n_heads, self.head_dim)).transpose(1, 2)
+            if self.use_coordkey:
+                assert self.q_coord_proj is not None and self.q_coord_norm is not None
+                q_s = self.q_coord_norm(
+                    self.q_coord_proj(q_mod).view(B, Lq, self.n_heads, self.coord_dim)
+                ).transpose(1, 2)
+                q = torch.cat([q, q_s], dim=-1)
 
-            if is_cross and past_kv is not None:
+            if shared_kv is not None:
+                if self.use_rope and rope_cos is not None and rope_sin is not None and not is_cross:
+                    q, _ = apply_rope(q, q, rope_cos, rope_sin)
+                k, v = shared_kv
+            elif is_cross and past_kv is not None:
                 k, v = past_kv
             else:
                 if kv_in is None:
-                    raise ValueError("kv_in must be provided when past_kv is None")
-                Lk = kv_in.shape[1]
-                can_fuse_kv = (
-                    (not in_onnx)
-                    and (self.k_proj.bias is None and self.v_proj.bias is None)
-                    and (not _is_qat_linear_active(self.k_proj))
-                    and (not _is_qat_linear_active(self.v_proj))
-                )
-                if can_fuse_kv:
-                    w_kv = torch.cat((self.k_proj.weight, self.v_proj.weight), dim=0)
-                    kv = F.linear(kv_in, w_kv)
-                    d_kv = self.n_kv_heads * self.head_dim
-                    k_raw, v_raw = kv.split((d_kv, d_kv), dim=-1)
-                    k = self.k_norm(k_raw.view(B, Lk, self.n_kv_heads, self.head_dim)).transpose(1, 2)
-                    v = v_raw.view(B, Lk, self.n_kv_heads, self.head_dim).transpose(1, 2)
+                    raise ValueError("kv_in must be provided when past_kv and shared_kv are None")
+                if self.use_coordkey or self.use_v_res or return_v_cur:
+                    k, v = self.compute_kv(kv_in, coord_feat=coord_feat, v0=v0)
+                    v_raw_cur = v
                 else:
-                    k = self.k_norm(self.k_proj(kv_in).view(B, Lk, self.n_kv_heads, self.head_dim)).transpose(1, 2)
-                    v = self.v_proj(kv_in).view(B, Lk, self.n_kv_heads, self.head_dim).transpose(1, 2)
+                    assert self.k_proj is not None and self.v_proj is not None and self.k_norm is not None
+                    Lk = kv_in.shape[1]
+                    can_fuse_kv = (
+                        (not in_onnx)
+                        and (self.k_proj.bias is None and self.v_proj.bias is None)
+                        and (not _is_qat_linear_active(self.k_proj))
+                        and (not _is_qat_linear_active(self.v_proj))
+                    )
+                    if can_fuse_kv:
+                        w_kv = torch.cat((self.k_proj.weight, self.v_proj.weight), dim=0)
+                        kv = F.linear(kv_in, w_kv)
+                        d_kv = self.n_kv_heads * self.head_dim
+                        k_raw, v_raw = kv.split((d_kv, d_kv), dim=-1)
+                        k = self.k_norm(k_raw.view(B, Lk, self.n_kv_heads, self.head_dim)).transpose(1, 2)
+                        v = v_raw.view(B, Lk, self.n_kv_heads, self.head_dim).transpose(1, 2)
+                    else:
+                        k = self.k_norm(self.k_proj(kv_in).view(B, Lk, self.n_kv_heads, self.head_dim)).transpose(1, 2)
+                        v = self.v_proj(kv_in).view(B, Lk, self.n_kv_heads, self.head_dim).transpose(1, 2)
                 if self.use_rope and rope_cos is not None and rope_sin is not None:
                     q, k = apply_rope(q, k, rope_cos, rope_sin)
                 if not is_cross and past_kv is not None:
                     k = torch.cat([past_kv[0], k], dim=2)
                     v = torch.cat([past_kv[1], v], dim=2)
 
-        present_kv = (k, v) if use_cache else None
+        if self.head_temp is not None:
+            q = q * self.head_temp.to(q.dtype)
+
+        present_kv = (k, v) if (use_cache or return_v_cur) else None
 
         use_causal_flag = is_causal and (attn_mask is None)
         eff_mask = attn_mask
-        if use_causal_flag and not is_cross and past_kv is not None:
-            past_len = past_kv[0].shape[2]
+        if use_causal_flag and not is_cross and k.shape[2] > Lq:
+            past_len = k.shape[2] - Lq
             if Lq == 1:
                 use_causal_flag = False
             else:
                 eff_mask = _get_causal_offset_mask(Lq, past_len, q.device)
                 use_causal_flag = False
 
-        if self.use_native_gqa and self.n_rep > 1:
+        if self.use_native_gqa and self.n_rep > 1 and (not self.use_coordkey):
             out = _sdpa(q, k, v, attn_mask=eff_mask, is_causal=use_causal_flag, enable_gqa=True)
         else:
             k_exp = self._expand_kv(k)
@@ -1777,6 +2473,8 @@ class GroupedQueryAttention(nn.Module):
             out = _sdpa(q, k_exp, v_exp, attn_mask=eff_mask, is_causal=use_causal_flag, enable_gqa=False)
         out = out.transpose(1, 2).reshape(B, Lq, self.d_model)
         out = self.o_proj(out)
+        if return_v_cur:
+            return out, present_kv, v_raw_cur
         if use_cache:
             return out, present_kv
         return out
@@ -1817,16 +2515,52 @@ class GQADecoderLayer(nn.Module):
         d_ff: int,
         dropout: float = 0.1,
         use_rope: bool = True,
+        *,
+        n_cross_kv_heads: Optional[int] = None,
+        owns_self_kv: bool = True,
+        owns_cross_kv: bool = True,
+        use_self_v_res: bool = False,
+        use_cross_v_res: bool = False,
+        use_diff_cross_attn: bool = False,
+        layer_idx: int = 0,
+        use_coordkey: bool = False,
+        coord_in_dim: int = 128,
+        coord_dim: int = 16,
+        use_mode_gate: bool = False,
+        mode_gate_rank: int = 32,
+        use_head_temp: bool = False,
     ) -> None:
         super().__init__()
         self.use_rope = bool(use_rope)
+        self.owns_self_kv = bool(owns_self_kv)
+        self.owns_cross_kv = bool(owns_cross_kv)
+        cross_kv = int(n_cross_kv_heads) if n_cross_kv_heads is not None else int(n_kv_heads)
         self.norm1 = RMSNorm(d_model)
         self.self_attn = GroupedQueryAttention(
-            d_model, n_heads=n_heads, n_kv_heads=n_kv_heads, use_rope=self.use_rope
+            d_model,
+            n_heads=n_heads,
+            n_kv_heads=n_kv_heads,
+            use_rope=self.use_rope,
+            owns_kv=self.owns_self_kv,
+            use_v_res=use_self_v_res,
+            use_head_temp=use_head_temp,
         )
         self.norm2 = RMSNorm(d_model)
         self.cross_attn = GroupedQueryAttention(
-            d_model, n_heads=n_heads, n_kv_heads=n_kv_heads, use_rope=False
+            d_model,
+            n_heads=n_heads,
+            n_kv_heads=cross_kv,
+            use_rope=False,
+            owns_kv=self.owns_cross_kv,
+            use_v_res=use_cross_v_res,
+            use_diff_attn=use_diff_cross_attn,
+            layer_idx=layer_idx,
+            use_coordkey=use_coordkey,
+            coord_in_dim=coord_in_dim,
+            coord_dim=coord_dim,
+            use_mode_gate=use_mode_gate,
+            mode_gate_rank=mode_gate_rank,
+            use_head_temp=use_head_temp,
         )
         self.norm3 = RMSNorm(d_model)
         self.ffn = SwiGLU(d_model, d_ff, dropout=dropout)
@@ -1841,10 +2575,52 @@ class GQADecoderLayer(nn.Module):
         past_kv: Optional[Tuple[Optional[Tuple[torch.Tensor, torch.Tensor]], Optional[Tuple[torch.Tensor, torch.Tensor]]]] = None,
         use_cache: bool = False,
         checkpoint_ffn: bool = False,
+        coord_feat: Optional[torch.Tensor] = None,
+        shared_self_kv: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+        shared_cross_kv: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+        self_v0: Optional[torch.Tensor] = None,
+        cross_v0: Optional[torch.Tensor] = None,
+        return_bank_state: bool = False,
     ) -> Any:
         h = self.norm1(x)
         r_cos = rope_cos if self.use_rope else None
         r_sin = rope_sin if self.use_rope else None
+
+        if return_bank_state:
+            self_past = past_kv[0] if past_kv is not None else None
+            cross_past = past_kv[1] if past_kv is not None else None
+            sa_out, self_kv_out, self_v_cur = self.self_attn(
+                h,
+                h if self.owns_self_kv else None,
+                rope_cos=r_cos,
+                rope_sin=r_sin,
+                is_causal=True,
+                past_kv=self_past if self.owns_self_kv else None,
+                use_cache=use_cache,
+                is_cross=False,
+                shared_kv=None if self.owns_self_kv else shared_self_kv,
+                v0=self_v0,
+                return_v_cur=True,
+            )
+            x = x + self.drop(sa_out)
+            ca_out, cross_kv_out, cross_v_cur = self.cross_attn(
+                self.norm2(x),
+                memory if self.owns_cross_kv else None,
+                past_kv=cross_past if self.owns_cross_kv else None,
+                use_cache=use_cache,
+                is_cross=True,
+                coord_feat=coord_feat,
+                shared_kv=None if self.owns_cross_kv else shared_cross_kv,
+                v0=cross_v0,
+                return_v_cur=True,
+            )
+            x = x + self.drop(ca_out)
+            if checkpoint_ffn and self.training and torch.is_grad_enabled():
+                x = x + self.drop(_grad_ckpt(self.ffn, self.norm3(x), use_reentrant=False))
+            else:
+                x = x + self.drop(self.ffn(self.norm3(x)))
+            return x, self_kv_out, cross_kv_out, self_v_cur, cross_v_cur
+
         if use_cache:
             self_past = past_kv[0] if past_kv is not None else None
             cross_past = past_kv[1] if past_kv is not None else None
@@ -1863,13 +2639,14 @@ class GQADecoderLayer(nn.Module):
                 past_kv=cross_past,
                 use_cache=True,
                 is_cross=True,
+                coord_feat=coord_feat,
             )
             x = x + self.drop(ca_out)
             x = x + self.drop(self.ffn(self.norm3(x)))
             return x, (new_self_kv, new_cross_kv)
 
         x = x + self.drop(self.self_attn(h, h, rope_cos=r_cos, rope_sin=r_sin, is_causal=True))
-        x = x + self.drop(self.cross_attn(self.norm2(x), memory))
+        x = x + self.drop(self.cross_attn(self.norm2(x), memory, is_cross=True, coord_feat=coord_feat))
         if checkpoint_ffn and self.training and torch.is_grad_enabled():
             x = x + self.drop(_grad_ckpt(self.ffn, self.norm3(x), use_reentrant=False))
         else:
@@ -1885,10 +2662,10 @@ class QATInt4ControllerV2(QATInt4Controller):
     """Zero-schema-change Hybrid FP16/INT4 QAT controller for ``UniOMRv2Net``.
 
     Quantizes Transformer ``nn.Linear`` layers inside ``encoder.axial_layers``,
-    ``encoder.patch_merger``, ``encoder.global_layers``, ``dec_layers``,
-    ``mtp_heads``, and ``lm_head`` via ``fake_quant_int4_ste`` while keeping
-    ``backbone``, ``encoder.router``, ``encoder.pos2d_proj``, ``tok_emb``,
-    norms, and aux heads in FP16.
+    ``encoder.patch_merger``, ``encoder.global_layers``, ``deepstack_fusions``,
+    ``dec_layers``, ``mtp_heads``, ``bd3_repair_head``, and ``lm_head`` via
+    ``fake_quant_int4_ste`` while keeping ``backbone``, ``encoder.router``,
+    ``encoder.pos2d_proj``, ``coord_mlp``, ``tok_emb``, norms, and aux heads in FP16.
     """
 
     TARGET_ROOTS: Tuple[str, ...] = (
@@ -1898,6 +2675,7 @@ class QATInt4ControllerV2(QATInt4Controller):
         "deepstack_fusions",
         "dec_layers",
         "mtp_heads",
+        "bd3_repair_head",
         "lm_head",
     )
 
@@ -1953,7 +2731,8 @@ class UniOMRv2Net(nn.Module):
         super().__init__()
         self.cfg = cfg if cfg is not None else UniOMRv2Config.small_45m()
         c = self.cfg
-        d_ff = int(round(c.d_model * c.ffn_mult))
+        dec_ffn_mult = c.dec_ffn_mult if c.dec_ffn_mult is not None else c.ffn_mult
+        d_ff = int(round(c.d_model * dec_ffn_mult))
         head_dim = c.d_model // c.n_heads
 
         # 1. Anisotropic ConvNeXt/InceptionNeXt backbone with P2 (/4) FPN lateral skip
@@ -1968,6 +2747,17 @@ class UniOMRv2Net(nn.Module):
         # 2. DeepSeek-OCR / Qwen2.5-VL Hybrid Encoder (Axial -> 2x2 Merger + Router -> Global 2D-RoPE)
         self.encoder = HybridAxialMergerEncoder(c)
 
+        # 2b. Optional shared 2D Fourier CoordMLP for CoordKey-CA (None by default)
+        self.coord_mlp: Optional[FourierCoordMLP] = (
+            FourierCoordMLP(
+                n_freqs=c.coord_n_freqs,
+                hidden_dim=c.coord_mlp_hidden,
+                out_dim=c.coord_mlp_hidden,
+            )
+            if c.use_coordkey_ca
+            else None
+        )
+
         # 3. Training-Only Zero-Inference-Cost Layout & Stroke-Gradient Aux Heads
         self.sys_y_head: Optional[SysYHead] = SysYHead(c.d_model) if c.use_sys_y_aux else None
         self.sys_count_head: Optional[SysCountHead] = SysCountHead(c.d_model) if c.use_sys_count_aux else None
@@ -1978,7 +2768,7 @@ class UniOMRv2Net(nn.Module):
             StrokeHogHead(self.backbone.p2_ch, n_bins=8) if c.use_stroke_hog_head else None
         )
 
-        # 4. GQA Causal Decoder (Llama 4 iRoPE) + DeepStack Multi-Level Visual Injection + MTP-4
+        # 4. GQA Causal Decoder (Llama 4 iRoPE / YOCO-3Bank + CLA-2:1 + ResFormer + Diff/CoordKey/ModeGate)
         _resolved_pad = c.resolved_pad_id()
         pad_idx = _resolved_pad if (0 <= _resolved_pad < c.vocab_size) else None
         self.tok_emb = nn.Embedding(c.vocab_size, c.d_model, padding_idx=pad_idx)
@@ -1986,30 +2776,100 @@ class UniOMRv2Net(nn.Module):
         self.deepstack_fusions = nn.ModuleList([
             DeepStackFusion(c.d_model) for _ in range(min(2, c.n_dec_layers))
         ])
-        self.dec_layers = nn.ModuleList([
-            GQADecoderLayer(
-                d_model=c.d_model,
-                n_heads=c.n_heads,
-                n_kv_heads=c.n_kv_heads,
-                d_ff=d_ff,
-                dropout=c.dropout,
-                use_rope=(c.irope_nope_every <= 0) or (((i + 1) % c.irope_nope_every) != 0),
+
+        self_kv_heads = c.yoco_self_kv_heads if c.yoco_self_kv_heads is not None else c.n_kv_heads
+        cross_kv_heads = c.yoco_cross_kv_heads if c.yoco_cross_kv_heads is not None else c.n_kv_heads
+
+        if c.use_yoco_cla:
+            self.yoco_cross_banks: Tuple[int, ...] = tuple(c.yoco_cross_banks)
+            bank_of_layer: List[int] = []
+            for i in range(c.n_dec_layers):
+                b_idx = 0
+                for bi, prod in enumerate(self.yoco_cross_banks):
+                    if prod <= i:
+                        b_idx = bi
+                bank_of_layer.append(b_idx)
+            self._cross_bank_of_layer: Tuple[int, ...] = tuple(bank_of_layer)
+            self._n_self_banks: int = (c.n_dec_layers + 1) // 2
+        else:
+            self.yoco_cross_banks = ()
+            self._cross_bank_of_layer = ()
+            self._n_self_banks = c.n_dec_layers
+
+        dec_layers: List[GQADecoderLayer] = []
+        for i in range(c.n_dec_layers):
+            if c.use_yoco_cla:
+                owns_self = (i % 2 == 0)
+                owns_cross = i in self.yoco_cross_banks
+                pair_idx = i // 2
+                use_rope = (c.irope_nope_every <= 0) or (
+                    ((pair_idx + 1) % max(1, c.irope_nope_every // 2)) != 0
+                )
+            else:
+                owns_self = True
+                owns_cross = True
+                use_rope = (c.irope_nope_every <= 0) or (((i + 1) % c.irope_nope_every) != 0)
+            dec_layers.append(
+                GQADecoderLayer(
+                    d_model=c.d_model,
+                    n_heads=c.n_heads,
+                    n_kv_heads=self_kv_heads,
+                    d_ff=d_ff,
+                    dropout=c.dropout,
+                    use_rope=use_rope,
+                    n_cross_kv_heads=cross_kv_heads,
+                    owns_self_kv=owns_self,
+                    owns_cross_kv=owns_cross,
+                    use_self_v_res=bool(c.use_resformer_v_res and owns_self and i > 0),
+                    use_cross_v_res=bool(c.use_resformer_v_res and owns_cross and i > 0),
+                    use_diff_cross_attn=c.use_diff_cross_attn,
+                    layer_idx=i,
+                    use_coordkey=c.use_coordkey_ca,
+                    coord_in_dim=c.coord_mlp_hidden,
+                    coord_dim=c.coord_dim,
+                    use_mode_gate=(i < c.mode_gate_layers),
+                    mode_gate_rank=c.mode_gate_rank,
+                    use_head_temp=c.use_quantvla_head_temp,
+                )
             )
-            for i in range(c.n_dec_layers)
-        ])
+        self.dec_layers = nn.ModuleList(dec_layers)
         self.dec_norm = RMSNorm(c.d_model)
         self.lm_head = nn.Linear(c.d_model, c.vocab_size, bias=False)
+        self.lm_head_text: Optional[nn.Linear] = (
+            nn.Linear(c.d_model, int(c.text_aux_vocab_size), bias=False)
+            if int(c.text_aux_vocab_size) > 0
+            else None
+        )
 
         n_extra_mtp = max(0, int(c.mtp_k) - 1)
-        self.mtp_heads = nn.ModuleList([MTPHead(c.d_model) for _ in range(n_extra_mtp)])
+        if c.use_chained_mtp:
+            self.mtp_heads = nn.ModuleList([ChainedMTPHead(c.d_model) for _ in range(n_extra_mtp)])
+        else:
+            self.mtp_heads = nn.ModuleList([MTPHead(c.d_model) for _ in range(n_extra_mtp)])
+
+        # 5. Optional BD3-LM + ReMDM-conf bidirectional intra-cell repair head (inference-capable)
+        self.bd3_repair_head: Optional[BD3ReMDMRepairHead] = (
+            BD3ReMDMRepairHead(
+                d_model=c.d_model,
+                d_rep=c.bd3_d_rep,
+                n_heads=c.bd3_n_heads,
+                d_ff=c.bd3_d_ff,
+                n_layers=c.bd3_n_layers,
+                block_size=c.bd3_block_size,
+                dropout=c.dropout,
+            )
+            if c.use_bd3_repair_head
+            else None
+        )
         self._struct_weight_cache: Dict[Tuple[int, float, torch.device, torch.dtype], torch.Tensor] = {}
 
     def strip_aux_heads(self, strip_mtp: bool = False) -> "UniOMRv2Net":
-        """Strip training-only layout & stroke-HOG aux heads (and optionally MTP heads) for 0%-cost export."""
+        """Strip training-only layout, stroke-HOG, and text aux heads (and optionally MTP heads) for 0%-cost export."""
         self.sys_y_head = None
         self.sys_count_head = None
         self.staff_seg_head = None
         self.stroke_hog_head = None
+        self.lm_head_text = None
         if strip_mtp:
             self.mtp_heads = nn.ModuleList()
         return self
@@ -2041,6 +2901,16 @@ class UniOMRv2Net(nn.Module):
         )
         mem_final = mem_levels[-1]
 
+        if self.coord_mlp is not None:
+            coord_feat = self.coord_mlp(
+                router_info["kept_idx"],
+                grid_hw=router_info["grid_hw"],
+                n_bg_summary=int(router_info["n_bg_summary"]),
+                dtype=mem_final.dtype,
+                is_full_grid=bool(router_info.get("is_full_grid", False)),
+            )
+            router_info["coord_feat"] = coord_feat
+
         aux_enc: Dict[str, Optional[torch.Tensor]] = {
             "sys_count_pred": None,
             "staff_seg_logits": None,
@@ -2059,7 +2929,8 @@ class UniOMRv2Net(nn.Module):
     def precompute_cross_kv(
         self,
         mem_levels: Any,
-    ) -> List[Tuple[None, Tuple[torch.Tensor, torch.Tensor]]]:
+        coord_feat: Optional[torch.Tensor] = None,
+    ) -> Any:
         """Precompute DeepStackFusion + cross-attention K/V once per page for cached decoding."""
         if isinstance(mem_levels, (tuple, list)):
             mem_post_merger, mem_global_mid, mem_final = mem_levels
@@ -2068,30 +2939,57 @@ class UniOMRv2Net(nn.Module):
             mem_final = mem_levels
             level_mems = None
 
+        if self.cfg.use_yoco_cla:
+            cross_banks: List[Tuple[torch.Tensor, torch.Tensor]] = []
+            cross_v0: Optional[torch.Tensor] = None
+            for bank_idx, prod_idx in enumerate(self.yoco_cross_banks):
+                if level_mems is not None and bank_idx < len(self.deepstack_fusions):
+                    bank_mem = self.deepstack_fusions[bank_idx](mem_final, level_mems[bank_idx])
+                else:
+                    bank_mem = mem_final
+                ca = self.dec_layers[prod_idx].cross_attn
+                k, v = ca.compute_kv(bank_mem, coord_feat=coord_feat, v0=cross_v0)
+                if bank_idx == 0:
+                    cross_v0 = v
+                cross_banks.append((k, v))
+            return {
+                "self_banks": [None] * self._n_self_banks,
+                "cross_banks": cross_banks,
+            }
+
         past_kvs: List[Tuple[None, Tuple[torch.Tensor, torch.Tensor]]] = []
+        cross_v0_std: Optional[torch.Tensor] = None
         for idx, layer in enumerate(self.dec_layers):
             if level_mems is not None and idx < len(self.deepstack_fusions):
                 layer_mem = self.deepstack_fusions[idx](mem_final, level_mems[idx])
             else:
                 layer_mem = mem_final
             ca = layer.cross_attn
-            B, Lk, _ = layer_mem.shape
-            k = ca.k_norm(ca.k_proj(layer_mem).view(B, Lk, ca.n_kv_heads, ca.head_dim)).transpose(1, 2)
-            v = ca.v_proj(layer_mem).view(B, Lk, ca.n_kv_heads, ca.head_dim).transpose(1, 2)
+            k, v = ca.compute_kv(layer_mem, coord_feat=coord_feat, v0=cross_v0_std)
+            if idx == 0:
+                cross_v0_std = v
             past_kvs.append((None, (k, v)))
         return past_kvs
 
-    def decode_tokens(
+    def _decode_tokens_impl(
         self,
         tgt_ids: torch.Tensor,
         memory: Optional[Any],
         return_mtp: Optional[bool] = None,
         return_aux: Optional[bool] = None,
-        past_kvs: Optional[List[Any]] = None,
+        past_kvs: Optional[Any] = None,
         use_cache: bool = False,
         apply_tok_dropout: bool = True,
-    ) -> Any:
-        """Run causal GQA decoder over ``tgt_ids`` ``(B, T)`` conditioned on DeepStack ``mem_levels`` or tensor ``memory``."""
+        coord_feat: Optional[torch.Tensor] = None,
+        targets: Optional[torch.Tensor] = None,
+        greedy_chain_mtp: bool = False,
+    ) -> Tuple[
+        torch.Tensor,
+        List[torch.Tensor],
+        Optional[torch.Tensor],
+        Optional[torch.Tensor],
+        Optional[Any],
+    ]:
         _, T = tgt_ids.shape
         inp_ids = tgt_ids
         if self.training and apply_tok_dropout and self.cfg.tok_dropout > 0.0 and not use_cache:
@@ -2117,15 +3015,19 @@ class UniOMRv2Net(nn.Module):
         compute_dtype = _active_compute_dtype(x)
         if x.dtype != compute_dtype:
             x = x.to(dtype=compute_dtype)
+
         past_len = 0
-        if past_kvs is not None and len(past_kvs) > 0 and past_kvs[0] is not None and past_kvs[0][0] is not None:
+        if isinstance(past_kvs, dict):
+            sb0 = past_kvs["self_banks"][0] if past_kvs.get("self_banks") else None
+            if sb0 is not None:
+                past_len = int(sb0[0].shape[2])
+        elif past_kvs is not None and len(past_kvs) > 0 and past_kvs[0] is not None and past_kvs[0][0] is not None:
             past_len = int(past_kvs[0][0][0].shape[2])
 
         cos_all, sin_all = self.rope1d(past_len + T, device=x.device, dtype=compute_dtype)
         cos1d = cos_all[:, :, past_len : past_len + T, :]
         sin1d = sin_all[:, :, past_len : past_len + T, :]
 
-        # Unpack DeepStack mem_levels = (mem_post_merger, mem_global_mid, mem_final) if provided.
         mem_final: Optional[torch.Tensor] = None
         level_mems: Optional[Tuple[torch.Tensor, torch.Tensor]] = None
         if memory is not None:
@@ -2139,80 +3041,275 @@ class UniOMRv2Net(nn.Module):
         can_dec_ckpt = self.training and self.cfg.grad_checkpoint and torch.is_grad_enabled()
         use_dec_full_ckpt = can_dec_ckpt and (bt > 8192)
         use_dec_ffn_ckpt = can_dec_ckpt and (4096 < bt <= 8192)
-        new_past_kvs: List[Any] = []
-        for idx, layer in enumerate(self.dec_layers):
-            layer_past = past_kvs[idx] if past_kvs is not None else None
-            need_cross_kv = (not use_cache) or (layer_past is None) or (layer_past[1] is None)
-            if (not need_cross_kv) or (mem_final is None):
+
+        new_past_kvs_out: Optional[Any] = None
+
+        if self.cfg.use_yoco_cla:
+            n_cross_banks = len(self.yoco_cross_banks)
+            bank_mems: Optional[List[torch.Tensor]] = None
+            if mem_final is not None:
+                bank_mems = []
+                for bi in range(n_cross_banks):
+                    if level_mems is not None and bi < len(self.deepstack_fusions):
+                        bank_mems.append(self.deepstack_fusions[bi](mem_final, level_mems[bi]))
+                    else:
+                        bank_mems.append(mem_final)
+
+            self_banks_in = past_kvs["self_banks"] if isinstance(past_kvs, dict) else [None] * self._n_self_banks
+            cross_banks_in = past_kvs["cross_banks"] if isinstance(past_kvs, dict) else [None] * n_cross_banks
+            new_self_banks: List[Any] = [None] * self._n_self_banks
+            new_cross_banks: List[Any] = list(cross_banks_in)
+            cur_self_kv: Optional[Tuple[torch.Tensor, torch.Tensor]] = None
+            cur_cross_kv: Optional[Tuple[torch.Tensor, torch.Tensor]] = None
+            self_v0: Optional[torch.Tensor] = None
+            cross_v0: Optional[torch.Tensor] = None
+
+            for idx, layer in enumerate(self.dec_layers):
+                self_bank_idx = idx // 2
+                cross_bank_idx = self._cross_bank_of_layer[idx]
+                past_c = cross_banks_in[cross_bank_idx]
                 layer_mem = None
-            elif level_mems is not None and idx < len(self.deepstack_fusions):
-                layer_mem = self.deepstack_fusions[idx](mem_final, level_mems[idx])
-            else:
-                layer_mem = mem_final
+                if layer.owns_cross_kv and past_c is None and bank_mems is not None:
+                    layer_mem = bank_mems[cross_bank_idx]
+
+                if use_cache:
+                    x, self_kv_out, cross_kv_out, self_v_cur, cross_v_cur = layer(
+                        x,
+                        memory=layer_mem,
+                        rope_cos=cos1d,
+                        rope_sin=sin1d,
+                        past_kv=(
+                            self_banks_in[self_bank_idx] if layer.owns_self_kv else None,
+                            past_c if layer.owns_cross_kv else None,
+                        ),
+                        use_cache=True,
+                        coord_feat=coord_feat,
+                        shared_self_kv=None if layer.owns_self_kv else cur_self_kv,
+                        shared_cross_kv=None if layer.owns_cross_kv else cur_cross_kv,
+                        self_v0=self_v0,
+                        cross_v0=cross_v0,
+                        return_bank_state=True,
+                    )
+                elif use_dec_full_ckpt:
+                    ss_k = None if (layer.owns_self_kv or cur_self_kv is None) else cur_self_kv[0]
+                    ss_v = None if (layer.owns_self_kv or cur_self_kv is None) else cur_self_kv[1]
+                    sc_k = None if (layer.owns_cross_kv or cur_cross_kv is None) else cur_cross_kv[0]
+                    sc_v = None if (layer.owns_cross_kv or cur_cross_kv is None) else cur_cross_kv[1]
+
+                    def _run_yoco_layer(
+                        _x: torch.Tensor,
+                        _mem: Optional[torch.Tensor],
+                        _c1d: torch.Tensor,
+                        _s1d: torch.Tensor,
+                        _cf: Optional[torch.Tensor],
+                        _ssk: Optional[torch.Tensor],
+                        _ssv: Optional[torch.Tensor],
+                        _sck: Optional[torch.Tensor],
+                        _scv: Optional[torch.Tensor],
+                        _sv0: Optional[torch.Tensor],
+                        _cv0: Optional[torch.Tensor],
+                        _layer: GQADecoderLayer = layer,
+                    ) -> Any:
+                        _ss = (_ssk, _ssv) if (_ssk is not None and _ssv is not None) else None
+                        _sc = (_sck, _scv) if (_sck is not None and _scv is not None) else None
+                        return _layer(
+                            _x,
+                            _mem,
+                            _c1d,
+                            _s1d,
+                            coord_feat=_cf,
+                            shared_self_kv=_ss,
+                            shared_cross_kv=_sc,
+                            self_v0=_sv0,
+                            cross_v0=_cv0,
+                            return_bank_state=True,
+                        )
+
+                    x, self_kv_out, cross_kv_out, self_v_cur, cross_v_cur = _grad_ckpt(
+                        _run_yoco_layer,
+                        x,
+                        layer_mem,
+                        cos1d,
+                        sin1d,
+                        coord_feat,
+                        ss_k,
+                        ss_v,
+                        sc_k,
+                        sc_v,
+                        self_v0,
+                        cross_v0,
+                        use_reentrant=False,
+                    )
+                else:
+                    x, self_kv_out, cross_kv_out, self_v_cur, cross_v_cur = layer(
+                        x,
+                        memory=layer_mem,
+                        rope_cos=cos1d,
+                        rope_sin=sin1d,
+                        checkpoint_ffn=use_dec_ffn_ckpt,
+                        coord_feat=coord_feat,
+                        shared_self_kv=None if layer.owns_self_kv else cur_self_kv,
+                        shared_cross_kv=None if layer.owns_cross_kv else cur_cross_kv,
+                        self_v0=self_v0,
+                        cross_v0=cross_v0,
+                        return_bank_state=True,
+                    )
+
+                if layer.owns_self_kv:
+                    cur_self_kv = self_kv_out
+                    new_self_banks[self_bank_idx] = self_kv_out
+                    if idx == 0:
+                        self_v0 = self_v_cur
+                if layer.owns_cross_kv:
+                    cur_cross_kv = cross_kv_out
+                    new_cross_banks[cross_bank_idx] = cross_kv_out
+                    if idx == 0:
+                        cross_v0 = cross_v_cur
 
             if use_cache:
-                x, layer_kv = layer(
-                    x, memory=layer_mem, rope_cos=cos1d, rope_sin=sin1d,
-                    past_kv=layer_past, use_cache=True,
-                )
-                new_past_kvs.append(layer_kv)
-            elif use_dec_full_ckpt:
-                x = _grad_ckpt(
-                    layer, x, layer_mem, cos1d, sin1d,
-                    use_reentrant=False,
-                )
-            else:
-                x = layer(
-                    x, memory=layer_mem, rope_cos=cos1d, rope_sin=sin1d,
-                    checkpoint_ffn=use_dec_ffn_ckpt,
-                )
+                new_past_kvs_out = {"self_banks": new_self_banks, "cross_banks": new_cross_banks}
+        else:
+            new_past_kvs: List[Any] = []
+            for idx, layer in enumerate(self.dec_layers):
+                layer_past = past_kvs[idx] if past_kvs is not None else None
+                need_cross_kv = (not use_cache) or (layer_past is None) or (layer_past[1] is None)
+                if (not need_cross_kv) or (mem_final is None):
+                    layer_mem = None
+                elif level_mems is not None and idx < len(self.deepstack_fusions):
+                    layer_mem = self.deepstack_fusions[idx](mem_final, level_mems[idx])
+                else:
+                    layer_mem = mem_final
+
+                if use_cache:
+                    x, layer_kv = layer(
+                        x, memory=layer_mem, rope_cos=cos1d, rope_sin=sin1d,
+                        past_kv=layer_past, use_cache=True, coord_feat=coord_feat,
+                    )
+                    new_past_kvs.append(layer_kv)
+                elif use_dec_full_ckpt:
+                    if coord_feat is not None:
+                        x = _grad_ckpt(
+                            lambda _x, _m, _c, _s, _cf, _l=layer: _l(_x, _m, _c, _s, coord_feat=_cf),
+                            x, layer_mem, cos1d, sin1d, coord_feat,
+                            use_reentrant=False,
+                        )
+                    else:
+                        x = _grad_ckpt(
+                            layer, x, layer_mem, cos1d, sin1d,
+                            use_reentrant=False,
+                        )
+                else:
+                    x = layer(
+                        x, memory=layer_mem, rope_cos=cos1d, rope_sin=sin1d,
+                        checkpoint_ffn=use_dec_ffn_ckpt, coord_feat=coord_feat,
+                    )
+            if use_cache:
+                new_past_kvs_out = new_past_kvs
+
         h = self.dec_norm(x)
 
         want_mtp = self.training if return_mtp is None else bool(return_mtp)
         if want_mtp and len(self.mtp_heads) > 0:
-            can_fuse_mtp = (
-                _HAS_F_RMS_NORM
-                and (not torch.onnx.is_in_onnx_export())
-                and all(
-                    (head.proj.bias is None) and (not _is_qat_linear_active(head.proj))
-                    for head in self.mtp_heads
-                )
-            )
-            if can_fuse_mtp:
-                eps0 = float(self.mtp_heads[0].norm.eps)
-                if all(float(head.norm.eps) == eps0 for head in self.mtp_heads):
-                    B_h, T_h, D_h = h.shape
-                    if h.dtype in (torch.bfloat16, torch.float16):
-                        with torch.amp.autocast(device_type=h.device.type, enabled=False):
-                            h_unit = F.rms_norm(h, (D_h,), None, eps0)
+            if self.cfg.use_chained_mtp:
+                logits = self.lm_head(h)
+                mtp_logits: List[torch.Tensor] = []
+                B_t, T_t = tgt_ids.shape
+                pad_id = self.cfg.resolved_pad_id()
+                h_prev = h
+                prev_logits = logits
+                for k_idx, head in enumerate(self.mtp_heads):
+                    if greedy_chain_mtp or targets is None:
+                        next_tok = prev_logits.detach().argmax(dim=-1)
                     else:
-                        h_unit = F.rms_norm(h, (D_h,), None, eps0)
-                    w_mtp = torch.cat(
-                        [head.proj.weight * head.norm.weight.unsqueeze(0) for head in self.mtp_heads],
-                        dim=0,
+                        if k_idx == 0:
+                            next_tok = targets
+                        elif T_t > k_idx:
+                            pad_tail = torch.full((B_t, k_idx), pad_id, device=targets.device, dtype=targets.dtype)
+                            next_tok = torch.cat([targets[:, k_idx:], pad_tail], dim=1)
+                        else:
+                            next_tok = torch.full((B_t, T_t), pad_id, device=targets.device, dtype=targets.dtype)
+                    next_emb = self.tok_emb(next_tok).to(h_prev.dtype)
+                    h_k = head(h_prev, next_emb)
+                    logits_k = self.lm_head(h_k)
+                    mtp_logits.append(logits_k)
+                    h_prev = h_k
+                    prev_logits = logits_k
+            else:
+                can_fuse_mtp = (
+                    _HAS_F_RMS_NORM
+                    and (not torch.onnx.is_in_onnx_export())
+                    and all(
+                        (head.proj.bias is None) and (not _is_qat_linear_active(head.proj))
+                        for head in self.mtp_heads
                     )
-                    mtp_h = h.unsqueeze(0) + F.silu(
-                        F.linear(h_unit, w_mtp)
-                        .view(B_h, T_h, len(self.mtp_heads), D_h)
-                        .permute(2, 0, 1, 3)
-                    )
-                    all_h = torch.cat((h.unsqueeze(0), mtp_h), dim=0)
+                )
+                if can_fuse_mtp:
+                    eps0 = float(self.mtp_heads[0].norm.eps)
+                    if all(float(head.norm.eps) == eps0 for head in self.mtp_heads):
+                        B_h, T_h, D_h = h.shape
+                        if h.dtype in (torch.bfloat16, torch.float16):
+                            with torch.amp.autocast(device_type=h.device.type, enabled=False):
+                                h_unit = F.rms_norm(h, (D_h,), None, eps0)
+                        else:
+                            h_unit = F.rms_norm(h, (D_h,), None, eps0)
+                        w_mtp = torch.cat(
+                            [head.proj.weight * head.norm.weight.unsqueeze(0) for head in self.mtp_heads],
+                            dim=0,
+                        )
+                        mtp_h = h.unsqueeze(0) + F.silu(
+                            F.linear(h_unit, w_mtp)
+                            .view(B_h, T_h, len(self.mtp_heads), D_h)
+                            .permute(2, 0, 1, 3)
+                        )
+                        all_h = torch.cat((h.unsqueeze(0), mtp_h), dim=0)
+                    else:
+                        all_h = torch.stack([h, *(head(h) for head in self.mtp_heads)], dim=0)
                 else:
                     all_h = torch.stack([h, *(head(h) for head in self.mtp_heads)], dim=0)
-            else:
-                all_h = torch.stack([h, *(head(h) for head in self.mtp_heads)], dim=0)
-            all_logits = self.lm_head(all_h)
-            logits = all_logits[0]
-            mtp_logits: List[torch.Tensor] = list(all_logits[1:].unbind(0))
+                all_logits = self.lm_head(all_h)
+                logits = all_logits[0]
+                mtp_logits = list(all_logits[1:].unbind(0))
         else:
             logits = self.lm_head(h)
             mtp_logits = []
 
         want_aux = self.training if return_aux is None else bool(return_aux)
         sys_y_pred: Optional[torch.Tensor] = None
-        if want_aux and self.sys_y_head is not None and not use_cache:
-            sys_y_pred = self.sys_y_head(h)
+        text_logits: Optional[torch.Tensor] = None
+        if want_aux and not use_cache:
+            if self.sys_y_head is not None:
+                sys_y_pred = self.sys_y_head(h)
+            if self.lm_head_text is not None:
+                text_logits = self.lm_head_text(h)
 
+        return logits, mtp_logits, sys_y_pred, text_logits, new_past_kvs_out
+
+    def decode_tokens(
+        self,
+        tgt_ids: torch.Tensor,
+        memory: Optional[Any],
+        return_mtp: Optional[bool] = None,
+        return_aux: Optional[bool] = None,
+        past_kvs: Optional[Any] = None,
+        use_cache: bool = False,
+        apply_tok_dropout: bool = True,
+        coord_feat: Optional[torch.Tensor] = None,
+        targets: Optional[torch.Tensor] = None,
+        greedy_chain_mtp: bool = False,
+    ) -> Any:
+        """Run causal GQA decoder over ``tgt_ids`` ``(B, T)`` conditioned on DeepStack ``mem_levels`` or tensor ``memory``."""
+        logits, mtp_logits, sys_y_pred, _text_logits, new_past_kvs = self._decode_tokens_impl(
+            tgt_ids,
+            memory,
+            return_mtp=return_mtp,
+            return_aux=return_aux,
+            past_kvs=past_kvs,
+            use_cache=use_cache,
+            apply_tok_dropout=apply_tok_dropout,
+            coord_feat=coord_feat,
+            targets=targets,
+            greedy_chain_mtp=greedy_chain_mtp,
+        )
         if use_cache:
             return logits, mtp_logits, new_past_kvs
         return logits, mtp_logits, sys_y_pred
@@ -2225,17 +3322,18 @@ class UniOMRv2Net(nn.Module):
         keep_ratio_override: Optional[float] = None,
         return_info: bool = False,
     ) -> Any:
-        """Fast KV-cached GQA greedy decoding (0% aux/MTP overhead, 4x smaller KV cache)."""
+        """Fast KV-cached GQA greedy decoding (0% aux/MTP overhead, compact KV cache)."""
         mem, _, router_info = self.encode_image(
             images, keep_ratio_override=keep_ratio_override, return_aux=False
         )
+        coord_feat = router_info.get("coord_feat")
         B = images.shape[0]
         device = images.device
         pad_id = self.cfg.resolved_pad_id()
         bos_id = self.cfg.resolved_bos_id()
         eos_id = self.cfg.resolved_eos_id()
         cur_ids = torch.full((B, 1), bos_id, dtype=torch.long, device=device)
-        past_kvs: Optional[List[Any]] = self.precompute_cross_kv(mem)
+        past_kvs: Any = self.precompute_cross_kv(mem, coord_feat=coord_feat)
         finished = torch.zeros(B, dtype=torch.bool, device=device)
         out_tokens: List[torch.Tensor] = [cur_ids]
 
@@ -2268,14 +3366,22 @@ class UniOMRv2Net(nn.Module):
         keep_ratio_override: Optional[float] = None,
         return_aux: Optional[bool] = None,
         return_mtp: Optional[bool] = None,
+        targets: Optional[torch.Tensor] = None,
+        coord_feat: Optional[torch.Tensor] = None,
     ) -> Dict[str, Any]:
         mem, aux_enc, router_info = self.encode_image(
             images, keep_ratio_override=keep_ratio_override, return_aux=return_aux
         )
-        logits, mtp_logits, sys_y_pred = self.decode_tokens(
-            tgt_ids, mem, return_mtp=return_mtp, return_aux=return_aux
+        eff_coord_feat = coord_feat if coord_feat is not None else router_info.get("coord_feat")
+        logits, mtp_logits, sys_y_pred, text_logits, _ = self._decode_tokens_impl(
+            tgt_ids,
+            mem,
+            return_mtp=return_mtp,
+            return_aux=return_aux,
+            coord_feat=eff_coord_feat,
+            targets=targets,
         )
-        return {
+        out: Dict[str, Any] = {
             "logits": logits,
             "mtp_logits": mtp_logits,
             "sys_y_pred": sys_y_pred,
@@ -2284,6 +3390,11 @@ class UniOMRv2Net(nn.Module):
             "stroke_hog_pred": aux_enc["stroke_hog_pred"],
             "router_info": router_info,
         }
+        if text_logits is not None:
+            out["text_logits"] = text_logits
+        if self.bd3_repair_head is not None:
+            out["mem_final"] = mem[-1]
+        return out
 
     def compute_loss(
         self,
@@ -2302,8 +3413,11 @@ class UniOMRv2Net(nn.Module):
         stroke_hog_loss_weight: float = 0.15,
         label_smoothing: float = 0.0,
         ce_token_weights: Optional[torch.Tensor] = None,
+        text_aux_loss_weight: Optional[float] = None,
+        bd3_repair_weight: float = 0.0,
+        bd3_n_views: int = 2,
     ) -> Dict[str, torch.Tensor]:
-        """Compute combined CE + MTP-4 + router saliency + layout & stroke-HOG aux losses."""
+        """Compute combined CE + MTP-4 + router saliency + layout & stroke-HOG + optional text/BD3 losses."""
         logits: torch.Tensor = out["logits"]
         V = logits.shape[-1]
         ls = float(max(0.0, min(0.5, label_smoothing)))
@@ -2388,6 +3502,38 @@ class UniOMRv2Net(nn.Module):
         else:
             stroke_hog_loss = logits.new_zeros(())
 
+        # Optional text-aux head loss (zero cost when disabled)
+        eff_text_aux_w = (
+            float(self.cfg.text_aux_loss_weight)
+            if text_aux_loss_weight is None
+            else float(text_aux_loss_weight)
+        )
+        text_logits: Optional[torch.Tensor] = out.get("text_logits")
+        if text_logits is not None and eff_text_aux_w > 0.0:
+            text_tgt, _ = build_text_aux_targets(
+                targets,
+                int(self.cfg.vocab_size),
+                pad_id=pad_id,
+                text_vocab_size=int(text_logits.shape[-1]),
+            )
+            text_aux_loss = F.cross_entropy(
+                text_logits.reshape(-1, text_logits.shape[-1]),
+                text_tgt.reshape(-1),
+                ignore_index=-100,
+            ).to(logits.dtype)
+        else:
+            text_aux_loss = logits.new_zeros(())
+
+        # Optional BD3-LM + ReMDM-conf complementary masked-diffusion repair loss
+        eff_bd3_w = float(bd3_repair_weight)
+        mem_final_bd3: Optional[torch.Tensor] = out.get("mem_final")
+        if self.bd3_repair_head is not None and mem_final_bd3 is not None and eff_bd3_w > 0.0:
+            bd3_repair_loss = compute_bd3_repair_loss(
+                self, mem_final_bd3, targets, n_views=int(bd3_n_views)
+            ).to(logits.dtype)
+        else:
+            bd3_repair_loss = logits.new_zeros(())
+
         total_loss = (
             ce_loss
             + mtp_loss_weight * mtp_loss
@@ -2396,6 +3542,8 @@ class UniOMRv2Net(nn.Module):
             + sys_count_loss_weight * sys_count_loss
             + staff_seg_loss_weight * staff_seg_loss
             + stroke_hog_loss_weight * stroke_hog_loss
+            + eff_text_aux_w * text_aux_loss
+            + eff_bd3_w * bd3_repair_loss
         )
         return {
             "loss": total_loss,
@@ -2406,6 +3554,8 @@ class UniOMRv2Net(nn.Module):
             "sys_count_loss": sys_count_loss,
             "staff_seg_loss": staff_seg_loss,
             "stroke_hog_loss": stroke_hog_loss,
+            "text_aux_loss": text_aux_loss,
+            "bd3_repair_loss": bd3_repair_loss,
         }
 
     def param_summary(self, int4_block_size: int = 32) -> Dict[str, Any]:
@@ -2417,7 +3567,9 @@ class UniOMRv2Net(nn.Module):
         backbone_params = _count(self.backbone)
         encoder_params = _count(self.encoder)
         router_params = _count(self.encoder.router)
+        coord_mlp_params = _count(self.coord_mlp)
         deepstack_params = _count(self.deepstack_fusions)
+        bd3_params = _count(self.bd3_repair_head)
         decoder_params = (
             _count(self.tok_emb)
             + deepstack_params
@@ -2431,20 +3583,24 @@ class UniOMRv2Net(nn.Module):
             + _count(self.sys_count_head)
             + _count(self.staff_seg_head)
             + _count(self.stroke_hog_head)
+            + _count(self.lm_head_text)
         )
         infer_params = total_params - aux_params - mtp_params
 
         # Exact Hybrid FP16/INT4-QAT split (matching QATInt4ControllerV2 target roots, excluding MTP/aux):
-        int4_roots = (
+        int4_roots: Tuple[Optional[nn.Module], ...] = (
             self.encoder.axial_layers,
             self.encoder.patch_merger,
             self.encoder.global_layers,
             self.deepstack_fusions,
             self.dec_layers,
+            self.bd3_repair_head,
             self.lm_head,
         )
         int4_weight_params = 0
         for root in int4_roots:
+            if root is None:
+                continue
             for m in root.modules():
                 if isinstance(m, nn.Linear):
                     int4_weight_params += m.weight.numel()
@@ -2464,8 +3620,10 @@ class UniOMRv2Net(nn.Module):
             "backbone_params": backbone_params,
             "encoder_params": encoder_params,
             "router_params": router_params,
+            "coord_mlp_params": coord_mlp_params,
             "deepstack_params": deepstack_params,
             "decoder_params": decoder_params,
+            "bd3_params": bd3_params,
             "mtp_params": mtp_params,
             "aux_params": aux_params,
             "int4_weight_params": int4_weight_params,

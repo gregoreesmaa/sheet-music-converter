@@ -130,6 +130,16 @@ def uni_omr_v2_edge85m(**overrides: Any) -> UniOMRv2Config:
     return UniOMRv2Config.edge85m(**overrides)
 
 
+def uni_omr_v2_pro200m(**overrides: Any) -> UniOMRv2Config:
+    """Return ``UniOMRv2Config`` for the ~195M ``pro200m`` (d=768) preset."""
+    return UniOMRv2Config.pro200m(**overrides)
+
+
+def uni_omr_v2_iter15_pro200m(**overrides: Any) -> UniOMRv2Config:
+    """Return ``UniOMRv2Config`` for the Iter 15 flagship ``iter15_pro200m`` preset."""
+    return UniOMRv2Config.iter15_pro200m(**overrides)
+
+
 def uni_omr_v2_tiny(**overrides: Any) -> UniOMRv2Config:
     """Return a tiny CPU-fast ``UniOMRv2Config`` for smoke tests & unit verification."""
     params: Dict[str, Any] = dict(
@@ -153,15 +163,21 @@ def uni_omr_v2_tiny(**overrides: Any) -> UniOMRv2Config:
 
 
 def build_v2_config(preset: str, **overrides: Any) -> UniOMRv2Config:
-    """Build a ``UniOMRv2Config`` from ``small_45m``, ``edge85m``, or ``tiny``."""
+    """Build a ``UniOMRv2Config`` from ``small_45m``, ``edge85m``, ``pro200m``, ``iter15_pro200m``, or ``tiny``."""
     p = str(preset).strip().lower()
     if p == "small_45m":
         return uni_omr_v2_small_45m(**overrides)
     if p == "edge85m":
         return uni_omr_v2_edge85m(**overrides)
+    if p == "pro200m":
+        return uni_omr_v2_pro200m(**overrides)
+    if p == "iter15_pro200m":
+        return uni_omr_v2_iter15_pro200m(**overrides)
     if p == "tiny":
         return uni_omr_v2_tiny(**overrides)
-    raise ValueError(f"Unknown preset={preset!r}; expected one of: small_45m, edge85m, tiny")
+    raise ValueError(
+        f"Unknown preset={preset!r}; expected one of: small_45m, edge85m, pro200m, iter15_pro200m, tiny"
+    )
 
 
 def _extract_state_dict(ckpt: Any) -> Dict[str, torch.Tensor]:
@@ -1108,6 +1124,7 @@ def partition_muon_adamw_params(
                     changed = True
         is_transformer_2d = (
             p.ndim == 2
+            and min(p.shape) >= 2
             and clean_name.startswith(_MUON_TRANSFORMER_PREFIXES)
         )
         if is_transformer_2d:
@@ -1745,6 +1762,8 @@ def forward_and_loss_v2(
     label_smoothing: float = 0.05,
     state_token_loss_weight: float = 1.0,
     expr_token_loss_weight: float = 1.0,
+    bd3_repair_weight: float = 0.0,
+    bd3_n_views: int = 2,
     sys_y_target: Optional[torch.Tensor] = None,
     sys_y_mask: Optional[torch.Tensor] = None,
     staff_seg_target: Optional[torch.Tensor] = None,
@@ -1794,12 +1813,19 @@ def forward_and_loss_v2(
                     images, return_aux=need_any_enc_aux
                 )
                 mem_det = tuple(m.detach() for m in mem_levels)
+                coord_feat = router_info.get("coord_feat")
+                coord_det = coord_feat.detach() if coord_feat is not None else None
                 was_training = model.training
                 try:
                     model.eval()
                     with torch.no_grad():
                         draft_logits, _, _ = model.decode_tokens(
-                            tgt_in, mem_det, return_mtp=False, return_aux=False, apply_tok_dropout=False
+                            tgt_in,
+                            mem_det,
+                            return_mtp=False,
+                            return_aux=False,
+                            apply_tok_dropout=False,
+                            coord_feat=coord_det,
                         )
                         pred_ids = draft_logits.argmax(dim=-1)
                 finally:
@@ -1818,12 +1844,14 @@ def forward_and_loss_v2(
                         [tgt_in[:, :1], torch.where(cass_mask, pred_ids[:, :-1], tail_in)],
                         dim=1,
                     )
-                logits, mtp_logits, sys_y_pred = model.decode_tokens(
+                logits, mtp_logits, sys_y_pred, text_logits, _ = model._decode_tokens_impl(
                     dec_in,
                     mem_levels,
                     return_mtp=(model.cfg.mtp_k > 1),
-                    return_aux=need_sys_y,
+                    return_aux=(need_sys_y or (model.lm_head_text is not None)),
                     apply_tok_dropout=False,
+                    coord_feat=coord_feat,
+                    targets=tgt_out,
                 )
                 out: Dict[str, Any] = {
                     "logits": logits,
@@ -1834,12 +1862,17 @@ def forward_and_loss_v2(
                     "stroke_hog_pred": aux_enc["stroke_hog_pred"],
                     "router_info": router_info,
                 }
+                if text_logits is not None:
+                    out["text_logits"] = text_logits
+                if model.bd3_repair_head is not None:
+                    out["mem_final"] = mem_levels[-1]
             else:
                 out = model(
                     images,
                     tgt_in,
-                    return_aux=(need_any_enc_aux or need_sys_y),
+                    return_aux=(need_any_enc_aux or need_sys_y or (model.lm_head_text is not None)),
                     return_mtp=(model.cfg.mtp_k > 1),
+                    targets=tgt_out,
                 )
 
         # Optional per-token CE upweighting on musical state tokens (time-*, key*, clef-*, tuplet-start-*)
@@ -1875,6 +1908,8 @@ def forward_and_loss_v2(
             stroke_hog_loss_weight=stroke_hog_weight,
             label_smoothing=label_smoothing,
             ce_token_weights=ce_token_weights,
+            bd3_repair_weight=bd3_repair_weight,
+            bd3_n_views=bd3_n_views,
         )
 
         # Hybrid KD: prefer offline Top-K cache hits, otherwise fall back to online frozen v1 teacher.
@@ -2337,6 +2372,18 @@ STRATIFIED_FULLPAGE_WEIGHTS_V3: Dict[str, float] = {
     "neg_control": 0.005,
 }
 
+# Promoted Iter 15 i15-09 arm1_hw_heavy_30_70 (30% Printed / 69.5% HW / 0.5% Neg):
+STRATIFIED_FULLPAGE_WEIGHTS_V4_HW70: Dict[str, float] = {
+    "legacy_printed": 0.132,
+    "multi_renderer_printed": 0.132,
+    "rare_printed": 0.036,
+    "synth_hw": 0.250,
+    "real_hw_archival": 0.180,
+    "real_hw_pseudo": 0.200,
+    "real_hw_stitched": 0.065,
+    "neg_control": 0.005,
+}
+
 _STITCHED_HW_MARKERS: Tuple[str, ...] = (
     "1s2s",
     "stitched",
@@ -2409,12 +2456,14 @@ class ArchivalStratifiedFullPageSampler(StratifiedFullPageSampler):
         preset_norm = str(preset or "v2").strip().lower()
         if weights is not None:
             raw_weights = dict(weights)
+        elif preset_norm == "v4_hw70":
+            raw_weights = dict(STRATIFIED_FULLPAGE_WEIGHTS_V4_HW70)
         elif preset_norm == "v3":
             raw_weights = dict(STRATIFIED_FULLPAGE_WEIGHTS_V3)
         else:
             raw_weights = dict(STRATIFIED_FULLPAGE_WEIGHTS_V2)
         support_v3 = (
-            preset_norm == "v3"
+            preset_norm in ("v3", "v4_hw70")
             or "real_hw_pseudo" in raw_weights
             or "neg_control" in raw_weights
         )
@@ -2745,7 +2794,7 @@ def _build_datasets_and_iters(
             if strat_preset is None:
                 strat_preset = "v2" if bool(getattr(args, "split_archival_hw", False)) else "v1"
             strat_preset = str(strat_preset).strip().lower()
-            if strat_preset in ("v2", "v3"):
+            if strat_preset in ("v2", "v3", "v4_hw70"):
                 fp_strat_sampler: Optional[StratifiedFullPageSampler] = ArchivalStratifiedFullPageSampler(
                     fp_tr, preset=strat_preset
                 )
@@ -3444,6 +3493,8 @@ def run_train_v2(args: argparse.Namespace) -> Dict[str, Any]:
                         label_smoothing=float(args.label_smoothing),
                         state_token_loss_weight=state_token_loss_weight,
                         expr_token_loss_weight=expr_token_loss_weight,
+                        bd3_repair_weight=float(getattr(args, "bd3_repair_weight", 0.0)),
+                        bd3_n_views=int(getattr(args, "bd3_n_views", 2)),
                         use_bf16=use_bf16,
                         device=device,
                     )
@@ -3687,7 +3738,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--preset",
         "--arch-preset",
         dest="preset",
-        choices=["small_45m", "edge85m", "tiny"],
+        choices=["small_45m", "edge85m", "pro200m", "iter15_pro200m", "tiny"],
         default="small_45m",
     )
     p.add_argument("--init-from", type=str, default=None, help="Resume full UniOMRv2 checkpoint")
@@ -3808,6 +3859,18 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--sys-count-loss-weight", type=float, default=0.15)
     p.add_argument("--staff-seg-loss-weight", type=float, default=0.20)
     p.add_argument("--stroke-hog-weight", type=float, default=0.15)
+    p.add_argument(
+        "--bd3-repair-weight",
+        type=float,
+        default=0.0,
+        help="Loss weight for BD3-LM + ReMDM-conf complementary masked-diffusion repair head (0.0 = disabled)",
+    )
+    p.add_argument(
+        "--bd3-n-views",
+        type=int,
+        default=2,
+        help="Number of complementary masked views per step for BD3 repair loss (default: 2)",
+    )
     p.add_argument("--label-smoothing", type=float, default=0.05)
     p.add_argument(
         "--state-token-loss-weight",
@@ -3936,9 +3999,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--stratified-fullpage", action="store_true", default=True)
     p.add_argument(
         "--stratified-preset",
-        choices=["v1", "v2", "v3"],
+        choices=["v1", "v2", "v3", "v4_hw70"],
         default=None,
-        help="Stratified full-page weight preset: v1 (5-bucket), v2 (6-bucket archival), v3 (8-bucket w/ real_hw_pseudo & neg_control)",
+        help="Stratified full-page weight preset: v1 (5-bucket), v2 (6-bucket archival), v3 (8-bucket w/ real_hw_pseudo & neg_control), v4_hw70 (30/70 HW-heavy promoted in i15-09)",
     )
     p.add_argument(
         "--split-archival-hw",
