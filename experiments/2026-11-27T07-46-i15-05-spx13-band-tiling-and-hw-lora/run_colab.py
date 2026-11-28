@@ -1133,6 +1133,7 @@ def _train_and_eval_hw_lora(
         return json.loads(cached.read_text(encoding="utf-8")), final_lora_path
 
     _seed_everything(SEED)
+    model.cfg.tok_dropout = 0.0
     lora_meta = _attach_hw_lora(model, rank=LORA_RANK, alpha=LORA_ALPHA, dropout=LORA_DROPOUT)
     print(f"[{EXP_ID}][arm_b_hw_lora_r16] Attached LoRA: {json.dumps(lora_meta)}", flush=True)
 

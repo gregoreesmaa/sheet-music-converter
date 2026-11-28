@@ -481,12 +481,15 @@
     "est_cu": 3.4,
     "script": "experiments/2026-11-26T01-38-ov-17-irope-registers-jitter-sweep/run_colab.py",
     "hf_eval_target": "evals/2026-11-26T01-38-ov-17-irope-registers-jitter-sweep.json",
-    "status": "RUNNING",
+    "status": "FAILED",
     "depends_on": [],
     "note": "re-queued after triage fix 2026-11-26 (round 2)",
     "session": "ov-17",
     "started_at": "2026-11-28T02:35:36Z",
-    "log_path": "D:\\tmp\\overnight-queue-logs\\2026-11-26T01-38-ov-17-irope-registers-jitter-sweep.log"
+    "log_path": "D:\\tmp\\overnight-queue-logs\\2026-11-26T01-38-ov-17-irope-registers-jitter-sweep.log",
+    "completed_at": "2026-11-28T02:52:47Z",
+    "elapsed_sec": 1030.27,
+    "returncode": 1
   },
   {
     "id": "2026-11-26T01-38-ov-21-paper-gate-border-threshold",
@@ -1932,13 +1935,16 @@
     "est_cu": 3.2,
     "script": "experiments/2026-11-26T16-20-ov-32b-gram-weight-high-vicreg/run_colab.py",
     "hf_eval_target": "evals/2026-11-26T16-20-ov-32b-gram-weight-high-vicreg.json",
-    "status": "RUNNING",
+    "status": "COMPLETED",
     "depends_on": [
       "2026-11-26T01-38-ov-32-dinov3-gram-weight-sweep"
     ],
     "session": "ov-32b",
     "started_at": "2026-11-28T02:28:10Z",
-    "log_path": "D:\\tmp\\overnight-queue-logs\\2026-11-26T16-20-ov-32b-gram-weight-high-vicreg.log"
+    "log_path": "D:\\tmp\\overnight-queue-logs\\2026-11-26T16-20-ov-32b-gram-weight-high-vicreg.log",
+    "completed_at": "2026-11-28T02:51:32Z",
+    "elapsed_sec": 1401.44,
+    "returncode": 0
   },
   {
     "id": "2026-11-26T19-35-i13-26b-asymmetric-gqa-cross-mha",
@@ -2249,15 +2255,10 @@
     "est_cu": 3.1,
     "script": "experiments/2026-11-26T22-18-i14-07-retinex-norm-and-clean-router-masks/run_colab.py",
     "hf_eval_target": "evals/2026-11-26T22-18-i14-07-retinex-norm-and-clean-router-masks.json",
-    "status": "FAILED",
+    "status": "QUEUED",
     "depends_on": [],
     "note": "Wave 11 Safe (Theorist 4 ALS 51.13->92+): ~0.14M zero-init Retinex normalizer + clean-render router BCE supervision.",
-    "session": "2026-11-26t22-18-i14-07-",
-    "started_at": "2026-11-28T02:25:49Z",
-    "log_path": "D:\\tmp\\overnight-queue-logs\\2026-11-26T22-18-i14-07-retinex-norm-and-clean-router-masks.log",
-    "completed_at": "2026-11-28T02:28:10Z",
-    "elapsed_sec": 141.5,
-    "returncode": 1
+    "requeue_note": "Fixed 6 bugs 2026-11-28: unpack resolve_manifest_pieces 2-tuple, load_uni_checkpoint vocab_size=237, _vocab_spec encoding, model()+compute_loss() API + reuse fwd router_info, piece gt/clean/photo keys, generate_mtp_spec return_stats=False."
   },
   {
     "id": "2026-11-26T22-18-i14-08-verifier-gated-rism-selftrain-flywheel",
@@ -2266,14 +2267,17 @@
     "wave": 11,
     "priority": 8,
     "provider": "colab_l4",
-    "gpu": "L4",
+    "gpu": "A100",
     "est_minutes": 42,
     "est_cu": 3.5,
     "script": "experiments/2026-11-26T22-18-i14-08-verifier-gated-rism-selftrain-flywheel/run_colab.py",
     "hf_eval_target": "evals/2026-11-26T22-18-i14-08-verifier-gated-rism-selftrain-flywheel.json",
-    "status": "QUEUED",
+    "status": "RUNNING",
     "depends_on": [],
-    "note": "Wave 11 Safe/Medium (Theorist 8 Flywheel): builds on ov-39 with pHash/8-gram decontamination, multi-scale MBR, zero-dropped-system check, w_t=p_t^2, and 30% GT anchor."
+    "note": "Wave 11 Safe/Medium (Theorist 8 Flywheel): builds on ov-39 with pHash/8-gram decontamination, multi-scale MBR, zero-dropped-system check, w_t=p_t^2, and 30% GT anchor.",
+    "session": "2026-11-26t22-18-i14-08-",
+    "started_at": "2026-11-28T02:51:32Z",
+    "log_path": "D:\\tmp\\overnight-queue-logs\\2026-11-26T22-18-i14-08-verifier-gated-rism-selftrain-flywheel.log"
   },
   {
     "id": "2026-11-26T22-18-i14-09-ink-aware-vjepa-dino-archival-pretrain",
@@ -2282,14 +2286,17 @@
     "wave": 11,
     "priority": 9,
     "provider": "colab_l4",
-    "gpu": "L4",
+    "gpu": "A100",
     "est_minutes": 48,
     "est_cu": 3.9,
     "script": "experiments/2026-11-26T22-18-i14-09-ink-aware-vjepa-dino-archival-pretrain/run_colab.py",
     "hf_eval_target": "evals/2026-11-26T22-18-i14-09-ink-aware-vjepa-dino-archival-pretrain.json",
-    "status": "QUEUED",
+    "status": "RUNNING",
     "depends_on": [],
-    "note": "Wave 11 Medium/Wild (Theorist 8 SSL): builds on ov-31b/ov-33b/i13-04 with ink-only structured measure-span & chord-column masking + DINOv2 view invariance."
+    "note": "Wave 11 Medium/Wild (Theorist 8 SSL): builds on ov-31b/ov-33b/i13-04 with ink-only structured measure-span & chord-column masking + DINOv2 view invariance.",
+    "session": "2026-11-26t22-18-i14-09-",
+    "started_at": "2026-11-28T02:52:47Z",
+    "log_path": "D:\\tmp\\overnight-queue-logs\\2026-11-26T22-18-i14-09-ink-aware-vjepa-dino-archival-pretrain.log"
   },
   {
     "id": "2026-11-26T22-18-i14-10-hw-crossout-nib-physics-and-scribe-adapt",
@@ -2709,19 +2716,14 @@
     "plan": "experiments/2026-11-27T07-46-i15-05-spx13-band-tiling-and-hw-lora/PLAN.md",
     "hf_eval_target": "evals/2026-11-27T07-46-i15-05-spx13-band-tiling-and-hw-lora.json",
     "hf_run_target": "runs/2026-11-27T07-46-i15-05-spx13-band-tiling-and-hw-lora.json",
-    "status": "FAILED",
+    "status": "QUEUED",
     "depends_on": [],
     "datasets": [
       "datasets/suite31_hw_eval.tar",
       "datasets/iter10_5_proxy_2k.tar"
     ],
     "note": "Wave 13 Pivot Strategist 5: Arm A tests zero-train dark-border crop + canonical s_px=13 px 1-2 system band tiling (n_bands=1 bit-identical passthrough when s_px>=10 px; gate hw_landscape >= +5.0 pp, 0.00 pp printed); Arm B freezes base and trains 1,500-step rank-16 HW-only LoRA (1.29 MB INT4 on edge85m, <55 MB total) strictly on HW s_px=13 bands (gate hw_clean/hw_photo >= +4.0 pp over Arm A, domain-gated 0.00 pp printed).",
-    "session": "2026-11-27t07-46-i15-05-",
-    "started_at": "2026-11-28T01:16:23Z",
-    "log_path": "D:\\tmp\\overnight-queue-logs\\2026-11-27T07-46-i15-05-spx13-band-tiling-and-hw-lora.log",
-    "completed_at": "2026-11-28T02:35:36Z",
-    "elapsed_sec": 4752.97,
-    "returncode": 1
+    "requeue_note": "Fixed 2026-11-28: set model.cfg.tok_dropout=0.0 before LoRA training + purged stale ov_mvd_bundle.tar.gz so Colab picks up updated uni_omr_v2.py."
   },
   {
     "id": "2026-11-27T07-52-i15-07-bekern3-2d-cursor-and-bar-rewind",
