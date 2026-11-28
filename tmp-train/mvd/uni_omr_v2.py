@@ -86,6 +86,7 @@ from uni_omr import (  # noqa: E402
     SwiGLU,
     _CUDA_SDPA_BACKENDS,
     _SDPA_HAS_SET_PRIORITY,
+    _SDPBackend,
     _sdpa_kernel,
     apply_rope,
     decode_uni,
@@ -240,6 +241,70 @@ def _get_causal_offset_mask(lq: int, past_len: int, device: torch.device) -> tor
     return mask
 
 
+def _apply_rope_single(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
+    """Apply rotary embeddings to a single tensor ``(B, H, L, D)`` (avoids double rotation in CLA consumers)."""
+    half = x.shape[-1] // 2
+    c = cos[..., :half]
+    s = sin[..., :half]
+    x1, x2 = x.chunk(2, dim=-1)
+    return torch.cat((x1 * c - x2 * s, x2 * c + x1 * s), dim=-1)
+
+
+_CUDA_SDPA_BACKENDS_CACHE: Dict[int, List[Any]] = {}
+_DEVICE_VRAM_GB_CACHE: Dict[int, float] = {}
+
+
+def _get_cuda_sdpa_backends(device: torch.device) -> List[Any]:
+    idx = int(device.index) if device.index is not None else 0
+    cached = _CUDA_SDPA_BACKENDS_CACHE.get(idx)
+    if cached is not None:
+        return cached
+    backends = list(_CUDA_SDPA_BACKENDS)
+    if (
+        sys.platform.startswith("linux")
+        and _SDPBackend is not None
+        and hasattr(_SDPBackend, "FLASH_ATTENTION")
+        and _SDPA_HAS_SET_PRIORITY
+    ):
+        try:
+            major, _ = torch.cuda.get_device_capability(device)
+            if major >= 8:
+                backends = [
+                    _SDPBackend.FLASH_ATTENTION,
+                    _SDPBackend.EFFICIENT_ATTENTION,
+                    _SDPBackend.MATH,
+                ]
+        except Exception:
+            pass
+    _CUDA_SDPA_BACKENDS_CACHE[idx] = backends
+    return backends
+
+
+def _get_device_vram_gb(device: torch.device) -> float:
+    if device.type != "cuda":
+        return 0.0
+    idx = int(device.index) if device.index is not None else 0
+    vram_gb = _DEVICE_VRAM_GB_CACHE.get(idx)
+    if vram_gb is None:
+        try:
+            props = torch.cuda.get_device_properties(device)
+            vram_gb = float(props.total_memory) / (1024.0 ** 3)
+        except Exception:
+            vram_gb = 0.0
+        _DEVICE_VRAM_GB_CACHE[idx] = vram_gb
+    return vram_gb
+
+
+def _get_grad_ckpt_thresholds(device: torch.device) -> Tuple[int, int, int]:
+    """Return ``(global_thr, dec_full_thr, dec_ffn_thr)`` scaled by total GPU VRAM."""
+    vram_gb = _get_device_vram_gb(device)
+    if vram_gb >= 64.0:
+        return (12288, 8192, 4096)
+    if vram_gb >= 20.0:
+        return (6144, 4096, 2048)
+    return (2048, 1024, 512)
+
+
 def _sdpa(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -248,16 +313,17 @@ def _sdpa(
     is_causal: bool = False,
     enable_gqa: bool = False,
 ) -> torch.Tensor:
-    """SDPA wrapper enforcing CUTLASS EFFICIENT_ATTENTION on CUDA (avoids cuDNN 9.10 stalls)."""
+    """SDPA wrapper: FlashAttention-2 -> CUTLASS on Linux Ampere+, CUTLASS on Windows (avoids cuDNN 9.10 stalls)."""
     sdpa_kwargs: Dict[str, Any] = dict(attn_mask=attn_mask, dropout_p=0.0, is_causal=is_causal)
     if enable_gqa:
         sdpa_kwargs["enable_gqa"] = True
     if q.device.type == "cuda" and _sdpa_kernel is not None:
+        backends = _get_cuda_sdpa_backends(q.device)
         if _SDPA_HAS_SET_PRIORITY:
-            with _sdpa_kernel(_CUDA_SDPA_BACKENDS, set_priority=True):
+            with _sdpa_kernel(backends, set_priority=True):
                 return F.scaled_dot_product_attention(q, k, v, **sdpa_kwargs)
         if attn_mask is None:
-            with _sdpa_kernel(_CUDA_SDPA_BACKENDS):
+            with _sdpa_kernel(backends):
                 return F.scaled_dot_product_attention(q, k, v, **sdpa_kwargs)
     return F.scaled_dot_product_attention(q, k, v, **sdpa_kwargs)
 
@@ -376,6 +442,8 @@ class UniOMRv2Config:
                     f"n_heads ({self.n_heads}) must be divisible by yoco_self_kv_heads ({self.yoco_self_kv_heads})"
                 )
             self.yoco_self_kv_heads = int(self.yoco_self_kv_heads)
+        if self.use_resformer_v_res and not self.use_yoco_cla:
+            raise ValueError("use_resformer_v_res=True requires use_yoco_cla=True")
         if self.use_yoco_cla:
             banks = tuple(sorted(set(int(b) for b in self.yoco_cross_banks if 0 <= int(b) < self.n_dec_layers)))
             if not banks or banks[0] != 0:
@@ -436,13 +504,11 @@ class UniOMRv2Config:
         """Return exclusive upper bound for random music tokens in ``tok_dropout``."""
         if self.music_vocab_end is not None:
             return int(self.music_vocab_end)
-        if self.pad_id is not None and int(self.pad_id) > 0:
-            return int(self.pad_id)
         v = int(self.vocab_size)
         if v == VOCAB_SIZE:
             return len(data.VOCAB)
         pad_id = self.resolved_pad_id()
-        if 0 < pad_id <= v:
+        if (v // 2) < pad_id <= v:
             return pad_id
         return max(1, v)
 
@@ -1092,11 +1158,17 @@ class InkTokenRouterV2(nn.Module):
             count_include_pad=False,
         )
         local_ink = local_bg.sub(luma).div_(local_bg.clamp(min=0.15)).clamp_(0.0, 1.0).mul_(paper_px)
-        ink_max = F.adaptive_max_pool2d(local_ink, (h_p, w_p))
-        ink_avg = F.adaptive_avg_pool2d(local_ink, (h_p, w_p))
+        _, _, H, W = local_ink.shape
+        if H == 16 * h_p and W == 16 * w_p:
+            ink_max = F.max_pool2d(local_ink, kernel_size=16, stride=16)
+            ink_avg = F.avg_pool2d(local_ink, kernel_size=16, stride=16)
+            paper_grid_f = F.avg_pool2d(paper_px, kernel_size=16, stride=16)
+        else:
+            ink_max = F.adaptive_max_pool2d(local_ink, (h_p, w_p))
+            ink_avg = F.adaptive_avg_pool2d(local_ink, (h_p, w_p))
+            paper_grid_f = F.adaptive_avg_pool2d(paper_px, (h_p, w_p))
         local_ink_grid = ink_max.mul_(0.5).add_(ink_avg, alpha=0.5)
 
-        paper_grid_f = F.adaptive_avg_pool2d(paper_px, (h_p, w_p))
         effective_paper = (paper_grid_f > 0.5).detach()
 
         local_ink_grid = local_ink_grid.mul_(effective_paper.to(local_ink_grid.dtype))
@@ -1137,13 +1209,25 @@ class InkTokenRouterV2(nn.Module):
             local_ink_grid = local_ink_grid.to(saliency_logits.dtype)
             paper_gate = paper_gate.to(saliency_logits.dtype)
             saliency_prob = saliency_prob * paper_gate
+            flat_ink: Optional[torch.Tensor] = None
             if getattr(self, "adaptive_ink_target", False):
                 flat_ink = local_ink_grid.flatten(1).float()
+                flat_paper = paper_mask_grid.flatten(1)
                 if torch.onnx.is_in_onnx_export():
                     k30 = max(1, min(N, int(round(0.30 * max(0, N - 1))) + 1))
                     bg_p30 = torch.topk(flat_ink, k=k30, dim=1, largest=False, sorted=True).values[:, -1:]
                 else:
-                    bg_p30 = torch.quantile(flat_ink, 0.30, dim=1, keepdim=True)
+                    # Sync-free exact linear-interpolation 30th percentile over valid paper tokens
+                    sorted_ink, _ = flat_ink.masked_fill(~flat_paper, float("inf")).sort(dim=1)
+                    n_valid = flat_paper.sum(dim=1)
+                    pos = (n_valid - 1).clamp(min=0).to(torch.float64) * 0.30
+                    lo = pos.floor().to(torch.long)
+                    hi = pos.ceil().to(torch.long)
+                    frac = (pos - lo.to(torch.float64)).to(flat_ink.dtype).unsqueeze(1)
+                    v_lo = sorted_ink.gather(1, lo.unsqueeze(1))
+                    v_hi = sorted_ink.gather(1, hi.unsqueeze(1))
+                    q30 = v_lo + frac * (v_hi - v_lo)
+                    bg_p30 = torch.where(n_valid.unsqueeze(1) > 0, q30, torch.zeros_like(q30))
                 ink_thr = (
                     (bg_p30 + 0.045)
                     .clamp(min=0.045, max=0.10)
@@ -1154,7 +1238,7 @@ class InkTokenRouterV2(nn.Module):
             else:
                 ink_target = ((local_ink_grid > 0.04) & paper_mask_grid).to(saliency_logits.dtype)
             if self.use_ink_prior:
-                flat_f = local_ink_grid.flatten(1).float()
+                flat_f = flat_ink if flat_ink is not None else local_ink_grid.flatten(1).float()
                 denom = (
                     (flat_f.mean(dim=-1) + 2.5 * flat_f.std(dim=-1, unbiased=False))
                     .clamp(min=1e-4)
@@ -1479,18 +1563,18 @@ class HybridAxialMergerEncoder(nn.Module):
         if x.dtype != compute_dtype:
             x = x.to(dtype=compute_dtype)
 
-        row_cos, row_sin = self.axial_rope(W_p, device=x.device, dtype=compute_dtype)
-        col_cos, col_sin = self.axial_rope(H_p, device=x.device, dtype=compute_dtype)
-
         use_ckpt = self.training and self.cfg.grad_checkpoint and torch.is_grad_enabled()
-        for layer in self.axial_layers:
-            if use_ckpt:
-                x = _grad_ckpt(
-                    layer, x, row_cos, row_sin, col_cos, col_sin,
-                    use_reentrant=False,
-                )
-            else:
-                x = layer(x, row_cos, row_sin, col_cos, col_sin)
+        if len(self.axial_layers) > 0:
+            row_cos, row_sin = self.axial_rope(W_p, device=x.device, dtype=compute_dtype)
+            col_cos, col_sin = self.axial_rope(H_p, device=x.device, dtype=compute_dtype)
+            for layer in self.axial_layers:
+                if use_ckpt:
+                    x = _grad_ckpt(
+                        layer, x, row_cos, row_sin, col_cos, col_sin,
+                        use_reentrant=False,
+                    )
+                else:
+                    x = layer(x, row_cos, row_sin, col_cos, col_sin)
 
         # 2x2 MLP Patch Merger (/8 -> /16)
         merged = self.patch_merger(x)  # (B, H_m, W_m, D)
@@ -1547,8 +1631,9 @@ class HybridAxialMergerEncoder(nn.Module):
         n_global = len(self.global_layers)
         mid_idx = max(0, (n_global // 2) - 1)
         mem_global_mid = mem_post_merger
+        global_ckpt_thr = _get_grad_ckpt_thresholds(mem.device)[0]
         for i, layer in enumerate(self.global_layers):
-            if use_ckpt and (mem.shape[0] * mem.shape[1] > 12000):
+            if use_ckpt and (mem.shape[0] * mem.shape[1] > global_ckpt_thr):
                 mem = _grad_ckpt(
                     layer, mem, cos2d, sin2d,
                     use_reentrant=False,
@@ -1851,6 +1936,28 @@ _TEXT_AUX_PREFIXES: Tuple[str, ...] = (
 )
 
 
+_TEXT_AUX_LUT_CACHE: Dict[Tuple[int, int, torch.device], torch.Tensor] = {}
+
+
+def _get_text_aux_lut(vocab_size: int, text_vocab_size: int, device: torch.device) -> torch.Tensor:
+    key = (int(vocab_size), int(text_vocab_size), device)
+    lut = _TEXT_AUX_LUT_CACHE.get(key)
+    if lut is not None:
+        return lut
+    other_id = max(0, int(text_vocab_size) - 1)
+    lut = torch.full((int(vocab_size),), other_id, dtype=torch.long)
+    if other_id > 0:
+        idx = 0
+        for tid in sorted(UNI_ID_TO_TOKEN.keys()):
+            tok = UNI_ID_TO_TOKEN[tid]
+            if 0 <= tid < int(vocab_size) and any(tok.startswith(p) for p in _TEXT_AUX_PREFIXES):
+                lut[tid] = min(other_id - 1, idx)
+                idx += 1
+    lut = lut.to(device)
+    _TEXT_AUX_LUT_CACHE[key] = lut
+    return lut
+
+
 def build_text_aux_targets(
     targets: torch.Tensor,
     vocab_size: int,
@@ -1859,12 +1966,8 @@ def build_text_aux_targets(
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Map structural/expressive text-like tokens into ``0..text_vocab_size-2`` and others to ``text_vocab_size-1``."""
     device = targets.device
-    other_id = max(1, int(text_vocab_size) - 1)
-    lut = torch.full((vocab_size,), other_id, dtype=torch.long)
-    for tid, tok in UNI_ID_TO_TOKEN.items():
-        if 0 <= tid < vocab_size and any(tok.startswith(p) for p in _TEXT_AUX_PREFIXES):
-            lut[tid] = tid % other_id
-    lut = lut.to(device)
+    other_id = max(0, int(text_vocab_size) - 1)
+    lut = _get_text_aux_lut(int(vocab_size), int(text_vocab_size), device)
     safe_t = targets.clamp(0, vocab_size - 1)
     text_tgt = lut[safe_t]
     valid = targets != pad_id
@@ -1906,20 +2009,14 @@ class _BD3RepairLayer(nn.Module):
         rope_cos: torch.Tensor,
         rope_sin: torch.Tensor,
         block_size: int = 32,
+        block_attn_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         B, T, D = x.shape
 
         # 1. Bidirectional intra-cell (block-local) self-attention (BD3-LM style)
         h = self.norm1(x)
         pad_t = (block_size - (T % block_size)) % block_size
-        if pad_t > 0:
-            h_pad = F.pad(h, (0, 0, 0, pad_t))
-            cos_pad = F.pad(rope_cos, (0, 0, 0, pad_t))
-            sin_pad = F.pad(rope_sin, (0, 0, 0, pad_t))
-        else:
-            h_pad = h
-            cos_pad = rope_cos
-            sin_pad = rope_sin
+        h_pad = F.pad(h, (0, 0, 0, pad_t)) if pad_t > 0 else h
 
         T_pad = h_pad.shape[1]
         n_blk = T_pad // block_size
@@ -1929,11 +2026,11 @@ class _BD3RepairLayer(nn.Module):
         k = self.sa_k_norm(k.view(B * n_blk, block_size, self.n_heads, self.head_dim)).transpose(1, 2)
         v = v.view(B * n_blk, block_size, self.n_heads, self.head_dim).transpose(1, 2)
 
-        c_blk = cos_pad[:, :, :block_size, :]
-        s_blk = sin_pad[:, :, :block_size, :]
+        c_blk = rope_cos[:, :, :block_size, :]
+        s_blk = rope_sin[:, :, :block_size, :]
         q, k = apply_rope(q, k, c_blk, s_blk)
 
-        sa_out = _sdpa(q, k, v, attn_mask=None, is_causal=False, enable_gqa=False)
+        sa_out = _sdpa(q, k, v, attn_mask=block_attn_mask, is_causal=False, enable_gqa=False)
         sa_out = sa_out.transpose(1, 2).reshape(B, T_pad, D)[:, :T, :]
         x = x + self.drop(self.sa_o_proj(sa_out))
 
@@ -1992,6 +2089,7 @@ class BD3ReMDMRepairHead(nn.Module):
         mask_flags: torch.Tensor,
         mem_final: torch.Tensor,
         lm_head: nn.Linear,
+        key_valid_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         compute_dtype = _active_compute_dtype(tok_embeds)
         x = self.in_proj(tok_embeds.to(compute_dtype))
@@ -1999,13 +2097,37 @@ class BD3ReMDMRepairHead(nn.Module):
         x = torch.where(mask_flags.unsqueeze(-1), m_emb, x)
 
         mem_rep = self.mem_proj(mem_final.to(compute_dtype))
-        T = x.shape[1]
-        cos1d, sin1d = self.rope1d(max(T, self.block_size), device=x.device, dtype=x.dtype)
-        cos1d = cos1d[:, :, :T, :]
-        sin1d = sin1d[:, :, :T, :]
+        B, T, _ = x.shape
+        cos1d, sin1d = self.rope1d(self.block_size, device=x.device, dtype=x.dtype)
+        cos1d = cos1d[:, :, : self.block_size, :]
+        sin1d = sin1d[:, :, : self.block_size, :]
+
+        pad_t = (self.block_size - (T % self.block_size)) % self.block_size
+        block_attn_mask: Optional[torch.Tensor] = None
+        if key_valid_mask is not None or pad_t > 0:
+            if key_valid_mask is None:
+                kv_mask = torch.ones((B, T), device=x.device, dtype=torch.bool)
+            else:
+                kv_mask = key_valid_mask.to(device=x.device, dtype=torch.bool)
+            if pad_t > 0:
+                kv_mask = F.pad(kv_mask, (0, pad_t), value=False)
+            n_blk = (T + pad_t) // self.block_size
+            kv_blk = kv_mask.view(B * n_blk, self.block_size)
+            all_false = ~kv_blk.any(dim=1, keepdim=True)
+            first_slot = torch.zeros((1, self.block_size), device=x.device, dtype=torch.bool)
+            first_slot[:, 0] = True
+            kv_blk = kv_blk | (all_false & first_slot)
+            block_attn_mask = kv_blk.view(B * n_blk, 1, 1, self.block_size)
 
         for layer in self.layers:
-            x = layer(x, mem_rep, cos1d, sin1d, block_size=self.block_size)
+            x = layer(
+                x,
+                mem_rep,
+                cos1d,
+                sin1d,
+                block_size=self.block_size,
+                block_attn_mask=block_attn_mask,
+            )
 
         h_out = self.out_proj(self.out_norm(x))
         return lm_head(h_out)
@@ -2022,10 +2144,14 @@ def sample_bd3_complementary_views(
 ) -> List[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
     """Build complementary masked/corrupted views (15-40% mask + 10% single-token corruption)."""
     valid = (tgt_y != pad_id) & (tgt_y != bos_id) & (tgt_y != eos_id)
-    p_mask = float(0.15 + 0.25 * torch.rand((), device=tgt_y.device).item())
+    p_mask = 0.15 + 0.25 * float(torch.rand(()))
     u = torch.rand(tgt_y.shape, device=tgt_y.device)
-    hi_vocab = int(music_vocab_end) if (music_vocab_end is not None and music_vocab_end > 4) else int(vocab_size)
-    lo_vocab = 0 if hi_vocab <= 4 else min(4, hi_vocab - 1)
+    hi_vocab = (
+        max(1, min(int(vocab_size), int(music_vocab_end)))
+        if music_vocab_end is not None
+        else max(1, int(vocab_size))
+    )
+    lo_vocab = 0
 
     n_v = max(1, int(n_views))
     masks: List[torch.Tensor] = [(u < p_mask) & valid]
@@ -2040,9 +2166,9 @@ def sample_bd3_complementary_views(
         rand_toks = torch.randint(lo_vocab, hi_vocab, tgt_y.shape, device=tgt_y.device, dtype=tgt_y.dtype)
         corrupt_ids = torch.where(corrupt_unmasked, rand_toks, tgt_y)
         supervise = m | corrupt_unmasked
-        if not bool(supervise.any()):
-            supervise = valid
-            m = valid
+        has_sup = supervise.any()
+        supervise = torch.where(has_sup, supervise, valid)
+        m = torch.where(has_sup, m, valid)
         views.append((corrupt_ids, m, supervise))
     return views
 
@@ -2052,6 +2178,9 @@ def compute_bd3_repair_loss(
     mem_final: torch.Tensor,
     tgt_y: torch.Tensor,
     n_views: int = 2,
+    is_v1_schema: Optional[torch.Tensor] = None,
+    v2a_token_ids: Optional[Sequence[int]] = None,
+    has_v1_schema: Optional[bool] = None,
 ) -> torch.Tensor:
     """Complementary masked-diffusion + single-token corruption repair loss."""
     if model.bd3_repair_head is None:
@@ -2068,16 +2197,39 @@ def compute_bd3_repair_loss(
         n_views=n_views,
         music_vocab_end=model.cfg.resolved_music_vocab_end(),
     )
+    v1_v2a_mask: Optional[torch.Tensor] = None
+    if is_v1_schema is not None and v2a_token_ids is not None and (has_v1_schema is not False):
+        v2a_idx = (
+            v2a_token_ids.to(device=tgt_y.device, dtype=torch.long)
+            if isinstance(v2a_token_ids, torch.Tensor)
+            else torch.as_tensor(list(v2a_token_ids), device=tgt_y.device, dtype=torch.long)
+        )
+        if v2a_idx.numel() > 0:
+            is_v1_bool = is_v1_schema.to(device=tgt_y.device, dtype=torch.bool)
+            v2a_col_mask = torch.zeros(int(model.cfg.vocab_size), device=tgt_y.device, dtype=torch.bool)
+            v2a_col_mask[v2a_idx] = True
+            v1_v2a_mask = is_v1_bool[:, None, None] & v2a_col_mask[None, None, :]
     total_loss = torch.zeros((), device=tgt_y.device, dtype=torch.float32)
+    safe_targets = tgt_y.clamp(0, int(model.cfg.vocab_size) - 1).reshape(-1)
     for corrupt_ids, mask_flags, supervise in views:
         tok_emb = model.tok_emb(corrupt_ids)
-        logits = model.bd3_repair_head(tok_emb, mask_flags, mem_final, model.lm_head)
-        targets = torch.where(supervise, tgt_y, torch.full_like(tgt_y, pad_id))
-        loss_v = F.cross_entropy(
-            logits.float().reshape(-1, logits.size(-1)),
-            targets.reshape(-1),
-            ignore_index=pad_id,
+        key_valid_mask = corrupt_ids != pad_id
+        logits = model.bd3_repair_head(
+            tok_emb,
+            mask_flags,
+            mem_final,
+            model.lm_head,
+            key_valid_mask=key_valid_mask,
         )
+        if v1_v2a_mask is not None:
+            logits = logits.masked_fill(v1_v2a_mask, -1e4)
+        per_tok = F.cross_entropy(
+            logits.reshape(-1, logits.size(-1)),
+            safe_targets,
+            reduction="none",
+        )
+        sup_f = supervise.reshape(-1).float()
+        loss_v = (per_tok.float() * sup_f).sum() / sup_f.sum().clamp(min=1.0)
         total_loss = total_loss + loss_v
     return (total_loss / float(len(views))).to(mem_final.dtype)
 
@@ -2241,8 +2393,8 @@ class GroupedQueryAttention(nn.Module):
         return x.unsqueeze(2).expand(B, n_kv, self.n_rep, L, hd).reshape(B, self.n_heads, L, hd)
 
     def _compute_lambda(self, dtype: torch.dtype) -> torch.Tensor:
-        lam_1 = torch.exp(torch.sum(self.lambda_q1.float() * self.lambda_k1.float()))
-        lam_2 = torch.exp(torch.sum(self.lambda_q2.float() * self.lambda_k2.float()))
+        lam_1 = torch.exp(torch.sum(self.lambda_q1.float() * self.lambda_k1.float()).clamp(-20.0, 20.0))
+        lam_2 = torch.exp(torch.sum(self.lambda_q2.float() * self.lambda_k2.float()).clamp(-20.0, 20.0))
         return (lam_1 - lam_2 + self.lambda_init).to(dtype)
 
     def compute_kv(
@@ -2276,7 +2428,7 @@ class GroupedQueryAttention(nn.Module):
                 k_s2 = self.k_s2_norm(k_s_raw[:, :, :, 1, :]).transpose(1, 2)
                 k1 = torch.cat([k1, k_s1], dim=-1)  # (B, n_kv, Lk, half_dim + half_coord_dim = 40)
                 k2 = torch.cat([k2, k_s2], dim=-1)  # (B, n_kv, Lk, 40)
-            k_out = torch.cat([k1, k2], dim=-1)     # (B, n_kv, Lk, 80 or 64)
+            k_out = torch.cat([k1, k2], dim=1)      # (B, 2*n_kv, Lk, 40 or 32)
         else:
             assert self.k_norm is not None
             k_c = self.k_norm(self.k_proj(kv_in).view(B, Lk, self.n_kv_heads, self.head_dim)).transpose(1, 2)
@@ -2322,20 +2474,40 @@ class GroupedQueryAttention(nn.Module):
             q_mod = q_in
 
         v_raw_cur: Optional[torch.Tensor] = None
+        in_onnx = torch.onnx.is_in_onnx_export()
 
         # --- Special path: Differential Attention (with or without CoordKey / YOCO) ---
         if self.use_diff_attn:
+            assert not is_causal, "Differential Attention does not support causal masking"
             assert self.q1_norm is not None and self.q2_norm is not None and self.subln is not None
-            q_c_raw = self.q_proj(q_mod).view(B, Lq, self.n_heads, 2, self.half_dim)
-            q1 = self.q1_norm(q_c_raw[:, :, :, 0, :]).transpose(1, 2)
-            q2 = self.q2_norm(q_c_raw[:, :, :, 1, :]).transpose(1, 2)
             if self.use_coordkey:
                 assert self.q_coord_proj is not None and self.q_s1_norm is not None and self.q_s2_norm is not None
-                q_s_raw = self.q_coord_proj(q_mod).view(B, Lq, self.n_heads, 2, self.half_coord_dim)
+                can_fuse_qc = (
+                    (not in_onnx)
+                    and (self.q_proj.bias is None and self.q_coord_proj.bias is None)
+                    and (not _is_qat_linear_active(self.q_proj))
+                    and (not _is_qat_linear_active(self.q_coord_proj))
+                )
+                if can_fuse_qc:
+                    d_qc = self.n_heads * self.head_dim
+                    d_qs = self.n_heads * self.coord_dim
+                    w_q = torch.cat((self.q_proj.weight, self.q_coord_proj.weight), dim=0)
+                    q_c_flat, q_s_flat = F.linear(q_mod, w_q).split((d_qc, d_qs), dim=-1)
+                    q_c_raw = q_c_flat.view(B, Lq, self.n_heads, 2, self.half_dim)
+                    q_s_raw = q_s_flat.view(B, Lq, self.n_heads, 2, self.half_coord_dim)
+                else:
+                    q_c_raw = self.q_proj(q_mod).view(B, Lq, self.n_heads, 2, self.half_dim)
+                    q_s_raw = self.q_coord_proj(q_mod).view(B, Lq, self.n_heads, 2, self.half_coord_dim)
+                q1 = self.q1_norm(q_c_raw[:, :, :, 0, :]).transpose(1, 2)
+                q2 = self.q2_norm(q_c_raw[:, :, :, 1, :]).transpose(1, 2)
                 q_s1 = self.q_s1_norm(q_s_raw[:, :, :, 0, :]).transpose(1, 2)
                 q_s2 = self.q_s2_norm(q_s_raw[:, :, :, 1, :]).transpose(1, 2)
                 q1 = torch.cat([q1, q_s1], dim=-1)  # (B, H, Lq, 40)
                 q2 = torch.cat([q2, q_s2], dim=-1)  # (B, H, Lq, 40)
+            else:
+                q_c_raw = self.q_proj(q_mod).view(B, Lq, self.n_heads, 2, self.half_dim)
+                q1 = self.q1_norm(q_c_raw[:, :, :, 0, :]).transpose(1, 2)
+                q2 = self.q2_norm(q_c_raw[:, :, :, 1, :]).transpose(1, 2)
 
             if self.head_temp is not None:
                 ht = self.head_temp.to(q1.dtype)
@@ -2353,14 +2525,26 @@ class GroupedQueryAttention(nn.Module):
                 v_raw_cur = v
 
             present_kv = (k_packed, v)
-            k1, k2 = k_packed.chunk(2, dim=-1)
-            # Explicit _expand_kv (enable_gqa=False) for CUTLASS asymmetric d_qk=40, d_v=64
-            k1_exp = self._expand_kv(k1)
-            k2_exp = self._expand_kv(k2)
+            # Batch (q1, q2) and (k1, k2) along head dim -> 1 CUTLASS SDPA call instead of 2
+            if self.n_rep == 1:
+                k12_exp = k_packed
+            else:
+                Bk, nk2, Lk_p, dk = k_packed.shape
+                k12_exp = (
+                    k_packed.unsqueeze(2)
+                    .expand(Bk, nk2, self.n_rep, Lk_p, dk)
+                    .reshape(Bk, nk2 * self.n_rep, Lk_p, dk)
+                )
+            q12 = torch.cat([q1, q2], dim=1)
             v_exp = self._expand_kv(v)
-
-            attn1 = _sdpa(q1, k1_exp, v_exp, attn_mask=attn_mask, is_causal=False, enable_gqa=False)
-            attn2 = _sdpa(q2, k2_exp, v_exp, attn_mask=attn_mask, is_causal=False, enable_gqa=False)
+            v12 = v_exp.repeat(1, 2, 1, 1)
+            attn_mask_12 = (
+                attn_mask.repeat(1, 2, 1, 1)
+                if (attn_mask is not None and attn_mask.ndim == 4 and attn_mask.shape[1] == self.n_heads)
+                else attn_mask
+            )
+            attn12 = _sdpa(q12, k12_exp, v12, attn_mask=attn_mask_12, is_causal=False, enable_gqa=False)
+            attn1, attn2 = attn12.chunk(2, dim=1)
             lam = self._compute_lambda(q1.dtype)
             out = self.subln(attn1 - lam * attn2) * (1.0 - self.lambda_init)
             out = self.o_proj(out.transpose(1, 2).reshape(B, Lq, self.d_model))
@@ -2371,15 +2555,12 @@ class GroupedQueryAttention(nn.Module):
             return out
 
         # --- Standard GQA path (supports legacy, CoordKey-only, YOCO/CLA, ResFormer, ModeGate, QuantVLA) ---
-        in_onnx = torch.onnx.is_in_onnx_export()
         can_fuse_qkv = (
             self.owns_kv
             and (shared_kv is None)
             and (not is_cross)
             and (kv_in is q_mod)
             and (not self.use_coordkey)
-            and (not self.use_v_res)
-            and (not return_v_cur)
             and (not in_onnx)
             and self.k_proj is not None
             and self.v_proj is not None
@@ -2398,6 +2579,11 @@ class GroupedQueryAttention(nn.Module):
             q = self.q_norm(q_raw.view(B, Lq, self.n_heads, self.head_dim)).transpose(1, 2)
             k = self.k_norm(k_raw.view(B, Lq, self.n_kv_heads, self.head_dim)).transpose(1, 2)
             v = v_raw.view(B, Lq, self.n_kv_heads, self.head_dim).transpose(1, 2)
+            if self.use_v_res and v0 is not None and self.v_res_alpha is not None:
+                g = torch.sigmoid(self.v_res_alpha).to(v.dtype)
+                v = (1.0 - g) * v + g * v0
+            if return_v_cur:
+                v_raw_cur = v
             if self.use_rope and rope_cos is not None and rope_sin is not None:
                 q, k = apply_rope(q, k, rope_cos, rope_sin)
             if past_kv is not None:
@@ -2405,17 +2591,33 @@ class GroupedQueryAttention(nn.Module):
                 v = torch.cat([past_kv[1], v], dim=2)
         else:
             assert self.q_norm is not None
-            q = self.q_norm(self.q_proj(q_mod).view(B, Lq, self.n_heads, self.head_dim)).transpose(1, 2)
             if self.use_coordkey:
                 assert self.q_coord_proj is not None and self.q_coord_norm is not None
-                q_s = self.q_coord_norm(
-                    self.q_coord_proj(q_mod).view(B, Lq, self.n_heads, self.coord_dim)
-                ).transpose(1, 2)
+                can_fuse_qc = (
+                    (not in_onnx)
+                    and (self.q_proj.bias is None and self.q_coord_proj.bias is None)
+                    and (not _is_qat_linear_active(self.q_proj))
+                    and (not _is_qat_linear_active(self.q_coord_proj))
+                )
+                if can_fuse_qc:
+                    d_qc = self.n_heads * self.head_dim
+                    d_qs = self.n_heads * self.coord_dim
+                    w_q = torch.cat((self.q_proj.weight, self.q_coord_proj.weight), dim=0)
+                    q_c_flat, q_s_flat = F.linear(q_mod, w_q).split((d_qc, d_qs), dim=-1)
+                    q = self.q_norm(q_c_flat.view(B, Lq, self.n_heads, self.head_dim)).transpose(1, 2)
+                    q_s = self.q_coord_norm(q_s_flat.view(B, Lq, self.n_heads, self.coord_dim)).transpose(1, 2)
+                else:
+                    q = self.q_norm(self.q_proj(q_mod).view(B, Lq, self.n_heads, self.head_dim)).transpose(1, 2)
+                    q_s = self.q_coord_norm(
+                        self.q_coord_proj(q_mod).view(B, Lq, self.n_heads, self.coord_dim)
+                    ).transpose(1, 2)
                 q = torch.cat([q, q_s], dim=-1)
+            else:
+                q = self.q_norm(self.q_proj(q_mod).view(B, Lq, self.n_heads, self.head_dim)).transpose(1, 2)
 
             if shared_kv is not None:
                 if self.use_rope and rope_cos is not None and rope_sin is not None and not is_cross:
-                    q, _ = apply_rope(q, q, rope_cos, rope_sin)
+                    q = _apply_rope_single(q, rope_cos, rope_sin)
                 k, v = shared_kv
             elif is_cross and past_kv is not None:
                 k, v = past_kv
@@ -2693,7 +2895,7 @@ class QATInt4ControllerV2(QATInt4Controller):
             if root_mod is None:
                 continue
             for sub_name, mod in root_mod.named_modules():
-                if isinstance(mod, nn.Linear) and mod not in self._orig_forwards:
+                if isinstance(mod, nn.Linear) and mod.out_features > 1 and mod not in self._orig_forwards:
                     full_name = f"{root_name}.{sub_name}" if sub_name else root_name
                     self._orig_forwards[mod] = mod.forward
                     self.target_names.append(full_name)
@@ -3004,6 +3206,7 @@ class UniOMRv2Net(nn.Module):
                 & (inp_ids != pad_id)
                 & (inp_ids != bos_id)
                 & (inp_ids != eos_id)
+                & (inp_ids != sys_id)
                 & (rand_toks != pad_id)
                 & (rand_toks != bos_id)
                 & (rand_toks != eos_id)
@@ -3038,9 +3241,10 @@ class UniOMRv2Net(nn.Module):
                 mem_final = memory
 
         bt = int(x.shape[0] * x.shape[1])
+        _, dec_full_thr, dec_ffn_thr = _get_grad_ckpt_thresholds(x.device)
         can_dec_ckpt = self.training and self.cfg.grad_checkpoint and torch.is_grad_enabled()
-        use_dec_full_ckpt = can_dec_ckpt and (bt > 8192)
-        use_dec_ffn_ckpt = can_dec_ckpt and (4096 < bt <= 8192)
+        use_dec_full_ckpt = can_dec_ckpt and (bt > dec_full_thr)
+        use_dec_ffn_ckpt = can_dec_ckpt and (dec_ffn_thr < bt <= dec_full_thr)
 
         new_past_kvs_out: Optional[Any] = None
 
@@ -3211,16 +3415,12 @@ class UniOMRv2Net(nn.Module):
         want_mtp = self.training if return_mtp is None else bool(return_mtp)
         if want_mtp and len(self.mtp_heads) > 0:
             if self.cfg.use_chained_mtp:
-                logits = self.lm_head(h)
-                mtp_logits: List[torch.Tensor] = []
                 B_t, T_t = tgt_ids.shape
                 pad_id = self.cfg.resolved_pad_id()
-                h_prev = h
-                prev_logits = logits
-                for k_idx, head in enumerate(self.mtp_heads):
-                    if greedy_chain_mtp or targets is None:
-                        next_tok = prev_logits.detach().argmax(dim=-1)
-                    else:
+                if (not greedy_chain_mtp) and (targets is not None):
+                    h_states: List[torch.Tensor] = [h]
+                    h_prev = h
+                    for k_idx, head in enumerate(self.mtp_heads):
                         if k_idx == 0:
                             next_tok = targets
                         elif T_t > k_idx:
@@ -3228,12 +3428,26 @@ class UniOMRv2Net(nn.Module):
                             next_tok = torch.cat([targets[:, k_idx:], pad_tail], dim=1)
                         else:
                             next_tok = torch.full((B_t, T_t), pad_id, device=targets.device, dtype=targets.dtype)
-                    next_emb = self.tok_emb(next_tok).to(h_prev.dtype)
-                    h_k = head(h_prev, next_emb)
-                    logits_k = self.lm_head(h_k)
-                    mtp_logits.append(logits_k)
-                    h_prev = h_k
-                    prev_logits = logits_k
+                        next_emb = self.tok_emb(next_tok).to(h_prev.dtype)
+                        h_k = head(h_prev, next_emb)
+                        h_states.append(h_k)
+                        h_prev = h_k
+                    all_logits = self.lm_head(torch.cat(h_states, dim=0)).split(B_t, dim=0)
+                    logits = all_logits[0]
+                    mtp_logits = list(all_logits[1:])
+                else:
+                    logits = self.lm_head(h)
+                    mtp_logits = []
+                    h_prev = h
+                    prev_logits = logits
+                    for head in self.mtp_heads:
+                        next_tok = prev_logits.detach().argmax(dim=-1)
+                        next_emb = self.tok_emb(next_tok).to(h_prev.dtype)
+                        h_k = head(h_prev, next_emb)
+                        logits_k = self.lm_head(h_k)
+                        mtp_logits.append(logits_k)
+                        h_prev = h_k
+                        prev_logits = logits_k
             else:
                 can_fuse_mtp = (
                     _HAS_F_RMS_NORM
@@ -3416,6 +3630,9 @@ class UniOMRv2Net(nn.Module):
         text_aux_loss_weight: Optional[float] = None,
         bd3_repair_weight: float = 0.0,
         bd3_n_views: int = 2,
+        is_v1_schema: Optional[torch.Tensor] = None,
+        v2a_token_ids: Optional[Any] = None,
+        has_v1_schema: Optional[bool] = None,
     ) -> Dict[str, torch.Tensor]:
         """Compute combined CE + MTP-4 + router saliency + layout & stroke-HOG + optional text/BD3 losses."""
         logits: torch.Tensor = out["logits"]
@@ -3462,9 +3679,9 @@ class UniOMRv2Net(nn.Module):
             )
             mtp_loss = (
                 (mtp_per_tok.float() * mtp_valid).sum() / mtp_valid.sum().clamp(min=1.0)
-            ).to(logits.dtype)
+            )
         else:
-            mtp_loss = logits.new_zeros(())
+            mtp_loss = logits.new_zeros((), dtype=torch.float32)
 
         # Router saliency BCE loss
         rinfo = out.get("router_info") or {}
@@ -3529,7 +3746,13 @@ class UniOMRv2Net(nn.Module):
         mem_final_bd3: Optional[torch.Tensor] = out.get("mem_final")
         if self.bd3_repair_head is not None and mem_final_bd3 is not None and eff_bd3_w > 0.0:
             bd3_repair_loss = compute_bd3_repair_loss(
-                self, mem_final_bd3, targets, n_views=int(bd3_n_views)
+                self,
+                mem_final_bd3,
+                targets,
+                n_views=int(bd3_n_views),
+                is_v1_schema=is_v1_schema,
+                v2a_token_ids=v2a_token_ids,
+                has_v1_schema=has_v1_schema,
             ).to(logits.dtype)
         else:
             bd3_repair_loss = logits.new_zeros(())
@@ -3602,9 +3825,15 @@ class UniOMRv2Net(nn.Module):
             if root is None:
                 continue
             for m in root.modules():
-                if isinstance(m, nn.Linear):
+                if isinstance(m, nn.Linear) and m.out_features > 1:
                     int4_weight_params += m.weight.numel()
         fp16_keep_params = infer_params - int4_weight_params
+
+        mtp_int4_weight_params = 0
+        for m in self.mtp_heads.modules():
+            if isinstance(m, nn.Linear) and m.out_features > 1:
+                mtp_int4_weight_params += m.weight.numel()
+        mtp_fp16_keep_params = mtp_params - mtp_int4_weight_params
 
         scale_bytes_per_param = 2.0 / float(int4_block_size)  # FP16 scale per block_size weights
         int4_raw_mb = (infer_params * 0.5) / 1_000_000.0
@@ -3612,6 +3841,10 @@ class UniOMRv2Net(nn.Module):
         hybrid_raw_mb = (fp16_keep_params * 2.0 + int4_weight_params * 0.5) / 1_000_000.0
         hybrid_scaled_mb = (
             fp16_keep_params * 2.0 + int4_weight_params * (0.5 + scale_bytes_per_param)
+        ) / 1_000_000.0
+        hybrid_with_mtp_mb = (
+            (fp16_keep_params + mtp_fp16_keep_params) * 2.0
+            + (int4_weight_params + mtp_int4_weight_params) * (0.5 + scale_bytes_per_param)
         ) / 1_000_000.0
 
         return {
@@ -3633,4 +3866,5 @@ class UniOMRv2Net(nn.Module):
             "pure_int4_with_scales_mb": int4_scaled_mb,
             "hybrid_fp16_int4_mb": hybrid_raw_mb,
             "hybrid_fp16_int4_with_scales_mb": hybrid_scaled_mb,
+            "hybrid_fp16_int4_with_mtp_mb": hybrid_with_mtp_mb,
         }

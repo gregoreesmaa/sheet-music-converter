@@ -313,12 +313,14 @@ def test_4_muon_partition_guard() -> None:
     assert "lm_head_text.weight" in adamw_names
     assert "lm_head_text.weight" not in muon_names
 
-    # 2D Transformer hidden matrices MUST be in Muon
+    # 2D Transformer hidden matrices MUST be in Muon; low-rank ModeGate adapters (q_down/q_up) in AdamW
     assert "dec_layers.0.cross_attn.q_proj.weight" in muon_names
     assert "dec_layers.0.cross_attn.q_coord_proj.weight" in muon_names
     assert "dec_layers.0.cross_attn.k_coord_proj.weight" in muon_names
-    assert "dec_layers.0.cross_attn.q_down.weight" in muon_names
-    assert "dec_layers.0.cross_attn.q_up.weight" in muon_names
+    assert "dec_layers.0.cross_attn.q_down.weight" in adamw_names
+    assert "dec_layers.0.cross_attn.q_up.weight" in adamw_names
+    assert "dec_layers.0.cross_attn.q_down.weight" not in muon_names
+    assert "dec_layers.0.cross_attn.q_up.weight" not in muon_names
     assert "encoder.global_layers.0.self_attn.qkv_proj.weight" in muon_names
 
 
@@ -367,3 +369,193 @@ def test_5_strip_aux_heads_and_iter15_pro200m_budget() -> None:
         + tv2.STRATIFIED_FULLPAGE_WEIGHTS_V4_HW70["rare_printed"]
     )
     assert printed_sum == pytest.approx(0.30, abs=1e-6)
+
+
+def test_6_bd3_neg_control_zero_nan() -> None:
+    """BD3 repair loss returns finite 0.0 (zero NaNs) on neg_control-only (<bos><eos><pad>) microbatches."""
+    torch.manual_seed(7)
+    cfg = _make_tiny_iter15_cfg(grad_checkpoint=False)
+    model = v2.UniOMRv2Net(cfg).train()
+
+    B, T = 2, 16
+    pad_id = cfg.resolved_pad_id()
+    bos_id = cfg.resolved_bos_id()
+    eos_id = cfg.resolved_eos_id()
+
+    # Construct a pure neg_control batch containing ONLY <bos>, <eos>, <pad>
+    tgt_y = torch.full((B, T), pad_id, dtype=torch.long)
+    tgt_y[:, 0] = bos_id
+    tgt_y[:, 1] = eos_id
+    mem_final = torch.randn(B, 24, cfg.d_model, requires_grad=True)
+
+    loss = v2.compute_bd3_repair_loss(model, mem_final, tgt_y, n_views=2)
+    assert torch.isfinite(loss), f"BD3 loss was non-finite on neg_control batch: {loss}"
+    assert loss.item() == pytest.approx(0.0, abs=1e-7)
+    loss.backward()
+    assert mem_final.grad is not None and torch.isfinite(mem_final.grad).all()
+
+    # Verify sample_bd3_complementary_views uses lo_vocab=0 (does not skip token IDs 0..3)
+    tiny_tgt = torch.full((4, 256), 3, dtype=torch.long)
+    views = v2.sample_bd3_complementary_views(
+        tiny_tgt, vocab_size=8, pad_id=4, bos_id=5, eos_id=6, n_views=2, music_vocab_end=4
+    )
+    corrupted_vals = torch.cat([c[sup & (~m)] for c, m, sup in views])
+    assert (corrupted_vals < 4).all(), "Corrupted tokens must stay below music_vocab_end"
+    assert (corrupted_vals == 0).any(), "lo_vocab must be 0 so pitch tokens 0..3 are sampled"
+
+
+def test_7_text_aux_lut_collision_free_and_cached() -> None:
+    """build_text_aux_targets uses a cached, deterministic, collision-free sequential LUT."""
+    vocab_size = v2.VOCAB_SIZE
+    text_vocab_size = 129
+    other_id = text_vocab_size - 1
+
+    matching_tids = sorted(
+        tid
+        for tid, tok in v2.UNI_ID_TO_TOKEN.items()
+        if 0 <= tid < vocab_size and any(tok.startswith(p) for p in v2._TEXT_AUX_PREFIXES)
+    )
+    assert len(matching_tids) > 0
+
+    tids_t = torch.tensor(matching_tids, dtype=torch.long).unsqueeze(0)
+    text_tgt, is_text = v2.build_text_aux_targets(
+        tids_t, vocab_size=vocab_size, pad_id=v2.PAD_ID, text_vocab_size=text_vocab_size
+    )
+    assert is_text.all()
+    mapped = text_tgt.squeeze(0).tolist()
+    expected = [min(other_id - 1, i) for i in range(len(matching_tids))]
+    assert mapped == expected
+    if len(matching_tids) <= other_id:
+        assert len(set(mapped)) == len(matching_tids), "Collision detected in text_aux LUT"
+
+    # Non-matching token -> other_id; pad_id -> -100
+    non_match = next(tid for tid in range(vocab_size) if tid not in set(matching_tids) and tid != v2.PAD_ID)
+    probe = torch.tensor([[non_match, v2.PAD_ID]], dtype=torch.long)
+    probe_tgt, probe_is_text = v2.build_text_aux_targets(
+        probe, vocab_size=vocab_size, pad_id=v2.PAD_ID, text_vocab_size=text_vocab_size
+    )
+    assert probe_tgt[0, 0].item() == other_id
+    assert probe_tgt[0, 1].item() == -100
+    assert not probe_is_text.any()
+
+    # Edge case: text_vocab_size=1 -> other_id=0, is_text all False
+    edge_tgt, edge_is_text = v2.build_text_aux_targets(
+        tids_t, vocab_size=vocab_size, pad_id=v2.PAD_ID, text_vocab_size=1
+    )
+    assert (edge_tgt == 0).all()
+    assert not edge_is_text.any()
+
+    # Verify cache identity
+    lut1 = v2._get_text_aux_lut(vocab_size, text_vocab_size, torch.device("cpu"))
+    lut2 = v2._get_text_aux_lut(vocab_size, text_vocab_size, torch.device("cpu"))
+    assert lut1 is lut2
+
+
+def test_8_bd3_pad_masking_and_all_pad_block() -> None:
+    """BD3ReMDMRepairHead masks out padded keys so pad tokens never leak into valid positions or NaN."""
+    torch.manual_seed(11)
+    head = v2.BD3ReMDMRepairHead(
+        d_model=64, d_rep=32, n_heads=4, d_ff=64, n_layers=2, block_size=8, dropout=0.0
+    ).eval()
+    lm_head = torch.nn.Linear(64, 32, bias=False).eval()
+
+    B, T = 2, 16  # 2 blocks of 8; block 1 of sample 0 will be all-pad
+    tok_emb_a = torch.randn(B, T, 64)
+    tok_emb_b = tok_emb_a.clone()
+    # Perturb padded positions heavily (positions 5..15 in sample 0, 6..15 in sample 1)
+    key_valid = torch.zeros(B, T, dtype=torch.bool)
+    key_valid[0, :5] = True   # block 0: 5 valid, 3 pad; block 1: ALL pad (all-False block)
+    key_valid[1, :6] = True   # block 0: 6 valid, 2 pad; block 1: ALL pad
+    tok_emb_b[~key_valid] = torch.randn_like(tok_emb_b[~key_valid]) * 50.0
+
+    mask_flags = torch.zeros(B, T, dtype=torch.bool)
+    mask_flags[:, 1] = True
+    mem_final = torch.randn(B, 10, 64)
+
+    with torch.no_grad():
+        logits_a = head(tok_emb_a, mask_flags, mem_final, lm_head, key_valid_mask=key_valid)
+        logits_b = head(tok_emb_b, mask_flags, mem_final, lm_head, key_valid_mask=key_valid)
+
+    assert torch.isfinite(logits_a).all(), "NaN/Inf in BD3 logits with all-pad block"
+    assert torch.isfinite(logits_b).all(), "NaN/Inf in BD3 logits with perturbed pads"
+    valid_diff = (logits_a[key_valid] - logits_b[key_valid]).abs().max().item()
+    assert valid_diff < 1e-5, f"Pad tokens leaked into valid BD3 positions: max_diff={valid_diff:.6e}"
+
+
+def test_9_qat_excludes_mode_gate_and_param_summary_with_mtp() -> None:
+    """QATInt4ControllerV2 skips out_features==1 scalar gates (mode_gate) and param_summary reports with_mtp MB."""
+    cfg = _make_tiny_iter15_cfg(grad_checkpoint=False)
+    model = v2.UniOMRv2Net(cfg)
+
+    qat = model.attach_qat_int4(block_size=32, enabled=True)
+    assert not any("mode_gate" in n for n in qat.target_names), (
+        f"mode_gate must be excluded from QAT-INT4: {[n for n in qat.target_names if 'mode_gate' in n]}"
+    )
+    for layer in model.dec_layers:
+        if layer.cross_attn.use_mode_gate:
+            assert not getattr(layer.cross_attn.mode_gate, "_qat_enabled", False)
+    qat.disable()
+
+    ps = model.param_summary(int4_block_size=32)
+    assert "hybrid_fp16_int4_with_mtp_mb" in ps
+    assert ps["hybrid_fp16_int4_with_mtp_mb"] > ps["hybrid_fp16_int4_with_scales_mb"]
+
+
+def test_10_tok_dropout_preserves_sys_and_guards() -> None:
+    """tok_dropout preserves <sys>, config rejects ResFormer without YOCO, lambda clamps safely, adaptive_ink handles dark borders."""
+    torch.manual_seed(19)
+    cfg = _make_tiny_iter15_cfg(grad_checkpoint=False)
+    cfg.tok_dropout = 1.0
+    model = v2.UniOMRv2Net(cfg).train()
+
+    pad_id = cfg.resolved_pad_id()
+    bos_id = cfg.resolved_bos_id()
+    eos_id = cfg.resolved_eos_id()
+    sys_id = cfg.resolved_sys_id()
+
+    # Intercept tok_emb input to verify exact token IDs seen after tok_dropout
+    seen_ids: list[torch.Tensor] = []
+    orig_emb = model.tok_emb.forward
+
+    def _capture_emb(x: torch.Tensor) -> torch.Tensor:
+        seen_ids.append(x.detach().clone())
+        return orig_emb(x)
+
+    model.tok_emb.forward = _capture_emb  # type: ignore[method-assign]
+    tgt_in = torch.tensor([[bos_id, 5, 10, sys_id, 12, sys_id, eos_id, pad_id]], dtype=torch.long)
+    mem = torch.randn(1, 16, cfg.d_model)
+    coord_feat = torch.randn(1, 16, cfg.coord_mlp_hidden)
+    model.decode_tokens(tgt_in, mem, return_mtp=False, return_aux=False, coord_feat=coord_feat)
+
+    assert len(seen_ids) == 1
+    out_ids = seen_ids[0]
+    assert out_ids[0, 0].item() == bos_id
+    assert out_ids[0, 3].item() == sys_id, "<sys> token was corrupted by tok_dropout!"
+    assert out_ids[0, 5].item() == sys_id, "<sys> token was corrupted by tok_dropout!"
+    assert out_ids[0, 6].item() == eos_id
+    assert out_ids[0, 7].item() == pad_id
+
+    # Config guard: use_resformer_v_res=True with use_yoco_cla=False raises ValueError
+    with pytest.raises(ValueError, match="use_yoco_cla"):
+        v2.UniOMRv2Config(use_yoco_cla=False, use_resformer_v_res=True)
+
+    # resolved_music_vocab_end guard when pad_id <= v // 2
+    cfg_low_pad = v2.UniOMRv2Config(vocab_size=100, pad_id=0, bos_id=1, eos_id=2, sys_id=3)
+    assert cfg_low_pad.resolved_music_vocab_end() == 100
+
+    # _compute_lambda clamp prevents FP32 exp overflow NaN
+    ca0 = model.dec_layers[0].cross_attn
+    with torch.no_grad():
+        ca0.lambda_q1.fill_(100.0)
+        ca0.lambda_k1.fill_(100.0)
+        ca0.lambda_q2.fill_(-100.0)
+        ca0.lambda_k2.fill_(100.0)
+    lam = ca0._compute_lambda(torch.float32)
+    assert torch.isfinite(lam), f"_compute_lambda overflowed: {lam}"
+
+    # adaptive_ink_target on all-dark image (no effective_paper cells) falls back cleanly to 0.0 without NaN
+    dark_img = torch.zeros(1, 3, 64, 64)
+    feat_2d = torch.randn(1, cfg.d_model, 4, 4)
+    _, _, rinfo = model.encoder.router(feat_2d, images=dark_img)
+    assert torch.isfinite(rinfo["ink_target"]).all()
+

@@ -951,7 +951,13 @@ class TestTrainUniV2(unittest.TestCase):
         for p in wds[0.0]:
             name, _ = all_trainable[id(p)]
             self.assertTrue(
-                p.ndim < 2 or "emb" in name.lower() or name.lower().endswith(".bias"),
+                p.ndim < 2
+                or p.squeeze().ndim < 2
+                or "emb" in name.lower()
+                or "register_tokens" in name.lower()
+                or "bg_queries" in name.lower()
+                or "mask_emb" in name.lower()
+                or name.lower().endswith(".bias"),
                 f"Unexpected param in no_decay group: {name} (ndim={p.ndim})",
             )
         for p in wds[0.01]:

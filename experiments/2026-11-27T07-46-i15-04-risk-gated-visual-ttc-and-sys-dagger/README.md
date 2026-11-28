@@ -2,7 +2,7 @@
 
 **Wave 13 · Exp `i15-04` — Risk-Gated Visual-Coverage TTC (Pivot 3) + `<sys>`-Aligned On-Policy DAgger & Counterfactual Anti-Prior (Pivot 2)**
 
-- **Status:** `QUEUED`
+- **Status:** `COMPLETED` — Verdict: **`DISCARD`** (see [OUTCOME.md](OUTCOME.md))
 - **Platform:** Google Colab `L4` (`provider: "colab_l4"`, BF16 native, 24 GB VRAM)
 - **Estimated Wall-Clock / Budget:** `~60 min` / `~4.5 CU`
 - **Baseline Commit SHA:** `e426c28`

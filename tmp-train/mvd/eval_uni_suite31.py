@@ -117,7 +117,7 @@ def trim_truncated_tokens(toks: Sequence[str]) -> List[str]:
     last_complete = 0
     for i, tok in enumerate(toks):
         if tok == uni_omr.SYS_TOKEN:
-            st = grammar.PrefixState(strict=False)
+            st.reset_system()
             continue
         try:
             st.step(tok)
@@ -167,7 +167,11 @@ def _allowed_ids_for_state(state: grammar.PrefixState, vocab_size: int) -> List[
             allow_ids.discard(cyc_id)
 
     after_bar = bool(state.recent) and (state.recent[-1] in grammar.BAR_LIKES)
-    can_end_sys = bool(eos_ok or after_bar) and (not state.has_open_tuplet())
+    can_end_sys = (
+        bool(eos_ok or after_bar)
+        and (not state.has_open_tuplet())
+        and (not state.in_text_span)
+    )
     if can_end_sys:
         allow_ids.add(eos_id)
         if state.can_emit_sys():
@@ -224,20 +228,78 @@ def _advance_grammar_state(
     return state
 
 
+def _past_kv_len(past_kvs: Any) -> int:
+    """Return cached self-attention sequence length for YOCO-CLA dict or legacy list caches."""
+    if past_kvs is None:
+        return 0
+    if isinstance(past_kvs, dict):
+        for sb in past_kvs.get("self_banks") or ():
+            if sb is not None:
+                return int(sb[0].shape[2])
+        return 0
+    if len(past_kvs) > 0 and past_kvs[0] is not None and past_kvs[0][0] is not None:
+        return int(past_kvs[0][0][0].shape[2])
+    return 0
+
+
+def _extract_cross_kvs(
+    past_kvs: Any,
+    expand_beam: int = 1,
+) -> List[Tuple[torch.Tensor, torch.Tensor]]:
+    """Extract (and optionally beam-expand) cross-attention K/V tensors for YOCO-CLA dict or legacy list caches."""
+    if isinstance(past_kvs, dict):
+        raw_cross = past_kvs["cross_banks"]
+    else:
+        raw_cross = [cross_kv for _, cross_kv in past_kvs]
+    out: List[Tuple[torch.Tensor, torch.Tensor]] = []
+    beam_n = int(expand_beam)
+    for ck, cv in raw_cross:
+        if beam_n > 1:
+            out.append((
+                ck.expand(beam_n, -1, -1, -1).contiguous(),
+                cv.expand(beam_n, -1, -1, -1).contiguous(),
+            ))
+        else:
+            out.append((ck, cv))
+    return out
+
+
 def _truncate_past_kvs(
-    past_kvs: List[Any],
+    past_kvs: Any,
     keep_len: int,
-) -> List[Any]:
-    """Slice decoder self-attention KV cache to ``keep_len`` (cross-attn untouched)."""
+) -> Any:
+    """Slice decoder self-attention KV cache to ``keep_len`` (cross-attn untouched).
+
+    Supports both Iter-15 YOCO-CLA dict caches (``{"self_banks": ..., "cross_banks": ...}``)
+    and legacy per-layer ``List[Tuple[self_kv, cross_kv]]`` caches.
+    """
+    if isinstance(past_kvs, dict):
+        trimmed_self: List[Any] = []
+        for sb in past_kvs["self_banks"]:
+            if sb is None:
+                trimmed_self.append(None)
+            else:
+                k, v = sb
+                trimmed_self.append((
+                    k[:, :, :keep_len, :].contiguous(),
+                    v[:, :, :keep_len, :].contiguous(),
+                ))
+        return {
+            "self_banks": trimmed_self,
+            "cross_banks": list(past_kvs["cross_banks"]),
+        }
     trimmed: List[Any] = []
     for self_kv, cross_kv in past_kvs:
-        k, v = self_kv
-        trimmed.append(
-            (
-                (k[:, :, :keep_len, :].contiguous(), v[:, :, :keep_len, :].contiguous()),
-                cross_kv,
+        if self_kv is None:
+            trimmed.append((None, cross_kv))
+        else:
+            k, v = self_kv
+            trimmed.append(
+                (
+                    (k[:, :, :keep_len, :].contiguous(), v[:, :, :keep_len, :].contiguous()),
+                    cross_kv,
+                )
             )
-        )
     return trimmed
 
 
@@ -621,25 +683,32 @@ def generate_constrained(
         keep_ratio_override=keep_ratio_override,
         return_aux=False,
     )
+    coord_feat = router_info.get("coord_feat")
     B = int(images.shape[0])
     device = images.device
     vocab_size = int(model.cfg.vocab_size)
     pad_id, bos_id, eos_id, _, tok_to_id, _ = _vocab_spec(vocab_size)
 
     cur_ids = torch.full((B, 1), bos_id, dtype=torch.long, device=device)
-    past_kvs: Optional[List[Any]] = None
+    past_kvs: Optional[Any] = (
+        model.precompute_cross_kv(mem, coord_feat=coord_feat)
+        if hasattr(model, "precompute_cross_kv")
+        else None
+    )
     finished = [False] * B
     states = [grammar.PrefixState(strict=strict, vocab_map=tok_to_id) for _ in range(B)]
     out_tokens: List[torch.Tensor] = [cur_ids]
 
     for _ in range(max_len):
-        logits, _, past_kvs = model.decode_tokens(
-            cur_ids,
+        dec_kwargs: Dict[str, Any] = dict(
             memory=mem if past_kvs is None else None,
             return_mtp=False,
             past_kvs=past_kvs,
             use_cache=True,
         )
+        if past_kvs is None and coord_feat is not None:
+            dec_kwargs["coord_feat"] = coord_feat
+        logits, _, past_kvs = model.decode_tokens(cur_ids, **dec_kwargs)
         step_logits = logits[:, -1, :]  # (B, V)
         next_ids: List[int] = []
         for b in range(B):
@@ -748,6 +817,12 @@ def generate_conf_gated_ilms(
         keep_ratio_override=keep_ratio_override,
         return_aux=False,
     )
+    coord_feat = router_info.get("coord_feat")
+    mem_blank_val: Optional[Any] = mem_blank
+    blank_coord_feat: Optional[torch.Tensor] = None
+    if isinstance(mem_blank, tuple) and len(mem_blank) == 2:
+        mem_blank_val, blank_coord_feat = mem_blank
+
     device = images.device
     vocab_size = int(model.cfg.vocab_size)
     _, bos_id, eos_id, _, tok_to_id, _ = _vocab_spec(vocab_size)
@@ -758,11 +833,15 @@ def generate_conf_gated_ilms(
     )
 
     out_ids: List[int] = [bos_id]
-    past_orig: Optional[List[Any]] = None
-    past_ref: Optional[List[Any]] = None
+    past_orig: Optional[Any] = (
+        model.precompute_cross_kv(mem_orig, coord_feat=coord_feat)
+        if hasattr(model, "precompute_cross_kv")
+        else None
+    )
+    past_ref: Optional[Any] = None
     ref_synced_len = 0
 
-    use_ilms = (float(alpha) > 0.0) and (mem_blank is not None)
+    use_ilms = (float(alpha) > 0.0) and (mem_blank_val is not None)
     log_conf_thr = math.log(max(1e-6, min(1.0, float(conf_thr))))
 
     n_uncertain = 0
@@ -773,13 +852,15 @@ def generate_conf_gated_ilms(
 
     for _ in range(int(max_len)):
         cur_t = torch.tensor([[cur_id]], dtype=torch.long, device=device)
-        logits_o, _, past_orig = model.decode_tokens(
-            cur_t,
+        orig_kwargs: Dict[str, Any] = dict(
             memory=mem_orig if past_orig is None else None,
             return_mtp=False,
             past_kvs=past_orig,
             use_cache=True,
         )
+        if past_orig is None and coord_feat is not None:
+            orig_kwargs["coord_feat"] = coord_feat
+        logits_o, _, past_orig = model.decode_tokens(cur_t, **orig_kwargs)
         lo = logits_o[0, -1, :].float()
 
         fsa_mask: Optional[torch.Tensor] = None
@@ -804,13 +885,19 @@ def generate_conf_gated_ilms(
                 n_uncertain += 1
                 chunk_ids = out_ids[ref_synced_len:]
                 chunk_t = torch.tensor([chunk_ids], dtype=torch.long, device=device)
-                logits_r, _, past_ref = model.decode_tokens(
-                    chunk_t,
-                    memory=mem_blank if past_ref is None else None,
+                if past_ref is None and hasattr(model, "precompute_cross_kv"):
+                    past_ref = model.precompute_cross_kv(
+                        mem_blank_val, coord_feat=blank_coord_feat
+                    )
+                ref_kwargs: Dict[str, Any] = dict(
+                    memory=mem_blank_val if past_ref is None else None,
                     return_mtp=False,
                     past_kvs=past_ref,
                     use_cache=True,
                 )
+                if past_ref is None and blank_coord_feat is not None:
+                    ref_kwargs["coord_feat"] = blank_coord_feat
+                logits_r, _, past_ref = model.decode_tokens(chunk_t, **ref_kwargs)
                 ref_synced_len = len(out_ids)
                 n_ref_calls += 1
 
@@ -955,6 +1042,7 @@ def generate_mtp_spec(
         keep_ratio_override=keep_ratio_override,
         return_aux=False,
     )
+    coord_feat = router_info.get("coord_feat")
     n_mtp = len(model.mtp_heads)
 
     bos = torch.full((B, 1), bos_id, dtype=torch.long, device=device)
@@ -1074,21 +1162,25 @@ def generate_mtp_spec(
         return drafts_out
 
     # Step 0 (prefill BOS): get first verified token + initial M drafts.
-    logits0, mtp0, past_kvs = model.decode_tokens(
-        bos,
-        memory=mem,
+    init_kvs: Optional[Any] = (
+        model.precompute_cross_kv(mem, coord_feat=coord_feat)
+        if hasattr(model, "precompute_cross_kv")
+        else None
+    )
+    step0_kwargs: Dict[str, Any] = dict(
+        memory=mem if init_kvs is None else None,
         return_mtp=(n_mtp > 0),
-        past_kvs=None,
+        past_kvs=init_kvs,
         use_cache=True,
     )
-    base_cross_kvs: List[Tuple[torch.Tensor, torch.Tensor]] = []
-    if use_measure_beam:
-        for _, cross_kv in past_kvs:
-            ck, cv = cross_kv
-            base_cross_kvs.append((
-                ck.expand(measure_beam_size, -1, -1, -1).contiguous(),
-                cv.expand(measure_beam_size, -1, -1, -1).contiguous(),
-            ))
+    if init_kvs is None and coord_feat is not None:
+        step0_kwargs["coord_feat"] = coord_feat
+    logits0, mtp0, past_kvs = model.decode_tokens(bos, **step0_kwargs)
+    base_cross_kvs: List[Tuple[torch.Tensor, torch.Tensor]] = (
+        _extract_cross_kvs(past_kvs, expand_beam=measure_beam_size)
+        if use_measure_beam
+        else []
+    )
 
     cur_tok = _pick_step(logits0[:, -1, :])
     _commit_token(cur_tok)
@@ -1170,7 +1262,7 @@ def generate_mtp_spec(
     while gen_len < max_len and not all(finished):
         rem = max_len - gen_len
         m = min(len(drafts), rem - 1) if n_mtp > 0 else 0
-        past_len = int(past_kvs[0][0][0].shape[2])
+        past_len = _past_kv_len(past_kvs)
 
         if m > 0:
             verify_ids = torch.stack([cur_tok] + drafts[:m], dim=1)  # (B, 1 + m)
@@ -1267,25 +1359,48 @@ def generate_mtp_spec(
 # ---------------------------------------------------------------------------
 
 def _reorder_beam_kvs(
-    past_kvs: List[Any],
+    past_kvs: Any,
     parent_idx: torch.Tensor,
     base_cross_kvs: List[Tuple[torch.Tensor, torch.Tensor]],
-) -> List[Any]:
+) -> Any:
     """Gather decoder self-attention KV cache for surviving beam parents.
 
     Reuses pre-expanded contiguous cross-attention K/V slices (zero re-projection).
+    Supports both Iter-15 YOCO-CLA dict caches and legacy per-layer list caches.
     """
     n_active = int(parent_idx.shape[0])
-    reordered: List[Any] = []
-    for layer_idx, (self_kv, _) in enumerate(past_kvs):
-        k_self, v_self = self_kv
-        k_cross_base, v_cross_base = base_cross_kvs[layer_idx]
-        reordered.append(
-            (
-                (
+    if isinstance(past_kvs, dict):
+        reordered_self: List[Any] = []
+        for sb in past_kvs["self_banks"]:
+            if sb is None:
+                reordered_self.append(None)
+            else:
+                k_self, v_self = sb
+                reordered_self.append((
                     k_self.index_select(0, parent_idx),
                     v_self.index_select(0, parent_idx),
-                ),
+                ))
+        reordered_cross = [
+            (ck[:n_active], cv[:n_active]) for ck, cv in base_cross_kvs
+        ]
+        return {
+            "self_banks": reordered_self,
+            "cross_banks": reordered_cross,
+        }
+    reordered: List[Any] = []
+    for layer_idx, (self_kv, _) in enumerate(past_kvs):
+        k_cross_base, v_cross_base = base_cross_kvs[layer_idx]
+        if self_kv is None:
+            reordered_self_kv = None
+        else:
+            k_self, v_self = self_kv
+            reordered_self_kv = (
+                k_self.index_select(0, parent_idx),
+                v_self.index_select(0, parent_idx),
+            )
+        reordered.append(
+            (
+                reordered_self_kv,
                 (
                     k_cross_base[:n_active],
                     v_cross_base[:n_active],
@@ -1330,6 +1445,7 @@ def generate_beam(
         keep_ratio_override=keep_ratio_override,
         return_aux=False,
     )
+    coord_feat = router_info.get("coord_feat")
     B = int(images.shape[0])
     device = images.device
     vocab_size = int(model.cfg.vocab_size)
@@ -1347,28 +1463,28 @@ def generate_beam(
             mem_b: Any = tuple(m[b : b + 1] for m in mem)
         else:
             mem_b = mem[b : b + 1]  # (1, L_mem, D)
+        coord_feat_b = coord_feat[b : b + 1] if coord_feat is not None else None
         bos_b = torch.full((1, 1), bos_id, dtype=torch.long, device=device)
 
         # Prefill BOS once to populate cross-attn K/V cache.
-        logits0, _, past_kvs0 = model.decode_tokens(
-            bos_b,
-            memory=mem_b,
+        init_kvs0: Optional[Any] = (
+            model.precompute_cross_kv(mem_b, coord_feat=coord_feat_b)
+            if hasattr(model, "precompute_cross_kv")
+            else None
+        )
+        prefill_kwargs: Dict[str, Any] = dict(
+            memory=mem_b if init_kvs0 is None else None,
             return_mtp=False,
-            past_kvs=None,
+            past_kvs=init_kvs0,
             use_cache=True,
         )
+        if init_kvs0 is None and coord_feat_b is not None:
+            prefill_kwargs["coord_feat"] = coord_feat_b
+        logits0, _, past_kvs0 = model.decode_tokens(bos_b, **prefill_kwargs)
 
         # Pre-expand cross-attn K/V once to (beam_size, H, L_mem, D_h) contiguous
         # so slicing [:n_active] is zero-copy and safe on all SDPA backends.
-        base_cross_kvs: List[Tuple[torch.Tensor, torch.Tensor]] = []
-        for _, cross_kv in past_kvs0:
-            ck, cv = cross_kv
-            if beam_size > 1:
-                ck_exp = ck.expand(beam_size, -1, -1, -1).contiguous()
-                cv_exp = cv.expand(beam_size, -1, -1, -1).contiguous()
-            else:
-                ck_exp, cv_exp = ck, cv
-            base_cross_kvs.append((ck_exp, cv_exp))
+        base_cross_kvs = _extract_cross_kvs(past_kvs0, expand_beam=beam_size)
 
         # Active beam tuples: (tokens, raw_score, grammar_state)
         init_state = (
@@ -1741,7 +1857,7 @@ def load_uni_checkpoint(
         # Legacy v2 checkpoints trained before adaptive_ink_target existed used fixed 0.04 threshold.
         if "adaptive_ink_target" not in filtered_cfg:
             filtered_cfg["adaptive_ink_target"] = False
-        for tup_k in ("backbone_channels", "backbone_blocks"):
+        for tup_k in ("backbone_channels", "backbone_blocks", "yoco_cross_banks"):
             if tup_k in filtered_cfg and isinstance(filtered_cfg[tup_k], list):
                 filtered_cfg[tup_k] = tuple(int(x) for x in filtered_cfg[tup_k])
         cfg: Any = uni_omr_v2.UniOMRv2Config(**filtered_cfg)
@@ -1755,6 +1871,26 @@ def load_uni_checkpoint(
         arch_name = "uni_omr_v1"
 
     inc = model.load_state_dict(sd, strict=False)
+    aux_key_prefixes = (
+        "uv_head.",
+        "sys_y_head.",
+        "sys_count_head.",
+        "staff_seg_head.",
+        "stroke_hog_head.",
+        "lm_head_text.",
+        "bd3_repair_head.",
+    )
+    non_aux_missing = [
+        k for k in inc.missing_keys
+        if not any(k.startswith(pfx) for pfx in aux_key_prefixes)
+    ]
+    if non_aux_missing:
+        print(
+            f"[load_uni_checkpoint] WARNING: {len(non_aux_missing)} non-aux missing keys "
+            f"when loading {ckpt_path} ({arch_name}): {non_aux_missing[:10]}",
+            file=sys.stderr,
+            flush=True,
+        )
     model.to(device).eval()
     meta = {
         "arch": arch_name,
@@ -1895,7 +2031,7 @@ def compute_fsa_beat_metrics(
 
     for tok in hyp_page_toks:
         if tok == uni_omr.SYS_TOKEN:
-            st = grammar.PrefixState(strict=False)
+            st.reset_system()
             continue
         if tok in grammar.BAR_LIKES:
             m_err, v_err = _measure_violation_errors(st)
@@ -2226,6 +2362,8 @@ def _decode_single_view(
 
 
 def evaluate_suite31(args: argparse.Namespace) -> Dict[str, Any]:
+    if bool(getattr(args, "no_cudnn", False)):
+        torch.backends.cudnn.enabled = False
     device = torch.device(args.device)
     model, cfg, ckpt_meta = load_uni_checkpoint(args.ckpt, device=device)
     _, pieces = resolve_manifest_pieces(args.manifest)
@@ -2340,7 +2478,8 @@ def evaluate_suite31(args: argparse.Namespace) -> Dict[str, Any]:
                 else _nullcontext()
             )
             with b_ctx:
-                mem_blank_cached, _, _ = model.encode_image(blank_t, return_aux=False)
+                mem_blank_val, _, blank_rinfo = model.encode_image(blank_t, return_aux=False)
+                mem_blank_cached = (mem_blank_val, blank_rinfo.get("coord_feat"))
 
     ttt_session: Optional[Any] = None
     ttt_steps: int = 0
@@ -2698,6 +2837,7 @@ def evaluate_suite31(args: argparse.Namespace) -> Dict[str, Any]:
             "tta_rerank": tta_rerank if tta_scales else None,
             "tta_selector": tta_rerank if tta_scales else None,
             "device": str(device),
+            "no_cudnn": bool(getattr(args, "no_cudnn", False)),
         },
         "summary": summary,
         "pieces": piece_rows,
@@ -2888,6 +3028,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Inference device (cuda or cpu)",
     )
     ap.add_argument("--bf16", action="store_true", help="Use bfloat16 autocast on CUDA")
+    ap.add_argument(
+        "--no-cudnn",
+        action="store_true",
+        help="Disable cuDNN (avoids Windows cuDNN 9.10 multi-scale variable-shape stalls)",
+    )
     ap.add_argument("--out", default=None, help="Optional output JSON report path")
     ap.add_argument("--limit-pieces", type=int, default=None, help="Cap number of pieces (smoke test)")
     ap.add_argument("--pieces", default=None, help="Comma-separated slugs to evaluate")

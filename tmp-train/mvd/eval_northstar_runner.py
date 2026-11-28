@@ -197,14 +197,14 @@ def evaluate_manifest(
                 except Exception:  # noqa: BLE001
                     pred_xml = ""
             else:
-                missing_preds += 1
-                pred_source = "missing"
                 # If a system wrote an explicit `.abstain` marker on a negative control,
                 # treat it as a valid empty MusicXML (0 hallucinated notes).
                 if is_neg and (pred_dir / f"{pid}.abstain").is_file():
                     pred_xml = EMPTY_VALID_MUSICXML
                     pred_source = "abstain-marker"
                 else:
+                    missing_preds += 1
+                    pred_source = "missing"
                     pred_xml = ""
 
         lat = timing_by_page.get(pid)

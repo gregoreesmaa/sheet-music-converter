@@ -58,9 +58,11 @@ from torch.utils.data import DataLoader, Dataset, Subset
 try:
     from torch.nn.attention import SDPBackend as _SDPBackend, sdpa_kernel as _sdpa_kernel
     _SDPA_HAS_SET_PRIORITY: bool = "set_priority" in inspect.signature(_sdpa_kernel).parameters
-    # Prefer EFFICIENT_ATTENTION (CUTLASS) over CUDNN_ATTENTION: cuDNN 9.10 SDPA
-    # compiles a new execution plan on CPU (~640 ms/shape) whenever (mem, T) changes,
-    # causing a 49x slowdown under dynamic routing + multi-scale + variable seq len.
+    # Base safe ordering (CUTLASS -> MATH). On Windows (and pre-Ampere GPUs), prefer
+    # EFFICIENT_ATTENTION (CUTLASS) over CUDNN_ATTENTION: cuDNN 9.10 SDPA compiles a new
+    # execution plan on CPU (~640 ms/shape) whenever (mem, T) changes, causing a 49x slowdown
+    # under dynamic routing + multi-scale + variable seq len. On Linux Ampere+ (cc >= 8),
+    # _get_cuda_sdpa_backends() lazily promotes FLASH_ATTENTION without initializing CUDA at import.
     _CUDA_SDPA_BACKENDS = [
         _SDPBackend.EFFICIENT_ATTENTION,
         _SDPBackend.MATH,
@@ -70,6 +72,33 @@ except Exception:
     _sdpa_kernel = None  # type: ignore[assignment]
     _SDPA_HAS_SET_PRIORITY = False
     _CUDA_SDPA_BACKENDS = []
+
+_CUDA_SDPA_BACKENDS_CACHE: Dict[int, List[Any]] = {}
+
+
+def _get_cuda_sdpa_backends(device: torch.device) -> List[Any]:
+    idx = int(device.index) if device.index is not None else 0
+    cached = _CUDA_SDPA_BACKENDS_CACHE.get(idx)
+    if cached is not None:
+        return cached
+    backends = list(_CUDA_SDPA_BACKENDS)
+    if (
+        sys.platform != "win32"
+        and _SDPBackend is not None
+        and hasattr(_SDPBackend, "FLASH_ATTENTION")
+    ):
+        try:
+            cc_maj, _ = torch.cuda.get_device_capability(device)
+            if cc_maj >= 8:
+                backends = [
+                    _SDPBackend.FLASH_ATTENTION,
+                    _SDPBackend.EFFICIENT_ATTENTION,
+                    _SDPBackend.MATH,
+                ]
+        except Exception:
+            pass
+    _CUDA_SDPA_BACKENDS_CACHE[idx] = backends
+    return backends
 
 # Ensure sibling imports (e.g. ``data.py``) resolve regardless of CWD.
 _THIS_DIR = Path(__file__).resolve().parent
@@ -817,8 +846,9 @@ class MultiHeadAttention(nn.Module):
         # Pass dropout_p=0.0 to SDPA (keeping FFN/residual dropout at cfg.dropout) so
         # cuDNN 9.10 Flash/CUDNN_ATTENTION is never disqualified by attention dropout.
         if q.device.type == "cuda" and _sdpa_kernel is not None:
+            cuda_backends = _get_cuda_sdpa_backends(q.device)
             if _SDPA_HAS_SET_PRIORITY:
-                with _sdpa_kernel(_CUDA_SDPA_BACKENDS, set_priority=True):
+                with _sdpa_kernel(cuda_backends, set_priority=True):
                     out = F.scaled_dot_product_attention(
                         q, k, v,
                         attn_mask=eff_mask,
@@ -826,7 +856,7 @@ class MultiHeadAttention(nn.Module):
                         is_causal=use_causal_flag,
                     )
             elif eff_mask is None:
-                with _sdpa_kernel(_CUDA_SDPA_BACKENDS):
+                with _sdpa_kernel(cuda_backends):
                     out = F.scaled_dot_product_attention(
                         q, k, v,
                         attn_mask=None,
@@ -3089,8 +3119,9 @@ class RismStylePool:
         self.max_cached = max(0, int(max_cached))
         self.ref_size = max(16, int(ref_size))
         self.seed = int(seed)
-        self._lock = threading.Lock()
         self._refs: Tuple[np.ndarray, ...] = ()
+        self._stats: Tuple[Tuple[np.ndarray, np.ndarray], ...] = ()
+        self._rfft_amps: Tuple[Tuple[torch.Tensor, torch.Tensor, int, int, int], ...] = ()
 
         if self.max_cached <= 0 or not self.style_dir.is_dir():
             return
@@ -3108,17 +3139,41 @@ class RismStylePool:
             paths = sel_rng.sample(paths, self.max_cached)
 
         loaded: List[np.ndarray] = []
+        stats_list: List[Tuple[np.ndarray, np.ndarray]] = []
+        rfft_list: List[Tuple[torch.Tensor, torch.Tensor, int, int, int]] = []
         sz = self.ref_size
+        max_b = max(1, min(64, sz // 2 - 1))
         for p in paths:
             try:
                 with Image.open(p) as raw:
                     arr = _load_and_resize_rgb_array(p, sz, sz, raw)
                 arr = np.ascontiguousarray(arr, dtype=np.uint8)
                 arr.setflags(write=False)
+                # Pre-cache per-channel (mean, std) for apply_color_adain
+                if _cv2 is not None:
+                    t_m, t_s = _cv2.meanStdDev(arr)
+                    t_mean = t_m.reshape(3).astype(np.float32)
+                    t_std = np.maximum(t_s.reshape(3).astype(np.float32), np.float32(1e-2))
+                else:
+                    sty_f = arr.astype(np.float32)
+                    t_mean = sty_f.mean(axis=(0, 1))
+                    t_std = np.maximum(sty_f.std(axis=(0, 1)), np.float32(1e-2))
+                t_mean.setflags(write=False)
+                t_std.setflags(write=False)
+                # Pre-cache low-frequency rfft2 amplitudes for apply_fda_transfer
+                sh, sw, _ = arr.shape
+                sty_t = torch.from_numpy(np.array(arr, dtype=np.float32, copy=True)).permute(2, 0, 1)
+                fft_sty = torch.fft.rfft2(sty_t, dim=(-2, -1))
+                pos_amp = torch.abs(fft_sty[:, : max_b + 1, : max_b + 1]).contiguous()
+                neg_amp = torch.abs(fft_sty[:, sh - max_b :, : max_b + 1]).contiguous()
                 loaded.append(arr)
+                stats_list.append((t_mean, t_std))
+                rfft_list.append((pos_amp, neg_amp, max_b, sh, sw))
             except Exception:
                 continue
         self._refs = tuple(loaded)
+        self._stats = tuple(stats_list)
+        self._rfft_amps = tuple(rfft_list)
 
     def __len__(self) -> int:
         return len(self._refs)
@@ -3135,11 +3190,30 @@ class RismStylePool:
         r = rng if rng is not None else random
         return refs[r.randrange(n)]
 
+    def sample_with_cache(
+        self, rng: Optional[random.Random] = None
+    ) -> Optional[
+        Tuple[
+            np.ndarray,
+            Tuple[np.ndarray, np.ndarray],
+            Tuple[torch.Tensor, torch.Tensor, int, int, int],
+        ]
+    ]:
+        """Return ``(ref_rgb, (mean, std), (pos_amp, neg_amp, max_b, sh, sw))``."""
+        refs = self._refs
+        n = len(refs)
+        if n == 0:
+            return None
+        r = rng if rng is not None else random
+        idx = r.randrange(n)
+        return refs[idx], self._stats[idx], self._rfft_amps[idx]
+
 
 def apply_fda_transfer(
     img_rgb: Union[np.ndarray, Image.Image],
     style_rgb: Union[np.ndarray, Image.Image],
     beta: float = 0.02,
+    style_amp_cache: Optional[Tuple[torch.Tensor, torch.Tensor, int, int, int]] = None,
 ) -> Union[np.ndarray, Image.Image]:
     """Fourier Domain Adaptation (Yang & Soatto, i13-05 winning ``beta=0.02``).
 
@@ -3161,14 +3235,6 @@ def apply_fda_transfer(
     if b_val <= 0.0 or h < 4 or w < 4:
         return Image.fromarray(src_u8.copy(), mode="RGB") if is_pil else src_u8.copy()
 
-    sty_u8 = (
-        np.asarray(style_rgb if style_rgb.mode == "RGB" else style_rgb.convert("RGB"), dtype=np.uint8)
-        if isinstance(style_rgb, Image.Image)
-        else np.asarray(style_rgb, dtype=np.uint8)
-    )
-    if sty_u8.ndim != 3 or sty_u8.shape[2] != 3:
-        raise ValueError(f"apply_fda_transfer expects (H, W, 3) RGB style, got shape {sty_u8.shape}")
-
     b = max(1, int(math.floor(min(h, w) * b_val)))
     b_y = min(b, max(1, h // 2 - 1))
     b_x = min(b, max(1, w // 2))
@@ -3176,34 +3242,53 @@ def apply_fda_transfer(
     # Real 2D-FFT on (3, H, W) float32 via torch.fft.rfft2 (2x faster than complex fft2).
     # Page-relative low-frequency bin k in a (sh, sw) DFT matches bin k in (h, w) up to
     # the area scale factor (h * w) / (sh * sw), avoiding full-res FFT on the style ref.
-    sh, sw, _ = sty_u8.shape
-    if sh > 2 * b_y and (sw // 2 + 1) > b_x:
-        sty_for_fft = sty_u8
-        area_scale = float(h * w) / float(sh * sw)
-    else:
-        if _cv2 is not None:
-            sty_for_fft = _cv2.resize(sty_u8, (w, h), interpolation=_cv2.INTER_LINEAR)
-        else:
-            sty_for_fft = np.asarray(
-                Image.fromarray(sty_u8, mode="RGB").resize((w, h), Image.Resampling.BILINEAR),
-                dtype=np.uint8,
-            )
-        area_scale = 1.0
-
     src_t = torch.from_numpy(np.array(src_u8, dtype=np.float32, copy=True)).permute(2, 0, 1)
-    sty_t = torch.from_numpy(np.array(sty_for_fft, dtype=np.float32, copy=True)).permute(2, 0, 1)
-
     fft_src = torch.fft.rfft2(src_t, dim=(-2, -1))
-    fft_sty = torch.fft.rfft2(sty_t, dim=(-2, -1))
+
+    use_cached_amp = (
+        style_amp_cache is not None
+        and b_y <= style_amp_cache[2]
+        and b_x <= style_amp_cache[2]
+        and style_amp_cache[3] > 2 * b_y
+        and (style_amp_cache[4] // 2 + 1) > b_x
+    )
+    if use_cached_amp:
+        pos_cached, neg_cached, max_b, sh, sw = style_amp_cache  # type: ignore[misc]
+        area_scale = float(h * w) / float(sh * sw)
+        pos_sty_amp = pos_cached[:, : b_y + 1, : b_x + 1] * area_scale
+        neg_sty_amp = neg_cached[:, max_b - b_y :, : b_x + 1] * area_scale
+    else:
+        sty_u8 = (
+            np.asarray(style_rgb if style_rgb.mode == "RGB" else style_rgb.convert("RGB"), dtype=np.uint8)
+            if isinstance(style_rgb, Image.Image)
+            else np.asarray(style_rgb, dtype=np.uint8)
+        )
+        if sty_u8.ndim != 3 or sty_u8.shape[2] != 3:
+            raise ValueError(f"apply_fda_transfer expects (H, W, 3) RGB style, got shape {sty_u8.shape}")
+        sh, sw, _ = sty_u8.shape
+        if sh > 2 * b_y and (sw // 2 + 1) > b_x:
+            sty_for_fft = sty_u8
+            area_scale = float(h * w) / float(sh * sw)
+        else:
+            if _cv2 is not None:
+                sty_for_fft = _cv2.resize(sty_u8, (w, h), interpolation=_cv2.INTER_LINEAR)
+            else:
+                sty_for_fft = np.asarray(
+                    Image.fromarray(sty_u8, mode="RGB").resize((w, h), Image.Resampling.BILINEAR),
+                    dtype=np.uint8,
+                )
+            area_scale = 1.0
+        sty_t = torch.from_numpy(np.array(sty_for_fft, dtype=np.float32, copy=True)).permute(2, 0, 1)
+        fft_sty = torch.fft.rfft2(sty_t, dim=(-2, -1))
+        pos_sty_amp = torch.abs(fft_sty[:, : b_y + 1, : b_x + 1]) * area_scale
+        neg_sty_amp = torch.abs(fft_sty[:, sty_t.shape[1] - b_y :, : b_x + 1]) * area_scale
 
     # Replace amplitude ONLY in the tiny low-frequency bands (0..b_y and -b_y..-1, x in 0..b_x)
     # while leaving high-frequency bins and all phase angles untouched.
     pos_src = fft_src[:, : b_y + 1, : b_x + 1]
-    pos_sty_amp = torch.abs(fft_sty[:, : b_y + 1, : b_x + 1]) * area_scale
     fft_src[:, : b_y + 1, : b_x + 1] = torch.polar(pos_sty_amp, torch.angle(pos_src))
 
     neg_src = fft_src[:, h - b_y :, : b_x + 1]
-    neg_sty_amp = torch.abs(fft_sty[:, sty_t.shape[1] - b_y :, : b_x + 1]) * area_scale
     fft_src[:, h - b_y :, : b_x + 1] = torch.polar(neg_sty_amp, torch.angle(neg_src))
 
     out_t = torch.fft.irfft2(fft_src, s=(h, w), dim=(-2, -1))
@@ -3215,6 +3300,7 @@ def apply_color_adain(
     img_rgb: Union[np.ndarray, Image.Image],
     style_rgb: Union[np.ndarray, Image.Image],
     alpha: float = 0.85,
+    style_stats: Optional[Tuple[np.ndarray, np.ndarray]] = None,
 ) -> Union[np.ndarray, Image.Image]:
     """Fast per-channel RGB mean/std moment transfer (AdaIN, i13-05 ``arm_color_adain``).
 
@@ -3234,28 +3320,33 @@ def apply_color_adain(
     if a <= 0.0:
         return Image.fromarray(src_u8.copy(), mode="RGB") if is_pil else src_u8.copy()
 
-    sty_u8 = (
-        np.asarray(style_rgb if style_rgb.mode == "RGB" else style_rgb.convert("RGB"), dtype=np.uint8)
-        if isinstance(style_rgb, Image.Image)
-        else np.asarray(style_rgb, dtype=np.uint8)
-    )
-    if sty_u8.ndim != 3 or sty_u8.shape[2] != 3:
-        raise ValueError(f"apply_color_adain expects (H, W, 3) RGB style, got shape {sty_u8.shape}")
-
     if _cv2 is not None:
         s_m, s_s = _cv2.meanStdDev(src_u8)
-        t_m, t_s = _cv2.meanStdDev(sty_u8)
         s_mean = s_m.reshape(3).astype(np.float32)
         s_std = np.maximum(s_s.reshape(3).astype(np.float32), np.float32(1e-2))
-        t_mean = t_m.reshape(3).astype(np.float32)
-        t_std = np.maximum(t_s.reshape(3).astype(np.float32), np.float32(1e-2))
     else:
         src_f = src_u8.astype(np.float32)
-        sty_f = sty_u8.astype(np.float32)
         s_mean = src_f.mean(axis=(0, 1))
         s_std = np.maximum(src_f.std(axis=(0, 1)), np.float32(1e-2))
-        t_mean = sty_f.mean(axis=(0, 1))
-        t_std = np.maximum(sty_f.std(axis=(0, 1)), np.float32(1e-2))
+
+    if style_stats is not None:
+        t_mean, t_std = style_stats
+    else:
+        sty_u8 = (
+            np.asarray(style_rgb if style_rgb.mode == "RGB" else style_rgb.convert("RGB"), dtype=np.uint8)
+            if isinstance(style_rgb, Image.Image)
+            else np.asarray(style_rgb, dtype=np.uint8)
+        )
+        if sty_u8.ndim != 3 or sty_u8.shape[2] != 3:
+            raise ValueError(f"apply_color_adain expects (H, W, 3) RGB style, got shape {sty_u8.shape}")
+        if _cv2 is not None:
+            t_m, t_s = _cv2.meanStdDev(sty_u8)
+            t_mean = t_m.reshape(3).astype(np.float32)
+            t_std = np.maximum(t_s.reshape(3).astype(np.float32), np.float32(1e-2))
+        else:
+            sty_f = sty_u8.astype(np.float32)
+            t_mean = sty_f.mean(axis=(0, 1))
+            t_std = np.maximum(sty_f.std(axis=(0, 1)), np.float32(1e-2))
 
     # Build exact 256-entry per-channel LUT: (1 - a) * v + a * ((v - s_mean)/s_std * t_std + t_mean)
     vals = np.arange(256, dtype=np.float32)[:, None]  # (256, 1)
@@ -3309,14 +3400,20 @@ def apply_online_augment(
     if rism_style_pool is not None and len(rism_style_pool) > 0 and (fda_p > 0.0 or adain_p > 0.0):
         u_rism = r.random()
         if u_rism < fda_p:
-            style_ref = rism_style_pool.sample(r)
-            if style_ref is not None:
-                out = apply_fda_transfer(out, style_ref, beta=float(rism_fda_beta))  # type: ignore[assignment]
+            sampled = rism_style_pool.sample_with_cache(r)
+            if sampled is not None:
+                style_ref, _, style_amp_cache = sampled
+                out = apply_fda_transfer(
+                    out, style_ref, beta=float(rism_fda_beta), style_amp_cache=style_amp_cache
+                )  # type: ignore[assignment]
                 did_rism_transfer = True
         elif u_rism < fda_p + adain_p:
-            style_ref = rism_style_pool.sample(r)
-            if style_ref is not None:
-                out = apply_color_adain(out, style_ref, alpha=r.uniform(0.4, 0.85))  # type: ignore[assignment]
+            sampled = rism_style_pool.sample_with_cache(r)
+            if sampled is not None:
+                style_ref, style_stats, _ = sampled
+                out = apply_color_adain(
+                    out, style_ref, alpha=r.uniform(0.4, 0.85), style_stats=style_stats
+                )  # type: ignore[assignment]
                 did_rism_transfer = True
 
     archival_p = (0.55 if is_hw else 0.12) if hw_archival_prob is None else float(hw_archival_prob)
@@ -3965,6 +4062,7 @@ class UniStripDataset(Dataset):
         rism_adain_prob: float = 0.0,
         rism_fda_beta: float = 0.02,
         canonicalize_voices: bool = True,
+        bekern_version: str = "v1",
     ) -> None:
         self.pairs = list(pairs)
         self.strip_height = int(strip_height)
@@ -3980,6 +4078,7 @@ class UniStripDataset(Dataset):
         self.rism_adain_prob = float(max(0.0, min(1.0, rism_adain_prob)))
         self.rism_fda_beta = float(rism_fda_beta)
         self.canonicalize_voices = bool(canonicalize_voices)
+        self.bekern_version = str(bekern_version).strip().lower()
         self._seq_cache: Dict[int, np.ndarray] = {}
 
     def __len__(self) -> int:
@@ -4023,6 +4122,7 @@ class UniStripDataset(Dataset):
             "sample_id": make_sample_id(img_path),
             "kind": self.kind,
             "domain": "hw" if self.is_hw else "printed",
+            "bekern_version": self.bekern_version,
         }
 
 
@@ -4127,12 +4227,34 @@ class UniFullPageDataset(Dataset):
             domain = self.domains[sample_idx]
         else:
             domain = ""
-        is_hw = domain in ("hw", "real_hw")
+        bekern_version = str(entry[3]).strip().lower() if len(entry) > 3 else "v2a"
+        is_hw = domain in (
+            "hw",
+            "real_hw",
+            "synth_hw",
+            "real_hw_pseudo",
+            "real_hw_archival",
+            "real_hw_stitched",
+            "rism_pseudo",
+            "pseudo_hw",
+        )
 
         arr = _load_and_resize_fullpage_array(img_path, target_dim)
         if self.augment and self.aug_prob > 0.0:
             if (not _is_pre_degraded_path(img_path)) and random.random() < self.aug_prob:
-                use_pool = None if domain == "real_hw" else self.rism_style_pool
+                use_pool = (
+                    None
+                    if domain in (
+                        "real_hw",
+                        "real_hw_pseudo",
+                        "real_hw_archival",
+                        "real_hw_stitched",
+                        "rism_pseudo",
+                        "pseudo_hw",
+                        "neg_control",
+                    )
+                    else self.rism_style_pool
+                )
                 img = apply_online_augment(
                     Image.fromarray(arr, mode="RGB"),
                     is_hw=is_hw,
@@ -4168,6 +4290,7 @@ class UniFullPageDataset(Dataset):
             "sample_id": make_sample_id(img_path),
             "kind": "fullpage",
             "domain": domain,
+            "bekern_version": bekern_version,
         }
 
 
@@ -4184,7 +4307,7 @@ def classify_fullpage_bucket(img_path: Any, domain: str = "") -> str:
     """Classify a full-page sample into one of the 5 domain/renderer stratification buckets."""
     dom = str(domain or "").strip().lower()
     p_str = str(img_path).replace("\\", "/").lower()
-    if dom == "real_hw" or "real_hw" in p_str or "debussy" in p_str:
+    if dom in ("real_hw", "real_hw_archival", "real_hw_stitched") or "real_hw" in p_str or "debussy" in p_str:
         return "real_hw"
     if (
         dom in ("hw", "synth_hw")
@@ -4453,6 +4576,23 @@ def build_2d_batches_with_neg_guard(
     return batches
 
 
+def _dl_worker_init_fn(worker_id: int, base_seed: int = 42) -> None:
+    """Per-worker DataLoader init: cap OpenMP/OpenCV threads to 1 and set deterministic RNG seeds."""
+    try:
+        torch.set_num_threads(1)
+    except Exception:
+        pass
+    if _cv2 is not None:
+        try:
+            _cv2.setNumThreads(1)
+        except Exception:
+            pass
+    w_seed = (int(base_seed) + int(worker_id)) % (2**32)
+    random.seed(w_seed)
+    np.random.seed(w_seed)
+    torch.manual_seed(w_seed)
+
+
 class MultiScaleBatchSampler:
     """Batch sampler that assigns one shared ``target_dim`` to every item in a batch.
 
@@ -4473,7 +4613,7 @@ class MultiScaleBatchSampler:
         seed: Optional[int] = None,
         stratified_sampler: Optional[StratifiedFullPageSampler] = None,
         aspect_len_buckets: Optional[Any] = None,
-        length_window: int = 64,
+        length_window: Optional[int] = None,
     ) -> None:
         self.num_samples = int(num_samples)
         self.batch_size = max(1, int(batch_size))
@@ -4481,7 +4621,12 @@ class MultiScaleBatchSampler:
         self.shuffle = bool(shuffle)
         self._rng = random.Random(seed) if seed is not None else None
         self.stratified_sampler = stratified_sampler
-        self._length_window = max(self.batch_size, int(length_window))
+        eff_window = (
+            max(256, 32 * self.batch_size)
+            if length_window is None
+            else int(length_window)
+        )
+        self._length_window = max(self.batch_size, eff_window)
         self._use_2d_buckets = False
         self._sample_bucket_id: List[int] = []
         self._sample_bytes: List[int] = []
@@ -4535,6 +4680,8 @@ FIXED_HW_BUCKETS: Tuple[Tuple[int, int], ...] = (
     (1280, 960),
     (1408, 1024),
     (1408, 1152),
+    (1536, 1152),
+    (1536, 1280),
     # Landscape (W > H)
     (640, 896),
     (768, 1024),
@@ -4542,6 +4689,8 @@ FIXED_HW_BUCKETS: Tuple[Tuple[int, int], ...] = (
     (960, 1280),
     (1024, 1408),
     (1152, 1408),
+    (1152, 1536),
+    (1280, 1536),
 )
 
 
@@ -4593,6 +4742,7 @@ def collate_uni_batch(
     seqs = torch.full((B, max_t), PAD_ID, dtype=torch.long)
     sample_ids: List[str] = []
     domains: List[str] = []
+    bekern_versions: List[str] = []
     orig_hw: List[Tuple[int, int]] = []
     orig_seq_len: List[int] = []
     for i, s in enumerate(samples):
@@ -4606,12 +4756,16 @@ def collate_uni_batch(
         orig_seq_len.append(t_len)
         sample_ids.append(str(s.get("sample_id", i)))
         domains.append(str(s.get("domain") or ("hw" if s.get("kind") == "hw_strip" else "printed")))
+        bekern_versions.append(str(s.get("bekern_version", "v2a")).strip().lower())
 
+    is_v1_schema = torch.tensor([bv == "v1" for bv in bekern_versions], dtype=torch.bool)
     return {
         "images": images,
         "seq": seqs,
         "sample_ids": sample_ids,
         "domains": domains,
+        "bekern_versions": bekern_versions,
+        "is_v1_schema": is_v1_schema,
         "orig_hw": orig_hw,
         "orig_seq_len": orig_seq_len,
         "kind": samples[0].get("kind", "unknown") if B > 0 else "empty",
@@ -4624,6 +4778,7 @@ def unpack_collated_batch(batch: Dict[str, Any], fallback_kind: str) -> List[Dic
     orig_hw = batch.get("orig_hw")
     orig_seq_len = batch.get("orig_seq_len")
     domains = batch.get("domains")
+    bekern_versions = batch.get("bekern_versions")
     out: List[Dict[str, Any]] = []
     for i in range(B_loc):
         im = batch["images"][i]
@@ -4643,6 +4798,7 @@ def unpack_collated_batch(batch: Dict[str, Any], fallback_kind: str) -> List[Dic
             "sample_id": batch["sample_ids"][i],
             "kind": fallback_kind,
             "domain": domains[i] if (domains is not None and i < len(domains)) else ("hw" if fallback_kind == "hw_strip" else "printed"),
+            "bekern_version": bekern_versions[i] if (bekern_versions is not None and i < len(bekern_versions)) else "v2a",
         })
     return out
 
@@ -5339,6 +5495,16 @@ class GPUEmaShadow:
     def cpu_state_dict(self, model: Optional[nn.Module] = None) -> Dict[str, torch.Tensor]:
         """Return a detached CPU copy of the EMA shadow state_dict."""
         return {k: v.detach().cpu() for k, v in self.shadow.items()}
+
+    @torch.no_grad()
+    def load_state_dict(self, sd: Dict[str, torch.Tensor]) -> None:
+        """Restore EMA shadow weights onto each shadow tensor's target device and dtype."""
+        for k, tgt in self.shadow.items():
+            if k in sd:
+                src = sd[k].detach().to(device=tgt.device, dtype=tgt.dtype)
+                if src.shape == tgt.shape:
+                    tgt.copy_(src)
+        self._model_id = -1
 
     @contextlib.contextmanager
     def swap_into(self, model: nn.Module, qat_ctrl: Optional[QATInt4Controller] = None) -> Iterator[None]:

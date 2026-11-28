@@ -44,6 +44,7 @@ from __future__ import annotations
 
 import argparse
 from collections import deque
+from concurrent.futures import Future, ThreadPoolExecutor
 import contextlib
 from dataclasses import asdict
 import functools
@@ -90,6 +91,7 @@ from uni_omr import (  # noqa: E402
     UniOMRConfig,
     UniOMRNet,
     UniStripDataset,
+    _dl_worker_init_fn,
     _fast_image_is_landscape,
     _images_to_device_float,
     _infinite_loader,
@@ -651,7 +653,7 @@ def compute_sparse_topk_jsd_loss(
 
     nb = student_logits.device.type == "cuda"
     idx_long = teacher_topk_idx.to(device=student_logits.device, dtype=torch.long, non_blocking=nb)
-    s_topk = torch.gather(student_logits.float(), dim=-1, index=idx_long)
+    s_topk = torch.gather(student_logits, dim=-1, index=idx_long).float()
     t_topk = teacher_topk_vals.to(device=student_logits.device, dtype=torch.float32, non_blocking=nb)
 
     log_p_s = F.log_softmax(s_topk / tau, dim=-1)
@@ -864,7 +866,11 @@ def extract_topk_from_logits(
     )
 
 
-def _linux_dl_kwargs(num_workers: int, device: torch.device) -> Dict[str, Any]:
+def _linux_dl_kwargs(
+    num_workers: int,
+    device: torch.device,
+    base_seed: int = 42,
+) -> Dict[str, Any]:
     """Return DataLoader worker/pinning kwargs (fast persistent workers on Linux, WDDM-safe on Windows)."""
     nw = max(0, int(num_workers))
     if nw > 0 and sys.platform != "win32":
@@ -872,7 +878,8 @@ def _linux_dl_kwargs(num_workers: int, device: torch.device) -> Dict[str, Any]:
             "num_workers": nw,
             "persistent_workers": True,
             "prefetch_factor": 4,
-            "pin_memory": True,
+            "pin_memory": (device.type == "cuda"),
+            "worker_init_fn": functools.partial(_dl_worker_init_fn, base_seed=int(base_seed)),
         }
     return {
         "num_workers": nw,
@@ -1126,6 +1133,8 @@ def partition_muon_adamw_params(
             p.ndim == 2
             and min(p.shape) >= 2
             and clean_name.startswith(_MUON_TRANSFORMER_PREFIXES)
+            and (".q_down." not in clean_name)
+            and (".q_up." not in clean_name)
         )
         if is_transformer_2d:
             muon_named.append((name, p))
@@ -1136,8 +1145,8 @@ def partition_muon_adamw_params(
 
 
 def _is_no_decay_param(name: str, p: nn.Parameter) -> bool:
-    """Return True for 1D/0D params (norms, biases, scalar gates) and token/pos embeddings."""
-    if p.ndim < 2:
+    """Return True for 1D/0D (including squeezed) params (norms, biases, scalar gates) and special embeddings."""
+    if p.squeeze().ndim < 2:
         return True
     low = name.lower()
     return (
@@ -1145,6 +1154,9 @@ def _is_no_decay_param(name: str, p: nn.Parameter) -> bool:
         or "embed" in low
         or "pos_emb" in low
         or "pos_embed" in low
+        or "mask_emb" in low
+        or "register_tokens" in low
+        or "bg_queries" in low
         or low.endswith(".bias")
         or low == "bias"
     )
@@ -1429,6 +1441,174 @@ def atomic_save_checkpoint(path: Path, payload: Dict[str, Any]) -> None:
     os.replace(tmp_path, path)
 
 
+def _atomic_write_json(path: Path, payload: Any) -> None:
+    """Atomically write JSON via ``.tmp`` -> ``os.replace``."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = path.with_name(path.name + ".tmp")
+    tmp_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    os.replace(tmp_path, path)
+
+
+def _capture_rng_state() -> Dict[str, Any]:
+    """Capture Python, NumPy, torch CPU, and torch CUDA RNG state using weights_only-safe primitives."""
+    np_st = np.random.get_state()
+    state: Dict[str, Any] = {
+        "python": random.getstate(),
+        "numpy": [str(np_st[0]), np_st[1].tolist(), int(np_st[2]), int(np_st[3]), float(np_st[4])],
+        "torch_cpu": torch.get_rng_state(),
+    }
+    if torch.cuda.is_available():
+        try:
+            state["torch_cuda"] = torch.cuda.get_rng_state_all()
+        except Exception:
+            pass
+    return state
+
+
+def _restore_rng_state(rng_state: Optional[Dict[str, Any]]) -> None:
+    """Restore Python, NumPy, torch CPU, and torch CUDA RNG state saved by ``_capture_rng_state``."""
+    if not isinstance(rng_state, dict):
+        return
+    py_st = rng_state.get("python")
+    if py_st is not None:
+        try:
+            random.setstate(py_st)
+        except Exception:
+            pass
+    np_st = rng_state.get("numpy")
+    if isinstance(np_st, (list, tuple)) and len(np_st) == 5:
+        try:
+            np.random.set_state(
+                (str(np_st[0]), np.asarray(np_st[1], dtype=np.uint32), int(np_st[2]), int(np_st[3]), float(np_st[4]))
+            )
+        except Exception:
+            pass
+    t_cpu = rng_state.get("torch_cpu")
+    if isinstance(t_cpu, torch.Tensor):
+        try:
+            torch.set_rng_state(t_cpu.to(device="cpu", dtype=torch.uint8))
+        except Exception:
+            pass
+    t_cuda = rng_state.get("torch_cuda")
+    if t_cuda is not None and torch.cuda.is_available():
+        try:
+            cuda_states = [s.to(device="cpu", dtype=torch.uint8) for s in t_cuda]
+            if len(cuda_states) == torch.cuda.device_count():
+                torch.cuda.set_rng_state_all(cuda_states)
+            elif cuda_states:
+                torch.cuda.set_rng_state(cuda_states[0])
+        except Exception:
+            pass
+
+
+def parse_ema_milestone_steps(spec: str) -> set[int]:
+    """Parse comma-separated global step integers for permanent EMA milestones."""
+    out: set[int] = set()
+    raw = str(spec or "").strip()
+    if not raw:
+        return out
+    for part in raw.split(","):
+        tok = part.strip()
+        if not tok:
+            continue
+        val = int(tok)
+        if val > 0:
+            out.add(val)
+    return out
+
+
+def _snapshot_to_cpu(obj: Any) -> Any:
+    """Recursively snapshot tensors to independent CPU copies for safe async serialization."""
+    if isinstance(obj, torch.Tensor):
+        return obj.detach().to(device="cpu", copy=True)
+    if isinstance(obj, dict):
+        return {k: _snapshot_to_cpu(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_snapshot_to_cpu(v) for v in obj]
+    if isinstance(obj, tuple):
+        return tuple(_snapshot_to_cpu(v) for v in obj)
+    return obj
+
+
+def prepare_v2_latest_payloads(
+    out_dir: Path,
+    model: UniOMRv2Net,
+    cfg: UniOMRv2Config,
+    step: int,
+    best_val_ser: float = float("inf"),
+    gpu_ema: Optional[GPUEmaShadow] = None,
+    best_ema_ser: float = float("inf"),
+    opt: Optional[HybridOptimizerV2] = None,
+    include_rng_state: bool = True,
+    copy_cpu_tensors: bool = False,
+) -> Tuple[Path, Dict[str, Any], Optional[Path], Optional[Dict[str, Any]]]:
+    """Build CPU-resident payloads for ``uni_omr_v2_latest.pt`` and optional ``uni_omr_v2_ema_latest.pt``.
+
+    When ``copy_cpu_tensors=True`` (used for async background serialization), every tensor
+    (model weights, optimizer states, EMA weights, RNG state) is cloned into an independent
+    CPU copy on the calling thread so subsequent optimizer steps cannot mutate serialized data.
+    """
+    cfg_dict = asdict(cfg)
+    latest_path = out_dir / "uni_omr_v2_latest.pt"
+    if copy_cpu_tensors:
+        model_sd = {k: v.detach().to(device="cpu", copy=True) for k, v in model.state_dict().items()}
+    else:
+        model_sd = {k: v.detach().cpu() for k, v in model.state_dict().items()}
+    latest_payload: Dict[str, Any] = {
+        "cfg": cfg_dict,
+        "config": cfg_dict,
+        "vocab": list(data.VOCAB),
+        "step": int(step),
+        "best_val_ser": float(best_val_ser),
+        "best_ema_ser": float(best_ema_ser),
+        "model": model_sd,
+    }
+    if opt is not None:
+        raw_opt_states = [o.state_dict() for o in opt.optimizers]
+        latest_payload["optimizer_states"] = (
+            _snapshot_to_cpu(raw_opt_states) if copy_cpu_tensors else raw_opt_states
+        )
+        latest_payload["optimizer_mode"] = str(opt.mode)
+    if include_rng_state:
+        raw_rng = _capture_rng_state()
+        latest_payload["rng_state"] = _snapshot_to_cpu(raw_rng) if copy_cpu_tensors else raw_rng
+
+    ema_path: Optional[Path] = None
+    ema_payload: Optional[Dict[str, Any]] = None
+    if gpu_ema is not None:
+        ema_path = out_dir / "uni_omr_v2_ema_latest.pt"
+        ema_sd = gpu_ema.cpu_state_dict(model)
+        if copy_cpu_tensors:
+            ema_sd = _snapshot_to_cpu(ema_sd)
+        ema_payload = {
+            "cfg": cfg_dict,
+            "config": cfg_dict,
+            "vocab": list(data.VOCAB),
+            "step": int(step),
+            "best_val_ser": float(best_ema_ser),
+            "ema_decay": float(gpu_ema.decay),
+            "model": ema_sd,
+        }
+    return latest_path, latest_payload, ema_path, ema_payload
+
+
+def _write_v2_latest_payloads(
+    latest_path: Path,
+    latest_payload: Dict[str, Any],
+    ema_path: Optional[Path],
+    ema_payload: Optional[Dict[str, Any]],
+    log_path: Optional[Path] = None,
+    log_payload: Optional[Any] = None,
+) -> Tuple[Path, Optional[Path]]:
+    """Atomically write prepared latest/EMA checkpoints and optional ``train_log.json``."""
+    atomic_save_checkpoint(latest_path, latest_payload)
+    if ema_path is not None and ema_payload is not None:
+        atomic_save_checkpoint(ema_path, ema_payload)
+    if log_path is not None and log_payload is not None:
+        _atomic_write_json(log_path, log_payload)
+    return latest_path, ema_path
+
+
 def atomic_save_v2_latest(
     out_dir: Path,
     model: UniOMRv2Net,
@@ -1437,37 +1617,23 @@ def atomic_save_v2_latest(
     best_val_ser: float = float("inf"),
     gpu_ema: Optional[GPUEmaShadow] = None,
     best_ema_ser: float = float("inf"),
+    opt: Optional[HybridOptimizerV2] = None,
+    include_rng_state: bool = True,
 ) -> Tuple[Path, Optional[Path]]:
-    """Atomically save BOTH ``uni_omr_v2_latest.pt`` and ``uni_omr_v2_ema_latest.pt``."""
-    cfg_dict = asdict(cfg)
-    latest_path = out_dir / "uni_omr_v2_latest.pt"
-    atomic_save_checkpoint(
-        latest_path,
-        {
-            "cfg": cfg_dict,
-            "config": cfg_dict,
-            "vocab": list(data.VOCAB),
-            "step": int(step),
-            "best_val_ser": float(best_val_ser),
-            "model": {k: v.detach().cpu() for k, v in model.state_dict().items()},
-        },
+    """Atomically save BOTH ``uni_omr_v2_latest.pt`` (with resume state) and ``uni_omr_v2_ema_latest.pt``."""
+    latest_path, latest_payload, ema_path, ema_payload = prepare_v2_latest_payloads(
+        out_dir=out_dir,
+        model=model,
+        cfg=cfg,
+        step=step,
+        best_val_ser=best_val_ser,
+        gpu_ema=gpu_ema,
+        best_ema_ser=best_ema_ser,
+        opt=opt,
+        include_rng_state=include_rng_state,
+        copy_cpu_tensors=False,
     )
-    ema_path: Optional[Path] = None
-    if gpu_ema is not None:
-        ema_path = out_dir / "uni_omr_v2_ema_latest.pt"
-        atomic_save_checkpoint(
-            ema_path,
-            {
-                "cfg": cfg_dict,
-                "config": cfg_dict,
-                "vocab": list(data.VOCAB),
-                "step": int(step),
-                "best_val_ser": float(best_ema_ser),
-                "ema_decay": float(gpu_ema.decay),
-                "model": gpu_ema.cpu_state_dict(model),
-            },
-        )
-    return latest_path, ema_path
+    return _write_v2_latest_payloads(latest_path, latest_payload, ema_path, ema_payload)
 
 
 def atomic_save_v2_ema_milestone(
@@ -1478,16 +1644,21 @@ def atomic_save_v2_ema_milestone(
     gpu_ema: Optional[GPUEmaShadow],
     best_ema_ser: float = float("inf"),
     keep_last: int = 0,
+    zero_pad_step: bool = False,
+    protected_steps: Optional[set[int]] = None,
 ) -> Optional[Path]:
-    """Atomically save a periodic EMA milestone checkpoint ``uni_omr_v2_ema_step{N}.pt``.
+    """Atomically save a periodic/exact EMA milestone checkpoint ``uni_omr_v2_ema_step{N}.pt``.
 
+    When ``zero_pad_step=True``, uses 6-digit zero-padded filenames ``uni_omr_v2_ema_step{step:06d}.pt``.
     When ``keep_last > 0``, prunes older ``uni_omr_v2_ema_step*.pt`` files beyond the
-    newest ``keep_last`` milestones (by step number). ``keep_last <= 0`` keeps all.
+    newest ``keep_last`` milestones (by step number), skipping any ``protected_steps``.
+    ``keep_last <= 0`` keeps all.
     """
     if gpu_ema is None:
         return None
     cfg_dict = asdict(cfg)
-    milestone_path = out_dir / f"uni_omr_v2_ema_step{int(step)}.pt"
+    fname = f"uni_omr_v2_ema_step{int(step):06d}.pt" if zero_pad_step else f"uni_omr_v2_ema_step{int(step)}.pt"
+    milestone_path = out_dir / fname
     atomic_save_checkpoint(
         milestone_path,
         {
@@ -1501,13 +1672,14 @@ def atomic_save_v2_ema_milestone(
         },
     )
     if int(keep_last) > 0:
+        prot = protected_steps or set()
         existing: List[Tuple[int, Path]] = []
         prefix = "uni_omr_v2_ema_step"
         for p in out_dir.glob(f"{prefix}*.pt"):
             stem = p.stem
             if stem.startswith(prefix):
                 tail = stem[len(prefix):]
-                if tail.isdigit():
+                if tail.isdigit() and int(tail) not in prot:
                     existing.append((int(tail), p))
         existing.sort(key=lambda pair: pair[0])
         while len(existing) > int(keep_last):
@@ -1597,8 +1769,12 @@ _HW_DOMAIN_VALUES: Tuple[str, ...] = (
     "real_hw_archival",
     "real_hw_pseudo",
     "real_hw_stitched",
+    "rism_pseudo",
+    "pseudo_hw",
     "hw_strip",
 )
+
+_COMPUTE_LOSS_SCHEMA_KWARGS_CACHE: Dict[type, Tuple[bool, bool, bool]] = {}
 
 _STATE_TOKEN_PREFIXES: Tuple[str, ...] = (
     "time-",
@@ -1625,6 +1801,42 @@ _EXPR_TOKEN_EXACT: Tuple[str, ...] = (
 
 _STATE_TOKEN_WEIGHT_CACHE: Dict[Tuple[int, float, torch.device, torch.dtype], torch.Tensor] = {}
 _CE_TOKEN_WEIGHT_CACHE: Dict[Tuple[int, float, float, torch.device, torch.dtype], torch.Tensor] = {}
+_V2A_TOKEN_ID_CACHE: Dict[Tuple[int, torch.device], torch.Tensor] = {}
+_V2A_MASK_CACHE: Dict[Tuple[int, torch.device, torch.dtype], Tuple[torch.Tensor, torch.Tensor]] = {}
+
+
+def _get_v2a_token_ids(vocab_size: int, device: torch.device) -> torch.Tensor:
+    """Return cached 1D LongTensor of the 28 ``_BEKERN_V2A_ADD`` token IDs within ``vocab_size``."""
+    key = (int(vocab_size), device)
+    cached = _V2A_TOKEN_ID_CACHE.get(key)
+    if cached is not None:
+        return cached
+    v2a_list = getattr(data, "_BEKERN_V2A_ADD", ())
+    ids = [
+        int(data.TOKEN_TO_ID[t])
+        for t in v2a_list
+        if t in data.TOKEN_TO_ID and int(data.TOKEN_TO_ID[t]) < int(vocab_size)
+    ]
+    t_ids = torch.tensor(ids, device=device, dtype=torch.long)
+    _V2A_TOKEN_ID_CACHE[key] = t_ids
+    return t_ids
+
+
+def _get_v2a_mask_tensors(
+    vocab_size: int, device: torch.device, dtype: torch.dtype
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Return cached ``(v2a_col_bool [1, 1, V], mask_val_scalar)`` for v1 schema logit masking."""
+    key = (int(vocab_size), device, dtype)
+    cached = _V2A_MASK_CACHE.get(key)
+    if cached is not None:
+        return cached
+    v2a_ids = _get_v2a_token_ids(vocab_size, device)
+    v2a_col = torch.zeros(int(vocab_size), device=device, dtype=torch.bool)
+    if v2a_ids.numel() > 0:
+        v2a_col[v2a_ids] = True
+    pair = (v2a_col.view(1, 1, -1), torch.tensor(-1e4, device=device, dtype=dtype))
+    _V2A_MASK_CACHE[key] = pair
+    return pair
 
 
 def _is_hw_sample_id(sample_id: str) -> bool:
@@ -1762,8 +1974,12 @@ def forward_and_loss_v2(
     label_smoothing: float = 0.05,
     state_token_loss_weight: float = 1.0,
     expr_token_loss_weight: float = 1.0,
+    text_aux_loss_weight: Optional[float] = None,
     bd3_repair_weight: float = 0.0,
     bd3_n_views: int = 2,
+    is_v1_schema: Optional[torch.Tensor] = None,
+    has_v1_schema: Optional[bool] = None,
+    schema_mask_v1: bool = True,
     sys_y_target: Optional[torch.Tensor] = None,
     sys_y_mask: Optional[torch.Tensor] = None,
     staff_seg_target: Optional[torch.Tensor] = None,
@@ -1892,6 +2108,56 @@ def forward_and_loss_v2(
                 dtype=s_logits.dtype,
             )
 
+        # Schema conditioning: mask the 28 bekern+v2a-only token logits to -1e4 on v1 rows
+        # (prevents false-negative poisoning on v1/HW rows while keeping vocab_size=265 KD-compatible).
+        # Preserve s_logits_raw BEFORE mutating out["logits"] so 265-vocab KD never sees -1e4 spikes.
+        s_logits_raw: torch.Tensor = out["logits"]
+        applied_v1_mask = False
+        n_v2a_masked = 0
+        v_dim_masked = 0
+        v2a_ids: Optional[torch.Tensor] = None
+        _do_v1_mask = (
+            schema_mask_v1
+            and is_v1_schema is not None
+            and (bool(has_v1_schema) if has_v1_schema is not None else bool(is_v1_schema.any()))
+        )
+        if _do_v1_mask:
+            v_dim_masked = int(s_logits_raw.shape[-1])
+            v2a_ids = _get_v2a_token_ids(v_dim_masked, s_logits_raw.device)
+            if v2a_ids.numel() > 0:
+                row_mask = is_v1_schema.to(device=s_logits_raw.device, dtype=torch.bool).view(-1, 1, 1)
+                v2a_col_11v, mask_val = _get_v2a_mask_tensors(
+                    v_dim_masked, s_logits_raw.device, s_logits_raw.dtype
+                )
+                mask_btv = row_mask & v2a_col_11v
+                out["logits"] = torch.where(mask_btv, mask_val, s_logits_raw)
+                if out.get("mtp_logits"):
+                    out["mtp_logits"] = [
+                        torch.where(mask_btv, mask_val, ml) for ml in out["mtp_logits"]
+                    ]
+                applied_v1_mask = True
+                n_v2a_masked = int(v2a_ids.numel())
+
+        extra_loss_kwargs: Dict[str, Any] = {}
+        if applied_v1_mask and v2a_ids is not None:
+            _m_cls = type(model)
+            _has_v1_kw = _COMPUTE_LOSS_SCHEMA_KWARGS_CACHE.get(_m_cls)
+            if _has_v1_kw is None:
+                import inspect
+                _cl_params = inspect.signature(model.compute_loss).parameters
+                _has_v1_kw = (
+                    "is_v1_schema" in _cl_params,
+                    "v2a_token_ids" in _cl_params,
+                    "has_v1_schema" in _cl_params,
+                )
+                _COMPUTE_LOSS_SCHEMA_KWARGS_CACHE[_m_cls] = _has_v1_kw
+            if _has_v1_kw[0]:
+                extra_loss_kwargs["is_v1_schema"] = is_v1_schema
+            if _has_v1_kw[1]:
+                extra_loss_kwargs["v2a_token_ids"] = v2a_ids
+            if _has_v1_kw[2]:
+                extra_loss_kwargs["has_v1_schema"] = True
+
         losses = model.compute_loss(
             out,
             tgt_out,
@@ -1908,9 +2174,53 @@ def forward_and_loss_v2(
             stroke_hog_loss_weight=stroke_hog_weight,
             label_smoothing=label_smoothing,
             ce_token_weights=ce_token_weights,
+            text_aux_loss_weight=text_aux_loss_weight,
             bd3_repair_weight=bd3_repair_weight,
             bd3_n_views=bd3_n_views,
+            **extra_loss_kwargs,
         )
+        # Subtract the exact constant label-smoothing offset introduced by -1e4 masked logits
+        # so logged CE/MTP/total loss stays on the true scale (zero effect on gradients).
+        ls_eff = float(max(0.0, min(0.5, label_smoothing)))
+        if applied_v1_mask and ls_eff > 0.0 and v_dim_masked > 0 and v2a_ids is not None:
+            with torch.no_grad():
+                pad_id_m = model.cfg.resolved_pad_id()
+                valid_ce = (tgt_out != pad_id_m)
+                row_v1_bt = is_v1_schema.to(device=tgt_out.device, dtype=torch.bool).unsqueeze(1).expand_as(tgt_out)
+                n_v1_ce = (valid_ce & row_v1_bt).sum().float()
+                const_per_tok_unw = ls_eff * (float(n_v2a_masked) / float(v_dim_masked)) * 1e4
+                if ce_token_weights is None:
+                    n_valid_ce = valid_ce.sum().clamp(min=1).float()
+                    ce_off = ((n_v1_ce / n_valid_ce) * const_per_tok_unw).to(losses["ce_loss"].dtype)
+                else:
+                    w_f = ce_token_weights.float()
+                    v2a_w_sum = w_f[v2a_ids].sum()
+                    safe_tgt_w = tgt_out.clamp(0, v_dim_masked - 1)
+                    tot_w_ce = (w_f[safe_tgt_w] * valid_ce.float()).sum().clamp(min=1e-8)
+                    ce_off = (
+                        (ls_eff / float(v_dim_masked)) * v2a_w_sum * 1e4 * (n_v1_ce / tot_w_ce)
+                    ).to(losses["ce_loss"].dtype)
+                mtp_off: Optional[torch.Tensor] = None
+                total_off = ce_off
+                mtp_l = out.get("mtp_logits") or []
+                if mtp_l and tgt_out.shape[1] > 1 and mtp_loss_weight > 0.0:
+                    T_m = tgt_out.shape[1]
+                    v1_cnt = tgt_out.new_zeros((), dtype=torch.float32)
+                    tot_cnt = tgt_out.new_zeros((), dtype=torch.float32)
+                    for idx_m in range(len(mtp_l)):
+                        sh = idx_m + 1
+                        if T_m > sh:
+                            v_m = (tgt_out[:, sh:] != pad_id_m)
+                            r_m = row_v1_bt[:, sh:]
+                            v1_cnt = v1_cnt + (v_m & r_m).sum().float()
+                            tot_cnt = tot_cnt + v_m.sum().float()
+                    frac_v1_mtp = v1_cnt / tot_cnt.clamp(min=1.0)
+                    mtp_off = (frac_v1_mtp * const_per_tok_unw).to(losses["mtp_loss"].dtype)
+                    total_off = total_off + float(mtp_loss_weight) * mtp_off
+            losses["ce_loss"] = losses["ce_loss"] - ce_off
+            if mtp_off is not None:
+                losses["mtp_loss"] = losses["mtp_loss"] - mtp_off
+            losses["loss"] = losses["loss"] - total_off
 
         # Hybrid KD: prefer offline Top-K cache hits, otherwise fall back to online frozen v1 teacher.
         # Optionally downweight/skip KD on HW samples (--kd-hw-scale) using both batch domains and
@@ -1919,6 +2229,7 @@ def forward_and_loss_v2(
         eff_kd_alpha = float(kd_alpha)
         hw_scale = float(max(0.0, kd_hw_scale))
         sample_kd_weights: Optional[torch.Tensor] = None
+        active_idx_cpu: Optional[List[int]] = None
         if eff_kd_alpha > 0.0 and hw_scale != 1.0:
             B_kd = int(images.shape[0])
             if kind == "hw_strip":
@@ -1935,6 +2246,7 @@ def forward_and_loss_v2(
                     eff_kd_alpha *= hw_scale
                 elif n_hw_batch > 0:
                     sample_kd_weights = torch.tensor(per_sample_scales, device=dev, dtype=torch.float32)
+                    active_idx_cpu = [i for i, s in enumerate(per_sample_scales) if s > 0.0]
 
         kd_p = float(max(0.0, min(1.0, kd_prob)))
         if eff_kd_alpha > 0.0 and (kd_p <= 0.0 or (kd_p < 1.0 and random.random() >= kd_p)):
@@ -1950,7 +2262,7 @@ def forward_and_loss_v2(
                 )
                 if n_hits > 0:
                     kd_loss, kd_gate_frac = compute_sparse_topk_jsd_loss(
-                        out["logits"],
+                        s_logits_raw,
                         c_vals,
                         c_idx,
                         tgt_out,
@@ -1965,13 +2277,16 @@ def forward_and_loss_v2(
                 del c_vals, c_idx, c_mask
             if (not used_cache) and teacher_v1 is not None:
                 active_idx: Optional[torch.Tensor] = None
-                if sample_kd_weights is not None:
-                    active_idx = (sample_kd_weights > 0).nonzero(as_tuple=True)[0]
-                if active_idx is not None and active_idx.numel() == 0:
+                n_active = int(images.shape[0])
+                if active_idx_cpu is not None:
+                    n_active = len(active_idx_cpu)
+                    if 0 < n_active < int(images.shape[0]):
+                        active_idx = torch.tensor(active_idx_cpu, device=dev, dtype=torch.long)
+                if n_active == 0:
                     kd_loss = out["logits"].new_zeros(())
                     kd_gate_frac = out["logits"].new_ones((), dtype=torch.float32)
                 else:
-                    slice_active = active_idx is not None and int(active_idx.numel()) < int(images.shape[0])
+                    slice_active = active_idx is not None
                     t_first_param = next(teacher_v1.parameters(), None)
                     t_dtype = t_first_param.dtype if t_first_param is not None else images.dtype
                     with torch.inference_mode():
@@ -2042,26 +2357,27 @@ def forward_and_loss_v2(
                             del exp_logits
                         del t_out, t_images, src_imgs, src_tgt_in, t_tgt_in
                     # _GeneralizedJSDAutograd consumes teacher_logits inside no_grad without saving it,
-                    # so no extra (B, T, V) clone is needed.
+                    # so no extra (B, T, V) clone is needed. Use unmasked s_logits_raw when teacher
+                    # shares full vocab (prevents +5000 * p_t JSD spike on v1 rows).
+                    s_logits_for_kd = out["logits"] if t_vocab_smaller else s_logits_raw
                     if slice_active:
-                        s_logits_kd = out["logits"].index_select(0, active_idx)
+                        s_logits_kd = s_logits_for_kd.index_select(0, active_idx)
                         tgt_out_kd = tgt_out.index_select(0, active_idx)
                         sw_kd = sample_kd_weights.index_select(0, active_idx) if sample_kd_weights is not None else None
                     else:
-                        s_logits_kd = out["logits"]
+                        s_logits_kd = s_logits_for_kd
                         tgt_out_kd = tgt_out
                         sw_kd = sample_kd_weights
                     if t_vocab_smaller:
-                        # Mask newly appended student-only tokens (t_base..s_base-1) out of teacher KD.
+                        # Mask newly appended student-only tokens (t_base..s_base-1) out of teacher KD (branchless, 0 syncs).
                         t_base = t_v - 4
                         s_base = s_v - 4
                         new_tok_mask = (tgt_out_kd >= t_base) & (tgt_out_kd < s_base)
-                        if new_tok_mask.any():
-                            tgt_out_kd = torch.where(
-                                new_tok_mask,
-                                torch.full_like(tgt_out_kd, PAD_ID),
-                                tgt_out_kd,
-                            )
+                        tgt_out_kd = torch.where(
+                            new_tok_mask,
+                            torch.full_like(tgt_out_kd, PAD_ID),
+                            tgt_out_kd,
+                        )
                     kd_loss, kd_gate_frac = compute_generalized_jsd_loss(
                         s_logits_kd,
                         t_logits_inf,
@@ -2114,12 +2430,16 @@ def generate_mtp_speculative_v2(
     mem, _, router_info = model.encode_image(
         images, keep_ratio_override=keep_ratio_override, return_aux=False
     )
+    coord_feat = router_info.get("coord_feat")
     B = images.shape[0]
     device = images.device
-    bos = torch.full((B, 1), BOS_ID, dtype=torch.long, device=device)
-    past_kvs: List[Any] = model.precompute_cross_kv(mem)
+    pad_id = model.cfg.resolved_pad_id()
+    bos_id = model.cfg.resolved_bos_id()
+    eos_id = model.cfg.resolved_eos_id()
+    bos = torch.full((B, 1), bos_id, dtype=torch.long, device=device)
+    past_kvs: Any = model.precompute_cross_kv(mem, coord_feat=coord_feat)
     finished = torch.zeros(B, dtype=torch.bool, device=device)
-    pad_tok = torch.full((B,), PAD_ID, dtype=torch.long, device=device)
+    pad_tok = torch.full((B,), pad_id, dtype=torch.long, device=device)
     out_tokens: List[torch.Tensor] = [bos]
 
     # Step 0 (prefill BOS): get exact y_1 + (K-1) draft tokens for y_2..y_K.
@@ -2133,7 +2453,7 @@ def generate_mtp_speculative_v2(
     )
     tok0 = logits[:, -1, :].argmax(dim=-1)
     out_tokens.append(tok0.unsqueeze(1))
-    finished = finished | (tok0 == EOS_ID)
+    finished = finished | (tok0 == eos_id)
     emitted = 1
 
     if emitted < max_len and not bool(finished.all()):
@@ -2145,7 +2465,11 @@ def generate_mtp_speculative_v2(
             if verify_ids.shape[1] > rem:
                 verify_ids = verify_ids[:, :rem]
             m = int(verify_ids.shape[1])
-            past_len = int(past_kvs[0][0][0].shape[2])
+            if isinstance(past_kvs, dict):
+                first_sb = next((sb for sb in past_kvs["self_banks"] if sb is not None), None)
+                past_len = int(first_sb[0].shape[2]) if first_sb is not None else 0
+            else:
+                past_len = int(past_kvs[0][0][0].shape[2])
 
             logits, mtp_logits, new_past_kvs = model.decode_tokens(
                 verify_ids,
@@ -2158,7 +2482,7 @@ def generate_mtp_speculative_v2(
             preds = logits.argmax(dim=-1)  # (B, m)
 
             # Determine consecutive accepted draft count across all unfinished items (1 sync).
-            fin_cum = finished.unsqueeze(1) | ((preds == EOS_ID).cumsum(dim=1) > 0)
+            fin_cum = finished.unsqueeze(1) | ((preds == eos_id).cumsum(dim=1) > 0)
             all_fin = fin_cum.all(dim=0)  # (m,)
             if m > 1:
                 step_ok = (preds[:, :-1] == verify_ids[:, 1:]) | fin_cum[:, :-1]
@@ -2171,7 +2495,7 @@ def generate_mtp_speculative_v2(
             for j in range(n_emit):
                 tok_j = torch.where(finished, pad_tok, preds[:, j])
                 out_tokens.append(tok_j.unsqueeze(1))
-                finished = finished | (tok_j == EOS_ID)
+                finished = finished | (tok_j == eos_id)
             emitted += n_emit
 
             if emitted >= max_len or bool(finished.all()):
@@ -2179,10 +2503,19 @@ def generate_mtp_speculative_v2(
 
             keep_len = past_len + n_emit
             if keep_len < past_len + m:
-                past_kvs = [
-                    ((sk[:, :, :keep_len, :], sv[:, :, :keep_len, :]), cross_kv)
-                    for (sk, sv), cross_kv in new_past_kvs
-                ]
+                if isinstance(new_past_kvs, dict):
+                    past_kvs = {
+                        "self_banks": [
+                            (sb[0][:, :, :keep_len, :], sb[1][:, :, :keep_len, :]) if sb is not None else None
+                            for sb in new_past_kvs["self_banks"]
+                        ],
+                        "cross_banks": new_past_kvs["cross_banks"],
+                    }
+                else:
+                    past_kvs = [
+                        ((sk[:, :, :keep_len, :], sv[:, :, :keep_len, :]), cross_kv)
+                        for (sk, sv), cross_kv in new_past_kvs
+                    ]
             else:
                 past_kvs = new_past_kvs
 
@@ -2468,6 +2801,7 @@ class ArchivalStratifiedFullPageSampler(StratifiedFullPageSampler):
             or "neg_control" in raw_weights
         )
         self.preset = preset_norm
+        self.raw_weights: Dict[str, float] = dict(raw_weights)
         self.buckets: Dict[str, List[int]] = {k: [] for k in raw_weights}
         for idx, entry in enumerate(pairs):
             dom = str(entry[2]) if len(entry) > 2 else ""
@@ -2540,12 +2874,122 @@ def split_fullpage_train_val_with_hw(
     return other_tr + hw_tr, other_va, hw_va
 
 
+class _StratifiedEpochSampler(torch.utils.data.Sampler[int]):
+    """PyTorch Sampler adapter for ``StratifiedFullPageSampler`` when ``--no-multi-scale`` is used."""
+
+    def __init__(self, strat_sampler: StratifiedFullPageSampler, seed: int = 42) -> None:
+        self._strat = strat_sampler
+        self._rng = random.Random(int(seed))
+
+    def __iter__(self) -> Iterator[int]:
+        return iter(self._strat.sample_epoch(self._rng))
+
+    def __len__(self) -> int:
+        return int(self._strat.epoch_size)
+
+
+def _check_startup_eval_leakage(fp_pairs: Sequence[Tuple[Any, ...]]) -> None:
+    """Fast startup check verifying zero path/slug overlap with local suite31_hw / NorthStar eval manifests."""
+    if not fp_pairs:
+        return
+    repo_root = Path(__file__).resolve().parent.parent.parent
+    suite31_manifest = repo_root / "data-gen" / "score-corpus" / "suite31" / "suite31_hw_manifest.json"
+    northstar_candidates = [
+        Path(r"D:\tmp\northstar-eval-pack\manifest.json"),
+        repo_root / "omr-northstar" / "manifest.json",
+    ]
+    eval_slugs: set[str] = set()
+    eval_paths: set[str] = set()
+    n_manifests = 0
+
+    def _norm_slug(s: str) -> str:
+        out = []
+        prev_dash = False
+        for ch in str(s).lower():
+            if ch.isalnum():
+                out.append(ch)
+                prev_dash = False
+            elif not prev_dash:
+                out.append("-")
+                prev_dash = True
+        return "".join(out).strip("-")
+
+    if suite31_manifest.is_file():
+        try:
+            d = json.loads(suite31_manifest.read_text(encoding="utf-8"))
+            for p in d.get("pieces", []):
+                slug = _norm_slug(str(p.get("slug", "")))
+                if len(slug) >= 5:
+                    eval_slugs.add(slug)
+                    if slug.startswith("hw-"):
+                        eval_slugs.add(slug[3:])
+            eval_slugs.add("mozart-k458")
+            n_manifests += 1
+        except Exception:
+            pass
+
+    for ns_path in northstar_candidates:
+        if ns_path.is_file():
+            try:
+                d = json.loads(ns_path.read_text(encoding="utf-8"))
+                for p in d.get("pages", []):
+                    ip = str(p.get("image_path", "")).strip()
+                    if ip:
+                        eval_paths.add(os.path.normcase(os.path.normpath(ip)))
+                    for fld in ("page_id", "work_id", "paired_anchor_id"):
+                        val = _norm_slug(str(p.get(fld, "")))
+                        for pfx in ("cdr-", "als-", "rwp-", "hwm-", "work-", "anchor-"):
+                            if val.startswith(pfx):
+                                val = val[len(pfx):]
+                        if len(val) >= 5:
+                            eval_slugs.add(val)
+                            if val.startswith("hw-"):
+                                eval_slugs.add(val[3:])
+                n_manifests += 1
+                break
+            except Exception:
+                pass
+
+    if n_manifests == 0 or (not eval_slugs and not eval_paths):
+        return
+
+    slug_list = sorted(eval_slugs)
+    hits: List[str] = []
+    for entry in fp_pairs:
+        img_str = str(entry[0])
+        if eval_paths and os.path.normcase(os.path.normpath(img_str)) in eval_paths:
+            hits.append(f"path:{img_str}")
+            if len(hits) >= 5:
+                break
+            continue
+        padded = f"-{_norm_slug(img_str)}-"
+        for sl in slug_list:
+            if f"-{sl}-" in padded:
+                hits.append(f"slug:{sl} in {img_str}")
+                break
+        if len(hits) >= 5:
+            break
+
+    if hits:
+        raise RuntimeError(
+            f"[UniOMRv2 data] EVAL LEAKAGE DETECTED ({len(hits)}+ matches against local eval manifests): "
+            + "; ".join(hits[:5])
+        )
+    print(
+        f"[UniOMRv2 data] startup eval leakage check PASSED "
+        f"({len(fp_pairs)} rows vs {len(slug_list)} eval slugs, {len(eval_paths)} eval paths)",
+        flush=True,
+    )
+
+
 def _build_datasets_and_iters(
     args: argparse.Namespace,
     cfg: UniOMRv2Config,
     device: torch.device,
     strip_batch_size: int,
     prefetch_threads: int,
+    start_step: int = 0,
+    init_step_frac: float = 0.0,
 ) -> Dict[str, Any]:
     """Discover and construct train/val datasets & iterators reusing ``uni_omr.py``."""
     st_tr: List[Tuple[Path, Path]] = []
@@ -2591,8 +3035,9 @@ def _build_datasets_and_iters(
                     img_p = Path(rec["image"])
                     beks = [Path(b) for b in rec.get("bekerns", [])]
                     domain = str(rec.get("domain", "")).strip().lower()
+                    bekern_version = str(rec.get("bekern_version", "v2a")).strip().lower()
                     if img_p.is_file() and (beks or _is_neg_control_row(img_p, domain)):
-                        fp_pairs.append((img_p, beks, domain))
+                        fp_pairs.append((img_p, beks, domain, bekern_version))
         max_sys_cap = int(getattr(args, "max_systems_per_page", 16))
         if fp_pairs and max_sys_cap > 0:
             fp_pairs, n_dropped_sys = filter_fullpage_pairs_by_systems(
@@ -2605,6 +3050,7 @@ def _build_datasets_and_iters(
                     flush=True,
                 )
         if fp_pairs:
+            _check_startup_eval_leakage(fp_pairs)
             fp_tr, fp_va, fp_hw_va = split_fullpage_train_val_with_hw(
                 fp_pairs,
                 val_count=args.val_count,
@@ -2706,7 +3152,7 @@ def _build_datasets_and_iters(
                 max_workers=prefetch_threads,
                 prefetch_batches=3,
                 collate_fn=collate_uni_batch,
-                seed=args.seed + 101,
+                seed=args.seed + 101 + int(start_step),
             )
             prefetchers.append(pf)
             strip_train_iter = pf
@@ -2717,7 +3163,7 @@ def _build_datasets_and_iters(
                     batch_size=strip_batch_size,
                     shuffle=True,
                     collate_fn=collate_uni_batch,
-                    **_linux_dl_kwargs(args.num_workers, device),
+                    **_linux_dl_kwargs(args.num_workers, device, base_seed=args.seed + 101 + int(start_step)),
                 )
             )
         print(f"[UniOMRv2 data] printed_strips: {len(st_tr)} train / {len(st_va)} val", flush=True)
@@ -2768,7 +3214,7 @@ def _build_datasets_and_iters(
                 max_workers=prefetch_threads,
                 prefetch_batches=3,
                 collate_fn=collate_uni_batch,
-                seed=args.seed + 202,
+                seed=args.seed + 202 + int(start_step),
             )
             prefetchers.append(pf)
             hw_strip_train_iter = pf
@@ -2779,7 +3225,7 @@ def _build_datasets_and_iters(
                     batch_size=strip_batch_size,
                     shuffle=True,
                     collate_fn=collate_uni_batch,
-                    **_linux_dl_kwargs(args.num_workers, device),
+                    **_linux_dl_kwargs(args.num_workers, device, base_seed=args.seed + 202 + int(start_step)),
                 )
             )
         print(f"[UniOMRv2 data] hw_strips: {len(hw_tr)} train / {len(hw_va)} val", flush=True)
@@ -2788,7 +3234,7 @@ def _build_datasets_and_iters(
     fp_batch_sampler: Optional[MultiScaleBatchSampler] = None
     if fp_tr or fp_va or fp_hw_va:
         prog_res_sched = parse_prog_res_schedule(getattr(args, "prog_res_schedule", ""))
-        init_fp_max_dim = resolve_prog_res_dim(prog_res_sched, 0.0) or int(args.fullpage_max_dim)
+        init_fp_max_dim = resolve_prog_res_dim(prog_res_sched, float(init_step_frac)) or int(args.fullpage_max_dim)
         if args.stratified_fullpage and len(fp_tr) > 0:
             strat_preset = getattr(args, "stratified_preset", None)
             if strat_preset is None:
@@ -2800,11 +3246,20 @@ def _build_datasets_and_iters(
                 )
             else:
                 fp_strat_sampler = StratifiedFullPageSampler(fp_tr)
+            b_counts = fp_strat_sampler.bucket_counts()
             print(
-                f"[UniOMRv2 data] fullpage_strata ({strat_preset})={fp_strat_sampler.bucket_counts()} "
+                f"[UniOMRv2 data] fullpage_strata ({strat_preset})={b_counts} "
                 f"weights={ {k: round(v, 3) for k, v in fp_strat_sampler.active_weights.items()} }",
                 flush=True,
             )
+            cfg_weights = getattr(fp_strat_sampler, "raw_weights", {})
+            for b_name, b_w in cfg_weights.items():
+                if float(b_w) > 0.0 and int(b_counts.get(b_name, 0)) == 0:
+                    print(
+                        f"[WARN] stratified preset '{strat_preset}' bucket '{b_name}' has 0 samples "
+                        f"(configured weight={float(b_w):.3f}); effective weights were renormalized!",
+                        flush=True,
+                    )
         else:
             fp_strat_sampler = None
         fp_train_ds = UniFullPageDataset(
@@ -2860,7 +3315,7 @@ def _build_datasets_and_iters(
                 max_workers=prefetch_threads,
                 prefetch_batches=3,
                 collate_fn=collate_uni_batch,
-                seed=args.seed + 303,
+                seed=args.seed + 303 + int(start_step),
                 stratified_sampler=fp_strat_sampler,
                 fixed_hw_buckets=fixed_hw_buckets,
             )
@@ -2872,7 +3327,7 @@ def _build_datasets_and_iters(
                 batch_size=args.batch_size,
                 base_dim=init_fp_max_dim,
                 shuffle=True,
-                seed=args.seed + 303,
+                seed=args.seed + 303 + int(start_step),
                 stratified_sampler=fp_strat_sampler,
                 aspect_len_buckets=fp_train_ds,
             )
@@ -2881,19 +3336,31 @@ def _build_datasets_and_iters(
                     fp_train_ds,
                     batch_sampler=fp_batch_sampler,
                     collate_fn=fp_collate_fn,
-                    **_linux_dl_kwargs(args.num_workers, device),
+                    **_linux_dl_kwargs(args.num_workers, device, base_seed=args.seed + 303 + int(start_step)),
                 )
             )
         elif len(fp_tr) > 0:
-            fullpage_train_iter = _infinite_loader(
-                DataLoader(
-                    fp_train_ds,
-                    batch_size=args.batch_size,
-                    shuffle=True,
-                    collate_fn=fp_collate_fn,
-                    **_linux_dl_kwargs(args.num_workers, device),
+            if fp_strat_sampler is not None:
+                fullpage_train_iter = _infinite_loader(
+                    DataLoader(
+                        fp_train_ds,
+                        batch_size=args.batch_size,
+                        sampler=_StratifiedEpochSampler(fp_strat_sampler, seed=args.seed + 303 + int(start_step)),
+                        shuffle=False,
+                        collate_fn=fp_collate_fn,
+                        **_linux_dl_kwargs(args.num_workers, device, base_seed=args.seed + 303 + int(start_step)),
+                    )
                 )
-            )
+            else:
+                fullpage_train_iter = _infinite_loader(
+                    DataLoader(
+                        fp_train_ds,
+                        batch_size=args.batch_size,
+                        shuffle=True,
+                        collate_fn=fp_collate_fn,
+                        **_linux_dl_kwargs(args.num_workers, device, base_seed=args.seed + 303 + int(start_step)),
+                    )
+                )
         hw_val_note = f" / {len(fp_hw_va)} real_hw_val" if fp_hw_va else ""
         print(f"[UniOMRv2 data] fullpage: {len(fp_tr)} train / {len(fp_va)} val{hw_val_note}", flush=True)
 
@@ -2921,27 +3388,25 @@ def run_train_v2(args: argparse.Namespace) -> Dict[str, Any]:
     if device.type == "cuda":
         torch.backends.cuda.matmul.allow_tf32 = True
         torch.backends.cudnn.allow_tf32 = True
+        if hasattr(torch, "set_float32_matmul_precision"):
+            torch.set_float32_matmul_precision("high")
         if bool(getattr(args, "no_cudnn", False)):
             torch.backends.cudnn.enabled = False
+        elif sys.platform != "win32" and bool(getattr(args, "fixed_hw_buckets", False)):
+            torch.backends.cudnn.benchmark = True
         # On Linux Hopper (H100, cc >= 9.0), keep Flash + cuDNN SDPA enabled.
-        # On Windows (and pre-Hopper GPUs), force CUTLASS EFFICIENT_ATTENTION globally
-        # to avoid cuDNN 9.10's ~640ms/shape CPU plan recompilation on variable (mem, T) shapes.
+        # On Linux Ampere/Ada (cc >= 8.0), enable FlashAttention-2 + CUTLASS EFFICIENT_ATTENTION
+        # (keep cuDNN SDPA disabled for cc < 9 to avoid cuDNN 9.10 CPU plan recompilation).
+        # On Windows (and pre-Ampere GPUs), force CUTLASS EFFICIENT_ATTENTION globally.
         _cc_major, _cc_minor = torch.cuda.get_device_capability(device)
         _is_linux_hopper = (sys.platform != "win32") and (_cc_major >= 9)
-        if _is_linux_hopper:
-            if hasattr(torch.backends.cuda, "enable_cudnn_sdp"):
-                torch.backends.cuda.enable_cudnn_sdp(True)
-            if hasattr(torch.backends.cuda, "enable_flash_sdp"):
-                torch.backends.cuda.enable_flash_sdp(True)
-            if hasattr(torch.backends.cuda, "enable_mem_efficient_sdp"):
-                torch.backends.cuda.enable_mem_efficient_sdp(True)
-        else:
-            if hasattr(torch.backends.cuda, "enable_cudnn_sdp"):
-                torch.backends.cuda.enable_cudnn_sdp(False)
-            if hasattr(torch.backends.cuda, "enable_flash_sdp"):
-                torch.backends.cuda.enable_flash_sdp(False)
-            if hasattr(torch.backends.cuda, "enable_mem_efficient_sdp"):
-                torch.backends.cuda.enable_mem_efficient_sdp(True)
+        _is_linux_ampere_plus = (sys.platform != "win32") and (_cc_major >= 8)
+        if hasattr(torch.backends.cuda, "enable_cudnn_sdp"):
+            torch.backends.cuda.enable_cudnn_sdp(_is_linux_hopper)
+        if hasattr(torch.backends.cuda, "enable_flash_sdp"):
+            torch.backends.cuda.enable_flash_sdp(_is_linux_ampere_plus)
+        if hasattr(torch.backends.cuda, "enable_mem_efficient_sdp"):
+            torch.backends.cuda.enable_mem_efficient_sdp(True)
 
     prefetch_threads = (
         (6 if (device.type == "cuda" and not args.dry_run) else 0)
@@ -3030,12 +3495,39 @@ def run_train_v2(args: argparse.Namespace) -> Dict[str, Any]:
         return {"precomputed_samples": n_cached, "cache_dir": str(args.teacher_cache_dir)}
 
     model = UniOMRv2Net(cfg).to(device)
-    if args.init_encoder_from:
-        load_v2_checkpoint(model, args.init_encoder_from, encoder_only=True)
-    if args.init_from:
-        load_v2_checkpoint(model, args.init_from, encoder_only=False)
+    resume_ckpt: Optional[Dict[str, Any]] = None
+    resume_path: Optional[Path] = None
+    if getattr(args, "resume", None):
+        resume_path = Path(args.resume)
+        if not resume_path.is_file():
+            raise FileNotFoundError(f"--resume checkpoint not found: {resume_path}")
+        try:
+            resume_ckpt = torch.load(str(resume_path), map_location="cpu", weights_only=True)
+        except Exception:
+            resume_ckpt = torch.load(str(resume_path), map_location="cpu", weights_only=False)
+        model.load_state_dict(_extract_state_dict(resume_ckpt), strict=True)
+        print(
+            f"[UniOMRv2 resume] loaded model weights from {resume_path} "
+            f"(step={int(resume_ckpt.get('step', 0))})",
+            flush=True,
+        )
+    else:
+        if args.init_encoder_from:
+            load_v2_checkpoint(model, args.init_encoder_from, encoder_only=True)
+        if args.init_from:
+            load_v2_checkpoint(model, args.init_from, encoder_only=False)
     if args.channels_last:
         model.backbone.to(memory_format=torch.channels_last)
+        if device.type == "cuda":
+            if getattr(model, "staff_seg_head", None) is not None:
+                model.staff_seg_head.to(memory_format=torch.channels_last)
+            if getattr(model, "stroke_hog_head", None) is not None:
+                model.stroke_hog_head.to(memory_format=torch.channels_last)
+            _enc = getattr(model, "encoder", None)
+            _rtr = getattr(_enc, "router", None) if _enc is not None else None
+            _sal = getattr(_rtr, "saliency_net", None) if _rtr is not None else None
+            if _sal is not None:
+                _sal.to(memory_format=torch.channels_last)
     model.train()
 
     # Optional online frozen v1 teacher & offline Top-K cache
@@ -3119,6 +3611,52 @@ def run_train_v2(args: argparse.Namespace) -> Dict[str, Any]:
         else None
     )
 
+    start_step = 0
+    resumed_best_val_ser = float("inf")
+    resumed_best_ema_ser = float("inf")
+    if resume_ckpt is not None and resume_path is not None:
+        start_step = int(resume_ckpt.get("step", 0))
+        resumed_best_val_ser = float(resume_ckpt.get("best_val_ser", float("inf")))
+        resumed_best_ema_ser = float(resume_ckpt.get("best_ema_ser", float("inf")))
+        if gpu_ema is not None:
+            ema_sd: Optional[Dict[str, torch.Tensor]] = None
+            sib_ema_path = resume_path.parent / "uni_omr_v2_ema_latest.pt"
+            if sib_ema_path.is_file():
+                try:
+                    ema_ck = torch.load(str(sib_ema_path), map_location="cpu", weights_only=True)
+                except Exception:
+                    ema_ck = torch.load(str(sib_ema_path), map_location="cpu", weights_only=False)
+                ema_sd = _extract_state_dict(ema_ck)
+                if math.isinf(resumed_best_ema_ser) and isinstance(ema_ck, dict) and "best_val_ser" in ema_ck:
+                    resumed_best_ema_ser = float(ema_ck["best_val_ser"])
+                print(f"[UniOMRv2 resume] restored GPUEmaShadow from {sib_ema_path}", flush=True)
+            elif isinstance(resume_ckpt.get("ema_model"), dict):
+                ema_sd = resume_ckpt["ema_model"]
+                print("[UniOMRv2 resume] restored GPUEmaShadow from checkpoint ema_model", flush=True)
+            if ema_sd is not None:
+                gpu_ema.load_state_dict(ema_sd)
+        saved_opt_states = resume_ckpt.get("optimizer_states")
+        if isinstance(saved_opt_states, list) and len(saved_opt_states) == len(opt.optimizers):
+            for o_inst, o_sd in zip(opt.optimizers, saved_opt_states):
+                o_inst.load_state_dict(o_sd)
+            print(
+                f"[UniOMRv2 resume] restored {len(saved_opt_states)} optimizer state(s) "
+                f"(mode={resume_ckpt.get('optimizer_mode', opt.mode)})",
+                flush=True,
+            )
+        elif saved_opt_states is not None:
+            print(
+                f"[WARN] --resume optimizer count mismatch "
+                f"(saved={len(saved_opt_states)} vs current={len(opt.optimizers)}); skipping optimizer restore",
+                flush=True,
+            )
+        _restore_rng_state(resume_ckpt.get("rng_state"))
+        print(
+            f"[UniOMRv2 resume] resuming from global step {start_step}/{steps} "
+            f"(best_val_ser={resumed_best_val_ser:.4f}, best_ema_ser={resumed_best_ema_ser:.4f})",
+            flush=True,
+        )
+
     out_dir = Path(args.out_dir) if args.out_dir else None
     if out_dir is not None and not args.dry_run:
         out_dir.mkdir(parents=True, exist_ok=True)
@@ -3134,8 +3672,15 @@ def run_train_v2(args: argparse.Namespace) -> Dict[str, Any]:
         "prefetchers": [],
     }
     if use_real_data:
+        init_step_frac = float(start_step) / float(max(1, steps))
         ds_bundle = _build_datasets_and_iters(
-            args, cfg, device, strip_batch_size=strip_batch_size, prefetch_threads=prefetch_threads
+            args,
+            cfg,
+            device,
+            strip_batch_size=strip_batch_size,
+            prefetch_threads=prefetch_threads,
+            start_step=start_step,
+            init_step_frac=init_step_frac,
         )
 
     strip_train_iter = ds_bundle["strip_train_iter"]
@@ -3193,7 +3738,7 @@ def run_train_v2(args: argparse.Namespace) -> Dict[str, Any]:
         step_idx: int,
         micro_idx: int,
         want_fp: bool,
-    ) -> Tuple[torch.Tensor, torch.Tensor, List[str], str, List[str]]:
+    ) -> Tuple[torch.Tensor, torch.Tensor, List[str], str, List[str], Optional[torch.Tensor], bool]:
         if not use_real_data:
             bs_syn = args.batch_size if want_fp else strip_batch_size
             imgs, sq, _ = _make_synthetic_batch(
@@ -3205,7 +3750,7 @@ def run_train_v2(args: argparse.Namespace) -> Dict[str, Any]:
                 with_uv=False,
             )
             sids = [f"syn_{step_idx}_{micro_idx}_{i}" for i in range(bs_syn)]
-            return imgs, sq, sids, ("fullpage" if want_fp else "strip"), [""] * bs_syn
+            return imgs, sq, sids, ("fullpage" if want_fp else "strip"), [""] * bs_syn, None, False
 
         img_dtype = torch.bfloat16 if use_bf16 else torch.float32
         if want_fp and fullpage_train_iter is not None:
@@ -3215,12 +3760,19 @@ def run_train_v2(args: argparse.Namespace) -> Dict[str, Any]:
             )
             if args.channels_last:
                 imgs = imgs.to(memory_format=torch.channels_last)
+            is_v1 = b.get("is_v1_schema")
+            has_v1 = False
+            if isinstance(is_v1, torch.Tensor):
+                has_v1 = bool(is_v1.any())
+                is_v1 = is_v1.to(device, non_blocking=(device.type == "cuda"))
             return (
                 imgs,
                 b["seq"].to(device, non_blocking=(device.type == "cuda")),
                 list(b.get("sample_ids", [])),
                 "fullpage",
                 list(b.get("domains", [])),
+                is_v1,
+                has_v1,
             )
 
         if mix_strip_domains:
@@ -3247,12 +3799,19 @@ def run_train_v2(args: argparse.Namespace) -> Dict[str, Any]:
             )
             if args.channels_last:
                 imgs = imgs.to(memory_format=torch.channels_last)
+            is_v1 = b.get("is_v1_schema")
+            has_v1 = False
+            if isinstance(is_v1, torch.Tensor):
+                has_v1 = bool(is_v1.any())
+                is_v1 = is_v1.to(device, non_blocking=(device.type == "cuda"))
             return (
                 imgs,
                 b["seq"].to(device, non_blocking=(device.type == "cuda")),
                 list(b.get("sample_ids", [])),
                 kind,
                 doms,
+                is_v1,
+                has_v1,
             )
 
         if strip_train_iter is not None and hw_strip_train_iter is not None:
@@ -3267,12 +3826,19 @@ def run_train_v2(args: argparse.Namespace) -> Dict[str, Any]:
             )
             if args.channels_last:
                 imgs = imgs.to(memory_format=torch.channels_last)
+            is_v1 = b.get("is_v1_schema")
+            has_v1 = False
+            if isinstance(is_v1, torch.Tensor):
+                has_v1 = bool(is_v1.any())
+                is_v1 = is_v1.to(device, non_blocking=(device.type == "cuda"))
             return (
                 imgs,
                 b["seq"].to(device, non_blocking=(device.type == "cuda")),
                 list(b.get("sample_ids", [])),
                 kind,
                 list(b.get("domains", [])),
+                is_v1,
+                has_v1,
             )
         it = hw_strip_train_iter if hw_strip_train_iter is not None else strip_train_iter
         kind = "hw_strip" if hw_strip_train_iter is not None else "strip"
@@ -3283,12 +3849,19 @@ def run_train_v2(args: argparse.Namespace) -> Dict[str, Any]:
         )
         if args.channels_last:
             imgs = imgs.to(memory_format=torch.channels_last)
+        is_v1 = b.get("is_v1_schema")
+        has_v1 = False
+        if isinstance(is_v1, torch.Tensor):
+            has_v1 = bool(is_v1.any())
+            is_v1 = is_v1.to(device, non_blocking=(device.type == "cuda"))
         return (
             imgs,
             b["seq"].to(device, non_blocking=(device.type == "cuda")),
             list(b.get("sample_ids", [])),
             kind,
             list(b.get("domains", [])),
+            is_v1,
+            has_v1,
         )
 
     def _run_eval_suite(step_label: Any) -> Dict[str, Any]:
@@ -3352,16 +3925,26 @@ def run_train_v2(args: argparse.Namespace) -> Dict[str, Any]:
         return eval_rec
 
     history: List[Dict[str, Any]] = []
+    if resume_ckpt is not None and out_dir is not None and (out_dir / "train_log.json").is_file():
+        try:
+            loaded_hist = json.loads((out_dir / "train_log.json").read_text(encoding="utf-8"))
+            if isinstance(loaded_hist, list):
+                history = [r for r in loaded_hist if int(r.get("step", 0)) <= start_step]
+        except Exception:
+            pass
     eval_history: List[Dict[str, Any]] = []
-    best_val_ser = float("inf")
-    best_ema_ser = float("inf")
+    best_val_ser = resumed_best_val_ser
+    best_ema_ser = resumed_best_ema_ser
     save_every_sec = max(0.0, float(args.save_every_minutes) * 60.0)
     save_ema_milestones = max(0, int(getattr(args, "save_ema_milestones", 4000)))
+    ema_milestone_steps = parse_ema_milestone_steps(getattr(args, "ema_milestone_steps", ""))
     keep_ema_milestones = max(0, int(getattr(args, "keep_ema_milestones", 0)))
     best_min_step = max(0, int(getattr(args, "best_min_step", 0)))
+    schema_mask_v1 = bool(getattr(args, "schema_mask_v1", True))
+    text_aux_loss_weight = getattr(args, "text_aux_loss_weight", None)
     last_time_save = time.perf_counter()
     last_empty_cache_step = -25
-    last_logged_hist_idx = 0
+    last_logged_hist_idx = len(history)
     trainable_params = [p for p in model.parameters() if p.requires_grad]
 
     _acc_keys: Tuple[str, ...] = (
@@ -3370,6 +3953,8 @@ def run_train_v2(args: argparse.Namespace) -> Dict[str, Any]:
         "mtp_loss",
         "saliency_loss",
         "stroke_hog_loss",
+        "text_aux_loss",
+        "bd3_repair_loss",
         "kd_loss",
         "kd_gate_frac",
     )
@@ -3397,8 +3982,22 @@ def run_train_v2(args: argparse.Namespace) -> Dict[str, Any]:
         pending_history_meta.clear()
         pending_history_vals.clear()
 
+    ckpt_executor: Optional[ThreadPoolExecutor] = (
+        ThreadPoolExecutor(max_workers=1, thread_name_prefix="ckpt-save")
+        if (out_dir is not None and not args.dry_run)
+        else None
+    )
+    pending_ckpt_future: Optional[Future[Tuple[Path, Optional[Path]]]] = None
+
+    def _wait_pending_ckpt() -> None:
+        nonlocal pending_ckpt_future
+        if pending_ckpt_future is not None:
+            fut = pending_ckpt_future
+            pending_ckpt_future = None
+            fut.result()
+
     try:
-        for step in range(1, steps + 1):
+        for step in range(start_step + 1, steps + 1):
             step_frac = float(step) / float(max(1, steps))
             if prog_res_sched and fp_train_ds is not None:
                 target_fp_dim = resolve_prog_res_dim(prog_res_sched, step_frac)
@@ -3464,7 +4063,9 @@ def run_train_v2(args: argparse.Namespace) -> Dict[str, Any]:
             oom_hit = False
 
             for micro in range(step_ga):
-                images, seq, sample_ids, kind, domains = _next_batch(step, micro, want_fp=step_is_fp)
+                images, seq, sample_ids, kind, domains, is_v1_schema, has_v1_schema = _next_batch(
+                    step, micro, want_fp=step_is_fp
+                )
                 try:
                     losses, out = forward_and_loss_v2(
                         model,
@@ -3493,8 +4094,12 @@ def run_train_v2(args: argparse.Namespace) -> Dict[str, Any]:
                         label_smoothing=float(args.label_smoothing),
                         state_token_loss_weight=state_token_loss_weight,
                         expr_token_loss_weight=expr_token_loss_weight,
+                        text_aux_loss_weight=text_aux_loss_weight,
                         bd3_repair_weight=float(getattr(args, "bd3_repair_weight", 0.0)),
                         bd3_n_views=int(getattr(args, "bd3_n_views", 2)),
+                        is_v1_schema=is_v1_schema,
+                        has_v1_schema=has_v1_schema,
+                        schema_mask_v1=schema_mask_v1,
                         use_bf16=use_bf16,
                         device=device,
                     )
@@ -3557,16 +4162,27 @@ def run_train_v2(args: argparse.Namespace) -> Dict[str, Any]:
                     if kd_teacher_ce_cap > 0.0
                     else ""
                 )
+                txt_note = (
+                    f", txt={last_row['text_aux_loss']:.4f}"
+                    if (last_row.get("text_aux_loss", 0.0) > 0.0 or (text_aux_loss_weight is not None and float(text_aux_loss_weight) > 0.0))
+                    else ""
+                )
+                bd3_note = (
+                    f", bd3={last_row['bd3_repair_loss']:.4f}"
+                    if (float(getattr(args, "bd3_repair_weight", 0.0)) > 0.0 or last_row.get("bd3_repair_loss", 0.0) > 0.0)
+                    else ""
+                )
                 print(
                     f"[UniOMRv2 {'dry-run' if args.dry_run else 'train'} | {last_kind}] "
                     f"step {step}/{steps} | lr={cur_lr:.2e} | loss={last_row['loss']:.4f} "
                     f"(ce={last_row['ce_loss']:.4f}, mtp={last_row['mtp_loss']:.4f}, "
-                    f"hog={last_row['stroke_hog_loss']:.4f}, kd={last_row['kd_loss']:.4f}{kd_gate_note})"
+                    f"hog={last_row['stroke_hog_loss']:.4f}{txt_note}{bd3_note}, "
+                    f"kd={last_row['kd_loss']:.4f}{kd_gate_note})"
                     f"{strip_note} | tokens {last_n_in}->{last_n_out}",
                     flush=True,
                 )
 
-            # Time-based atomic rolling checkpoint save (default every 5.0 min)
+            # Time-based atomic rolling checkpoint save (default every 5.0 min, async background write)
             if (
                 out_dir is not None
                 and save_every_sec > 0.0
@@ -3574,17 +4190,66 @@ def run_train_v2(args: argparse.Namespace) -> Dict[str, Any]:
                 and (time.perf_counter() - last_time_save) >= save_every_sec
             ):
                 last_time_save = time.perf_counter()
-                lp, ep = atomic_save_v2_latest(
+                _wait_pending_ckpt()
+                _flush_pending_history()
+                if ckpt_executor is not None:
+                    lp, lp_payload, ep, ep_payload = prepare_v2_latest_payloads(
+                        out_dir,
+                        model,
+                        cfg,
+                        step=step,
+                        best_val_ser=best_val_ser,
+                        gpu_ema=gpu_ema,
+                        best_ema_ser=best_ema_ser,
+                        opt=opt,
+                        copy_cpu_tensors=True,
+                    )
+                    hist_snap = list(history)
+                    pending_ckpt_future = ckpt_executor.submit(
+                        _write_v2_latest_payloads,
+                        lp,
+                        lp_payload,
+                        ep,
+                        ep_payload,
+                        out_dir / "train_log.json",
+                        hist_snap,
+                    )
+                    ema_note = f" + {ep.name}" if ep is not None else ""
+                    print(f"  [autosave @ step {step}] queued async {lp.name}{ema_note} + train_log.json", flush=True)
+                else:
+                    lp, ep = atomic_save_v2_latest(
+                        out_dir,
+                        model,
+                        cfg,
+                        step=step,
+                        best_val_ser=best_val_ser,
+                        gpu_ema=gpu_ema,
+                        best_ema_ser=best_ema_ser,
+                        opt=opt,
+                    )
+                    _atomic_write_json(out_dir / "train_log.json", history)
+                    ema_note = f" + {ep.name}" if ep is not None else ""
+                    print(f"  [autosave @ step {step}] saved {lp.name}{ema_note} + train_log.json", flush=True)
+
+            # Exact global-step permanent EMA milestones (--ema-milestone-steps)
+            if (
+                out_dir is not None
+                and (not args.dry_run)
+                and gpu_ema is not None
+                and step in ema_milestone_steps
+            ):
+                mp = atomic_save_v2_ema_milestone(
                     out_dir,
                     model,
                     cfg,
                     step=step,
-                    best_val_ser=best_val_ser,
                     gpu_ema=gpu_ema,
                     best_ema_ser=best_ema_ser,
+                    keep_last=0,
+                    zero_pad_step=True,
                 )
-                ema_note = f" + {ep.name}" if ep is not None else ""
-                print(f"  [autosave @ step {step}] saved {lp.name}{ema_note}", flush=True)
+                if mp is not None:
+                    print(f"  [milestone-exact @ step {step}] saved {mp.name}", flush=True)
 
             # Periodic milestone EMA snapshots (default every 4,000 steps)
             if (
@@ -3593,6 +4258,7 @@ def run_train_v2(args: argparse.Namespace) -> Dict[str, Any]:
                 and gpu_ema is not None
                 and save_ema_milestones > 0
                 and (step % save_ema_milestones == 0)
+                and (step not in ema_milestone_steps)
             ):
                 mp = atomic_save_v2_ema_milestone(
                     out_dir,
@@ -3602,6 +4268,7 @@ def run_train_v2(args: argparse.Namespace) -> Dict[str, Any]:
                     gpu_ema=gpu_ema,
                     best_ema_ser=best_ema_ser,
                     keep_last=keep_ema_milestones,
+                    protected_steps=ema_milestone_steps,
                 )
                 if mp is not None:
                     print(f"  [milestone @ step {step}] saved {mp.name}", flush=True)
@@ -3684,11 +4351,24 @@ def run_train_v2(args: argparse.Namespace) -> Dict[str, Any]:
                         )
                 eval_history.append(eval_rec)
     finally:
-        _flush_pending_history()
-        for pf in prefetchers:
-            pf.close()
-        if teacher_cache is not None:
-            teacher_cache.close()
+        primary_exc = sys.exc_info()[0]
+        ckpt_err: Optional[Exception] = None
+        try:
+            _wait_pending_ckpt()
+        except Exception as e:
+            ckpt_err = e
+        finally:
+            if ckpt_executor is not None:
+                ckpt_executor.shutdown(wait=True)
+            _flush_pending_history()
+            for pf in prefetchers:
+                pf.close()
+            if teacher_cache is not None:
+                teacher_cache.close()
+        if ckpt_err is not None:
+            if primary_exc is None:
+                raise ckpt_err
+            print(f"[WARN] Async checkpoint save failed during unwind: {ckpt_err}", flush=True)
 
     if out_dir is not None and not args.dry_run:
         atomic_save_v2_latest(
@@ -3699,6 +4379,7 @@ def run_train_v2(args: argparse.Namespace) -> Dict[str, Any]:
             best_val_ser=best_val_ser,
             gpu_ema=gpu_ema,
             best_ema_ser=best_ema_ser,
+            opt=opt,
         )
         ensure_v2_best_checkpoints(
             out_dir,
@@ -3709,7 +4390,7 @@ def run_train_v2(args: argparse.Namespace) -> Dict[str, Any]:
             gpu_ema=gpu_ema,
             best_ema_ser=best_ema_ser,
         )
-        (out_dir / "train_log.json").write_text(json.dumps(history, indent=2), encoding="utf-8")
+        _atomic_write_json(out_dir / "train_log.json", history)
 
     if qat_ctrl is not None:
         qat_ctrl.detach()
@@ -3741,7 +4422,13 @@ def build_arg_parser() -> argparse.ArgumentParser:
         choices=["small_45m", "edge85m", "pro200m", "iter15_pro200m", "tiny"],
         default="small_45m",
     )
-    p.add_argument("--init-from", type=str, default=None, help="Resume full UniOMRv2 checkpoint")
+    p.add_argument("--init-from", type=str, default=None, help="Warm-start full UniOMRv2 weights (strict=False, step resets to 0)")
+    p.add_argument(
+        "--resume",
+        type=str,
+        default=None,
+        help="True resume from uni_omr_v2_latest.pt (restores model, EMA, optimizer states, global step, best SER, and RNG)",
+    )
     p.add_argument("--init-encoder-from", type=str, default=None, help="Load I-JEPA v2 encoder weights (strict=False)")
     p.add_argument("--grad-checkpoint", action="store_true", help="Enable axial-only selective checkpointing")
     p.add_argument("--channels-last", action="store_true", help="Use channels_last on backbone")
@@ -3756,7 +4443,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--adaptive-ink-target",
         action="store_true",
         default=True,
-        help="Use per-page adaptive router ink threshold clamp(mean+0.5*std, 0.08, 0.20) (default: True)",
+        help="Use per-page adaptive router ink threshold (default: True)",
     )
     p.add_argument("--no-adaptive-ink-target", dest="adaptive_ink_target", action="store_false")
     p.add_argument(
@@ -3860,6 +4547,19 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--staff-seg-loss-weight", type=float, default=0.20)
     p.add_argument("--stroke-hog-weight", type=float, default=0.15)
     p.add_argument(
+        "--text-aux-loss-weight",
+        type=float,
+        default=None,
+        help="Optional override for text-aux head CE loss weight (default: None = use model cfg value)",
+    )
+    p.add_argument(
+        "--schema-mask-v1",
+        action="store_true",
+        default=True,
+        help="Mask the 28 bekern+v2a-only logits to -1e4 on v1 rows during CE/MTP loss (default: True)",
+    )
+    p.add_argument("--no-schema-mask-v1", dest="schema_mask_v1", action="store_false")
+    p.add_argument(
         "--bd3-repair-weight",
         type=float,
         default=0.0,
@@ -3915,6 +4615,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
         type=int,
         default=4000,
         help="Save periodic EMA milestone uni_omr_v2_ema_step{N}.pt every N steps (default: 4000; 0 disables)",
+    )
+    p.add_argument(
+        "--ema-milestone-steps",
+        type=str,
+        default="",
+        help="Comma-separated exact global steps to save permanent uni_omr_v2_ema_step{step:06d}.pt snapshots (never pruned)",
     )
     p.add_argument(
         "--keep-ema-milestones",

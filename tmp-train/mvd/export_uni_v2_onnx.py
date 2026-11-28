@@ -55,6 +55,40 @@ DEFAULT_OUT_DIR = REPO_ROOT / "web" / "models_v2"
 VALID_TARGETS = ("webgpu", "npu", "cpu")
 
 
+def _assert_no_unsupported_iter15_flags(cfg: uni_omr_v2.UniOMRv2Config) -> None:
+    """Fail fast if any Iter-15-only architecture flag is enabled (ONNX lowering not yet implemented)."""
+    unsupported: List[str] = []
+    if bool(getattr(cfg, "use_yoco_cla", False)):
+        unsupported.append("use_yoco_cla=True")
+    else:
+        yoco_self_kv = getattr(cfg, "yoco_self_kv_heads", None)
+        if yoco_self_kv is not None and int(yoco_self_kv) != int(cfg.n_kv_heads):
+            unsupported.append(
+                f"yoco_self_kv_heads={int(yoco_self_kv)} (n_kv_heads={int(cfg.n_kv_heads)})"
+            )
+        yoco_cross_kv = getattr(cfg, "yoco_cross_kv_heads", None)
+        if yoco_cross_kv is not None and int(yoco_cross_kv) != int(cfg.n_kv_heads):
+            unsupported.append(
+                f"yoco_cross_kv_heads={int(yoco_cross_kv)} (n_kv_heads={int(cfg.n_kv_heads)})"
+            )
+    if bool(getattr(cfg, "use_diff_cross_attn", False)):
+        unsupported.append("use_diff_cross_attn=True")
+    if bool(getattr(cfg, "use_coordkey_ca", False)):
+        unsupported.append("use_coordkey_ca=True")
+    if bool(getattr(cfg, "use_chained_mtp", False)):
+        unsupported.append("use_chained_mtp=True")
+    if int(getattr(cfg, "mode_gate_layers", 0)) > 0:
+        unsupported.append(f"mode_gate_layers={int(cfg.mode_gate_layers)}")
+    if bool(getattr(cfg, "use_quantvla_head_temp", False)):
+        unsupported.append("use_quantvla_head_temp=True")
+    if unsupported:
+        raise NotImplementedError(
+            "Iter-15 ONNX lowering is not yet implemented for config flags: "
+            + ", ".join(unsupported)
+            + ". Wait for Iter-15 ONNX export support before exporting this model."
+        )
+
+
 # ---------------------------------------------------------------------------
 # Shared Clean ONNX-Safe Primitives (Zero WebGPU/NPU CPU-Fallback Ops)
 # ---------------------------------------------------------------------------
@@ -191,6 +225,7 @@ class UniOMRv2EncoderONNX(nn.Module):
         static_k_mem: Optional[int] = None,
     ) -> None:
         super().__init__()
+        _assert_no_unsupported_iter15_flags(model.cfg)
         self.cfg = model.cfg
         self.use_chunked_sdpa = bool(use_chunked_sdpa) and (static_hw is None)
         self.attn_chunk_q = int(attn_chunk_q)
@@ -351,15 +386,36 @@ class UniOMRv2EncoderONNX(nn.Module):
     def _compute_ink_and_paper_gate_f32(
         self, images: torch.Tensor
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Pure float32 InkTokenRouterV2 ink map + 3x3 eroded paper_gate.
+        """Pure float32 InkTokenRouterV2 edge-connected dark-border ink map + paper_gate.
 
-        Zero ``bool`` ``~`` / ``&`` / ``Where`` ops.
+        Exact parity with ``InkTokenRouterV2._compute_ink_and_paper_gate`` using
+        zero ``bool`` ``~`` / ``&`` / ``|`` / ``Where`` ops.
         """
         luma = (
             0.299 * images[:, 0:1]
             + 0.587 * images[:, 1:2]
             + 0.114 * images[:, 2:3]
         )
+
+        # Edge-connected dark-border mask via float32 cumsums (exact for H, W <= 2^24).
+        bright_f = (luma >= 0.35).to(torch.float32)
+        cs_y = bright_f.cumsum(dim=2)
+        cs_x = bright_f.cumsum(dim=3)
+        top_dark = (cs_y < 0.5).to(torch.float32)
+        bot_dark = ((cs_y[:, :, -1:, :] - cs_y) < 0.5).to(torch.float32)
+        left_dark = (cs_x < 0.5).to(torch.float32)
+        right_dark = ((cs_x[:, :, :, -1:] - cs_x) < 0.5).to(torch.float32)
+        edge_dark_f = (top_dark + bot_dark + left_dark + right_dark).clamp(0.0, 1.0)
+        border_px = edge_dark_f * (luma < 0.22).to(torch.float32)
+
+        border_dilated_px = F.max_pool2d(
+            F.max_pool2d(border_px, kernel_size=(1, 13), stride=1, padding=(0, 6)),
+            kernel_size=(13, 1),
+            stride=1,
+            padding=(6, 0),
+        )
+        paper_px = (1.0 - border_dilated_px).clamp(0.0, 1.0)
+
         local_bg = F.avg_pool2d(
             F.avg_pool2d(
                 luma,
@@ -373,8 +429,7 @@ class UniOMRv2EncoderONNX(nn.Module):
             padding=(15, 0),
             count_include_pad=False,
         )
-        paper_mask = (local_bg > 0.35).to(torch.float32)
-        local_ink = ((local_bg - luma) / local_bg.clamp(min=0.15)).clamp(0.0, 1.0) * paper_mask
+        local_ink = ((local_bg - luma) / local_bg.clamp(min=0.15)).clamp(0.0, 1.0) * paper_px
 
         # Merged grid is /16 (H, W are multiples of 16 -> exact fixed-stride pooling).
         ks = (16, 16)
@@ -382,13 +437,8 @@ class UniOMRv2EncoderONNX(nn.Module):
         ink_avg = F.avg_pool2d(local_ink, kernel_size=ks, stride=ks)
         local_ink_grid = 0.5 * ink_max + 0.5 * ink_avg
 
-        local_bg_grid = F.avg_pool2d(local_bg, kernel_size=ks, stride=ks)
-        paper_f = (local_bg_grid > 0.35).to(torch.float32)
-        non_paper_f = 1.0 - paper_f
-        border_dilated_f = F.max_pool2d(non_paper_f, kernel_size=3, stride=1, padding=1)
-        interior_f = paper_f * (1.0 - border_dilated_f)
-        has_interior_f = interior_f.amax(dim=(1, 2, 3), keepdim=True)
-        effective_paper_f = has_interior_f * interior_f + (1.0 - has_interior_f) * paper_f
+        paper_grid_f = F.avg_pool2d(paper_px, kernel_size=ks, stride=ks)
+        effective_paper_f = (paper_grid_f > 0.5).to(torch.float32)
 
         local_ink_grid = local_ink_grid * effective_paper_f
         paper_gate = 0.05 + 0.95 * effective_paper_f
@@ -404,6 +454,16 @@ class UniOMRv2EncoderONNX(nn.Module):
         """Pure float32 InkTokenRouterV2 forward (dynamic or static k_mem)."""
         r = self.router
         saliency_logits = r.saliency_net(merged_2d)
+        if r.vrfm_band_alpha > 0.0 and merged_2d.shape[2] >= 3:
+            row_mean = saliency_logits.mean(dim=3, keepdim=True)
+            row_smooth = F.avg_pool2d(
+                row_mean,
+                kernel_size=(3, 1),
+                stride=1,
+                padding=(1, 0),
+                count_include_pad=False,
+            )
+            saliency_logits = saliency_logits + r.vrfm_band_alpha * row_smooth
         saliency_prob = torch.sigmoid(saliency_logits)
 
         local_ink_grid, paper_gate = self._compute_ink_and_paper_gate_f32(images)
@@ -451,9 +511,15 @@ class UniOMRv2EncoderONNX(nn.Module):
 
             if r.dynamic_routing:
                 score_sorted, _ = torch.sort(score_flat, dim=1)
-                med_idx = ((n_t - 1) // 2).view(1, 1)
-                med = torch.gather(score_sorted, 1, med_idx)
-                above = (score_flat > (med + r.saliency_thr)).to(torch.long).sum(dim=1)
+                pos = (n_t - 1).clamp(min=0).to(torch.float32) * 0.10
+                lo_f = torch.floor(pos)
+                hi_f = torch.ceil(pos)
+                frac = (pos - lo_f).view(1, 1)
+                v_lo = torch.gather(score_sorted, 1, lo_f.to(torch.long).view(1, 1))
+                v_hi = torch.gather(score_sorted, 1, hi_f.to(torch.long).view(1, 1))
+                p10 = v_lo + frac * (v_hi - v_lo)
+                thr = max(float(r.saliency_thr), 0.15)
+                above = (score_flat > (p10 + thr)).to(torch.long).sum(dim=1)
                 k_min = torch.clamp(torch.ceil(n_t.to(torch.float32) * r.min_keep_ratio).to(torch.long), min=1)
                 k_max = torch.minimum(
                     n_t,
@@ -651,6 +717,7 @@ class UniOMRv2DecoderDynamicONNX(nn.Module):
 
     def __init__(self, model: uni_omr_v2.UniOMRv2Net) -> None:
         super().__init__()
+        _assert_no_unsupported_iter15_flags(model.cfg)
         self.d_model = int(model.cfg.d_model)
         self.n_heads = int(model.cfg.n_heads)
         self.n_kv_heads = int(model.cfg.n_kv_heads)
@@ -803,6 +870,7 @@ class UniOMRv2DecoderNPUONNX(nn.Module):
         static_t: int = 1,
     ) -> None:
         super().__init__()
+        _assert_no_unsupported_iter15_flags(model.cfg)
         self.d_model = int(model.cfg.d_model)
         self.n_heads = int(model.cfg.n_heads)
         self.n_kv_heads = int(model.cfg.n_kv_heads)
@@ -1172,7 +1240,7 @@ def load_v2_model(
         filtered: Dict[str, Any] = {}
         for k, v in cfg_dict.items():
             if k in valid_fields:
-                if k in ("backbone_channels", "backbone_blocks") and isinstance(v, list):
+                if k in ("backbone_channels", "backbone_blocks", "yoco_cross_banks") and isinstance(v, list):
                     v = tuple(v)
                 filtered[k] = v
         cfg = uni_omr_v2.UniOMRv2Config(**filtered)
@@ -1592,6 +1660,7 @@ def export_all_targets(
     dummy_hw: Tuple[int, int] = (128, 128),
     ckpt_vocab: Optional[List[str]] = None,
 ) -> Dict[str, Any]:
+    _assert_no_unsupported_iter15_flags(cfg)
     out_dir.mkdir(parents=True, exist_ok=True)
     model.eval()
 

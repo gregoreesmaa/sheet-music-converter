@@ -109,6 +109,10 @@ resolves to the WSL stub and fails. Each crate also runs standalone —
 - `docs/UNIOMR.md` — UniOMR neural OMR architecture, training, and eval reference.
 - `.agents/skills/learn-from-suite31/SKILL.md` — workspace skill for the
   post-evaluation forensic learning loop on `suite31_hw` runs.
+- `.agents/skills/hw-gold-harvest/SKILL.md` — mandatory real-HW GOLD matching &
+  single-page promotion pipeline (visual canvas/staff-count gate → forced
+  single-page `[m_start, m_end)` & `<sys>` alignment/slicing → eyeball QA;
+  never merge unsliced/multi-page GOLD matches into training manifests).
 - Read `todo.md`, `goal.md`, and `progress.md` at the start of any session or
   goal continuation before touching code. Update `progress.md` whenever a worker
   result is verified on disk (files changed, test counts, metric values, open

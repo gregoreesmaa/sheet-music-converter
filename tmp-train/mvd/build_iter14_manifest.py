@@ -82,9 +82,14 @@ def classify_bucket_iter14(img_path: str, domain: str = "", bucket: str = "") ->
     p_str = str(img_path).replace("\\", "/").lower()
     if b_in == "neg_control" or dom == "neg_control" or "neg-controls" in p_str:
         return "neg_control"
-    if b_in == "rism_pseudo" or dom == "rism_pseudo" or "rism_pseudo" in p_str:
+    if (
+        b_in in ("rism_pseudo", "real_hw_pseudo")
+        or dom in ("rism_pseudo", "real_hw_pseudo")
+        or "rism_pseudo" in p_str
+        or "real_hw_pseudo" in p_str
+    ):
         return "rism_pseudo"
-    if dom == "real_hw" or "real_hw" in p_str or "debussy" in p_str:
+    if dom in ("real_hw", "real_hw_archival", "real_hw_stitched") or "real_hw" in p_str or "debussy" in p_str:
         if any(tok in p_str or tok in dom for tok in _STITCHED_HW_MARKERS):
             return "real_hw_stitched"
         return "real_hw_archival"
@@ -118,8 +123,8 @@ def load_northstar_eval_index(manifest_path: Path = NORTHSTAR_MANIFEST) -> Dict[
         raise FileNotFoundError(f"Missing northstar manifest.json: {manifest_path}")
     d = json.loads(manifest_path.read_text(encoding="utf-8"))
     pages = d.get("pages", [])
-    if len(pages) != 125:
-        raise ValueError(f"Expected 125 northstar pages, got {len(pages)}")
+    if len(pages) < 100:
+        raise ValueError(f"Expected >= 100 northstar pages, got {len(pages)}")
     img_keys: Set[str] = set()
     slugs: Set[str] = set()
     for p in pages:

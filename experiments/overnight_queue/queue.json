@@ -1847,17 +1847,23 @@
     "id": "2026-11-26T14-30-ov-19b-router-saliency-keep-converged",
     "wave": 10,
     "priority": 20,
-    "provider": "colab_l4",
-    "gpu": "L4",
+    "provider": "local_4080s",
+    "gpu": "RTX_4080_SUPER",
     "est_minutes": 35,
-    "est_cu": 2.9,
+    "est_cu": 0.0,
     "script": "experiments/2026-11-26T14-30-ov-19b-router-saliency-keep-converged/run_colab.py",
     "hf_eval_target": "evals/2026-11-26T14-30-ov-19b-router-saliency-keep-converged.json",
-    "status": "QUEUED",
+    "status": "COMPLETED",
     "depends_on": [
       "2026-11-26T01-38-ov-19-router-saliency-keep-sweep",
       "2026-11-26T07-15-iter12-v2-strip-warmup-24k"
-    ]
+    ],
+    "started_at": "2026-11-28T05:07:03Z",
+    "completed_at": "2026-11-28T05:30:25Z",
+    "elapsed_sec": 1401.35,
+    "returncode": 0,
+    "verdict": "DISCARD",
+    "summary": "Local RTX 4080S (iter12_v2_best, 90/90 suite31_hw, 1401.35s): arm_005_075 base F1 0.5360 (pr_cl 0.6829 / pr_ph 0.7182 / hw_cl 0.1901 / hw_ph 0.1535) vs arm_002_065 0.5381 (+0.20pp; 0/62 PR changed, hw_cl +1.36pp, hw_ph -0.05pp; mathematically <=1.154x cap <1.2x gate) vs arm_003_055 0.5343 (-0.18pp; pr_ph -1.51pp from beach-prayer -46.9pp clip, hw_cl +2.45pp, hw_ph -0.72pp). Root-caused compression_x=1.0/keep_frac=1.0 to _, rinfo, _ unpacking aux_enc instead of router_info (3rd tuple elem). Retain max_keep_ratio=0.75 default."
   },
   {
     "id": "2026-11-26T16-20-i13-06c-sar-sam-tight-conf-skip",
@@ -2311,7 +2317,7 @@
     "est_cu": 3.8,
     "script": "experiments/2026-11-26T22-18-i14-10-hw-crossout-nib-physics-and-scribe-adapt/run_colab.py",
     "hf_eval_target": "evals/2026-11-26T22-18-i14-10-hw-crossout-nib-physics-and-scribe-adapt.json",
-    "status": "QUEUED",
+    "status": "FAILED",
     "depends_on": [],
     "note": "Wave 11 Wild (Theorist 2 HWM 18.77->88+): 2x2 factorial combining nib/dry-brush/cram/cross-out training with ov-38b page-level Scribe-TTT."
   },
@@ -2327,7 +2333,7 @@
     "est_cu": 3.4,
     "script": "experiments/2026-11-26T22-18-i14-11-1d-sysband-anchor-and-eos-lock/run_colab.py",
     "hf_eval_target": "evals/2026-11-26T22-18-i14-11-1d-sysband-anchor-and-eos-lock.json",
-    "status": "QUEUED",
+    "status": "FAILED",
     "depends_on": [],
     "note": "Wave 11 Theorist 5 Zero-Dropped-Systems (k_dropped -> 0, LoopPen -> 1.0)."
   },
@@ -2680,8 +2686,8 @@
     "title": "Pivot Strategist 4 (Pivots 3 & 2): Risk-Gated Visual-Coverage TTC on NorthStar 125p + <sys>-Aligned On-Policy DAgger & Counterfactual Anti-Prior Probe",
     "wave": 13,
     "priority": 4,
-    "provider": "colab_l4",
-    "gpu": "A100",
+    "provider": "local_4080s",
+    "gpu": "RTX 4080 SUPER",
     "est_minutes": 60,
     "est_cu": 4.5,
     "script": "experiments/2026-11-27T07-46-i15-04-risk-gated-visual-ttc-and-sys-dagger/run_colab.py",
@@ -2689,7 +2695,7 @@
     "plan": "experiments/2026-11-27T07-46-i15-04-risk-gated-visual-ttc-and-sys-dagger/PLAN.md",
     "hf_eval_target": "evals/2026-11-27T07-46-i15-04-risk-gated-visual-ttc-and-sys-dagger.json",
     "hf_run_target": "runs/2026-11-27T07-46-i15-04-risk-gated-visual-ttc-and-sys-dagger.json",
-    "status": "RUNNING",
+    "status": "COMPLETED",
     "depends_on": [],
     "datasets": [
       "datasets/northstar_eval_pack_125p.tar.gz",
@@ -2698,9 +2704,15 @@
     ],
     "note": "Wave 13 Strategist 4 (Pivots 3 & 2): Part A zero-train Risk-Gated Visual-Coverage TTC on NorthStar 125p (fixes all 5 i14-14 defects + bsvr=0.997 blind spot; gates: CDR esc<=15%, lat<=1.45x, 0.0pp printed reg, NS>=+3.0); Part B 1,200-step <sys>-aligned On-Policy DAgger + Counterfactual Anti-Prior (75% SFT + 25% DAgger/Anti-Prior, ignore_index=-100 on prefix, 3x <sys> header weight) vs SFT control on suite31_hw (gates: HWM Note F1>=+3.0pp, printed>=-0.3pp).",
     "session": "2026-11-27t07-46-i15-04-",
-    "started_at": "2026-11-28T00:52:32Z",
+    "started_at": "2026-11-28T02:07:54Z",
     "log_path": "D:\\tmp\\overnight-queue-logs\\2026-11-27T07-46-i15-04-risk-gated-visual-ttc-and-sys-dagger.log",
-    "requeue_note": "Fixed 3 bugs 2026-11-28: Part B vocab_size=237 compat encoding (was 265->CUDA assert), Part A bf16 q_proj/k_proj dtype mismatch (was silently swallowing RuntimeError), Part B _pil_to_tensor [0,1] norm."
+    "requeue_note": "Fixed 3 bugs 2026-11-28: Part B vocab_size=237 compat encoding (was 265->CUDA assert), Part A bf16 q_proj/k_proj dtype mismatch (was silently swallowing RuntimeError), Part B _pil_to_tensor [0,1] norm.",
+    "completed_at": "2026-11-28T05:06:51Z",
+    "elapsed_sec": 10737.82,
+    "returncode": 0,
+    "hf_eval_exists": true,
+    "verdict": "DISCARD",
+    "summary": "Local RTX 4080 SUPER BF16 (10,737.82s). Both parts failed all gates -> DISCARD. Part A (NorthStar 125p): NS 34.5117 vs 34.9265 (-0.4148, gate >=+3.0 FAIL), Tier-W NS 55.58 vs 55.71, M_geom 59.92 vs 59.24, HWM CFR 64.29% vs 60.71% (+3.58pp worse), 89.6% all / 80.0% CDR escalation (gate <=15% FAIL), 68.8% replacement, 7.20x latency (28.47s vs 3.96s, gate <=1.45x FAIL). Part B (1200 steps/arm, suite31_hw 90p): EMA hw_mean 0.1733 vs 0.1753 (-0.20pp, gate >=+3.0pp FAIL), printed_mean 0.6440 vs 0.6823 (-3.83pp, gate >=-0.3pp FAIL), all90 0.4976 vs 0.5246 (-2.70pp); RAW hw_mean +0.91pp, printed_mean -0.60pp, all90 -0.13pp."
   },
   {
     "id": "2026-11-27T07-46-i15-05-spx13-band-tiling-and-hw-lora",
