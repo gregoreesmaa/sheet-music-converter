@@ -1,8 +1,8 @@
 # `2026-11-26T01-30-academic-gevt-vbkern-mr` — Gauge-Equivariant Visual Tokenization (`V-bekern`) & 2-Step Bidirectional Masked Refinement
 
-**Status:** `RUNNING`
+**Status:** `COMPLETED (ITERATE — Strong V-bekern Early-Convergence & Rare-Clef Signal)`
 **Baseline Commit SHA:** `164852f`
-**Platform:** Google Colab `L4` (24 GB VRAM, BF16 native, session `acad-c-gevt-vbkern`)
+**Platform:** Google Colab `A100-SXM4-40GB` (BF16 native, session `acad-c-gevt-vbkern`, terminated cleanly)
 
 ## Summary & Hypothesis
 

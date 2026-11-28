@@ -569,6 +569,7 @@ def main() -> int:
         import torch
         import eval_uni_suite31 as eval_s31
         import rlvr_grpo
+        import uni_omr
 
         t_start = time.perf_counter()
         started_utc = _utc_now()
@@ -606,13 +607,14 @@ def main() -> int:
         for idx, piece in enumerate(all_pieces, start=1):
             slug = str(piece["slug"])
             is_hw = bool(piece["handwritten"])
-            ref_notes = _extract_musicxml_notes(Path(piece["gt_xml"]))
+            ref_notes = _extract_musicxml_notes(Path(piece["gt"]))
             for domain in ("clean", "photo"):
                 if (slug, domain) in done_keys:
                     continue
-                img_path = Path(piece["clean_img"] if domain == "clean" else piece["photo_img"])
+                img_path = Path(piece["clean"] if domain == "clean" else piece["photo"])
                 img_pil = Image.open(img_path).convert("RGB")
-                img_t = eval_s31.load_page_image_tensor(img_pil, max_dim=MAX_DIM).to(device)
+                pil_resized = uni_omr._resize_fullpage_pil(img_pil, MAX_DIM)
+                img_t = uni_omr._pil_to_chw_tensor(pil_resized).unsqueeze(0).to(device)
 
                 t0 = time.perf_counter()
                 with torch.no_grad():

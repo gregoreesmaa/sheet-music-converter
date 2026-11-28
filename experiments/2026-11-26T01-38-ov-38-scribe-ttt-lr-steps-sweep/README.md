@@ -1,6 +1,6 @@
 # `2026-11-26T01-38-ov-38-scribe-ttt-lr-steps-sweep` — SCRIBE/DocTTT Per-Manuscript TTA `steps` × `lr` × `scope` Sweep
 
-- **Status:** `QUEUED` (Overnight Batch 09, Wave 7 — Google Colab `NVIDIA L4`, `cc=8.9`, BF16)
+- **Status:** `COMPLETED (ITERATE)` (Overnight Batch 09, Wave 7 — ran on Kaggle `2× T4` FP32, `10,031 s`; best cell `full_encoder_lr3e-05_s2` hit `hw_photo +0.0181` `9W/1T/4L`, `hw_clean +0.0044` `9W/0T/5L`, avg `+0.0113`; `encoder_norm_only` inert; successor `ov-38b` queued)
 - **Baseline:** Commit `164852f` | Checkpoint: HF `checkpoints/iter10_soup_baseline/uni_omr_soup.pt` (`hw_clean 0.2550`, `hw_photo 0.1516`, `printed_clean 0.8895`, `printed_photo 0.8738`, `all45_clean 0.6921`)
 - **Single Variable Tested:** 3D sweep of per-manuscript `SCRIBE/DocTTT` test-time adaptation (`tmp-train/mvd/trial_2028_ttt_adapt.py`) across `steps` ∈ `{2, 4, 8}` × `lr` ∈ `{1e-5, 3e-5, 1e-4}` × `adapt_scope` ∈ `{"encoder_norm_only", "full_encoder"}` (`18` grid cells) on all **14 real historical handwritten manuscripts** in `suite31_hw` (`clean` + `photo` = `28` pages), with bit-exact (`atol=0`) weight reset between pages and trajectories.
 
@@ -12,6 +12,6 @@ Historical handwritten scores vary dramatically in nib width, paper foxing, slan
 ## Quick Links
 - Execution Plan, Hyperparameters & Decision Tree: [PLAN.md](./PLAN.md)
 - Standalone Colab L4 Runner: [run_colab.py](./run_colab.py)
-- Outcome: `OUTCOME.md` *(to be written immediately once Colab run completes)*
+- Outcome: [OUTCOME.md](./OUTCOME.md) (`ITERATE` → successor [`2026-11-26T06-25-ov-38b-scribe-ttt-budget-cons-3840`](../2026-11-26T06-25-ov-38b-scribe-ttt-budget-cons-3840/README.md))
 - Hugging Face Eval Target: `gregoreesmaa/sheet-music-converter-omr` → `evals/2026-11-26T01-38-ov-38-scribe-ttt-lr-steps-sweep.json`
 - Hugging Face Run Ledger: `gregoreesmaa/sheet-music-converter-omr` → `runs/2026-11-26T01-38-ov-38-scribe-ttt-lr-steps-sweep.json`

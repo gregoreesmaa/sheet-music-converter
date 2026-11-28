@@ -434,9 +434,13 @@ def _train_and_eval_arm(
         mtp_k=4,
     )
 
+    class _CompatViRTwoTierRouter(ViRTwoTierRouter):
+        def forward(self, *args: Any, feat_nhwc: Any = None, **kwargs: Any) -> Any:
+            return super().forward(*args, **kwargs)
+
     _seed_everything(SEED)
     model = UniOMRv2Net(cfg)
-    model.encoder.router = ViRTwoTierRouter(
+    model.encoder.router = _CompatViRTwoTierRouter(
         d_model=cfg.d_model,
         keep_ratio=keep_ratio,
         k_coarse=K_COARSE,

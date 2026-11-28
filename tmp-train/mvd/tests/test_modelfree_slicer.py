@@ -586,13 +586,14 @@ def test_extract_1d_profiles_tacet_norm_floor_and_clamping() -> None:
     # Include an out-of-bounds band to verify clamping doesn't crash or produce NaN
     bands = [(0, 40), (40, 120)]
     F, active = mfs.extract_1d_profiles(ink, bands, n_bars=4, target_w=192, mask_preamble_frac=0.0)
-    assert F.shape == (192, 10)
+    assert F.shape == (192, 2 * mfs.CHANNELS_PER_STAFF)
+    assert mfs.CHANNELS_PER_STAFF == 8
     assert np.all(np.isfinite(F))
     assert active[0] is True
     assert active[1] is False
     # With 0.5 norm floor, tacet staff block norm stays strongly attenuated vs active staff
-    norm_active = float(np.linalg.norm(F[:, :5]))
-    norm_tacet = float(np.linalg.norm(F[:, 5:10]))
+    norm_active = float(np.linalg.norm(F[:, : mfs.CHANNELS_PER_STAFF]))
+    norm_tacet = float(np.linalg.norm(F[:, mfs.CHANNELS_PER_STAFF :]))
     assert norm_tacet < 0.25 * norm_active
 
 
@@ -806,3 +807,129 @@ def test_resume_preserves_status_counts(tmp_path: Path) -> None:
     assert summary["status_counts"]["rej_missing_img"] == 1
     assert summary["final_accepted"] == 1
     assert summary["resumed_skipped"] == 2
+
+
+# ---------------------------------------------------------------------------
+# 8. v2.1 Recall Fixes: force_single_staff & Single-Staff Over-Splitting Guard
+# ---------------------------------------------------------------------------
+
+def test_force_single_staff_prevents_false_partbook_merges() -> None:
+    """1-staff partbooks with close staves and vertical bleed/barlines stay [1, 1, 1, 1]."""
+    h, w = 800, 1000
+    img = np.full((h, w), 245, dtype=np.uint8)
+    d_line = 8
+    staff_ys = [100, 220, 340, 480]
+    for y0 in staff_ys:
+        for k in range(5):
+            y = y0 + k * d_line
+            img[y : y + 2, 80:920] = 30
+        # Add musical ink (vertical stems + noteheads) so staves pass blank-staff filter
+        for x in range(150, 880, 60):
+            img[y0 + 4 : y0 + 30, x : x + 3] = 25
+            img[y0 + 18 : y0 + 26, x - 4 : x + 1] = 25
+
+    # Draw accidental vertical bleed/barlines connecting staves 1 and 2 (would falsely merge into [1, 2, 1])
+    for bx in (82, 320, 600):
+        img[220 : 340 + 4 * d_line + 2, bx : bx + 3] = 25
+
+    pil_im = Image.fromarray(img)
+    vis_multi = mfs.detect_staves_and_systems(pil_im, force_single_staff=False)
+    assert vis_multi["n_staves_total"] == 4
+    assert vis_multi["all_systems_uniform"] is False
+    assert vis_multi["system_staff_counts"] == [1, 2, 1]
+
+    vis_single = mfs.detect_staves_and_systems(pil_im, force_single_staff=True)
+    assert vis_single["n_staves_total"] == 4
+    assert vis_single["visual_n_systems"] == 4
+    assert vis_single["visual_n_staves"] == 1
+    assert vis_single["all_systems_uniform"] is True
+    assert vis_single["system_staff_counts"] == [1, 1, 1, 1]
+
+
+def test_split_merged_staff_clusters_does_not_split_single_staff_with_double_peaks() -> None:
+    """Chopin 1001061624 root cause: a single 5-line staff with half-space double-peaks must NOT split."""
+    # Exact Chopin 1001061624 bottom-staff peak patterns (true d_line=9.0; gaps <= 9 px)
+    chopin_s8 = [957, 961, 966, 970, 975, 980, 984, 988, 994, 999, 1006]
+    chopin_s12 = [1260, 1264, 1270, 1274, 1279, 1288, 1292, 1297, 1306]
+    # Even if d_line were underestimated at 6.0, max gap in chopin_s8 is 7 <= max(1.25*6, 8) = 8 -> NOT split!
+    assert mfs._split_merged_staff_clusters([chopin_s8], d_line=6.0) == [chopin_s8]
+    # With true median d_line=9.0, neither cluster splits!
+    assert mfs._split_merged_staff_clusters([chopin_s8, chopin_s12], d_line=9.0) == [
+        chopin_s8,
+        chopin_s12,
+    ]
+    # Real 2 merged staves (d_line=9.0, inter-staff gap=18 > 11.25) MUST still split cleanly!
+    st_a = [100, 109, 118, 127, 136]
+    st_b = [154, 163, 172, 181, 190]
+    assert mfs._split_merged_staff_clusters([st_a + st_b], d_line=9.0) == [st_a, st_b]
+
+
+# ---------------------------------------------------------------------------
+# 9. v2.2 Upgrades: 2D 6-Band Vertical Pitch-Grid & SVG Barline X-Alignment
+# ---------------------------------------------------------------------------
+
+def test_2d_pitch_grid_discriminates_high_vs_low_melody_identical_rhythm() -> None:
+    """8-channel 2D pitch-grid strongly discriminates high vs low melody with identical 1D rhythm."""
+    h, w = 60, 240
+    bands = [(0, h)]
+    ink_high = np.zeros((h, w), dtype=np.float32)
+    ink_low = np.zeros((h, w), dtype=np.float32)
+    # Identical horizontal note positions & widths (1D horizontal density & onset are 100% identical!)
+    note_xs = [20, 48, 76, 110, 145, 175, 205]
+    for x in note_xs:
+        ink_high[6:14, x : x + 8] = 1.0   # top staff / upper-ledger band
+        ink_low[46:54, x : x + 8] = 1.0   # bottom staff / lower-ledger band
+
+    # Verify 1D horizontal density is literally identical
+    assert np.allclose(ink_high.mean(axis=0), ink_low.mean(axis=0))
+
+    F_high, act_h = mfs.extract_1d_profiles(ink_high, bands, n_bars=4, target_w=192, mask_preamble_frac=0.0)
+    F_low, act_l = mfs.extract_1d_profiles(ink_low, bands, n_bars=4, target_w=192, mask_preamble_frac=0.0)
+    assert F_high.shape == (192, 8)
+    assert F_low.shape == (192, 8)
+    assert act_h == [True] and act_l == [True]
+
+    sc_same, _, _ = mfs.compare_system_profiles_dtw(F_high, F_high)
+    sc_diff, _, _ = mfs.compare_system_profiles_dtw(F_high, F_low)
+    assert sc_same > 0.70, f"Expected high self-similarity, got sc_same={sc_same:.4f}"
+    assert sc_diff < 0.35, f"Expected strong pitch discrimination, got sc_diff={sc_diff:.4f}"
+    assert (sc_same - sc_diff) > 0.40, f"Expected large gap, got same={sc_same:.4f}, diff={sc_diff:.4f}"
+
+
+def test_barline_alignment_bonus_along_dtw_path() -> None:
+    """Verovio SVG internal barline alignment bonus rewards exact P* spatial match and rejects mismatches."""
+    N = 200
+    id_path = [(i, i) for i in range(N)]
+
+    # Exact 2-barline match along identity path -> full bonus
+    b_exact = mfs.compute_barline_alignment_bonus([0.33, 0.67], [0.33, 0.67], id_path, N)
+    assert abs(b_exact - mfs.BARLINE_BONUS_WEIGHT) < 1e-5
+
+    # Slight 2% offset (within ±5% tol) -> strong positive bonus
+    b_near = mfs.compute_barline_alignment_bonus([0.33, 0.67], [0.35, 0.65], id_path, N)
+    assert 0.5 * mfs.BARLINE_BONUS_WEIGHT < b_near < mfs.BARLINE_BONUS_WEIGHT
+
+    # Misaligned barlines (>5% off) -> zero bonus
+    b_miss = mfs.compute_barline_alignment_bonus([0.25, 0.50], [0.40, 0.80], id_path, N)
+    assert b_miss == 0.0
+
+    # Dense 10-barline decoy vs 2 manuscript barlines -> penalized by F1 (cannot beat exact match)
+    dense_vr = [k / 11.0 for k in range(1, 11)]
+    b_dense = mfs.compute_barline_alignment_bonus([0.33, 0.67], dense_vr, id_path, N)
+    assert b_dense < 0.4 * b_exact
+
+    # VerovioMeasureBank.get_slice_with_bars returns exact internal barline pixel offsets
+    bank = mfs.VerovioMeasureBank(
+        m_start=0,
+        m_end=4,
+        sym_ink=np.zeros((40, 400), dtype=np.float32),
+        staff_bands=[(0, 40)],
+        measure_px_bounds=[(0, 100), (100, 220), (220, 310), (310, 400)],
+    )
+    sl = bank.get_slice_with_bars(1, 4)
+    assert sl is not None
+    sub, _, has_pre, bars_px = sl
+    assert sub.shape == (40, 300)
+    assert has_pre is False
+    assert bars_px == [120.0, 210.0]
+

@@ -618,7 +618,7 @@ def main() -> None:
 
         ckpt_path, train_manifest, s31_manifest = _ensure_assets(hf_token)
         train_pairs = _load_manifest_pairs(train_manifest)
-        all_pieces = eval_s31.load_suite31_manifest(s31_manifest)
+        _, all_pieces = eval_s31.resolve_manifest_pieces(s31_manifest)
         sweep_pieces = _select_sweep_pieces(all_pieces, n_printed=12)
 
         api = HfApi(token=hf_token)

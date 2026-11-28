@@ -220,6 +220,21 @@ def _upload_json_to_hf(hf_token: str, local_path: Path, path_in_repo: str) -> No
     print(f"[{EXP_ID}] Uploaded {path_in_repo} -> {HF_REPO_ID}", flush=True)
 
 
+def _load_manifest_pairs(manifest_path: Path) -> List[Tuple[Path, List[Path], str]]:
+    pairs: List[Tuple[Path, List[Path], str]] = []
+    for raw in manifest_path.read_text(encoding="utf-8").splitlines():
+        raw = raw.strip()
+        if not raw:
+            continue
+        rec = json.loads(raw)
+        img_p = Path(rec["image"])
+        beks = [Path(b) for b in rec.get("bekerns", [])]
+        domain = str(rec.get("domain", "")).strip().lower()
+        if img_p.is_file() and beks:
+            pairs.append((img_p, beks, domain))
+    return pairs
+
+
 def _eval_faint_probe(
     arm_dir: Path,
     faint_val_manifest: Path,
@@ -247,7 +262,7 @@ def _eval_faint_probe(
     model.load_state_dict(ck["model"], strict=False)
     model.eval()
 
-    faint_pairs = uni_omr.discover_fullpage_pairs([], manifest=str(faint_val_manifest))
+    faint_pairs = _load_manifest_pairs(faint_val_manifest)
     faint_ds = uni_omr.UniFullPageDataset(
         faint_pairs,
         fullpage_max_dim=FULLPAGE_MAX_DIM,
@@ -375,7 +390,7 @@ def _run_arm(
     args = parser.parse_args(argv)
     args.multi_scale = False
 
-    val_pairs = uni_omr.discover_fullpage_pairs([], manifest=str(val_manifest))
+    val_pairs = _load_manifest_pairs(val_manifest)
     orig_split = train_uni_v2.split_train_val
 
     def _fixed_val_split(pairs: Any, val_count: int = 0, seed: int = 42) -> Tuple[Any, Any]:

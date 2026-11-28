@@ -1,6 +1,6 @@
 # `2026-11-26T02-45-ov-35b-lower-res-tight-maxlen-sweep` — Lower-Resolution & Tight-`max_len` Boundary Sweep on `suite31_hw`
 
-- **Status:** `QUEUED` (Wave 4 follow-up — successor to [`2026-11-26T01-38-ov-35-maxlen-resolution-inference-sweep`](../2026-11-26T01-38-ov-35-maxlen-resolution-inference-sweep/OUTCOME.md), Google Colab `NVIDIA L4`, `BF16`)
+- **Status:** `COMPLETED (PROMOTE)` (Wave 4 follow-up — successor to [`2026-11-26T01-38-ov-35-maxlen-resolution-inference-sweep`](../2026-11-26T01-38-ov-35-maxlen-resolution-inference-sweep/OUTCOME.md), executed on Kaggle `2× Tesla T4`, `FP32`)
 - **Depends On:** `2026-11-26T01-38-ov-35-maxlen-resolution-inference-sweep` (`COMPLETED`)
 - **Baseline:** Checkpoint HF `checkpoints/iter10_soup_baseline/uni_omr_soup.pt` — `ov-35` winner `(1280px, 3840)`: `printed_clean 0.8997`, `printed_photo 0.8818`, `hw_clean 0.2799`, `hw_photo 0.1867`, `all45_clean 0.7069`, `all45_photo 0.6655`.
 - **Single Variable Tested:** Lower/intermediate inference resolutions `--max-dim in {1024, 1152, 1280, 1408}` crossed with tighter token horizons `--max-len in {2560, 3072, 3584, 3840}` across all **45 `suite31_hw` pieces** (`clean` + `photo` = 90 pages).
@@ -14,6 +14,6 @@
 - Execution Plan & Copy-Paste Colab Commands: [PLAN.md](./PLAN.md)
 - Standalone Colab L4 Runner: [run_colab.py](./run_colab.py)
 - Predecessor Outcome: [ov-35 OUTCOME.md](../2026-11-26T01-38-ov-35-maxlen-resolution-inference-sweep/OUTCOME.md)
-- Outcome: `OUTCOME.md` *(to be written immediately once Colab run completes)*
+- Outcome: [OUTCOME.md](./OUTCOME.md) (`PROMOTE` — `(1408px, 3072–3584)` brackets the global 2D peak: `all45_clean=0.7016`, `all45_photo=0.6833`, 90p mean `0.6924`, `hw_photo=0.2047`)
 - Hugging Face Eval Target: `gregoreesmaa/sheet-music-converter-omr` -> `evals/2026-11-26T02-45-ov-35b-lower-res-tight-maxlen-sweep.json`
 - Hugging Face Run Ledger: `gregoreesmaa/sheet-music-converter-omr` -> `runs/2026-11-26T02-45-ov-35b-lower-res-tight-maxlen-sweep.json`

@@ -1,7 +1,8 @@
 ---
 id: 2026-11-26T01-38-ov-15-ema-decay-soup-sweep
 title: "Overnight Exp 15: GPU EMA Decay & k=3 Checkpoint Souping Sweep on UniOMR v2 small_45m"
-status: QUEUED
+status: COMPLETED
+verdict: ITERATE
 wave: 4
 priority: 3
 provider: colab_l4
@@ -13,7 +14,7 @@ baseline_sha: 164852f
 
 # `2026-11-26T01-38-ov-15-ema-decay-soup-sweep` — GPU EMA Decay & `k=3` Checkpoint Souping Sweep (`UniOMR v2 small_45m`)
 
-- **Status:** `QUEUED` (Wave 4 overnight batch 01, Google Colab `L4`)
+- **Status:** `COMPLETED (ITERATE)` (Wave 4 overnight batch 01, Google Colab `L4`) — see [OUTCOME.md](./OUTCOME.md) and successor [`2026-11-26T05-33-ov-15b-ema-warmup-late-cooldown-soup`](../2026-11-26T05-33-ov-15b-ema-warmup-late-cooldown-soup/PLAN.md)
 - **Baseline Commit SHA:** `164852f`
 - **Model:** `UniOMR v2 small_45m` (`~43M` params, `bf16`, `fullpage_max_dim=1280`)
 - **Dataset (100% permissive):** `gregoreesmaa/sheet-music-converter-omr` → `datasets/iter10_5_proxy_2k.tar` (`2,000` train + `64` val full pages, zero `CC-BY-NC`, zero `suite31_hw` overlap)
@@ -43,6 +44,7 @@ baseline_sha: 164852f
 
 - Plan & Copy-Paste Launch Commands: [PLAN.md](./PLAN.md)
 - Colab Runner: [run_colab.py](./run_colab.py)
-- Outcome: `OUTCOME.md` *(written after HF eval JSON is retrieved)*
+- Outcome: [OUTCOME.md](./OUTCOME.md) (`ITERATE` — `k=3` traj soup `+0.0787` mean Token F1 / `-0.0504` SER, `+0.0225` CE; un-warmed EMA lagged)
+- Successor: [2026-11-26T05-33-ov-15b-ema-warmup-late-cooldown-soup](../2026-11-26T05-33-ov-15b-ema-warmup-late-cooldown-soup/PLAN.md)
 - HF Eval JSON: `gregoreesmaa/sheet-music-converter-omr` → `evals/2026-11-26T01-38-ov-15-ema-decay-soup-sweep.json`
 - HF Run Ledger: `gregoreesmaa/sheet-music-converter-omr` → `runs/2026-11-26T01-38-ov-15-ema-decay-soup-sweep.json`

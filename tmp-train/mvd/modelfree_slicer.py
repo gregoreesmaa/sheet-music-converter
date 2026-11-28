@@ -530,6 +530,7 @@ def _split_merged_staff_clusters(
     clusters: List[List[int]], d_line: float
 ) -> List[List[int]]:
     """Recursively split clusters containing 2, 3, or more merged staves."""
+    min_inter_staff_gap = max(1.25 * float(d_line), float(d_line) + 2.0)
     queue: List[List[int]] = list(clusters)
     split_clusters: List[List[int]] = []
     while queue:
@@ -542,12 +543,13 @@ def _split_merged_staff_clusters(
             if hi_idx >= lo_idx:
                 cut_rel = int(np.argmax(cgaps[lo_idx - 1 : hi_idx]))
                 cut = lo_idx + cut_rel
-                left = cl[:cut]
-                right = cl[cut:]
-                if len(left) >= 3 and len(right) >= 3:
-                    queue.insert(0, right)
-                    queue.insert(0, left)
-                    continue
+                if float(cgaps[cut - 1]) > min_inter_staff_gap:
+                    left = cl[:cut]
+                    right = cl[cut:]
+                    if len(left) >= 3 and len(right) >= 3:
+                        queue.insert(0, right)
+                        queue.insert(0, left)
+                        continue
         split_clusters.append(cl)
     return split_clusters
 
@@ -592,7 +594,11 @@ def clamp_staff_bands_to_midpoints(
     return [(int(a), max(int(a) + 1, int(b))) for a, b in out]
 
 
-def detect_staves_and_systems(pil_im: Image.Image) -> Dict[str, Any]:
+def detect_staves_and_systems(
+    pil_im: Image.Image,
+    *,
+    force_single_staff: bool = False,
+) -> Dict[str, Any]:
     """Detect physical 5-line staves, group into systems, and return per-system crops."""
     gray_pil = pil_im.convert("L")
     orig_w, orig_h = gray_pil.size
@@ -691,7 +697,7 @@ def detect_staves_and_systems(pil_im: Image.Image) -> Dict[str, Any]:
         sg_arr = g_arr[(g_arr >= 3) & (g_arr <= max(18, int(0.03 * h)))]
         if sg_arr.size == 0:
             return pks, 0.0, "no_regular_line_spacing"
-        dl = max(3.5, float(np.percentile(sg_arr, 40)))
+        dl = max(3.5, float(np.median(sg_arr)))
         return pks, dl, "ok"
 
     peaks, d_line, pk_reason = _detect_line_peaks(h_mask)
@@ -859,162 +865,165 @@ def detect_staves_and_systems(pil_im: Image.Image) -> Dict[str, Any]:
         n_st = len(staves)
         med_sh = float(np.median([s["h"] for s in staves]))
 
-    connected: List[bool] = []
-    inter_gaps: List[int] = []
-    for i in range(n_st - 1):
-        s0 = staves[i]
-        s1 = staves[i + 1]
-        g_top = s0["y_bot"]
-        g_bot = s1["y_top"]
-        gap_px = max(1, g_bot - g_top)
-        inter_gaps.append(gap_px)
+    if force_single_staff:
+        systems = [[i] for i in range(n_st)]
+    else:
+        connected: List[bool] = []
+        inter_gaps: List[int] = []
+        for i in range(n_st - 1):
+            s0 = staves[i]
+            s1 = staves[i + 1]
+            g_top = s0["y_bot"]
+            g_bot = s1["y_top"]
+            gap_px = max(1, g_bot - g_top)
+            inter_gaps.append(gap_px)
 
-        xl = max(0, min(s0["x_left"], s1["x_left"]) - int(0.035 * w))
-        xr = min(w, max(s0["x_right"], s1["x_right"]) + int(0.015 * w))
-        x_left_ref = min(s0["x_left"], s1["x_left"]) - xl
+            xl = max(0, min(s0["x_left"], s1["x_left"]) - int(0.035 * w))
+            xr = min(w, max(s0["x_right"], s1["x_right"]) + int(0.015 * w))
+            x_left_ref = min(s0["x_left"], s1["x_left"]) - xl
 
-        pad_in = min(3, max(0, gap_px // 8))
-        band_y0 = min(h - 1, g_top + pad_in)
-        band_y1 = max(band_y0 + 1, g_bot - pad_in)
-        gap_band = v_dil[band_y0:band_y1, xl:xr].astype(np.uint8)
-        bh = gap_band.shape[0]
-        n_cc, _, stats, centroids = cv2.connectedComponentsWithStats(gap_band, connectivity=8)
+            pad_in = min(3, max(0, gap_px // 8))
+            band_y0 = min(h - 1, g_top + pad_in)
+            band_y1 = max(band_y0 + 1, g_bot - pad_in)
+            gap_band = v_dil[band_y0:band_y1, xl:xr].astype(np.uint8)
+            bh = gap_band.shape[0]
+            n_cc, _, stats, centroids = cv2.connectedComponentsWithStats(gap_band, connectivity=8)
 
-        left_zone_lo = max(0, x_left_ref - int(0.03 * w))
-        left_zone_hi = x_left_ref + int(0.045 * w)
-        has_left_conn = False
-        n_gap_bars = 0
-        bar_xs_seen: List[int] = []
+            left_zone_lo = max(0, x_left_ref - int(0.03 * w))
+            left_zone_hi = x_left_ref + int(0.045 * w)
+            has_left_conn = False
+            n_gap_bars = 0
+            bar_xs_seen: List[int] = []
 
-        for cid in range(1, n_cc):
-            ch_cc = int(stats[cid, cv2.CC_STAT_HEIGHT])
-            cw_cc = int(stats[cid, cv2.CC_STAT_WIDTH])
-            cx = float(centroids[cid][0])
-            if ch_cc < max(3, int(0.90 * bh)):
-                continue
-            if left_zone_lo <= cx <= left_zone_hi:
-                if cw_cc <= max(28, int(0.04 * w)):
-                    has_left_conn = True
-            elif cx > left_zone_hi:
-                if cw_cc > max(18, int(0.02 * w)):
+            for cid in range(1, n_cc):
+                ch_cc = int(stats[cid, cv2.CC_STAT_HEIGHT])
+                cw_cc = int(stats[cid, cv2.CC_STAT_WIDTH])
+                cx = float(centroids[cid][0])
+                if ch_cc < max(3, int(0.90 * bh)):
                     continue
-                gx = xl + int(round(cx))
-                staff_h_pair = 0.5 * (s0["h"] + s1["h"])
-                x_rad = max(6, int(0.10 * (gap_px + staff_h_pair)))
-                x_lo = max(0, gx - x_rad)
-                x_hi = min(w, gx + x_rad + 1)
-                in_s0 = float(v_dil[s0["y_top"] : s0["y_bot"] + 1, x_lo:x_hi].max(axis=1).mean())
-                in_s1 = float(v_dil[s1["y_top"] : s1["y_bot"] + 1, x_lo:x_hi].max(axis=1).mean())
-                if in_s0 >= 0.65 and in_s1 >= 0.65:
-                    if _dedup_bar_xs_unsorted(gx, bar_xs_seen, min_sep=20):
-                        bar_xs_seen.append(gx)
-                        n_gap_bars += 1
+                if left_zone_lo <= cx <= left_zone_hi:
+                    if cw_cc <= max(28, int(0.04 * w)):
+                        has_left_conn = True
+                elif cx > left_zone_hi:
+                    if cw_cc > max(18, int(0.02 * w)):
+                        continue
+                    gx = xl + int(round(cx))
+                    staff_h_pair = 0.5 * (s0["h"] + s1["h"])
+                    x_rad = max(6, int(0.10 * (gap_px + staff_h_pair)))
+                    x_lo = max(0, gx - x_rad)
+                    x_hi = min(w, gx + x_rad + 1)
+                    in_s0 = float(v_dil[s0["y_top"] : s0["y_bot"] + 1, x_lo:x_hi].max(axis=1).mean())
+                    in_s1 = float(v_dil[s1["y_top"] : s1["y_bot"] + 1, x_lo:x_hi].max(axis=1).mean())
+                    if in_s0 >= 0.65 and in_s1 >= 0.65:
+                        if _dedup_bar_xs_unsorted(gx, bar_xs_seen, min_sep=20):
+                            bar_xs_seen.append(gx)
+                            n_gap_bars += 1
 
-        b0 = staff_bar_xs[i]
-        b1 = staff_bar_xs[i + 1]
-        n_aligned_bars = 0
-        if len(b0) >= 2 and len(b1) >= 2:
-            for x0 in b0:
-                if any(abs(x0 - x1) <= 12 for x1 in b1):
-                    n_aligned_bars += 1
-        align_frac = (
-            (2.0 * n_aligned_bars) / float(len(b0) + len(b1))
-            if (len(b0) + len(b1)) > 0
-            else 0.0
-        )
+            b0 = staff_bar_xs[i]
+            b1 = staff_bar_xs[i + 1]
+            n_aligned_bars = 0
+            if len(b0) >= 2 and len(b1) >= 2:
+                for x0 in b0:
+                    if any(abs(x0 - x1) <= 12 for x1 in b1):
+                        n_aligned_bars += 1
+            align_frac = (
+                (2.0 * n_aligned_bars) / float(len(b0) + len(b1))
+                if (len(b0) + len(b1)) > 0
+                else 0.0
+            )
 
-        is_conn = (
-            (n_gap_bars >= 2)
-            or (has_left_conn and n_gap_bars >= 1)
-            or (has_left_conn and n_aligned_bars >= 4 and align_frac >= 0.45)
-        )
-        connected.append(bool(is_conn))
+            is_conn = (
+                (n_gap_bars >= 2)
+                or (has_left_conn and n_gap_bars >= 1)
+                or (has_left_conn and n_aligned_bars >= 4 and align_frac >= 0.45)
+            )
+            connected.append(bool(is_conn))
 
-    # Vertical gap-periodicity clustering alongside barline continuity
-    if n_st >= 4 and len(inter_gaps) == n_st - 1:
-        best_k: Optional[int] = None
-        best_ratio = 0.0
-        for k in (2, 3, 4, 5, 6):
-            if n_st % k != 0 or (n_st // k) < 2:
-                continue
-            g_in = [inter_gaps[i] for i in range(n_st - 1) if (i + 1) % k != 0]
-            g_out = [inter_gaps[i] for i in range(n_st - 1) if (i + 1) % k == 0]
-            if not g_in or not g_out:
-                continue
-            max_in = max(g_in)
-            min_out = min(g_out)
-            ratio = float(min_out) / float(max(1, max_in))
-            # Check that barline connectivity does not contradict inter-system boundaries
-            out_conn = sum(1 for i in range(n_st - 1) if (i + 1) % k == 0 and connected[i])
-            if ratio >= 1.35 and out_conn == 0 and ratio > best_ratio:
-                best_ratio = ratio
-                best_k = k
-        if best_k is not None:
-            for i in range(n_st - 1):
-                if (i + 1) % best_k != 0:
-                    connected[i] = True
-
-    systems: List[List[int]] = [[0]]
-    for i, is_conn in enumerate(connected):
-        if is_conn:
-            systems[-1].append(i + 1)
-        else:
-            systems.append([i + 1])
-
-    # Voice + Piano Lied [1, 2] -> [3] merge with inter-staff vs inter-system gap ratio check
-    raw_counts = [len(s) for s in systems]
-    n_12_pairs = sum(
-        1 for i in range(len(raw_counts) - 1) if raw_counts[i] == 1 and raw_counts[i + 1] == 2
-    )
-    n_threes = sum(1 for c in raw_counts if c == 3)
-    can_try_12_merge = (
-        n_12_pairs >= 2
-        or (n_12_pairs >= 1 and n_threes >= 1)
-        or (len(raw_counts) == 2 and raw_counts == [1, 2])
-    )
-    if can_try_12_merge:
-        merged_sys: List[List[int]] = []
-        i = 0
-        while i < len(systems):
-            if i + 1 < len(systems) and len(systems[i]) == 1 and len(systems[i + 1]) == 2:
-                s_voice = staves[systems[i][0]]
-                s_p0 = staves[systems[i + 1][0]]
-                s_p1 = staves[systems[i + 1][1]]
-                g_12 = max(1, s_p0["y_top"] - s_voice["y_bot"])
-                g_piano = max(1, s_p1["y_top"] - s_p0["y_bot"])
-
-                # Horizontal overlap check
-                ov_lo = max(s_voice["x_left"], s_p0["x_left"])
-                ov_hi = min(s_voice["x_right"], s_p0["x_right"])
-                min_span = max(1, min(s_voice["x_right"] - s_voice["x_left"], s_p0["x_right"] - s_p0["x_left"]))
-                x_overlap = float(max(0, ov_hi - ov_lo)) / float(min_span)
-
-                # Inter-system gap comparison when neighboring systems exist
-                neighbor_sys_gaps: List[int] = []
-                if i > 0:
-                    prev_bot = staves[systems[i - 1][-1]]["y_bot"]
-                    neighbor_sys_gaps.append(max(1, s_voice["y_top"] - prev_bot))
-                if i + 2 < len(systems):
-                    next_top = staves[systems[i + 2][0]]["y_top"]
-                    neighbor_sys_gaps.append(max(1, next_top - s_p1["y_bot"]))
-
-                if neighbor_sys_gaps:
-                    max_gap_ratio = 1.15 if (n_12_pairs >= 2 and x_overlap >= 0.75) else 0.85
-                    gap_ok = g_12 <= max_gap_ratio * min(neighbor_sys_gaps)
-                else:
-                    # Single-system [1, 2] page
-                    gap_ok = g_12 <= 2.2 * max(float(g_piano), med_sh)
-
-                if gap_ok and x_overlap >= 0.70:
-                    merged_sys.append(systems[i] + systems[i + 1])
-                    i += 2
+        # Vertical gap-periodicity clustering alongside barline continuity
+        if n_st >= 4 and len(inter_gaps) == n_st - 1:
+            best_k: Optional[int] = None
+            best_ratio = 0.0
+            for k in (2, 3, 4, 5, 6):
+                if n_st % k != 0 or (n_st // k) < 2:
                     continue
-            merged_sys.append(systems[i])
-            i += 1
-        systems = merged_sys
+                g_in = [inter_gaps[i] for i in range(n_st - 1) if (i + 1) % k != 0]
+                g_out = [inter_gaps[i] for i in range(n_st - 1) if (i + 1) % k == 0]
+                if not g_in or not g_out:
+                    continue
+                max_in = max(g_in)
+                min_out = min(g_out)
+                ratio = float(min_out) / float(max(1, max_in))
+                # Check that barline connectivity does not contradict inter-system boundaries
+                out_conn = sum(1 for i in range(n_st - 1) if (i + 1) % k == 0 and connected[i])
+                if ratio >= 1.35 and out_conn == 0 and ratio > best_ratio:
+                    best_ratio = ratio
+                    best_k = k
+            if best_k is not None:
+                for i in range(n_st - 1):
+                    if (i + 1) % best_k != 0:
+                        connected[i] = True
+
+        systems = [[0]]
+        for i, is_conn in enumerate(connected):
+            if is_conn:
+                systems[-1].append(i + 1)
+            else:
+                systems.append([i + 1])
+
+        # Voice + Piano Lied [1, 2] -> [3] merge with inter-staff vs inter-system gap ratio check
+        raw_counts = [len(s) for s in systems]
+        n_12_pairs = sum(
+            1 for i in range(len(raw_counts) - 1) if raw_counts[i] == 1 and raw_counts[i + 1] == 2
+        )
+        n_threes = sum(1 for c in raw_counts if c == 3)
+        can_try_12_merge = (
+            n_12_pairs >= 2
+            or (n_12_pairs >= 1 and n_threes >= 1)
+            or (len(raw_counts) == 2 and raw_counts == [1, 2])
+        )
+        if can_try_12_merge:
+            merged_sys: List[List[int]] = []
+            i = 0
+            while i < len(systems):
+                if i + 1 < len(systems) and len(systems[i]) == 1 and len(systems[i + 1]) == 2:
+                    s_voice = staves[systems[i][0]]
+                    s_p0 = staves[systems[i + 1][0]]
+                    s_p1 = staves[systems[i + 1][1]]
+                    g_12 = max(1, s_p0["y_top"] - s_voice["y_bot"])
+                    g_piano = max(1, s_p1["y_top"] - s_p0["y_bot"])
+
+                    # Horizontal overlap check
+                    ov_lo = max(s_voice["x_left"], s_p0["x_left"])
+                    ov_hi = min(s_voice["x_right"], s_p0["x_right"])
+                    min_span = max(1, min(s_voice["x_right"] - s_voice["x_left"], s_p0["x_right"] - s_p0["x_left"]))
+                    x_overlap = float(max(0, ov_hi - ov_lo)) / float(min_span)
+
+                    # Inter-system gap comparison when neighboring systems exist
+                    neighbor_sys_gaps: List[int] = []
+                    if i > 0:
+                        prev_bot = staves[systems[i - 1][-1]]["y_bot"]
+                        neighbor_sys_gaps.append(max(1, s_voice["y_top"] - prev_bot))
+                    if i + 2 < len(systems):
+                        next_top = staves[systems[i + 2][0]]["y_top"]
+                        neighbor_sys_gaps.append(max(1, next_top - s_p1["y_bot"]))
+
+                    if neighbor_sys_gaps:
+                        max_gap_ratio = 1.15 if (n_12_pairs >= 2 and x_overlap >= 0.75) else 0.85
+                        gap_ok = g_12 <= max_gap_ratio * min(neighbor_sys_gaps)
+                    else:
+                        # Single-system [1, 2] page
+                        gap_ok = g_12 <= 2.2 * max(float(g_piano), med_sh)
+
+                    if gap_ok and x_overlap >= 0.70:
+                        merged_sys.append(systems[i] + systems[i + 1])
+                        i += 2
+                        continue
+                merged_sys.append(systems[i])
+                i += 1
+            systems = merged_sys
 
     sys_counts = [len(s) for s in systems]
-    all_systems_uniform = len(set(sys_counts)) == 1
+    all_systems_uniform = (len(systems) >= 1) if force_single_staff else (len(set(sys_counts)) == 1)
     cnt = Counter(sys_counts)
     modal_staves = sorted(cnt.items(), key=lambda kv: (kv[1], kv[0]), reverse=True)[0][0]
 
@@ -1830,9 +1839,10 @@ class VerovioMeasureBank:
     staff_bands: List[Tuple[int, int]]
     measure_px_bounds: List[Tuple[int, int]]  # per-measure (x0, x1) in sym_ink
 
-    def get_slice(
+    def get_slice_with_bars(
         self, m_lo: int, m_hi: int
-    ) -> Optional[Tuple[np.ndarray, List[Tuple[int, int]], bool]]:
+    ) -> Optional[Tuple[np.ndarray, List[Tuple[int, int]], bool, List[float]]]:
+        """Return (sub_ink, staff_bands, has_preamble, internal_bar_xs_px) in O(1)."""
         if m_lo < self.m_start or m_hi > self.m_end or m_hi <= m_lo:
             return None
         i0 = m_lo - self.m_start
@@ -1845,7 +1855,19 @@ class VerovioMeasureBank:
             return None
         sub = self.sym_ink[:, x0:x1]
         has_preamble = (m_lo == self.m_start)
-        return sub, self.staff_bands, has_preamble
+        internal_bar_xs: List[float] = []
+        for k in range(i0, i1):
+            bx = 0.5 * (self.measure_px_bounds[k][1] + self.measure_px_bounds[k + 1][0]) - float(x0)
+            internal_bar_xs.append(bx)
+        return sub, self.staff_bands, has_preamble, internal_bar_xs
+
+    def get_slice(
+        self, m_lo: int, m_hi: int
+    ) -> Optional[Tuple[np.ndarray, List[Tuple[int, int]], bool]]:
+        res = self.get_slice_with_bars(m_lo, m_hi)
+        if res is None:
+            return None
+        return res[0], res[1], res[2]
 
 
 def build_verovio_measure_bank(
@@ -1943,16 +1965,19 @@ class VerovioBankManager:
         self.render_fn = render_fn
         self._banks: Dict[Tuple[int, int], Optional[VerovioMeasureBank]] = {}
 
-    def get_slice(
+    def get_slice_with_bars(
         self, m_start: int, m_end: int
-    ) -> Optional[Tuple[np.ndarray, List[Tuple[int, int]], bool]]:
+    ) -> Optional[Tuple[np.ndarray, List[Tuple[int, int]], bool, Optional[List[float]]]]:
         if self.render_fn is not None:
-            return self.render_fn(self.indexed, m_start, m_end, self.n_staves)
+            sl = self.render_fn(self.indexed, m_start, m_end, self.n_staves)
+            if sl is None:
+                return None
+            return sl[0], sl[1], sl[2], None
 
         # Check if any cached bank already covers [m_start, m_end)
         for (b0, b1), bank in self._banks.items():
             if bank is not None and b0 <= m_start and m_end <= b1:
-                sl = bank.get_slice(m_start, m_end)
+                sl = bank.get_slice_with_bars(m_start, m_end)
                 if sl is not None:
                     return sl
 
@@ -1970,7 +1995,7 @@ class VerovioBankManager:
             )
         bank = self._banks[key]
         if bank is not None:
-            sl = bank.get_slice(m_start, m_end)
+            sl = bank.get_slice_with_bars(m_start, m_end)
             if sl is not None:
                 return sl
         direct_key = (m_start, m_end)
@@ -1981,20 +2006,32 @@ class VerovioBankManager:
                 )
             direct_bank = self._banks[direct_key]
             if direct_bank is not None:
-                return direct_bank.get_slice(m_start, m_end)
+                return direct_bank.get_slice_with_bars(m_start, m_end)
         return None
+
+    def get_slice(
+        self, m_start: int, m_end: int
+    ) -> Optional[Tuple[np.ndarray, List[Tuple[int, int]], bool]]:
+        res = self.get_slice_with_bars(m_start, m_end)
+        if res is None:
+            return None
+        return res[0], res[1], res[2]
 
 
 def extract_symbol_ink_from_manuscript(
-    deskewed: np.ndarray, sys_crop: Dict[str, Any]
-) -> Tuple[np.ndarray, List[Tuple[int, int]]]:
+    deskewed: np.ndarray,
+    sys_crop: Dict[str, Any],
+    *,
+    return_x_offset: bool = False,
+) -> Any:
     """Extract staff-line-suppressed symbol ink map and midpoint-clamped staff bands."""
     y0, y1 = int(sys_crop["y_top"]), int(sys_crop["y_bot"])
     x0, x1 = int(sys_crop["x_left"]), int(sys_crop["x_right"])
     crop = deskewed[y0:y1, x0:x1].astype(np.float32)
     ch, cw = crop.shape
     if ch < 8 or cw < 16:
-        return np.zeros((max(1, ch), max(1, cw)), dtype=np.float32), []
+        empty = np.zeros((max(1, ch), max(1, cw)), dtype=np.float32)
+        return (empty, [], x0) if return_x_offset else (empty, [])
 
     k_bg = max(15, int(round(min(ch, cw) * 0.12)) | 1)
     k_bg = min(k_bg, 51)
@@ -2002,7 +2039,8 @@ def extract_symbol_ink_from_manuscript(
     dark = np.clip(bg - crop, 0.0, 255.0)
     pos = dark[dark > 4.0]
     if pos.size < 20:
-        return np.zeros((ch, cw), dtype=np.float32), []
+        empty = np.zeros((ch, cw), dtype=np.float32)
+        return (empty, [], x0) if return_x_offset else (empty, [])
     thr = max(8.0, min(28.0, 0.30 * float(np.percentile(pos, 85))))
     bin_ink = (dark > thr).astype(np.uint8)
 
@@ -2028,11 +2066,15 @@ def extract_symbol_ink_from_manuscript(
         raw_bands.append((sy0, max(sy0 + 1, sy1)))
     staff_bands = clamp_staff_bands_to_midpoints(raw_bands, staff_cores, ch)
 
+    trim_x0 = 0
     col_sum = sym_ink.sum(axis=0)
     nz = np.flatnonzero(col_sum > 0.5)
     if nz.size >= 16:
-        sym_ink = sym_ink[:, int(nz[0]) : int(nz[-1]) + 1]
+        trim_x0 = int(nz[0])
+        sym_ink = sym_ink[:, trim_x0 : int(nz[-1]) + 1]
 
+    if return_x_offset:
+        return sym_ink, staff_bands, x0 + trim_x0
     return sym_ink, staff_bands
 
 
@@ -2040,7 +2082,81 @@ def extract_symbol_ink_from_manuscript(
 # 5. High-Res Onset-Sensitive Profiles, Itakura DTW, 2-Best Viterbi DP & 3-Tier Gate
 # ---------------------------------------------------------------------------
 
-CHANNELS_PER_STAFF = 5  # dens_z, onset_z, upper_z, lower_z, cent_z
+N_PITCH_BANDS = 6
+CHANNELS_PER_STAFF = 2 + N_PITCH_BANDS  # dens_z, onset_z, + 6 vertical pitch sub-bands
+BARLINE_BONUS_WEIGHT = 0.08
+BARLINE_MATCH_TOL = 0.05
+
+
+def _bars_to_profile_fracs(
+    bar_xs_rel: Sequence[float],
+    cw: int,
+    mask_preamble_frac: float,
+) -> List[float]:
+    """Convert barline x-positions in sym_ink space [0, cw) to preamble-masked profile fractions (0, 1)."""
+    if cw < 4 or not bar_xs_rel:
+        return []
+    x_cut = int(round(max(0.0, min(0.25, mask_preamble_frac)) * cw))
+    if cw - x_cut < 8:
+        x_cut = 0
+    work_w = float(max(1, cw - x_cut))
+    fracs: List[float] = []
+    for bx in bar_xs_rel:
+        f = (float(bx) - float(x_cut)) / work_w
+        if 0.02 < f < 0.98:
+            fracs.append(f)
+    return fracs
+
+
+def compute_barline_alignment_bonus(
+    ms_bar_fracs: Sequence[float],
+    vr_bar_fracs: Optional[Sequence[float]],
+    path: Sequence[Tuple[int, int]],
+    N: int,
+    *,
+    tol: float = BARLINE_MATCH_TOL,
+    weight: float = BARLINE_BONUS_WEIGHT,
+) -> float:
+    """Pure visual barline-position consistency bonus along DTW warping path P* (model-free, non-circular).
+
+    Maps detected manuscript internal barlines through P* and checks 1-to-1 spatial alignment
+    within ±tol of Verovio SVG internal barline x-positions using F1 weighting.
+    Applied identically to DP candidates and all decoys.
+    """
+    if not ms_bar_fracs or not vr_bar_fracs or not path or N < 2:
+        return 0.0
+    path_i = np.array([p[0] for p in path], dtype=np.float32)
+    path_j = np.array([p[1] for p in path], dtype=np.float32)
+    denom_n = float(N - 1)
+
+    mapped_ms = [
+        float(np.interp(f_ms * denom_n, path_i, path_j)) / denom_n
+        for f_ms in ms_bar_fracs
+    ]
+
+    # Greedy 1-to-1 closest matching within ±tol
+    pairs: List[Tuple[float, int, int]] = []
+    for mi, fm in enumerate(mapped_ms):
+        for vi, fv in enumerate(vr_bar_fracs):
+            err = abs(fm - float(fv))
+            if err <= tol:
+                pairs.append((err, mi, vi))
+    if not pairs:
+        return 0.0
+    pairs.sort(key=lambda x: x[0])
+
+    used_m: Set[int] = set()
+    used_v: Set[int] = set()
+    match_sum = 0.0
+    for err, mi, vi in pairs:
+        if mi not in used_m and vi not in used_v:
+            used_m.add(mi)
+            used_v.add(vi)
+            # Smoothly reward exact hits (1.0 at err=0, 0.5 at err=tol)
+            match_sum += 1.0 - 0.5 * (err / max(tol, 1e-6))
+
+    bar_f1 = (2.0 * match_sum) / float(len(ms_bar_fracs) + len(vr_bar_fracs))
+    return float(weight * np.clip(bar_f1, 0.0, 1.0))
 
 
 def extract_1d_profiles(
@@ -2052,7 +2168,11 @@ def extract_1d_profiles(
     sigma: float = 1.4,
     mask_preamble_frac: float = 0.09,
 ) -> Tuple[np.ndarray, List[bool]]:
-    """Compute high-res, preamble-masked, per-staff 5-channel L2-normalized profiles (N, 5*S).
+    """Compute high-res, preamble-masked, per-staff 8-channel 2D pitch-grid profiles (N, 8*S).
+
+    Channels per staff: [dens_z, onset_z, pitch_band_0..5] where the 6 vertical pitch sub-bands
+    evenly span [sy0, sy1] (upper ledger, top staff, upper-mid, lower-mid, bottom staff, lower ledger)
+    and are normalized per column t with a 0.5 norm floor so tacet/rest staves stay attenuated.
 
     Returns (F, active_staves) where active_staves[s] indicates whether staff s is non-rest.
     No whole-system (0, ch) double-counting: every staff has equal weight.
@@ -2064,7 +2184,7 @@ def extract_1d_profiles(
             False for _ in staff_bands
         ]
 
-    # Mask left 9% clef/key preamble
+    # Mask left preamble
     x_cut = int(round(max(0.0, min(0.25, mask_preamble_frac)) * cw))
     if cw - x_cut >= 8:
         work = sym_ink[:, x_cut:]
@@ -2109,26 +2229,28 @@ def extract_1d_profiles(
         onset_std_floor = max(0.008, 0.15 * float(onset.std()) + 0.005)
         onset_z = (onset - float(onset.mean())) / (float(onset.std()) + onset_std_floor)
 
-        # 3) Upper-half & 4) Lower-half density
-        mid = max(1, bh // 2)
-        up = b[:mid, :].mean(axis=0).astype(np.float32)
-        lo = b[mid:, :].mean(axis=0).astype(np.float32) if bh > 1 else up
-        up_s = cv2.GaussianBlur(up.reshape(1, -1), (ksize, 1), sigma).ravel()
-        lo_s = cv2.GaussianBlur(lo.reshape(1, -1), (ksize, 1), sigma).ravel()
-        up_z = (up_s - float(up_s.mean())) / (float(up_s.std()) + dens_std_floor)
-        lo_z = (lo_s - float(lo_s.mean())) / (float(lo_s.std()) + dens_std_floor)
+        # 3..8) 2D 6-band vertical pitch-grid spanning [sy0, sy1]
+        interp = cv2.INTER_AREA if bh >= N_PITCH_BANDS else cv2.INTER_LINEAR
+        bands_raw = cv2.resize(
+            b.astype(np.float32), (N, N_PITCH_BANDS), interpolation=interp
+        )  # (6, N)
+        bands_s = cv2.GaussianBlur(bands_raw, (ksize, 1), sigma)  # horizontal-only blur, (6, N)
+        pitch_denom = float(bands_s.std()) + dens_std_floor
+        # Center across the 6 vertical bands at each column t so empty columns stay 0
+        # and opposite-pitch melodies are anti-correlated; apply 0.5 norm floor for tacet attenuation
+        pitch_c = ((bands_s - bands_s.mean(axis=0, keepdims=True)) / pitch_denom).T  # (N, 6)
+        pnorms = np.linalg.norm(pitch_c, axis=1, keepdims=True)
+        pitch_u = (pitch_c / np.maximum(pnorms, 0.5)).astype(np.float32)  # (N, 6)
 
-        # 5) Weighted vertical pitch centroid
-        ys = np.linspace(-1.0, 1.0, bh, dtype=np.float32)[:, None]
-        col_mass = b.sum(axis=0).astype(np.float32)
-        cent = (b * ys).sum(axis=0) / (col_mass + 1e-4)
-        w_mask = np.clip(col_mass / (float(np.percentile(col_mass, 75)) + 1e-4), 0.0, 1.0)
-        cent = cent * w_mask
-        cent_s = cv2.GaussianBlur(cent.reshape(1, -1), (ksize, 1), sigma).ravel()
-        cent_z = (cent_s - float(cent_s.mean())) / (float(cent_s.std()) + 0.08)
-
-        # Per-staff L2 normalization with 0.5 floor so damped rest/tacet staves stay attenuated
-        fs = np.stack([dens_z, 0.85 * onset_z, 0.70 * up_z, 0.70 * lo_z, 0.65 * cent_z], axis=1).astype(np.float32)
+        # Combine 1D rhythm/onset + 2D 6-band vertical pitch distribution; per-staff L2 norm with 0.5 floor
+        fs = np.concatenate(
+            [
+                (0.75 * dens_z)[:, None],
+                (0.65 * onset_z)[:, None],
+                (1.40 * pitch_u),
+            ],
+            axis=1,
+        ).astype(np.float32)
         snorms = np.linalg.norm(fs, axis=1, keepdims=True)
         fs = (fs / np.maximum(snorms, 0.5)).astype(np.float32)
         staff_blocks.append(fs)
@@ -2275,6 +2397,9 @@ class CandidateEval:
     active_ms: List[bool]
     active_vr: List[bool]
     valid: bool = True
+    dtw_score: float = 0.0
+    bar_bonus: float = 0.0
+    vr_bar_fracs: Optional[List[float]] = None
 
 
 def solve_2best_viterbi_dp(
@@ -2415,12 +2540,15 @@ def slice_page_modelfree(
     bar_ests: List[int] = []
     bar_confs: List[float] = []
     bar_hints_n: List[int] = []
+    ms_bar_xs_rel: List[List[float]] = []
     ms_inks: List[np.ndarray] = []
     ms_bands_list: List[List[Tuple[int, int]]] = []
 
     for s_idx, sc in enumerate(sys_crops):
         m_est, bar_xs, b_conf = estimate_system_measures_from_barlines(ink_vert, sc)
-        ms_ink, ms_bands = extract_symbol_ink_from_manuscript(deskewed, sc)
+        ms_ink, ms_bands, ink_x_origin = extract_symbol_ink_from_manuscript(
+            deskewed, sc, return_x_offset=True
+        )
         if ms_ink.sum() < 10.0 or len(ms_bands) != n_staves:
             return {
                 "accepted": False,
@@ -2431,6 +2559,10 @@ def slice_page_modelfree(
         bar_ests.append(m_est)
         bar_confs.append(b_conf)
         bar_hints_n.append(len(bar_xs))
+        if n_staves >= 2 and bar_xs:
+            ms_bar_xs_rel.append([float(bx) - float(ink_x_origin) for bx in bar_xs])
+        else:
+            ms_bar_xs_rel.append([])
         ms_inks.append(ms_ink)
         ms_bands_list.append(ms_bands)
 
@@ -2457,20 +2589,30 @@ def slice_page_modelfree(
             )
         return ms_prof_cache[key]
 
+    def _get_ms_bar_fracs(s_idx: int, n_bars: int) -> List[float]:
+        if not ms_bar_xs_rel[s_idx]:
+            return []
+        return _bars_to_profile_fracs(
+            ms_bar_xs_rel[s_idx],
+            ms_inks[s_idx].shape[1],
+            _preamble_frac(n_bars),
+        )
+
     def _eval_cand(s_idx: int, m_s: int, m_e: int) -> Optional[CandidateEval]:
         key = (s_idx, m_s, m_e)
         if key in cand_cache:
             return cand_cache[key]
-        sl = bank_mgr.get_slice(m_s, m_e)
+        sl = bank_mgr.get_slice_with_bars(m_s, m_e)
         if sl is None:
             cand_cache[key] = None
             return None
-        vr_ink, vr_bands, has_preamble = sl
+        vr_ink, vr_bands, has_preamble, vr_bar_xs_px = sl
         if len(vr_bands) != n_staves:
             cand_cache[key] = None
             return None
         n_bars = m_e - m_s
         N = int(np.clip(32 * max(1, n_bars), 192, 320))
+        vr_pf = _preamble_frac(n_bars) if has_preamble else 0.0
         F_ms, active_ms = _get_ms_prof(s_idx, n_bars)
         F_vr, active_vr = extract_1d_profiles(
             vr_ink,
@@ -2478,18 +2620,32 @@ def slice_page_modelfree(
             n_bars=n_bars,
             target_w=N,
             sigma=1.4,
-            mask_preamble_frac=_preamble_frac(n_bars) if has_preamble else 0.0,
+            mask_preamble_frac=vr_pf,
         )
-        sc, path, warp_frac = compare_system_profiles_dtw(F_ms, F_vr)
+        dtw_sc, path, warp_frac = compare_system_profiles_dtw(F_ms, F_vr)
+        vr_bar_fracs: Optional[List[float]] = None
+        if vr_bar_xs_px is not None:
+            vr_bar_fracs = _bars_to_profile_fracs(vr_bar_xs_px, vr_ink.shape[1], vr_pf)
+
+        bar_bonus = 0.0
+        if dtw_sc > -0.99 and len(path) > 0 and n_staves >= 2:
+            ms_fracs = _get_ms_bar_fracs(s_idx, n_bars)
+            if ms_fracs and vr_bar_fracs:
+                bar_bonus = compute_barline_alignment_bonus(ms_fracs, vr_bar_fracs, path, N)
+
+        total_sc = float(np.clip(dtw_sc + bar_bonus, -1.0, 1.0)) if dtw_sc > -0.99 else -1.0
         ev = CandidateEval(
-            score=sc,
+            score=total_sc,
             path=path,
             warp_frac=warp_frac,
             F_ms=F_ms,
             F_vr=F_vr,
             active_ms=active_ms,
             active_vr=active_vr,
-            valid=(sc > -0.99 and len(path) > 0),
+            valid=(dtw_sc > -0.99 and len(path) > 0),
+            dtw_score=dtw_sc,
+            bar_bonus=bar_bonus,
+            vr_bar_fracs=vr_bar_fracs,
         )
         cand_cache[key] = ev
         return ev
@@ -2544,25 +2700,39 @@ def slice_page_modelfree(
         spread_st = max_r_st - min_r_st if len(active_rs) >= 2 else 0.0
 
         # Tier 1: Within-piece strictly non-overlapping Decoy Z-Score Gate (+ reversed template)
-        # Use identical DTW parameters across ALL decoys (never append -1.0 sentinels).
+        # Use identical DTW + barline-bonus parameters across ALL decoys (never append -1.0 sentinels).
+        n_bars_win = m_e - m_s
+        N_win = ev.F_ms.shape[0]
+        ms_fracs_win = _get_ms_bar_fracs(s_idx, n_bars_win) if n_staves >= 2 else []
         decoy_ranges = _sample_decoy_ranges(m_s, m_e, n_measures, target_count=10)
         decoy_scores: List[float] = []
-        rev_sc, _, _ = compare_system_profiles_dtw(
+        rev_sc, rev_path, _ = compare_system_profiles_dtw(
             ev.F_ms, ev.F_vr[::-1].copy(), max_mean_warp_frac=1.0
         )
         if rev_sc > -0.99:
-            decoy_scores.append(rev_sc)
+            rev_bonus = 0.0
+            if ms_fracs_win and ev.vr_bar_fracs:
+                rev_vr_fracs = [1.0 - f for f in reversed(ev.vr_bar_fracs)]
+                rev_bonus = compute_barline_alignment_bonus(
+                    ms_fracs_win, rev_vr_fracs, rev_path, N_win
+                )
+            decoy_scores.append(float(np.clip(rev_sc + rev_bonus, -1.0, 1.0)))
         for d0, d1 in decoy_ranges:
             dev = _eval_cand(s_idx, d0, d1)
             if dev is not None:
                 if dev.score > -0.99:
                     decoy_scores.append(dev.score)
                 else:
-                    d_sc, _, _ = compare_system_profiles_dtw(
+                    d_sc, d_path, _ = compare_system_profiles_dtw(
                         ev.F_ms, dev.F_vr, max_mean_warp_frac=1.0
                     )
                     if d_sc > -0.99:
-                        decoy_scores.append(d_sc)
+                        d_bonus = 0.0
+                        if ms_fracs_win and dev.vr_bar_fracs:
+                            d_bonus = compute_barline_alignment_bonus(
+                                ms_fracs_win, dev.vr_bar_fracs, d_path, N_win
+                            )
+                        decoy_scores.append(float(np.clip(d_sc + d_bonus, -1.0, 1.0)))
 
         if len(decoy_scores) >= 6:
             sorted_decoys = sorted(decoy_scores)
@@ -2592,6 +2762,8 @@ def slice_page_modelfree(
             "bar_conf": bar_confs[s_idx],
             "n_bar_hints": bar_hints_n[s_idx],
             "score": round(ev.score, 4),
+            "dtw_score": round(ev.dtw_score, 4),
+            "bar_bonus": round(ev.bar_bonus, 4),
             "warp_frac": round(ev.warp_frac, 4),
             "n_decoys": len(decoy_scores),
             "decoy_mean": round(decoy_mean, 4),
@@ -2912,6 +3084,7 @@ def _process_work_group(
                     continue
 
                 # Stage 2: Visual Canvas & Physical Staff-Count Gate
+                matched_staff = row.get("matched_staff")
                 with safe_open_image(img_path) as im:
                     is_nm, nm_info = ncg.is_non_music_page(im)
                     if is_nm:
@@ -2922,23 +3095,30 @@ def _process_work_group(
                             "reason": f"non_music:{nm_info['reason']}",
                         })
                         continue
-                    vis = detect_staves_and_systems(im)
+                    vis = detect_staves_and_systems(
+                        im, force_single_staff=(work_n_staves == 1)
+                    )
+                    vis_staves = int(vis["visual_n_staves"])
+                    vis_systems = int(vis["visual_n_systems"])
+                    all_uniform = bool(vis.get("all_systems_uniform", False))
 
-                vis_staves = int(vis["visual_n_staves"])
-                vis_systems = int(vis["visual_n_systems"])
-                all_uniform = bool(vis.get("all_systems_uniform", False))
+                    # Support 1-staff historical partbooks when matched_staff is known
+                    is_partbook_1staff = (
+                        vis_staves == 1
+                        and work_n_staves > 1
+                        and matched_staff is not None
+                        and 0 <= int(matched_staff) < work_n_staves
+                    )
+                    if is_partbook_1staff and not all_uniform:
+                        vis = detect_staves_and_systems(im, force_single_staff=True)
+                        vis_staves = int(vis["visual_n_staves"])
+                        vis_systems = int(vis["visual_n_systems"])
+                        all_uniform = bool(vis.get("all_systems_uniform", False))
 
-                # Support 1-staff historical partbooks when matched_staff is known
-                matched_staff = row.get("matched_staff")
-                is_partbook_1staff = (
-                    vis_staves == 1
-                    and work_n_staves > 1
-                    and matched_staff is not None
-                    and 0 <= int(matched_staff) < work_n_staves
-                )
                 target_staves = 1 if is_partbook_1staff else work_n_staves
 
                 if vis_systems < 1 or not all_uniform or vis_staves != target_staves:
+                    sys_counts_diag = vis.get("system_staff_counts")
                     vis.clear()
                     results.append({
                         "status": "rej_staff_mismatch",
@@ -2946,7 +3126,7 @@ def _process_work_group(
                         "rism_id": rism_id,
                         "reason": (
                             f"staff_mismatch(vis_st={vis_staves},vis_sys={vis_systems},"
-                            f"uniform={all_uniform},counts={vis.get('system_staff_counts')},target={target_staves})"
+                            f"uniform={all_uniform},counts={sys_counts_diag},target={target_staves})"
                         ),
                     })
                     continue

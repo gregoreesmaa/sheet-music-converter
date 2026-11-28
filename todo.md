@@ -239,3 +239,26 @@ Standing frontier prototypes built & CPU-verified ahead of schedule; queue on GP
 - [x] **`i15-37` (`2026-11-27T10-30-i15-37-modegate-dualhead-text-and-chained-mtp`)** — `COMPLETED` → **`ITERATE`** (CONFOUNDED POSITIVE: `ema_val_ce 1.19205 vs 1.29243`, `val_ce 1.03970 vs 1.08365`, `spec_accept_len 1.1319 vs 0.8838` EMA / `1.3443 vs 1.1603` raw, `54.050 MB` INT4 w/ MTP, but Arm 1 fell back to `opt=adamw` via `"base."` prefix bug fixed in `95446af`/`b64fd64`).
 - [ ] **`i15-37b` (`2026-11-27T14-30-i15-37b-modegate-cmtp-muon-clean`)** — `QUEUED` (`wave=0`, `LOCAL_ELIGIBLE`): clean matched `opt.mode == "muon+adamw"` + `QATInt4ControllerV2` (`int4_dequant_val_ce`) + `EMA_DECAY=0.99` verification of ModeGate Dual-Head + Chained MTP-4.
 - [x] **`i15-40` (`2026-11-27T10-30-i15-40-pro200m-d768-capacity-proxy`)** — `COMPLETED` → **`ITERATE`** (`pro200m` `191.99M` / `119.156 MB` INT4 beat `edge85m_ctrl` by `-0.02690` `ema_val_ce`, `-0.02686` `int4_dequant_val_ce`, lossless `+0.00001` INT4 drop, `1.066×` `step_ms`, `10.677 GB` VRAM; inside `-0.02..-0.04` `ITERATE` band under `AdamW` `lr=3e-4` × `600` steps — needs `muon+adamw` + `lr=2e-4` × `1,200`-step follow-up `i15-40b` to clear `-0.04` `PROMOTE` gate).
+
+---
+
+## PAUSED / STALLED BACKLOG (written 2026-11-28 10:41) - subagent quota 429 (~118 h reset)
+
+**FOCUS RULE: until agent credits return, ONLY Iter 15 (iter15_pro200m, 64k, frozen 3478648) training matters. Everything below is parked; revise when credits reset.**
+
+### Active (only thing being worked)
+- Iter 15 resume: HF checkpoints/iter15_pro200m_64k/latest/ @ step 145 (local 4080S start). Colab A100/H100 race launcher D:\tmp\launch_iter15_h100.py (task-6586) hitting backend-capacity 503s (no Retry-After; not rate limit). Prior Colab run died with run_colab_iter15.py rc=1 (cause undiagnosed; read streamed traceback next time). Fallback: restart local bridge D:\tmp\start_iter15_local_bridge.py. Milestone watcher: watch_milestones_local.py.
+
+### Killed by 429 (work NOT completed)
+- Subagent 525afde4: modelfree_slicer v2.2 (2D 6-band pitch grid + Verovio barline x-sync; keep decoy gate z>=2.5/gap>=0.05). v2.1 (25/25 tests) is UNCOMMITTED; 0/48 GOLD accepted.
+- Subagent 5e06613b: hw-score-sim v0.8 push + 200-page realism bench (v0.8 UNCOMMITTED, 154 passed); v0.7 baseline report in D:\tmp\hwsim-realism-bench-v07\report.json. v0.8 row of docs/SIM_REALISM_STRATEGY.md empty.
+
+### Uncommitted / unpushed
+- docs/SIM_REALISM_STRATEGY.md; tmp-train/mvd/modelfree_slicer.py + tests/test_modelfree_slicer.py (v2.1); hw-score-sim v0.8 (no provenance words in commit message).
+
+### Parked Iter 16 / follow-ups
+- Wire bekern_canon into training labels; build bekern-full training data (Layer 3 text); 2-stage warm-start (gate HWM >= 24.83); scale model-free GOLD slicing to ~1,400 local real-HW pages; Tier-2/3 realism classifier (DINOv2/UniOMR encoder, system-strip, cross-archive CV).
+- Mandatory learn-from-suite31 forensic loop after Iter 15 finishes, before any Iter 16 training; NorthStar eval of milestones.
+- Overnight Colab queue (experiments/overnight_queue/run_queue_colab.py) paused: i14-08 failed, i14-09 stopped; resume only after Iter 15 is stable.
+- Cleanup offer: C: temp dirs (~6.4 GB), later D:\tmp\iter15_local_data (~18 GB).
+- Measure real A100/H100 steps/sec (estimates only: local 0.16, A100 ~0.55-0.85, H100 ~1.2-1.8).

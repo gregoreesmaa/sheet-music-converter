@@ -2290,12 +2290,15 @@
     "est_cu": 3.5,
     "script": "experiments/2026-11-26T22-18-i14-08-verifier-gated-rism-selftrain-flywheel/run_colab.py",
     "hf_eval_target": "evals/2026-11-26T22-18-i14-08-verifier-gated-rism-selftrain-flywheel.json",
-    "status": "RUNNING",
+    "status": "FAILED",
     "depends_on": [],
     "note": "Wave 11 Safe/Medium (Theorist 8 Flywheel): builds on ov-39 with pHash/8-gram decontamination, multi-scale MBR, zero-dropped-system check, w_t=p_t^2, and 30% GT anchor.",
     "session": "2026-11-26t22-18-i14-08-",
     "started_at": "2026-11-28T06:20:23Z",
-    "log_path": "D:\\tmp\\overnight-queue-logs\\2026-11-26T22-18-i14-08-verifier-gated-rism-selftrain-flywheel.log"
+    "log_path": "D:\\tmp\\overnight-queue-logs\\2026-11-26T22-18-i14-08-verifier-gated-rism-selftrain-flywheel.log",
+    "completed_at": "2026-11-28T06:35:04Z",
+    "elapsed_sec": 880.84,
+    "returncode": 1
   },
   {
     "id": "2026-11-26T22-18-i14-09-ink-aware-vjepa-dino-archival-pretrain",
@@ -2309,9 +2312,12 @@
     "est_cu": 3.9,
     "script": "experiments/2026-11-26T22-18-i14-09-ink-aware-vjepa-dino-archival-pretrain/run_colab.py",
     "hf_eval_target": "evals/2026-11-26T22-18-i14-09-ink-aware-vjepa-dino-archival-pretrain.json",
-    "status": "QUEUED",
+    "status": "RUNNING",
     "depends_on": [],
-    "note": "Wave 11 Medium/Wild (Theorist 8 SSL): builds on ov-31b/ov-33b/i13-04 with ink-only structured measure-span & chord-column masking + DINOv2 view invariance."
+    "note": "Wave 11 Medium/Wild (Theorist 8 SSL): builds on ov-31b/ov-33b/i13-04 with ink-only structured measure-span & chord-column masking + DINOv2 view invariance.",
+    "session": "2026-11-26t22-18-i14-09-",
+    "started_at": "2026-11-28T06:35:04Z",
+    "log_path": "D:\\tmp\\overnight-queue-logs\\2026-11-26T22-18-i14-09-ink-aware-vjepa-dino-archival-pretrain.log"
   },
   {
     "id": "2026-11-26T22-18-i14-10-hw-crossout-nib-physics-and-scribe-adapt",

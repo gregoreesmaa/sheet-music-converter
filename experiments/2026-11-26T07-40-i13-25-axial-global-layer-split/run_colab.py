@@ -287,7 +287,9 @@ def _run_arm(
     orig_split = train_uni_v2.split_train_val
     orig_build_cfg = train_uni_v2.build_v2_config
 
-    def _fixed_val_split(pairs: Any, val_count: int = 0, seed: int = 42) -> Tuple[Any, Any]:
+    def _fixed_val_split(
+        pairs: Any, val_count: int = 0, seed: int = 42, *args: Any, **kwargs: Any
+    ) -> Tuple[Any, Any]:
         return list(pairs), list(val_pairs)
 
     def _patched_build_cfg(preset: str, **overrides: Any) -> Any:

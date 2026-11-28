@@ -619,7 +619,7 @@ def _train_and_eval_arm(
 
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         optimizer.step()
-        gpu_ema.update(model)
+        gpu_ema.update(model, step)
 
         buf_loss.append(step_loss)
         buf_ce.append(step_ce)

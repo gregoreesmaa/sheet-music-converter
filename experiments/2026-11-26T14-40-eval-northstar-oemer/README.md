@@ -1,6 +1,6 @@
 # `2026-11-26T14-40-eval-northstar-oemer` — `oemer` (Black-Box CLI) on OMR-NorthStar
 
-- **Status:** `PLANNED`
+- **Status:** `DONE` (`NS = 0.79 [0.41, 1.05]`, `Tier-W = 3.09`, `NMHR = 0.0%` — published to `omr-northstar` Public Leaderboard)
 - **Baseline Commit SHA:** `36484e2`
 - **Target System:** `oemer` (MIT license — open-source UNet + symbolic-assembly OMR, invoked via isolated black-box CLI subprocess)
 - **Benchmark:** OMR-NorthStar local real-image eval pack (`D:\tmp\northstar-eval-pack\manifest.json`, 125 pages across `CDR`, `ALS`, `RWP`, `HWM` + 4 Pillar 3B Negative Controls)

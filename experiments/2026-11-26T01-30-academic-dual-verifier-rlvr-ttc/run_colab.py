@@ -343,7 +343,9 @@ def main() -> None:
         gpu_name = torch.cuda.get_device_name(0) if device.type == "cuda" else "cpu"
         cc = torch.cuda.get_device_capability(0) if device.type == "cuda" else (0, 0)
         use_bf16 = device.type == "cuda" and cc[0] >= 8
-        print(f"[acad-a] device={device} ({gpu_name}, cc={cc}) bf16={use_bf16}", flush=True)
+        use_fp16 = device.type == "cuda" and (not use_bf16) and cc[0] >= 7
+        amp_dtype = torch.bfloat16 if use_bf16 else (torch.float16 if use_fp16 else None)
+        print(f"[acad-a] device={device} ({gpu_name}, cc={cc}) bf16={use_bf16} fp16={use_fp16}", flush=True)
 
         api = HfApi(token=hf_token)
 
@@ -469,6 +471,32 @@ def main() -> None:
             }
 
         page_records: List[Dict[str, Any]] = []
+        done_keys: set[Tuple[str, str]] = set()
+        partial_hf_path = f"runs/{EXP_ID}_partial.jsonl"
+        try:
+            dl_part = hf_hub_download(
+                repo_id=HF_REPO,
+                repo_type="dataset",
+                filename=partial_hf_path,
+                token=hf_token,
+                local_dir=str(CACHE_ROOT / "hf"),
+            )
+            for line in Path(dl_part).read_text(encoding="utf-8").splitlines():
+                if line.strip():
+                    rec = json.loads(line)
+                    k = (str(rec["piece"]), str(rec["domain"]))
+                    if k not in done_keys:
+                        done_keys.add(k)
+                        page_records.append(rec)
+            if page_records:
+                partial_path.write_text(
+                    "\n".join(json.dumps(r) for r in page_records) + "\n",
+                    encoding="utf-8",
+                )
+                print(f"[acad-a] resumed {len(page_records)} completed pages from HF partial checkpoint", flush=True)
+        except Exception:
+            pass
+
         total_pages = len(selected_pieces) * 2
         page_counter = 0
 
@@ -477,12 +505,17 @@ def main() -> None:
                 slug = piece["slug"]
                 is_hw = bool(piece["handwritten"])
                 tag = "HW" if is_hw else "PR"
+                if (slug, "clean") in done_keys and (slug, "photo") in done_keys:
+                    page_counter += 2
+                    continue
                 ref_page_toks, page_ref_notes = esg.suite31_page_refs(
                     piece["gt"], "acad-" + slug, workdir
                 )
 
                 for domain in ("clean", "photo"):
                     page_counter += 1
+                    if (slug, domain) in done_keys:
+                        continue
                     t_pg0 = time.perf_counter()
                     img_path: Path = piece[domain]
                     with Image.open(img_path) as raw_im:
@@ -495,8 +528,8 @@ def main() -> None:
                     # 1. K=1 Greedy (FSA-constrained, exact apples-to-apples baseline)
                     with torch.no_grad():
                         ctx = (
-                            torch.autocast(device_type="cuda", dtype=torch.bfloat16)
-                            if use_bf16
+                            torch.autocast(device_type="cuda", dtype=amp_dtype)
+                            if amp_dtype is not None
                             else eval_s31._nullcontext()
                         )
                         with ctx:
@@ -513,13 +546,13 @@ def main() -> None:
                     if eos_id not in g_ids[1:]:
                         g_toks = eval_s31.trim_truncated_tokens(g_toks)
 
-                    # 2. K=16 diverse FSA-constrained rollouts (single batched G=16 pass on L4/A100)
+                    # 2. K=16 diverse FSA-constrained rollouts (single batched G=16 pass on L4/A100/H100/T4)
                     sampled_toks_list: List[List[str]] = []
                     torch.manual_seed(1000 + page_counter * 10)
                     with torch.no_grad():
                         ctx = (
-                            torch.autocast(device_type="cuda", dtype=torch.bfloat16)
-                            if use_bf16
+                            torch.autocast(device_type="cuda", dtype=amp_dtype)
+                            if amp_dtype is not None
                             else eval_s31._nullcontext()
                         )
                         with ctx:
@@ -588,8 +621,20 @@ def main() -> None:
                         "rollouts": roll_res,
                     }
                     page_records.append(pg_row)
+                    done_keys.add((slug, domain))
                     with open(partial_path, "a", encoding="utf-8") as pf:
                         pf.write(json.dumps(pg_row) + "\n")
+                    if len(page_records) % 6 == 0:
+                        try:
+                            api.upload_file(
+                                path_or_fileobj=str(partial_path),
+                                path_in_repo=partial_hf_path,
+                                repo_id=HF_REPO,
+                                repo_type="dataset",
+                                commit_message=f"acad-a phase1: partial checkpoint ({len(page_records)}/{total_pages} pages)",
+                            )
+                        except Exception as exc:
+                            print(f"[hf warn] partial sync failed: {exc}", flush=True)
 
                     rho_s = f"{rho_d:+.2f}" if rho_d is not None else "  n/a"
                     print(

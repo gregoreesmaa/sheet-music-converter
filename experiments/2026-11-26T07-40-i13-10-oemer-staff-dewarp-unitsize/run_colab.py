@@ -395,6 +395,7 @@ def _decode_and_score(
     rlvr_grpo: Any,
 ) -> Dict[str, Any]:
     import torch
+    import uni_omr
 
     pre_meta: Dict[str, Any] = {}
     work_img = img_pil
@@ -408,7 +409,8 @@ def _decode_and_score(
         target_dim = BASE_MAX_DIM
         pre_meta["target_max_dim"] = target_dim
 
-    img_t = eval_s31.load_page_image_tensor(work_img, max_dim=target_dim).to(device)
+    pil_resized = uni_omr._resize_fullpage_pil(work_img, target_dim)
+    img_t = uni_omr._pil_to_chw_tensor(pil_resized).unsqueeze(0).to(device)
     _, _, eos_id, _, _, id_to_tok = eval_s31._vocab_spec(int(cfg.vocab_size))
     model.eval()
     t0 = time.perf_counter()

@@ -1,6 +1,6 @@
 # `2026-11-26T01-30-academic-gauge-rope` — Academic Experiment B: Gauge-RoPE (Diffeomorphism-Equivariant Intrinsic Rotary Embeddings)
 
-- **Status:** `RUNNING` (launched `2026-11-26 01:45` on Google Colab `L4`, session `acad-b-gauge-rope`)
+- **Status:** `COMPLETED (ITERATE)` (`2026-11-26 02:15 UTC`, Modal `2× L4`, `ap-woqJUva6rjQCbQnyydluQ5`, full results in [OUTCOME.md](./OUTCOME.md))
 - **Baseline Commit SHA:** `164852f`
 - **Model:** `UniOMR v2 small_45m` (`~43M` params) + `GaugeFieldHead` (`138,587` params / `0.139M`, `< 0.15 MB` INT8)
 - **Datasets (100% permissive):**

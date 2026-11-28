@@ -518,7 +518,7 @@ def run_experiment() -> Dict[str, Any]:
                 with Image.open(piece[domain]) as raw_im:
                     rgb = raw_im.convert("RGB")
                     pil_views = {
-                        vname: uni_omr.resize_preserve_aspect(rgb, max_dim=vdim)
+                        vname: uni_omr._resize_fullpage_pil(rgb, vdim)
                         for vname, vdim in VIEW_SPECS
                     }
 

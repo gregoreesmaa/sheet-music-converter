@@ -10,7 +10,8 @@
 - **Rationale:** Native BF16, zero local GPU usage (`$env:CUDA_VISIBLE_DEVICES=""`), fast ~8s cold start with `torch` pre-installed, and immediate teardown via `colab stop -s acad-b-gauge-rope` in `finally`.
 
 ## 2. Identifiers for Follow-Up Queries
-- **Colab Session:** `acad-b-gauge-rope`
+- **Colab Session:** `acad-b-gauge-rope` (stopped cleanly on exit; fell back to Modal `2× L4` due to 2-session L4 cap + Colab A100/H100 503s)
+- **Modal App ID & URL:** `ap-woqJUva6rjQCbQnyydluQ5` (`https://modal.com/apps/gregoreesmaa1/main/ap-woqJUva6rjQCbQnyydluQ5`, `run_modal.py`, completed cleanly)
 - **Hugging Face Repo:** `gregoreesmaa/sheet-music-converter-omr` (`repo_type="dataset"`)
   - Full Eval JSON: `evals/2026-11-26T01-30-academic-gauge-rope.json`
   - Run Ledger JSON: `runs/2026-11-26T01-30-academic-gauge-rope.json`

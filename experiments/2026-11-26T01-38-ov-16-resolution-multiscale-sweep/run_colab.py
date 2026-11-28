@@ -314,7 +314,9 @@ def _run_arm(
             val_pairs.append((_img_p, _beks, _dom))
     orig_split = train_uni_v2.split_train_val
 
-    def _fixed_val_split(pairs: Any, val_count: int = 0, seed: int = 42) -> Tuple[Any, Any]:
+    def _fixed_val_split(
+        pairs: Any, val_count: int = 0, seed: int = 42, *args: Any, **kwargs: Any
+    ) -> Tuple[Any, Any]:
         return list(pairs), list(val_pairs)
 
     if torch.cuda.is_available():

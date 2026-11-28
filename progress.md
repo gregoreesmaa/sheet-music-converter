@@ -2693,3 +2693,26 @@ All numbers below are measured on disk, never projected.
     - **Wave-4 Exp `ov-17` (`2026-11-26T01-38-ov-17-irope-registers-jitter-sweep`, Colab A100-SXM4-40GB BF16, `small_45m`, `300` steps/arm, `1280px`, `6/6` arms, `2,966.99 s` compute / `6,006.72 s` queue wall, `0` NaNs) — Verdict: `PROMOTE` (`n_register_tokens=8`, keep `rope_jitter=0.08`):**
       - **Register sweep (`rope_jitter=0.08`, `proxy_val` `64p`):** **`reg8_jit008` `0.2735` EMA Token F1 / `0.8629` EMA SER** (**`+4.05 pp`** vs `reg0_jit008` `0.2330` / `0.9001`, **`+0.50 pp`** vs `reg4_jit008` `0.2685` / `0.8647` — clears `>= +0.4 pp` promote gate; Raw F1 `0.0325` vs `0.0289` vs `0.0244`) at **zero speed/VRAM cost** (`461.40 s` [`0.6502 steps/s`] vs `492.71 s` / `462.68 s`, `9,300.9 MB` vs `9,301.0 MB`, `+1,536` params / `+0.003 MB`); `reg16_jit008` collapses (`0.1467` EMA F1, `-12.68 pp` vs `reg8`, `594.02 s`).
       - **RoPE jitter sweep (`n_register_tokens=4`):** EMA Token F1 flat within `0.10 pp` (`jit000` `0.2675` / `jit008` **`0.2685`** / `jit016` `0.2684`, SER `0.8643` / `0.8647` / `0.8638`) -> keep `rope_jitter=0.08`. Wired `n_register_tokens=8` into `UniOMRv2Config.iter15_pro200m()` and exposed `--n-register-tokens` / `--rope-jitter` CLI overrides in `train_uni_v2.py` (base default `4` preserved for checkpoint compatibility).
+
+---
+
+## PAUSED / STALLED BACKLOG (written 2026-11-28 10:41) - subagent quota 429 (~118 h reset)
+
+**FOCUS RULE: until agent credits return, ONLY Iter 15 (iter15_pro200m, 64k, frozen 3478648) training matters. Everything below is parked; revise when credits reset.**
+
+### Active (only thing being worked)
+- Iter 15 resume: HF checkpoints/iter15_pro200m_64k/latest/ @ step 145 (local 4080S start). Colab A100/H100 race launcher D:\tmp\launch_iter15_h100.py (task-6586) hitting backend-capacity 503s (no Retry-After; not rate limit). Prior Colab run died with run_colab_iter15.py rc=1 (cause undiagnosed; read streamed traceback next time). Fallback: restart local bridge D:\tmp\start_iter15_local_bridge.py. Milestone watcher: watch_milestones_local.py.
+
+### Killed by 429 (work NOT completed)
+- Subagent 525afde4: modelfree_slicer v2.2 (2D 6-band pitch grid + Verovio barline x-sync; keep decoy gate z>=2.5/gap>=0.05). v2.1 (25/25 tests) is UNCOMMITTED; 0/48 GOLD accepted.
+- Subagent 5e06613b: hw-score-sim v0.8 push + 200-page realism bench (v0.8 UNCOMMITTED, 154 passed); v0.7 baseline report in D:\tmp\hwsim-realism-bench-v07\report.json. v0.8 row of docs/SIM_REALISM_STRATEGY.md empty.
+
+### Uncommitted / unpushed
+- docs/SIM_REALISM_STRATEGY.md; tmp-train/mvd/modelfree_slicer.py + tests/test_modelfree_slicer.py (v2.1); hw-score-sim v0.8 (no provenance words in commit message).
+
+### Parked Iter 16 / follow-ups
+- Wire bekern_canon into training labels; build bekern-full training data (Layer 3 text); 2-stage warm-start (gate HWM >= 24.83); scale model-free GOLD slicing to ~1,400 local real-HW pages; Tier-2/3 realism classifier (DINOv2/UniOMR encoder, system-strip, cross-archive CV).
+- Mandatory learn-from-suite31 forensic loop after Iter 15 finishes, before any Iter 16 training; NorthStar eval of milestones.
+- Overnight Colab queue (experiments/overnight_queue/run_queue_colab.py) paused: i14-08 failed, i14-09 stopped; resume only after Iter 15 is stable.
+- Cleanup offer: C: temp dirs (~6.4 GB), later D:\tmp\iter15_local_data (~18 GB).
+- Measure real A100/H100 steps/sec (estimates only: local 0.16, A100 ~0.55-0.85, H100 ~1.2-1.8).

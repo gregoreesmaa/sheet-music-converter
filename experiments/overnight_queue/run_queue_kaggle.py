@@ -93,6 +93,10 @@ VERIFIED_T4_SAFE_TAGS: Dict[str, str] = {
     "i13-22": "self-play error-inject repair scout (cc>=8 + FP16 GradScaler, zero Rust)",
     "i13-23": "per-measure process-GRPO curriculum (cc>=8 + FP16 GradScaler, zero Rust)",
     "i13-24": "multi-teacher disagreement KD scout (cc>=8 + FP16 GradScaler, zero Rust)",
+    # Iter 14 Wave 11 verified T4-safe zero-retrain inference/eval sweeps (cc>=8 guard, zero Rust)
+    "i14-01": "inference-only RapidOCR + spatial text aligner on NorthStar 125p (cc>=8 guard, zero Rust)",
+    "i14-04": "inference-only adaptive band-tiling eval on suite31_hw 90p (cc>=8 guard, zero Rust)",
+    "i14-14": "inference-only 3-tier cascade TTT+MBR+zoom+Chamfer rerank on 52p (cc>=8 guard, zero Rust)",
 }
 
 PRINT_LOCK = threading.Lock()
@@ -109,7 +113,7 @@ def _log_console(msg: str) -> None:
 
 
 def _short_tag(exp_id: str) -> str:
-    m = re.search(r"(ov-\d+[a-z]*|i13-\d+[a-z]*)", exp_id)
+    m = re.search(r"(ov-\d+[a-z]*|i\d+-\d+[a-z]*)", exp_id)
     if m:
         return m.group(1)
     slug = re.sub(r"[^a-z0-9-]+", "-", exp_id.lower()).strip("-")
