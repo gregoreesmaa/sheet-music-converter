@@ -2237,6 +2237,7 @@ def forward_and_loss_v2(
                 )
                 mask_btv = row_mask & v2a_col_11v
                 out["logits"] = torch.where(mask_btv, mask_val, s_logits_raw)
+                out["v1_mask_btv"] = mask_btv  # active-class-only label smoothing (no logit-shift drift)
                 if out.get("mtp_logits"):
                     out["mtp_logits"] = [
                         torch.where(mask_btv, mask_val, ml) for ml in out["mtp_logits"]
@@ -2295,7 +2296,8 @@ def forward_and_loss_v2(
         # Subtract the exact constant label-smoothing offset introduced by -1e4 masked logits
         # so logged CE/MTP/total loss stays on the true scale (zero effect on gradients).
         ls_eff = float(max(0.0, min(0.5, label_smoothing)))
-        if applied_v1_mask and ls_eff > 0.0 and v_dim_masked > 0 and v2a_ids is not None:
+        # Legacy offset only needed when smoothing ran over masked classes (no v1_mask_btv path).
+        if applied_v1_mask and ls_eff > 0.0 and v_dim_masked > 0 and v2a_ids is not None and out.get("v1_mask_btv") is None:
             with torch.no_grad():
                 pad_id_m = model.cfg.resolved_pad_id()
                 valid_ce = (tgt_out != pad_id_m)

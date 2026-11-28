@@ -3153,6 +3153,39 @@ class _CachedRoPE1D(RoPE1D):
         return cos[:, :, :seq_len, :], sin[:, :, :seq_len, :]
 
 
+def _active_class_label_smoothed_ce(
+    logits: torch.Tensor,
+    targets: torch.Tensor,
+    masked_cols: torch.Tensor,
+    *,
+    label_smoothing: float,
+    pad_id: int,
+    weight: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """Label-smoothed CE that spreads smoothing mass over ACTIVE classes only.
+
+    ``masked_cols`` (bool, broadcastable to ``logits``) marks schema-masked logit columns.
+    Plain ``F.cross_entropy(label_smoothing=...)`` averages ``-logp`` over all V classes,
+    which gives masked columns a term ``lse + 1e4`` whose ``lse`` part is unbounded
+    below (the optimiser drifts all logits negative). Here masked columns contribute 0.
+    """
+    lg = logits.float().masked_fill(masked_cols, -1e30)
+    lp = torch.log_softmax(lg, dim=-1)
+    valid = targets != pad_id
+    safe_t = targets.clamp(min=0, max=lg.shape[-1] - 1)
+    nll = -lp.gather(-1, safe_t.unsqueeze(-1)).squeeze(-1)
+    active = (~masked_cols).expand_as(lp)
+    n_act = active.sum(-1).clamp(min=1).float()
+    smooth = -(lp.masked_fill(~active, 0.0)).sum(-1) / n_act
+    per_tok = (1.0 - label_smoothing) * nll + label_smoothing * smooth
+    if weight is not None:
+        w = weight.float()[safe_t]
+    else:
+        w = torch.ones_like(per_tok)
+    w = w * valid.float()
+    return (per_tok * w).sum() / w.sum().clamp(min=1e-8)
+
+
 class UniOMRv2Net(nn.Module):
     """UniOMR v2: Anisotropic FPN + Hybrid Axial/Merger/2D-RoPE Encoder + GQA MTP-4 Decoder."""
 
@@ -4155,6 +4188,10 @@ class UniOMRv2Net(nn.Module):
             ce_loss = bekern_full.masked_layer_cross_entropy(
                 logits, targets, layer_masks, label_smoothing=ls, weight=ce_w
             )
+        elif out.get("v1_mask_btv") is not None and ls > 0.0:
+            ce_loss = _active_class_label_smoothed_ce(
+                logits, targets, out["v1_mask_btv"], label_smoothing=ls, pad_id=pad_id, weight=ce_w
+            ).to(logits.dtype)
         else:
             ce_loss = F.cross_entropy(
                 logits.reshape(-1, V),
@@ -4185,6 +4222,14 @@ class UniOMRv2Net(nn.Module):
                     mtp_acc = mtp_acc + bekern_full.masked_layer_cross_entropy(
                         mtp_logits[idx], shifted_tgts[idx], layer_masks, label_smoothing=ls
                     ).float()
+                mtp_loss = mtp_acc / float(n_mtp)
+            elif out.get("v1_mask_btv") is not None and ls > 0.0:
+                mtp_acc = logits.new_zeros((), dtype=torch.float32)
+                for idx in range(n_mtp):
+                    mtp_acc = mtp_acc + _active_class_label_smoothed_ce(
+                        mtp_logits[idx], shifted_tgts[idx], out["v1_mask_btv"],
+                        label_smoothing=ls, pad_id=pad_id,
+                    )
                 mtp_loss = mtp_acc / float(n_mtp)
             else:
                 mtp_stacked = torch.stack(mtp_logits, dim=0)  # (M, B, T, V)
