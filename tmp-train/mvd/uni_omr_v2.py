@@ -597,8 +597,7 @@ class UniOMRv2Config:
             router_hidden=64,
             max_mem_tokens=3072,
             mtp_k=4,
-            # Promoted Iter 15 winners:
-            n_register_tokens=8,
+            # Promoted Iter 15 winners (frozen; new winners like n_register_tokens=8 go to Iter 16):
             use_yoco_cla=True,
             yoco_cross_banks=(0, 3, 7),
             yoco_cross_kv_heads=12,
