@@ -481,9 +481,12 @@
     "est_cu": 3.4,
     "script": "experiments/2026-11-26T01-38-ov-17-irope-registers-jitter-sweep/run_colab.py",
     "hf_eval_target": "evals/2026-11-26T01-38-ov-17-irope-registers-jitter-sweep.json",
-    "status": "QUEUED",
+    "status": "RUNNING",
     "depends_on": [],
-    "note": "re-queued after triage fix 2026-11-26 (round 2)"
+    "note": "re-queued after triage fix 2026-11-26 (round 2)",
+    "session": "ov-17",
+    "started_at": "2026-11-28T04:40:16Z",
+    "log_path": "D:\\tmp\\overnight-queue-logs\\2026-11-26T01-38-ov-17-irope-registers-jitter-sweep.log"
   },
   {
     "id": "2026-11-26T01-38-ov-21-paper-gate-border-threshold",
@@ -2251,10 +2254,18 @@
     "est_cu": 3.1,
     "script": "experiments/2026-11-26T22-18-i14-07-retinex-norm-and-clean-router-masks/run_colab.py",
     "hf_eval_target": "evals/2026-11-26T22-18-i14-07-retinex-norm-and-clean-router-masks.json",
-    "status": "QUEUED",
+    "status": "COMPLETED",
     "depends_on": [],
     "note": "Wave 11 Safe (Theorist 4 ALS 51.13->92+): ~0.14M zero-init Retinex normalizer + clean-render router BCE supervision.",
-    "requeue_note": "Fixed 6 bugs 2026-11-28: unpack resolve_manifest_pieces 2-tuple, load_uni_checkpoint vocab_size=237, _vocab_spec encoding, model()+compute_loss() API + reuse fwd router_info, piece gt/clean/photo keys, generate_mtp_spec return_stats=False."
+    "requeue_note": "Fixed 6 bugs 2026-11-28: unpack resolve_manifest_pieces 2-tuple, load_uni_checkpoint vocab_size=237, _vocab_spec encoding, model()+compute_loss() API + reuse fwd router_info, piece gt/clean/photo keys, generate_mtp_spec return_stats=False.",
+    "session": "2026-11-26t22-18-i14-07-",
+    "started_at": "2026-11-28T03:18:20Z",
+    "log_path": "D:\\tmp\\overnight-queue-logs\\2026-11-26T22-18-i14-07-retinex-norm-and-clean-router-masks.log",
+    "completed_at": "2026-11-28T04:40:14Z",
+    "elapsed_sec": 4913.51,
+    "returncode": 0,
+    "verdict": "DISCARD",
+    "summary": "A100 2/2 arms (600 steps from iter12_v2_best, 2748.2s compute, 0 NaNs): als_stress 0.3978 vs 0.4106 (-1.28pp), hw_photo 0.1376 vs 0.1409 (-0.33pp), hw_clean 0.1715 vs 0.2010 (-2.95pp), router_recall 0.8629 vs 0.8579 (+0.50pp), gutter_eviction 0.5077 vs 0.3374 (+17.03pp), printed_clean 0.6704 vs 0.6336 (+3.68pp), printed_photo 0.6939 vs 0.6550 (+3.89pp). Failed ALS/HW/recall gates; Retinex gate inverted sign (tanh=-0.06534) and raw (1-luma)>0.12 mask miscalibrated on aged-parchment HW."
   },
   {
     "id": "2026-11-26T22-18-i14-08-verifier-gated-rism-selftrain-flywheel",
@@ -2706,14 +2717,17 @@
     "plan": "experiments/2026-11-27T07-46-i15-05-spx13-band-tiling-and-hw-lora/PLAN.md",
     "hf_eval_target": "evals/2026-11-27T07-46-i15-05-spx13-band-tiling-and-hw-lora.json",
     "hf_run_target": "runs/2026-11-27T07-46-i15-05-spx13-band-tiling-and-hw-lora.json",
-    "status": "QUEUED",
+    "status": "RUNNING",
     "depends_on": [],
     "datasets": [
       "datasets/suite31_hw_eval.tar",
       "datasets/iter10_5_proxy_2k.tar"
     ],
     "note": "Wave 13 Pivot Strategist 5: Arm A tests zero-train dark-border crop + canonical s_px=13 px 1-2 system band tiling (n_bands=1 bit-identical passthrough when s_px>=10 px; gate hw_landscape >= +5.0 pp, 0.00 pp printed); Arm B freezes base and trains 1,500-step rank-16 HW-only LoRA (1.29 MB INT4 on edge85m, <55 MB total) strictly on HW s_px=13 bands (gate hw_clean/hw_photo >= +4.0 pp over Arm A, domain-gated 0.00 pp printed).",
-    "requeue_note": "Fixed 2026-11-28: set model.cfg.tok_dropout=0.0 before LoRA training + purged stale ov_mvd_bundle.tar.gz so Colab picks up updated uni_omr_v2.py."
+    "requeue_note": "Fixed 2026-11-28: set model.cfg.tok_dropout=0.0 before LoRA training + purged stale ov_mvd_bundle.tar.gz so Colab picks up updated uni_omr_v2.py.",
+    "session": "2026-11-27t07-46-i15-05-",
+    "started_at": "2026-11-28T03:18:20Z",
+    "log_path": "D:\\tmp\\overnight-queue-logs\\2026-11-27T07-46-i15-05-spx13-band-tiling-and-hw-lora.log"
   },
   {
     "id": "2026-11-27T07-52-i15-07-bekern3-2d-cursor-and-bar-rewind",

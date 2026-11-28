@@ -1,0 +1,15 @@
+{
+  "exp_id": "2026-11-26T22-18-i14-07-retinex-norm-and-clean-router-masks",
+  "status": "COMPLETED",
+  "verdict": "DISCARD",
+  "completed_at": "2026-11-28T04:40:04Z",
+  "elapsed_sec": 2748.22,
+  "deltas": {
+    "als_stress_note_f1_delta": -0.0128,
+    "hw_photo_note_f1_delta": -0.0033,
+    "hw_clean_note_f1_delta": -0.0295,
+    "printed_clean_note_f1_delta": 0.0368,
+    "router_notation_recall_delta": 0.005,
+    "gutter_eviction_rate_delta": 0.1703
+  }
+}
