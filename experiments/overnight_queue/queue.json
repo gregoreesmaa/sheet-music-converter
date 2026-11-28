@@ -454,17 +454,17 @@
     "wave": 4,
     "priority": 7,
     "provider": "colab_l4",
-    "gpu": "L4",
+    "gpu": "A100",
     "est_minutes": 38,
     "est_cu": 3.2,
     "script": "experiments/2026-11-26T01-38-ov-16-resolution-multiscale-sweep/run_colab.py",
     "hf_eval_target": "evals/2026-11-26T01-38-ov-16-resolution-multiscale-sweep.json",
-    "status": "QUEUED",
+    "status": "RUNNING",
     "depends_on": [],
     "note": "re-queued after triage fix 2026-11-26 (round 2)",
     "session": "ov-16",
-    "started_at": "2026-11-26T21:32:17Z",
-    "log_path": "D:\\tmp\\overnight-queue-logs\\2026-11-26T01-38-ov-16-resolution-multiscale-sweep.modal.log"
+    "started_at": "2026-11-28T01:43:59Z",
+    "log_path": "D:\\tmp\\overnight-queue-logs\\2026-11-26T01-38-ov-16-resolution-multiscale-sweep.log"
   },
   {
     "id": "2026-11-26T01-38-ov-17-irope-registers-jitter-sweep",
@@ -1944,7 +1944,7 @@
     "est_cu": 3.8,
     "script": "experiments/2026-11-26T19-35-i13-26b-asymmetric-gqa-cross-mha/run_colab.py",
     "hf_eval_target": "evals/2026-11-26T19-35-i13-26b-asymmetric-gqa-cross-mha.json",
-    "status": "RUNNING",
+    "status": "COMPLETED",
     "depends_on": [
       "2026-11-26T07-40-i13-26-gqa-kv-heads-sweep"
     ]
@@ -2062,7 +2062,7 @@
   {
     "id": "2026-11-26T21-56-eval-northstar-iter10_5-v1",
     "short_id": "ns-i10_5-v1",
-    "title": "OMR-NorthStar v0.1 125p Eval — UniOMR Iter 10.5 (v1, 4x8, 8k EMA)",
+    "title": "OMR-NorthStar v0.1 125p Eval \u2014 UniOMR Iter 10.5 (v1, 4x8, 8k EMA)",
     "wave": 10,
     "priority": 1,
     "provider": "colab_l4",
@@ -2361,7 +2361,7 @@
   {
     "id": "2026-11-26T22-41-eval-northstar-iter13-mid",
     "short_id": "ns-i13-mid",
-    "title": "OMR-NorthStar v0.1 125p Eval — UniOMR Iter 13 Stage 2 Mid (v2, step 744 EMA, max_mem=3072)",
+    "title": "OMR-NorthStar v0.1 125p Eval \u2014 UniOMR Iter 13 Stage 2 Mid (v2, step 744 EMA, max_mem=3072)",
     "wave": 10,
     "priority": 1,
     "provider": "colab_l4",
@@ -2387,7 +2387,7 @@
   {
     "id": "2026-11-26T22-47-eval-northstar-iter10_5-v1-msczrs",
     "short_id": "ns-i10_5-rs",
-    "title": "OMR-NorthStar v0.1 125p Eval — UniOMR Iter 10.5 (v1, 8k EMA) with Rust mscz-rs Exporter",
+    "title": "OMR-NorthStar v0.1 125p Eval \u2014 UniOMR Iter 10.5 (v1, 8k EMA) with Rust mscz-rs Exporter",
     "wave": 10,
     "priority": 1,
     "provider": "colab_l4",
@@ -2630,16 +2630,21 @@
     "plan": "experiments/2026-11-27T07-46-i15-03-lyrics-textspotter-vs-deferred-bpe/PLAN.md",
     "hf_eval_target": "evals/2026-11-27T07-46-i15-03-lyrics-textspotter-vs-deferred-bpe.json",
     "hf_run_target": "runs/2026-11-27T07-46-i15-03-lyrics-textspotter-vs-deferred-bpe.json",
-    "status": "RUNNING",
+    "status": "COMPLETED",
     "depends_on": [],
     "datasets": [
       "datasets/iter10_5_proxy_2k.tar",
       "datasets/suite31_hw_eval.tar"
     ],
-    "note": "Wave 13 Pivot Strategist 3: 2-arm 1,500-step bake-off on edge85m (<55MB INT4) breaking the -13.5pp S_expr text=0.000 ceiling — arm_a_textspotter_head (~1.8M parallel 2L d=256 cross-attending to mem_post_merger + unfrozen router) vs arm_b_deferred_sys_lyr_bpe (end-of-system <sys_lyr> + 256-token syllable BPE). Promote gate: held-out text F1 >= 0.70, vocal S_note delta >= -0.5pp, packed INT4 < 55.0 MB.",
+    "note": "Wave 13 Pivot Strategist 3: 2-arm 1,500-step bake-off on edge85m (<55MB INT4) breaking the -13.5pp S_expr text=0.000 ceiling \u2014 arm_a_textspotter_head (~1.8M parallel 2L d=256 cross-attending to mem_post_merger + unfrozen router) vs arm_b_deferred_sys_lyr_bpe (end-of-system <sys_lyr> + 256-token syllable BPE). Promote gate: held-out text F1 >= 0.70, vocal S_note delta >= -0.5pp, packed INT4 < 55.0 MB.",
     "session": "2026-11-27t07-46-i15-03-",
     "started_at": "2026-11-27T20:08:58Z",
-    "log_path": "D:\\tmp\\overnight-queue-logs\\2026-11-27T07-46-i15-03-lyrics-textspotter-vs-deferred-bpe.log"
+    "log_path": "D:\\tmp\\overnight-queue-logs\\2026-11-27T07-46-i15-03-lyrics-textspotter-vs-deferred-bpe.log",
+    "completed_at": "2026-11-28T01:43:59Z",
+    "elapsed_sec": 20100.98,
+    "returncode": 0,
+    "verdict": "ITERATE",
+    "verdict_summary": "CONFOUNDED (0/2000 train pages had XML text events; random-init edge85m base): both arms heldout_text_f1=0.0000 (Arm A collapsed to <t_eos> loss=4e-5, Arm B music-only S_note=0.0042). Valid INT4 footprint: Arm B 52.789 MB PASS (<55 MB) vs Arm A 55.081 MB FAIL (+0.081 MB over). Needs XML-sidecar vocal tar + pretrained warm-start + d_text=192."
   },
   {
     "id": "2026-11-27T07-46-i15-04-risk-gated-visual-ttc-and-sys-dagger",
@@ -2656,7 +2661,7 @@
     "plan": "experiments/2026-11-27T07-46-i15-04-risk-gated-visual-ttc-and-sys-dagger/PLAN.md",
     "hf_eval_target": "evals/2026-11-27T07-46-i15-04-risk-gated-visual-ttc-and-sys-dagger.json",
     "hf_run_target": "runs/2026-11-27T07-46-i15-04-risk-gated-visual-ttc-and-sys-dagger.json",
-    "status": "QUEUED",
+    "status": "RUNNING",
     "depends_on": [],
     "datasets": [
       "datasets/northstar_eval_pack_125p.tar.gz",
